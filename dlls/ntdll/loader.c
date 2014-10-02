@@ -44,6 +44,7 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 WINE_DECLARE_DEBUG_CHANNEL(snoop);
 WINE_DECLARE_DEBUG_CHANNEL(loaddll);
 WINE_DECLARE_DEBUG_CHANNEL(imports);
+WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
 #ifdef _WIN64
 #define DEFAULT_SECURITY_COOKIE_64  (((ULONGLONG)0x00002b99 << 32) | 0x2ddfa232)
@@ -4083,6 +4084,7 @@ void WINAPI LdrShutdownProcess(void)
     process_detach();
 }
 
+extern const char * CDECL wine_get_version(void);
 
 /******************************************************************
  *		RtlExitUserProcess (NTDLL.@)
@@ -4621,6 +4623,9 @@ static void release_address_space(void)
  */
 void loader_init( CONTEXT *context, void **entry )
 {
+    OBJECT_ATTRIBUTES staging_event_attr;
+    UNICODE_STRING staging_event_string;
+    HANDLE staging_event;
     static int attach_done;
     NTSTATUS status;
     ULONG_PTR cookie, port = 0;
@@ -4741,7 +4746,18 @@ void loader_init( CONTEXT *context, void **entry )
         }
 
         wm = get_modref( NtCurrentTeb()->Peb->ImageBaseAddress );
+        /* This hunk occasionally applies in the wrong place;
+         * add a comment here to try to prevent that. */
     }
+    RtlInitUnicodeString( &staging_event_string, L"\\__wine_staging_warn_event" );
+    InitializeObjectAttributes( &staging_event_attr, &staging_event_string, OBJ_OPENIF, NULL, NULL );
+    if (NtCreateEvent( &staging_event, EVENT_ALL_ACCESS, &staging_event_attr, NotificationEvent, FALSE ) == STATUS_SUCCESS)
+    {
+        FIXME_(winediag)("wine-cachyos %s is a testing version containing experimental patches.\n", wine_get_version());
+        FIXME_(winediag)("this wine contains many experimental patches, please don't report bugs to winehq.org.\n");
+    }
+    else
+        WARN_(winediag)("wine-cachyos %s is a testing version containing experimental patches.\n", wine_get_version());
 
     NtCurrentTeb()->FlsSlots = fls_alloc_data();
 
