@@ -358,6 +358,7 @@
 @ stdcall SetupDiGetDeviceInterfaceDetailA(long ptr ptr long ptr ptr)
 @ stdcall SetupDiGetDeviceInterfaceDetailW(long ptr ptr long ptr ptr)
 @ stdcall SetupDiGetDevicePropertyKeys(ptr ptr ptr long ptr long)
+@ stdcall SetupDiGetDeviceInterfacePropertyW(ptr ptr ptr ptr ptr long ptr long)
 @ stdcall SetupDiGetDevicePropertyW(ptr ptr ptr ptr ptr long ptr long)
 @ stdcall SetupDiGetDeviceRegistryPropertyA(long ptr long ptr ptr long ptr)
 @ stdcall SetupDiGetDeviceRegistryPropertyW(long ptr long ptr ptr long ptr)
