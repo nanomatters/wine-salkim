@@ -133,6 +133,7 @@ struct vulkan_device
     unsigned int allocated_fence_ops_count;
 
     BOOL keyed_mutexes_enabled;
+    BOOL low_latency_enabled;
 };
 
 static inline struct vulkan_device *vulkan_device_from_handle( VkDevice handle )
@@ -210,6 +211,7 @@ struct vulkan_funcs
     PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR p_vkGetPhysicalDeviceWin32PresentationSupportKHR;
     PFN_vkGetSwapchainImagesKHR p_vkGetSwapchainImagesKHR;
     PFN_vkQueuePresentKHR p_vkQueuePresentKHR;
+    PFN_vkSetLatencySleepModeNV p_vkSetLatencySleepModeNV;
 
     /* winevulkan specific functions */
     const char *(*p_get_host_surface_extension)(void);
