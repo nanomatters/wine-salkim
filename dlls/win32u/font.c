@@ -5993,12 +5993,6 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
         goto done;
     }
 
-    pt.x = x;
-    pt.y = y;
-    lp_to_dp(dc, &pt, 1);
-    x = pt.x;
-    y = pt.y;
-
     char_extra = dc->attr->char_extra;
     if (char_extra && lpDx && NtGdiGetDeviceCaps( hdc, TECHNOLOGY ) == DT_RASPRINTER)
         char_extra = 0; /* Printer drivers don't add char_extra if lpDx is supplied */
@@ -6123,8 +6117,6 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
         width = desired[1];
     }
 
-    tm.tmAscent = abs(INTERNAL_YWSTODS(dc, tm.tmAscent));
-    tm.tmDescent = abs(INTERNAL_YWSTODS(dc, tm.tmDescent));
     switch( align & (TA_LEFT | TA_RIGHT | TA_CENTER) )
     {
     case TA_LEFT:
@@ -6186,11 +6178,18 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
                 text_box.bottom = y + tm.tmDescent;
 
                 if (flags & ETO_CLIPPED) intersect_rect( &text_box, &text_box, &rc );
+                lp_to_dp(dc, (POINT *)&text_box, 2);
                 if (!IsRectEmpty( &text_box ))
                     physdev->funcs->pExtTextOut( physdev, 0, 0, ETO_OPAQUE, &text_box, NULL, 0, NULL );
             }
         }
     }
+
+    pt.x = x;
+    pt.y = y;
+    lp_to_dp(dc, &pt, 1);
+    x = pt.x;
+    y = pt.y;
 
     ret = physdev->funcs->pExtTextOut( physdev, x, y, (flags & ~ETO_OPAQUE), &rc,
                                        str, count, (INT*)deltas );
