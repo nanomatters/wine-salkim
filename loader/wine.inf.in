@@ -104,6 +104,7 @@ AddReg=\
     VersionInfo,\
     LicenseInformation,\
     NVIDIANGX, \
+    WineNonSteamController, \
     ProtonOverrides
 
 [DefaultInstall.ntamd64]
@@ -135,6 +136,7 @@ AddReg=\
     VersionInfo,\
     LicenseInformation,\
     NVIDIANGX, \
+    WineNonSteamController, \
     ProtonOverrides
 
 [DefaultInstall.ntarm64]
@@ -190,6 +192,7 @@ AddReg=\
     VersionInfo,\
     LicenseInformation,\
     NVIDIANGX, \
+    WineNonSteamController, \
     ProtonOverrides
 
 [Wow64Install.ntarm]
@@ -2884,6 +2887,10 @@ HKLM,Software\Wow6432Node\Valve\Steam,"InstallPath",,"%16422%\Steam"
 
 [NVIDIANGX]
 HKLM,Software\NVIDIA Corporation\Global\NGXCore,"FullPath",,"C:\Windows\System32"
+
+[WineNonSteamController]
+HKLM,System\CurrentControlSet\Services\winebus,"DisableHidraw",0x10001,"1"
+HKLM,System\CurrentControlSet\Services\winebus,"Enable SDL",0x10001,"1"
 
 [ProtonOverrides]
 ;;Likely want *80 and *90 too, but those require removing Wine's manifest files.
