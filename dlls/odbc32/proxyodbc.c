@@ -5503,6 +5503,29 @@ static SQLRETURN bind_parameter_win32( struct statement *stmt, SQLUSMALLINT para
     if (stmt->hdr.win32_funcs->SQLBindParameter)
         return stmt->hdr.win32_funcs->SQLBindParameter( stmt->hdr.win32_handle, param, io_type, value_type,
                                                         param_type, size, digits, value, buflen, len );
+    else if(stmt->hdr.win32_funcs->SQLBindParam)
+    {
+        /* ODBC v2 */
+        /* TODO: Make function */
+        if (value_type == SQL_C_TYPE_TIME)
+            value_type = SQL_C_TIME;
+        else if (value_type == SQL_C_TYPE_DATE)
+            value_type = SQL_C_DATE;
+        else if (value_type == SQL_C_TYPE_TIMESTAMP)
+            value_type = SQL_C_TIMESTAMP;
+
+        /* TODO: Make function */
+        if (param_type == SQL_TIME)
+            param_type = SQL_TYPE_TIME;
+        else if (param_type == SQL_DATE)
+            param_type = SQL_TYPE_DATE;
+        else if (param_type == SQL_TIMESTAMP)
+            param_type = SQL_TYPE_TIMESTAMP;;;
+
+        return stmt->hdr.win32_funcs->SQLBindParam( stmt->hdr.win32_handle, param, value_type, param_type,
+                                                 size, digits, value, len);
+    }
+
     return SQL_ERROR;
 }
 
