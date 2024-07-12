@@ -6684,6 +6684,11 @@ static SQLRETURN set_connect_attr_win32_w( struct connection *con, SQLINTEGER at
     if (con->hdr.win32_funcs->SQLSetConnectAttrW)
         return con->hdr.win32_funcs->SQLSetConnectAttrW( con->hdr.win32_handle, attr, value, len );
     if (con->hdr.win32_funcs->SQLSetConnectAttr) FIXME( "Unicode to ANSI conversion not handled\n" );
+    else if(con->hdr.win32_funcs->SQLSetConnectOptionW)
+    {
+        /* ODBC v2 */
+        return con->hdr.win32_funcs->SQLSetConnectOptionW( con->hdr.win32_handle, attr, (SQLULEN)value );
+    }
     return SQL_ERROR;
 }
 
