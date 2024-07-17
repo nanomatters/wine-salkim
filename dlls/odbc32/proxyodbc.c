@@ -7918,6 +7918,11 @@ static SQLRETURN set_stmt_attr_win32_w( struct statement *stmt, SQLINTEGER attr,
     if (stmt->hdr.win32_funcs->SQLSetStmtAttrW)
         return stmt->hdr.win32_funcs->SQLSetStmtAttrW( stmt->hdr.win32_handle, attr, value, len );
     if (stmt->hdr.win32_funcs->SQLSetStmtAttr) FIXME( "Unicode to ANSI conversion not handled\n" );
+    else if (stmt->hdr.win32_funcs->SQLSetStmtOption)
+    {
+        /* ODBC v2.0 */
+        return stmt->hdr.win32_funcs->SQLSetStmtOption( stmt->hdr.win32_handle, attr, (SQLULEN)value );
+    }
     return SQL_ERROR;
 }
 
