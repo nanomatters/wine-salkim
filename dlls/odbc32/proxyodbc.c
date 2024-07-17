@@ -2458,11 +2458,35 @@ static SQLRETURN get_data_unix( struct statement *stmt, SQLUSMALLINT column, SQL
     return ret;
 }
 
+static struct object *find_object_type(SQLSMALLINT type, struct object *object)
+{
+    while (object && object->type != type)
+    {
+        object = object->parent;
+    }
+
+    return object;
+}
+
 static SQLRETURN get_data_win32( struct statement *stmt, SQLUSMALLINT column, SQLSMALLINT type, SQLPOINTER value,
                                  SQLLEN buflen, SQLLEN *retlen )
 {
     if (stmt->hdr.win32_funcs->SQLGetData)
+    {
+        struct environment *env = (struct environment *)find_object_type(SQL_HANDLE_ENV, stmt->hdr.parent);
+        if (env && env->attr_version == SQL_OV_ODBC2)
+        {
+            if (type == SQL_C_TYPE_TIME)
+                type = SQL_C_TIME;
+            else if (type == SQL_C_TYPE_DATE)
+                type = SQL_C_DATE;
+            else if (type == SQL_C_TYPE_TIMESTAMP)
+                type = SQL_C_TIMESTAMP;
+        }
+
         return stmt->hdr.win32_funcs->SQLGetData( stmt->hdr.win32_handle, column, type, value, buflen, retlen );
+    }
+
     return SQL_ERROR;
 }
 
