@@ -464,6 +464,7 @@ static struct environment *create_environment( void )
     if (!(ret = calloc( 1, sizeof(*ret) ))) return NULL;
     init_object( &ret->hdr, SQL_HANDLE_ENV, NULL );
     ret->attr_version = SQL_OV_ODBC2;
+    ret->driver_ver = SQL_OV_ODBC2;
     return ret;
 }
 
@@ -1257,6 +1258,9 @@ static SQLRETURN set_env_attr( struct environment *env, SQLINTEGER attr, SQLPOIN
     }
     else if (env->hdr.win32_handle)
     {
+        if (env->hdr.win32_funcs->SQLGetEnvAttr)
+           ret = env->hdr.win32_funcs->SQLGetEnvAttr( env->hdr.win32_handle, SQL_ATTR_ODBC_VERSION, &env->driver_ver, 0, NULL );
+
         if (env->hdr.win32_funcs->SQLSetEnvAttr)
             ret = env->hdr.win32_funcs->SQLSetEnvAttr( env->hdr.win32_handle, attr, value, len );
     }
