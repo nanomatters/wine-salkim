@@ -1027,7 +1027,6 @@ static SQLRETURN col_attribute_win32_a( struct statement *stmt, SQLUSMALLINT col
 
         default:
             FIXME( "field id %u not handled\n", field_id );
-            return SQL_ERROR;
         }
 
         return stmt->hdr.win32_funcs->SQLColAttributes( stmt->hdr.win32_handle, col, field_id, char_attr, buflen,
@@ -6290,7 +6289,6 @@ static SQLRETURN col_attribute_win32_w( struct statement *stmt, SQLUSMALLINT col
 
         default:
             FIXME( "field id %u not handled\n", field_id );
-            return SQL_ERROR;
         }
 
         ret = stmt->hdr.win32_funcs->SQLColAttributesW( stmt->hdr.win32_handle, col, field_id, char_attr, buflen,
