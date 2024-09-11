@@ -1,6 +1,11 @@
 # Changelog
 
 ##Version 9.0-20250402
+* Wine:
+  -   rebase: on top of proton-cachyos
+  - reverted: winevulkan: [HACK] Set default mxcsr for vkEnumeratePhysicalDevices() call.
+  - reverted: ntdll: [GAMEFIX] Uplay fsync wine hotfix
+  - reverted: ntdll: Use a critical section for setting the newly created timer in RtlCreateTimer
 * Proton
   -    added: explorer: Enable the Wayland driver.
   - reverted: HACK: winegstreamer: Set GST_GL_WINDOW environment variable.
@@ -10,6 +15,8 @@ base: experimental-wine-bleeding-edge-9.0-181629-20250402-p8dd17c-wd02b1a-d2e20d
 --
 
 ##Version 9.0-20250307
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   added: ntdll: Enable esync and fsync by default. (disable with WINEESYNC=0/WINEFSYNC=0 respectively)
   -   added: winex11: add Muffin (Cinnamon) to Mutter detection (thanks NelloKudo)
@@ -23,6 +30,8 @@ base: experimental-wine-bleeding-edge-9.0-171504-20250307-p9fdc47-wb9323b-d35e2e
 --
 
 ## Version 9.0-20250227
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   added: ntdll, msvcrt: Use runtime-dispatched per-architecture-optimized code for string functions.
   -   added: ntdll: Use clock_nanosleep for delay.
@@ -37,6 +46,10 @@ base: experimental-wine-bleeding-edge-9.0-168280-20250227-p9fdc47-w507bc0-dfcbdf
 --
 
 ## Version 9.0-20250211
+* Wine
+  -  rebase: on top of proton-cachyos
+  -  revert: "icu: Add stub dll."
+  -  revert: "icu: Forward function to Unicode library v68."  
 * Proton
   - updated: winebus: introduce variable to prefer sdl over hidraw
   - updated: user32: [GAMEFIX] Fix xinput support for Dragon Age Inquisition
@@ -47,6 +60,8 @@ base: experimental-wine-bleeding-edge-9.0-161257-20250211-p66871e-wa4f519-dac17d
 --
 
 ## Version 9.0-20250126
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   added: winebus: introduce variable to prefer sdl over hidraw
 
@@ -55,6 +70,8 @@ base: experimental-wine-bleeding-edge-9.0-155969-20250126-p2152e5-w023c900-d5b21
 --
 
 ## Version 9.0-20250117
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   added: winex11.drv: add env switch to disable wm decorations
   - removed: winex11.drv: disable wm decorations by default
@@ -64,12 +81,16 @@ base: experimental-wine-bleeding-edge-9.0-152395-20250117-p9ccbc1-wd18134-dc52a6
 --
 
 ## Version 9.0-20250106
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   - removed: ntsync7 patchset
 
 --
 
 ## Version 9.0-20250102
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   added: ntsync7 patchset
   -   added: win32u: Check for driver events more often.
@@ -78,6 +99,8 @@ base: experimental-wine-bleeding-edge-9.0-152395-20250117-p9ccbc1-wd18134-dc52a6
 --
 
 ## Version 9.0-20241206
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   added: ntdll: Implement dynamic spinning
   -   added: include: Allow YieldProcessor() on Clang MSVC mode.
@@ -88,6 +111,8 @@ base: experimental-wine-bleeding-edge-9.0-152395-20250117-p9ccbc1-wd18134-dc52a6
 --
 
 ## Version 9.0-20241123
+* Wine
+  -  rebase: on top of proton-cachyos
 * Proton
   -   fixed: winex11.drv: disable wm decorations by default
   -   added: cherry-picks from mainline to fix compilation with clang
@@ -101,6 +126,8 @@ base: experimental-wine-bleeding-edge-9.0-152395-20250117-p9ccbc1-wd18134-dc52a6
 --
 
 ## Version 9.0-20241115
+* Wine
+  - rebase-only
 * Proton
   - dropped: (in-upstream) Revert "gdi32: Add stub for D3DKMTEnumAdapters2()."
   - dropped: (in-upstream) gdi32,win32u,winex11: Implement D3DKMTEnumAdapters2.
@@ -111,18 +138,24 @@ base: experimental-wine-bleeding-edge-9.0-152395-20250117-p9ccbc1-wd18134-dc52a6
 --
 
 ## Version 9.0-20241031
+* Wine
+  - rebase-only
 * Proton
   - rebase-only
 
 --
 
 ## Version 9.0-20240928
+* Wine
+  - rebase-only
 * Proton
   -   added: ntdll: Downgrade 'using kernel write watches' from MESSAGE to TRACE.
 
 --
 
 ## Version 9.0-20240918
+* Wine
+  - rebase-only
 * Proton
   - removed: (staging) d3dx11_43-D3DX11CreateTextureFromMemory
   - removed: (staging) d3dx9_36-BumpLuminance
@@ -136,6 +169,8 @@ base: experimental-wine-bleeding-edge-9.0-152395-20250117-p9ccbc1-wd18134-dc52a6
 ---
 
 ## Version 9.0-20240905
+* Wine
+  - removed: Revert "fastsync: Implement fastsync synchronization (winesync)"
 * Proton
   - removed: fastsync: Implement fastsync synchronization (winesync)
   - added: ntdll: fix compilation with link-time optimizations
