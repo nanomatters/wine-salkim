@@ -2241,11 +2241,13 @@ HKLM,%CurrentVersion%\Telephony\Country List\998,"SameAreaRule",,"G"
 11,,start.exe
 11,,winhlp32.exe
 52,win40\0,wineps16.drv,wineps16.drv16
+16426,Microsoft\EdgeWebView\Application\131.0.2903.86\EBWebView\x32,embeddedbrowserwebview.dll
 
 ; 64bit-only fake dlls
 [FakeDllsWin64]
 10,twain_64,sane.ds
 10,twain_64,gphoto2.ds
+16426,Microsoft\EdgeWebView\Application\131.0.2903.86\EBWebView\x64,embeddedbrowserwebview.dll
 
 ; Wow64-only fake dlls
 [FakeDllsWow64]
