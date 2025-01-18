@@ -3238,6 +3238,7 @@ const char *debug_hlsl_expr_op(enum hlsl_ir_expr_op op)
         [HLSL_OP1_F32TOF16]     = "f32tof16",
         [HLSL_OP1_FLOOR]        = "floor",
         [HLSL_OP1_FRACT]        = "fract",
+        [HLSL_OP1_ISINF]        = "isinf",
         [HLSL_OP1_LOG2]         = "log2",
         [HLSL_OP1_LOGIC_NOT]    = "!",
         [HLSL_OP1_NEG]          = "-",
