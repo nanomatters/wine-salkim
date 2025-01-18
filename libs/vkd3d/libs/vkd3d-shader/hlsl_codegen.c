@@ -2881,6 +2881,7 @@ static bool lower_separate_samples(struct hlsl_ctx *ctx, struct hlsl_ir_node *in
     load = hlsl_ir_resource_load(instr);
 
     if (load->load_type != HLSL_RESOURCE_SAMPLE
+            && load->load_type != HLSL_RESOURCE_SAMPLE_GRAD
             && load->load_type != HLSL_RESOURCE_SAMPLE_LOD
             && load->load_type != HLSL_RESOURCE_SAMPLE_LOD_BIAS)
         return false;
@@ -2907,6 +2908,13 @@ static bool lower_separate_samples(struct hlsl_ctx *ctx, struct hlsl_ir_node *in
     if (!(name = hlsl_get_string_buffer(ctx)))
         return false;
     vkd3d_string_buffer_printf(name, "%s+%s", sampler->name, resource->name);
+
+    if (load->texel_offset.node)
+    {
+        hlsl_error(ctx, &instr->loc, VKD3D_SHADER_ERROR_HLSL_INCOMPATIBLE_PROFILE,
+                "Texel offsets are not supported on profiles lower than 4.0.\n");
+        return false;
+    }
 
     TRACE("Lowering to combined sampler %s.\n", debugstr_a(name->buffer));
 
@@ -3099,11 +3107,24 @@ static bool sort_synthetic_separated_samplers_first(struct hlsl_ctx *ctx)
     return false;
 }
 
-/* Turn CAST to int or uint into FLOOR + REINTERPRET (which is written as a mere MOV). */
+/* Turn CAST to int or uint as follows:
+ *
+ *     CAST(x) = x - FRACT(x) + extra
+ *
+ * where
+ *
+ *      extra = FRACT(x) > 0 && x < 0
+ *
+ * where the comparisons in the extra term are performed using CMP or SLT
+ * depending on whether this is a pixel or vertex shader, respectively.
+ *
+ * A REINTERPET (which is written as a mere MOV) is also applied to the final
+ * result for type consistency.
+ */
 static bool lower_casts_to_int(struct hlsl_ctx *ctx, struct hlsl_ir_node *instr, struct hlsl_block *block)
 {
     struct hlsl_ir_node *operands[HLSL_MAX_OPERANDS] = { 0 };
-    struct hlsl_ir_node *arg, *floor, *res;
+    struct hlsl_ir_node *arg, *res;
     struct hlsl_ir_expr *expr;
 
     if (instr->type != HLSL_IR_EXPR)
@@ -3118,12 +3139,83 @@ static bool lower_casts_to_int(struct hlsl_ctx *ctx, struct hlsl_ir_node *instr,
     if (arg->data_type->e.numeric.type != HLSL_TYPE_FLOAT && arg->data_type->e.numeric.type != HLSL_TYPE_HALF)
         return false;
 
-    if (!(floor = hlsl_new_unary_expr(ctx, HLSL_OP1_FLOOR, arg, &instr->loc)))
-        return false;
-    hlsl_block_add_instr(block, floor);
+    if (ctx->profile->type == VKD3D_SHADER_TYPE_PIXEL)
+    {
+        struct hlsl_ir_node *fract, *neg_fract, *has_fract, *floor, *extra, *zero, *one;
+        struct hlsl_constant_value zero_value, one_value;
+
+        memset(&zero_value, 0, sizeof(zero_value));
+        if (!(zero = hlsl_new_constant(ctx, arg->data_type, &zero_value, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, zero);
+
+        one_value.u[0].f = 1.0;
+        one_value.u[1].f = 1.0;
+        one_value.u[2].f = 1.0;
+        one_value.u[3].f = 1.0;
+        if (!(one = hlsl_new_constant(ctx, arg->data_type, &one_value, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, one);
+
+        if (!(fract = hlsl_new_unary_expr(ctx, HLSL_OP1_FRACT, arg, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, fract);
+
+        if (!(neg_fract = hlsl_new_unary_expr(ctx, HLSL_OP1_NEG, fract, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, neg_fract);
+
+        if (!(has_fract = hlsl_new_ternary_expr(ctx, HLSL_OP3_CMP, neg_fract, zero, one)))
+            return false;
+        hlsl_block_add_instr(block, has_fract);
+
+        if (!(extra = hlsl_new_ternary_expr(ctx, HLSL_OP3_CMP, arg, zero, has_fract)))
+            return false;
+        hlsl_block_add_instr(block, extra);
+
+        if (!(floor = hlsl_new_binary_expr(ctx, HLSL_OP2_ADD, arg, neg_fract)))
+            return false;
+        hlsl_block_add_instr(block, floor);
+
+        if (!(res = hlsl_new_binary_expr(ctx, HLSL_OP2_ADD, floor, extra)))
+            return false;
+        hlsl_block_add_instr(block, res);
+    }
+    else
+    {
+        struct hlsl_ir_node *neg_arg, *is_neg, *fract, *neg_fract, *has_fract, *floor;
+
+        if (!(neg_arg = hlsl_new_unary_expr(ctx, HLSL_OP1_NEG, arg, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, neg_arg);
+
+        if (!(is_neg = hlsl_new_binary_expr(ctx, HLSL_OP2_SLT, arg, neg_arg)))
+            return false;
+        hlsl_block_add_instr(block, is_neg);
+
+        if (!(fract = hlsl_new_unary_expr(ctx, HLSL_OP1_FRACT, arg, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, fract);
+
+        if (!(neg_fract = hlsl_new_unary_expr(ctx, HLSL_OP1_NEG, fract, &instr->loc)))
+            return false;
+        hlsl_block_add_instr(block, neg_fract);
+
+        if (!(has_fract = hlsl_new_binary_expr(ctx, HLSL_OP2_SLT, neg_fract, fract)))
+            return false;
+        hlsl_block_add_instr(block, has_fract);
+
+        if (!(floor = hlsl_new_binary_expr(ctx, HLSL_OP2_ADD, arg, neg_fract)))
+            return false;
+        hlsl_block_add_instr(block, floor);
+
+        if (!(res = hlsl_new_ternary_expr(ctx, HLSL_OP3_MAD, is_neg, has_fract, floor)))
+            return false;
+        hlsl_block_add_instr(block, res);
+    }
 
     memset(operands, 0, sizeof(operands));
-    operands[0] = floor;
+    operands[0] = res;
     if (!(res = hlsl_new_expr(ctx, HLSL_OP1_REINTERPRET, operands, instr->data_type, &instr->loc)))
         return false;
     hlsl_block_add_instr(block, res);
@@ -6977,7 +7069,8 @@ static void sm1_generate_vsir_sampler_dcls(struct hlsl_ctx *ctx,
                         break;
 
                     case HLSL_SAMPLER_DIM_GENERIC:
-                        /* These can appear in sm4-style combined sample instructions. */
+                        /* These can appear in sm4-style separate sample
+                         * instructions that haven't been lowered. */
                         hlsl_fixme(ctx, &var->loc, "Generic samplers need to be lowered.");
                         continue;
 
@@ -11732,6 +11825,95 @@ static bool lower_f32tof16(struct hlsl_ctx *ctx, struct hlsl_ir_node *node, stru
     return true;
 }
 
+static bool lower_isinf(struct hlsl_ctx *ctx, struct hlsl_ir_node *node, struct hlsl_block *block)
+{
+    struct hlsl_ir_node *call, *rhs, *store;
+    struct hlsl_ir_function_decl *func;
+    unsigned int component_count;
+    struct hlsl_ir_load *load;
+    struct hlsl_ir_expr *expr;
+    struct hlsl_ir_var *lhs;
+    const char *template;
+    char *body;
+
+    static const char template_sm2[] =
+        "typedef bool%u boolX;\n"
+        "typedef float%u floatX;\n"
+        "boolX isinf(floatX x)\n"
+        "{\n"
+        "    floatX v = 1 / x;\n"
+        "    v = v * v;\n"
+        "    return v <= 0;\n"
+        "}\n";
+
+    static const char template_sm3[] =
+        "typedef bool%u boolX;\n"
+        "typedef float%u floatX;\n"
+        "boolX isinf(floatX x)\n"
+        "{\n"
+        "    floatX v = 1 / x;\n"
+        "    return v <= 0;\n"
+        "}\n";
+
+    static const char template_sm4[] =
+        "typedef bool%u boolX;\n"
+        "typedef float%u floatX;\n"
+        "boolX isinf(floatX x)\n"
+        "{\n"
+        "    return (asuint(x) & 0x7fffffff) == 0x7f800000;\n"
+        "}\n";
+
+    static const char template_int[] =
+        "typedef bool%u boolX;\n"
+        "typedef float%u floatX;\n"
+        "boolX isinf(floatX x)\n"
+        "{\n"
+        "    return false;\n"
+        "}";
+
+    if (node->type != HLSL_IR_EXPR)
+        return false;
+
+    expr = hlsl_ir_expr(node);
+
+    if (expr->op != HLSL_OP1_ISINF)
+        return false;
+
+    rhs = expr->operands[0].node;
+
+    if (hlsl_version_lt(ctx, 3, 0))
+        template = template_sm2;
+    else if (hlsl_version_lt(ctx, 4, 0))
+        template = template_sm3;
+    else if (type_is_integer(rhs->data_type))
+        template = template_int;
+    else
+        template = template_sm4;
+
+    component_count = hlsl_type_component_count(rhs->data_type);
+    if (!(body = hlsl_sprintf_alloc(ctx, template, component_count, component_count)))
+        return false;
+
+    if (!(func = hlsl_compile_internal_function(ctx, "isinf", body)))
+        return false;
+
+    lhs = func->parameters.vars[0];
+
+    if (!(store = hlsl_new_simple_store(ctx, lhs, rhs)))
+        return false;
+    hlsl_block_add_instr(block, store);
+
+    if (!(call = hlsl_new_call(ctx, func, &node->loc)))
+        return false;
+    hlsl_block_add_instr(block, call);
+
+    if (!(load = hlsl_new_var_load(ctx, func->return_var, &node->loc)))
+        return false;
+    hlsl_block_add_instr(block, &load->node);
+
+    return true;
+}
+
 static void process_entry_function(struct hlsl_ctx *ctx,
         const struct hlsl_block *global_uniform_block, struct hlsl_ir_function_decl *entry_func)
 {
@@ -11764,6 +11946,8 @@ static void process_entry_function(struct hlsl_ctx *ctx,
         lower_ir(ctx, lower_f16tof32, body);
         lower_ir(ctx, lower_f32tof16, body);
     }
+
+    lower_ir(ctx, lower_isinf, body);
 
     lower_return(ctx, entry_func, body, false);
 
