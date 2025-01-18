@@ -4313,6 +4313,19 @@ static bool intrinsic_fwidth(struct hlsl_ctx *ctx,
     return !!add_user_call(ctx, func, params, false, loc);
 }
 
+static bool intrinsic_isinf(struct hlsl_ctx *ctx,
+        const struct parse_initializer *params, const struct vkd3d_shader_location *loc)
+{
+    struct hlsl_type *type = params->args[0]->data_type, *bool_type;
+    struct hlsl_ir_node *args[HLSL_MAX_OPERANDS] = {0};
+
+    bool_type = hlsl_get_numeric_type(ctx, type->class, HLSL_TYPE_BOOL,
+            type->e.numeric.dimx, type->e.numeric.dimy);
+
+    args[0] = params->args[0];
+    return !!add_expr(ctx, params->instrs, HLSL_OP1_ISINF, args, bool_type, loc);
+}
+
 static bool intrinsic_ldexp(struct hlsl_ctx *ctx,
         const struct parse_initializer *params, const struct vkd3d_shader_location *loc)
 {
@@ -5410,6 +5423,7 @@ intrinsic_functions[] =
     {"fmod",                                2, true,  intrinsic_fmod},
     {"frac",                                1, true,  intrinsic_frac},
     {"fwidth",                              1, true,  intrinsic_fwidth},
+    {"isinf",                               1, true,  intrinsic_isinf},
     {"ldexp",                               2, true,  intrinsic_ldexp},
     {"length",                              1, true,  intrinsic_length},
     {"lerp",                                3, true,  intrinsic_lerp},
