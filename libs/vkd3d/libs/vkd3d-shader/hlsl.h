@@ -704,6 +704,7 @@ enum hlsl_ir_expr_op
     HLSL_OP1_F32TOF16,
     HLSL_OP1_FLOOR,
     HLSL_OP1_FRACT,
+    HLSL_OP1_ISINF,
     HLSL_OP1_LOG2,
     HLSL_OP1_LOGIC_NOT,
     HLSL_OP1_NEG,
