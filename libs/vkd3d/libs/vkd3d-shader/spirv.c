@@ -10923,7 +10923,8 @@ static int spirv_compiler_generate_spirv(struct spirv_compiler *compiler, struct
     compiler->input_control_point_count = program->input_control_point_count;
     compiler->output_control_point_count = program->output_control_point_count;
 
-    if (program->shader_version.type == VKD3D_SHADER_TYPE_HULL && !spirv_compiler_is_opengl_target(compiler))
+    if (program->shader_version.type == VKD3D_SHADER_TYPE_DOMAIN
+            || (program->shader_version.type == VKD3D_SHADER_TYPE_HULL && !spirv_compiler_is_opengl_target(compiler)))
         spirv_compiler_emit_tessellator_domain(compiler, program->tess_domain);
 
     if (compiler->shader_type != VKD3D_SHADER_TYPE_HULL)
