@@ -2031,6 +2031,25 @@ struct hlsl_ir_node *hlsl_new_stateblock_constant(struct hlsl_ctx *ctx, const ch
     return &constant->node;
 }
 
+struct hlsl_ir_node *hlsl_new_interlocked(struct hlsl_ctx *ctx, enum hlsl_interlocked_op op, struct hlsl_type *type,
+        const struct hlsl_deref *dst, struct hlsl_ir_node *coords, struct hlsl_ir_node *cmp_value,
+        struct hlsl_ir_node *value, const struct vkd3d_shader_location *loc)
+{
+    struct hlsl_ir_interlocked *interlocked;
+
+    if (!(interlocked = hlsl_alloc(ctx, sizeof(*interlocked))))
+        return NULL;
+
+    init_node(&interlocked->node, HLSL_IR_INTERLOCKED, type, loc);
+    interlocked->op = op;
+    hlsl_copy_deref(ctx, &interlocked->dst, dst);
+    hlsl_src_from_node(&interlocked->coords, coords);
+    hlsl_src_from_node(&interlocked->cmp_value, cmp_value);
+    hlsl_src_from_node(&interlocked->value, value);
+
+    return &interlocked->node;
+}
+
 bool hlsl_index_is_noncontiguous(struct hlsl_ir_index *index)
 {
     struct hlsl_type *type = index->val.node->data_type;
@@ -2375,6 +2394,27 @@ static struct hlsl_ir_node *clone_index(struct hlsl_ctx *ctx, struct clone_instr
     return dst;
 }
 
+static struct hlsl_ir_node *clone_interlocked(struct hlsl_ctx *ctx,
+        struct clone_instr_map *map, struct hlsl_ir_interlocked *src)
+{
+    struct hlsl_ir_interlocked *dst;
+
+    if (!(dst = hlsl_alloc(ctx, sizeof(*dst))))
+        return NULL;
+    init_node(&dst->node, HLSL_IR_INTERLOCKED, NULL, &src->node.loc);
+    dst->op = src->op;
+
+    if (!clone_deref(ctx, map, &dst->dst, &src->dst))
+    {
+        vkd3d_free(dst);
+        return NULL;
+    }
+    clone_src(map, &dst->coords, &src->coords);
+    clone_src(map, &dst->cmp_value, &src->cmp_value);
+    clone_src(map, &dst->value, &src->value);
+    return &dst->node;
+}
+
 static struct hlsl_ir_node *clone_compile(struct hlsl_ctx *ctx,
         struct clone_instr_map *map, struct hlsl_ir_compile *compile)
 {
@@ -2574,6 +2614,9 @@ static struct hlsl_ir_node *clone_instr(struct hlsl_ctx *ctx,
 
         case HLSL_IR_SWIZZLE:
             return clone_swizzle(ctx, map, hlsl_ir_swizzle(instr));
+
+        case HLSL_IR_INTERLOCKED:
+            return clone_interlocked(ctx, map, hlsl_ir_interlocked(instr));
 
         case HLSL_IR_COMPILE:
             return clone_compile(ctx, map, hlsl_ir_compile(instr));
@@ -3013,6 +3056,7 @@ const char *hlsl_node_type_to_string(enum hlsl_ir_node_type type)
         [HLSL_IR_STORE          ] = "HLSL_IR_STORE",
         [HLSL_IR_SWITCH         ] = "HLSL_IR_SWITCH",
         [HLSL_IR_SWIZZLE        ] = "HLSL_IR_SWIZZLE",
+        [HLSL_IR_INTERLOCKED    ] = "HLSL_IR_INTERLOCKED",
 
         [HLSL_IR_COMPILE]             = "HLSL_IR_COMPILE",
         [HLSL_IR_SAMPLER_STATE]       = "HLSL_IR_SAMPLER_STATE",
@@ -3458,6 +3502,35 @@ static void dump_ir_index(struct vkd3d_string_buffer *buffer, const struct hlsl_
     vkd3d_string_buffer_printf(buffer, "]");
 }
 
+static void dump_ir_interlocked(struct vkd3d_string_buffer *buffer, const struct hlsl_ir_interlocked *interlocked)
+{
+    static const char *const op_names[] =
+    {
+        [HLSL_INTERLOCKED_ADD] = "add",
+        [HLSL_INTERLOCKED_AND] = "and",
+        [HLSL_INTERLOCKED_CMP_EXCH] = "cmp_exch",
+        [HLSL_INTERLOCKED_EXCH] = "exch",
+        [HLSL_INTERLOCKED_MAX] = "max",
+        [HLSL_INTERLOCKED_MIN] = "min",
+        [HLSL_INTERLOCKED_OR] = "or",
+        [HLSL_INTERLOCKED_XOR] = "xor",
+    };
+
+    VKD3D_ASSERT(interlocked->op < ARRAY_SIZE(op_names));
+    vkd3d_string_buffer_printf(buffer, "interlocked_%s(dst = ", op_names[interlocked->op]);
+    dump_deref(buffer, &interlocked->dst);
+    vkd3d_string_buffer_printf(buffer, ", coords = ");
+    dump_src(buffer, &interlocked->coords);
+    if (interlocked->cmp_value.node)
+    {
+        vkd3d_string_buffer_printf(buffer, ", cmp_value = ");
+        dump_src(buffer, &interlocked->cmp_value);
+    }
+    vkd3d_string_buffer_printf(buffer, ", value = ");
+    dump_src(buffer, &interlocked->value);
+    vkd3d_string_buffer_printf(buffer, ")");
+}
+
 static void dump_ir_compile(struct hlsl_ctx *ctx, struct vkd3d_string_buffer *buffer,
         const struct hlsl_ir_compile *compile)
 {
@@ -3589,6 +3662,10 @@ static void dump_instr(struct hlsl_ctx *ctx, struct vkd3d_string_buffer *buffer,
 
         case HLSL_IR_SWIZZLE:
             dump_ir_swizzle(buffer, hlsl_ir_swizzle(instr));
+            break;
+
+        case HLSL_IR_INTERLOCKED:
+            dump_ir_interlocked(buffer, hlsl_ir_interlocked(instr));
             break;
 
         case HLSL_IR_COMPILE:
@@ -3819,6 +3896,15 @@ static void free_ir_index(struct hlsl_ir_index *index)
     vkd3d_free(index);
 }
 
+static void free_ir_interlocked(struct hlsl_ir_interlocked *interlocked)
+{
+    hlsl_cleanup_deref(&interlocked->dst);
+    hlsl_src_remove(&interlocked->coords);
+    hlsl_src_remove(&interlocked->cmp_value);
+    hlsl_src_remove(&interlocked->value);
+    vkd3d_free(interlocked);
+}
+
 static void free_ir_compile(struct hlsl_ir_compile *compile)
 {
     unsigned int i;
@@ -3903,6 +3989,10 @@ void hlsl_free_instr(struct hlsl_ir_node *node)
 
         case HLSL_IR_SWITCH:
             free_ir_switch(hlsl_ir_switch(node));
+            break;
+
+        case HLSL_IR_INTERLOCKED:
+            free_ir_interlocked(hlsl_ir_interlocked(node));
             break;
 
         case HLSL_IR_COMPILE:
