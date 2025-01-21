@@ -739,6 +739,10 @@ static bool transform_instr_derefs(struct hlsl_ctx *ctx, struct hlsl_ir_node *in
             res = func(ctx, &hlsl_ir_resource_store(instr)->resource, instr);
             return res;
 
+        case HLSL_IR_INTERLOCKED:
+            res = func(ctx, &hlsl_ir_interlocked(instr)->dst, instr);
+            return res;
+
         default:
             return false;
     }
@@ -1836,6 +1840,15 @@ static bool copy_propagation_transform_resource_store(struct hlsl_ctx *ctx,
     return progress;
 }
 
+static bool copy_propagation_transform_interlocked(struct hlsl_ctx *ctx,
+        struct hlsl_ir_interlocked *interlocked, struct copy_propagation_state *state)
+{
+    bool progress = false;
+
+    progress |= copy_propagation_transform_object_load(ctx, &interlocked->dst, state, interlocked->node.index);
+    return progress;
+}
+
 static void copy_propagation_record_store(struct hlsl_ctx *ctx, struct hlsl_ir_store *store,
         struct copy_propagation_state *state)
 {
@@ -2042,6 +2055,9 @@ static bool copy_propagation_transform_block(struct hlsl_ctx *ctx, struct hlsl_b
                 progress |= copy_propagation_process_switch(ctx, hlsl_ir_switch(instr), state);
                 break;
 
+            case HLSL_IR_INTERLOCKED:
+                progress |= copy_propagation_transform_interlocked(ctx, hlsl_ir_interlocked(instr), state);
+
             default:
                 break;
         }
@@ -2223,6 +2239,24 @@ static bool validate_dereferences(struct hlsl_ctx *ctx, struct hlsl_ir_node *ins
         {
             struct hlsl_ir_store *store = hlsl_ir_store(instr);
             validate_component_index_range_from_deref(ctx, &store->lhs);
+            break;
+        }
+        case HLSL_IR_INTERLOCKED:
+        {
+            struct hlsl_ir_interlocked *interlocked = hlsl_ir_interlocked(instr);
+
+            if (!interlocked->dst.var->is_uniform)
+            {
+                hlsl_error(ctx, &instr->loc, VKD3D_SHADER_ERROR_HLSL_NON_STATIC_OBJECT_REF,
+                        "Accessed resource must have a single uniform source.");
+            }
+            else if (validate_component_index_range_from_deref(ctx, &interlocked->dst) == DEREF_VALIDATION_NOT_CONSTANT)
+            {
+                hlsl_error(ctx, &instr->loc, VKD3D_SHADER_ERROR_HLSL_NON_STATIC_OBJECT_REF,
+                        "Accessed resource from \"%s\" must be determinable at compile time.",
+                        interlocked->dst.var->name);
+                note_non_static_deref_expressions(ctx, &interlocked->dst, "accessed resource");
+            }
             break;
         }
         default:
@@ -4478,6 +4512,7 @@ static bool dce(struct hlsl_ctx *ctx, struct hlsl_ir_node *instr, void *context)
         case HLSL_IR_LOOP:
         case HLSL_IR_RESOURCE_STORE:
         case HLSL_IR_SWITCH:
+        case HLSL_IR_INTERLOCKED:
             break;
         case HLSL_IR_STATEBLOCK_CONSTANT:
             /* Stateblock constants should not appear in the shader program. */
@@ -4722,6 +4757,19 @@ static void compute_liveness_recurse(struct hlsl_block *block, unsigned int loop
 
             index->val.node->last_read = last_read;
             index->idx.node->last_read = last_read;
+            break;
+        }
+        case HLSL_IR_INTERLOCKED:
+        {
+            struct hlsl_ir_interlocked *interlocked = hlsl_ir_interlocked(instr);
+
+            var = interlocked->dst.var;
+            var->last_read = max(var->last_read, last_read);
+            deref_mark_last_read(&interlocked->dst, last_read);
+            interlocked->coords.node->last_read = last_read;
+            interlocked->value.node->last_read = last_read;
+            if (interlocked->cmp_value.node)
+                interlocked->cmp_value.node->last_read = last_read;
             break;
         }
         case HLSL_IR_JUMP:
@@ -5133,6 +5181,10 @@ static bool track_components_usage(struct hlsl_ctx *ctx, struct hlsl_ir_node *in
 
         case HLSL_IR_RESOURCE_STORE:
             register_deref_usage(ctx, &hlsl_ir_resource_store(instr)->resource);
+            break;
+
+        case HLSL_IR_INTERLOCKED:
+            register_deref_usage(ctx, &hlsl_ir_interlocked(instr)->dst);
             break;
 
         default:
@@ -9942,6 +9994,81 @@ static bool sm4_generate_vsir_instr_resource_load(struct hlsl_ctx *ctx,
     }
 }
 
+static bool sm4_generate_vsir_instr_interlocked(struct hlsl_ctx *ctx,
+        struct vsir_program *program, struct hlsl_ir_interlocked *interlocked)
+{
+
+    static const enum vkd3d_shader_opcode opcodes[] =
+    {
+        [HLSL_INTERLOCKED_ADD] = VKD3DSIH_ATOMIC_IADD,
+        [HLSL_INTERLOCKED_AND] = VKD3DSIH_ATOMIC_AND,
+        [HLSL_INTERLOCKED_CMP_EXCH] = VKD3DSIH_ATOMIC_CMP_STORE,
+        [HLSL_INTERLOCKED_MAX] = VKD3DSIH_ATOMIC_UMAX,
+        [HLSL_INTERLOCKED_MIN] = VKD3DSIH_ATOMIC_UMIN,
+        [HLSL_INTERLOCKED_OR] = VKD3DSIH_ATOMIC_OR,
+        [HLSL_INTERLOCKED_XOR] = VKD3DSIH_ATOMIC_XOR,
+    };
+
+    static const enum vkd3d_shader_opcode imm_opcodes[] =
+    {
+        [HLSL_INTERLOCKED_ADD] = VKD3DSIH_IMM_ATOMIC_IADD,
+        [HLSL_INTERLOCKED_AND] = VKD3DSIH_IMM_ATOMIC_AND,
+        [HLSL_INTERLOCKED_CMP_EXCH] = VKD3DSIH_IMM_ATOMIC_CMP_EXCH,
+        [HLSL_INTERLOCKED_EXCH] = VKD3DSIH_IMM_ATOMIC_EXCH,
+        [HLSL_INTERLOCKED_MAX] = VKD3DSIH_IMM_ATOMIC_UMAX,
+        [HLSL_INTERLOCKED_MIN] = VKD3DSIH_IMM_ATOMIC_UMIN,
+        [HLSL_INTERLOCKED_OR] = VKD3DSIH_IMM_ATOMIC_OR,
+        [HLSL_INTERLOCKED_XOR] = VKD3DSIH_IMM_ATOMIC_XOR,
+    };
+
+    struct hlsl_ir_node *cmp_value = interlocked->cmp_value.node, *value = interlocked->value.node;
+    struct hlsl_ir_node *coords = interlocked->coords.node;
+    struct hlsl_ir_node *instr = &interlocked->node;
+    bool is_imm = interlocked->node.reg.allocated;
+    struct vkd3d_shader_dst_param *dst_param;
+    struct vkd3d_shader_instruction *ins;
+    enum vkd3d_shader_opcode opcode;
+
+    opcode = is_imm ? imm_opcodes[interlocked->op] : opcodes[interlocked->op];
+
+    if (value->data_type->e.numeric.type == HLSL_TYPE_INT)
+    {
+        if (opcode == VKD3DSIH_ATOMIC_UMAX)
+            opcode = VKD3DSIH_ATOMIC_IMAX;
+        else if (opcode == VKD3DSIH_ATOMIC_UMIN)
+            opcode = VKD3DSIH_ATOMIC_IMIN;
+        else if (opcode == VKD3DSIH_IMM_ATOMIC_UMAX)
+            opcode = VKD3DSIH_IMM_ATOMIC_IMAX;
+        else if (opcode == VKD3DSIH_IMM_ATOMIC_UMIN)
+            opcode = VKD3DSIH_IMM_ATOMIC_IMIN;
+    }
+
+    if (!(ins = generate_vsir_add_program_instruction(ctx, program, &instr->loc, opcode,
+            is_imm ? 2 : 1, cmp_value ? 3 : 2)))
+        return false;
+
+    if (is_imm)
+        vsir_dst_from_hlsl_node(&ins->dst[0], ctx, instr);
+
+    dst_param = is_imm ? &ins->dst[1] : &ins->dst[0];
+    if (!sm4_generate_vsir_init_dst_param_from_deref(ctx, program, dst_param, &interlocked->dst, &instr->loc, 0))
+        return false;
+    dst_param->reg.dimension = VSIR_DIMENSION_NONE;
+
+    vsir_src_from_hlsl_node(&ins->src[0], ctx, coords, VKD3DSP_WRITEMASK_ALL);
+    if (cmp_value)
+    {
+        vsir_src_from_hlsl_node(&ins->src[1], ctx, cmp_value, VKD3DSP_WRITEMASK_ALL);
+        vsir_src_from_hlsl_node(&ins->src[2], ctx, value, VKD3DSP_WRITEMASK_ALL);
+    }
+    else
+    {
+        vsir_src_from_hlsl_node(&ins->src[1], ctx, value, VKD3DSP_WRITEMASK_ALL);
+    }
+
+    return true;
+}
+
 static bool sm4_generate_vsir_instr_jump(struct hlsl_ctx *ctx,
         struct vsir_program *program, const struct hlsl_ir_jump *jump)
 {
@@ -10117,6 +10244,10 @@ static void sm4_generate_vsir_block(struct hlsl_ctx *ctx, struct hlsl_block *blo
 
             case HLSL_IR_SWIZZLE:
                 generate_vsir_instr_swizzle(ctx, program, hlsl_ir_swizzle(instr));
+                break;
+
+            case HLSL_IR_INTERLOCKED:
+                sm4_generate_vsir_instr_interlocked(ctx, program, hlsl_ir_interlocked(instr));
                 break;
 
             default:
