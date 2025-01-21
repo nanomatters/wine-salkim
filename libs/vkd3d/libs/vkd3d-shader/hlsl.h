@@ -319,6 +319,7 @@ enum hlsl_ir_node_type
     HLSL_IR_STORE,
     HLSL_IR_SWIZZLE,
     HLSL_IR_SWITCH,
+    HLSL_IR_INTERLOCKED,
 
     HLSL_IR_COMPILE,
     HLSL_IR_SAMPLER_STATE,
@@ -950,6 +951,32 @@ struct hlsl_ir_stateblock_constant
     char *name;
 };
 
+enum hlsl_interlocked_op
+{
+    HLSL_INTERLOCKED_ADD,
+    HLSL_INTERLOCKED_AND,
+    HLSL_INTERLOCKED_CMP_EXCH,
+    HLSL_INTERLOCKED_EXCH,
+    HLSL_INTERLOCKED_MAX,
+    HLSL_INTERLOCKED_MIN,
+    HLSL_INTERLOCKED_OR,
+    HLSL_INTERLOCKED_XOR,
+};
+
+/* Represents an interlocked operation.
+ *
+ * The data_type of the node indicates whether or not the original value is returned.
+ * If the original value is not returned, the data_type is set to NULL.
+ * Otherwise, the data_type is set to the type of the original value.
+ */
+struct hlsl_ir_interlocked
+{
+    struct hlsl_ir_node node;
+    enum hlsl_interlocked_op op;
+    struct hlsl_deref dst;
+    struct hlsl_src coords, cmp_value, value;
+};
+
 struct hlsl_scope
 {
     /* Item entry for hlsl_ctx.scopes. */
@@ -1245,6 +1272,12 @@ static inline struct hlsl_ir_switch *hlsl_ir_switch(const struct hlsl_ir_node *n
 {
     VKD3D_ASSERT(node->type == HLSL_IR_SWITCH);
     return CONTAINING_RECORD(node, struct hlsl_ir_switch, node);
+}
+
+static inline struct hlsl_ir_interlocked *hlsl_ir_interlocked(const struct hlsl_ir_node *node)
+{
+    VKD3D_ASSERT(node->type == HLSL_IR_INTERLOCKED);
+    return CONTAINING_RECORD(node, struct hlsl_ir_interlocked, node);
 }
 
 static inline struct hlsl_ir_compile *hlsl_ir_compile(const struct hlsl_ir_node *node)
@@ -1554,6 +1587,9 @@ struct hlsl_ir_node *hlsl_new_compile(struct hlsl_ctx *ctx, enum hlsl_compile_ty
         struct hlsl_block *args_instrs, const struct vkd3d_shader_location *loc);
 struct hlsl_ir_node *hlsl_new_index(struct hlsl_ctx *ctx, struct hlsl_ir_node *val,
         struct hlsl_ir_node *idx, const struct vkd3d_shader_location *loc);
+struct hlsl_ir_node *hlsl_new_interlocked(struct hlsl_ctx *ctx, enum hlsl_interlocked_op op, struct hlsl_type *type,
+        const struct hlsl_deref *dst, struct hlsl_ir_node *coords, struct hlsl_ir_node *cmp_value,
+        struct hlsl_ir_node *value, const struct vkd3d_shader_location *loc);
 struct hlsl_ir_node *hlsl_new_loop(struct hlsl_ctx *ctx, struct hlsl_block *iter,
         struct hlsl_block *block, enum hlsl_loop_unroll_type unroll_type,
         unsigned int unroll_limit, const struct vkd3d_shader_location *loc);
