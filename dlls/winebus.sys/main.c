@@ -450,6 +450,20 @@ static const WCHAR *wcscasestr(const WCHAR *search, const WCHAR *needle)
     return NULL;
 }
 
+static BOOL is_fanatec_wheelbase(WORD pid)
+{
+    if (pid == 0x0e03) return TRUE; /* Fanatec CSL Elite */
+    if (pid == 0x0005) return TRUE; /* Fanatec CSL Elite PS4 */
+    if (pid == 0x0020) return TRUE; /* Fanatec CSL DD / DD Pro / ClubSport DD */
+    if (pid == 0x0001) return TRUE; /* Fanatec ClubSport V2 */
+    if (pid == 0x0004) return TRUE; /* Fanatec ClubSport V2.5 */
+    if (pid == 0x0006) return TRUE; /* Fanatec Podium DD1 */
+    if (pid == 0x0007) return TRUE; /* Fanatec Podium DD2 */
+    if (pid == 0x0011) return TRUE; /* Fanatec CSR Elite / Forza Motorsport */
+    if (pid == 0xe0fe) return TRUE; /* CS-WB-DD (FW update mode) */
+    return FALSE;
+}
+
 static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, UINT buttons)
 {
     char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
@@ -518,6 +532,7 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
     case 0x0eb7:
         if (pid == 0x183b) prefer_hidraw = TRUE; /* Fanatec ClubSport Pedals v3 */
         if (pid == 0x1839) prefer_hidraw = TRUE; /* Fanatec ClubSport Pedals v1/v2 */
+        if (is_fanatec_wheelbase(pid)) prefer_hidraw = TRUE;
         break;
     case 0x231d:
         /* comes with 128 buttons in the default configuration */
