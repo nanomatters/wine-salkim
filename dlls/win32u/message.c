@@ -2839,6 +2839,16 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
     return skip;
 }
 
+static inline BOOL using_server_or_ntsync(void)
+{
+    static int server_or_nt_cached = -1;
+    if (server_or_nt_cached == -1)
+    {
+        server_or_nt_cached = !(do_esync() || do_fsync());
+    }
+    return !!server_or_nt_cached;
+}
+
 /***********************************************************************
  *           peek_message
  *
@@ -2886,7 +2896,7 @@ int peek_message( MSG *msg, const struct peek_message_filter *filter )
         thread_info->client_info.msg_source = prev_source;
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
-        if (!filter->waited && NtGetTickCount() - thread_info->last_getmsg_time < 3000 && /* avoid hung queue */
+        if ((using_server_or_ntsync() || !filter->waited) && NtGetTickCount() - thread_info->last_getmsg_time < 3000 && /* avoid hung queue */
             check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
                               &wake_bits, &changed_bits ))
             res = STATUS_PENDING;
