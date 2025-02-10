@@ -51,7 +51,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(esync);
 
-int do_esync(void)
+NTSTATUS do_esync(void)
 {
 #ifdef HAVE_SYS_EVENTFD_H
     static int do_esync_cached = -1;
