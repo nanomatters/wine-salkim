@@ -40,6 +40,9 @@
 
 #include "unixlib.h"
 
+#include "initguid.h"
+DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+
 WINE_DEFAULT_DEBUG_CHANNEL(hid);
 
 static DRIVER_OBJECT *driver_obj;
@@ -196,6 +199,21 @@ static WCHAR *get_instance_id(DEVICE_OBJECT *device)
     }
 
     return dst;
+}
+
+static WCHAR *get_container_id(DEVICE_OBJECT *device)
+{
+    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+    UNICODE_STRING dst;
+
+    if (IsEqualGUID(&ext->desc.container_id, &GUID_NULL)) {
+        return NULL;
+    }
+
+    RtlZeroMemory(&dst, sizeof(dst));
+    RtlStringFromGUID(&ext->desc.container_id, &dst);
+
+    return dst.Buffer;
 }
 
 static WCHAR *get_device_id(DEVICE_OBJECT *device)
@@ -748,6 +766,10 @@ static NTSTATUS handle_IRP_MN_QUERY_ID(DEVICE_OBJECT *device, IRP *irp)
         case BusQueryInstanceID:
             TRACE("BusQueryInstanceID\n");
             irp->IoStatus.Information = (ULONG_PTR)get_instance_id(device);
+            break;
+        case BusQueryContainerID:
+            TRACE("BusQueryContainerID\n");
+            irp->IoStatus.Information = (ULONG_PTR)get_container_id(device);
             break;
         default:
             WARN("Unhandled type %08x\n", type);
