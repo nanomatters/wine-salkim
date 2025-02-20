@@ -510,7 +510,7 @@ static int active_users;                    /* current number of active users */
 static int allocated_users;                 /* count of allocated entries in the array */
 static struct fd **freelist;                /* list of free entries in the array */
 
-static int get_next_timeout(void);
+static int get_next_timeout( struct timespec *ts );
 
 static inline void fd_poll_event( struct fd *fd, int event )
 {
@@ -589,7 +589,7 @@ static inline void main_loop_epoll(void)
 
     while (active_users)
     {
-        timeout = get_next_timeout();
+        timeout = get_next_timeout( NULL );
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (epoll_fd == -1) break;  /* an error occurred with epoll */
@@ -677,26 +677,19 @@ static inline void remove_epoll_user( struct fd *fd, int user )
 static inline void main_loop_epoll(void)
 {
     int i, ret, timeout;
+    struct timespec ts;
     struct kevent events[128];
 
     if (kqueue_fd == -1) return;
 
     while (active_users)
     {
-        timeout = get_next_timeout();
+        timeout = get_next_timeout( &ts );
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (kqueue_fd == -1) break;  /* an error occurred with kqueue */
 
-        if (timeout != -1)
-        {
-            struct timespec ts;
-
-            ts.tv_sec = timeout / 1000;
-            ts.tv_nsec = (timeout % 1000) * 1000000;
-            ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), &ts );
-        }
-        else ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), NULL );
+        ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts );
 
         set_current_time();
 
@@ -779,27 +772,20 @@ static inline void remove_epoll_user( struct fd *fd, int user )
 static inline void main_loop_epoll(void)
 {
     int i, nget, ret, timeout;
+    struct timespec ts;
     port_event_t events[128];
 
     if (port_fd == -1) return;
 
     while (active_users)
     {
-        timeout = get_next_timeout();
+        timeout = get_next_timeout( &ts );
         nget = 1;
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (port_fd == -1) break;  /* an error occurred with event completion */
 
-        if (timeout != -1)
-        {
-            struct timespec ts;
-
-            ts.tv_sec = timeout / 1000;
-            ts.tv_nsec = (timeout % 1000) * 1000000;
-            ret = port_getn( port_fd, events, ARRAY_SIZE( events ), &nget, &ts );
-        }
-        else ret = port_getn( port_fd, events, ARRAY_SIZE( events ), &nget, NULL );
+        ret = port_getn( port_fd, events, ARRAY_SIZE( events ), &nget, timeout == -1 ? NULL : &ts );
 
 	if (ret == -1) break;  /* an error occurred with event completion */
 
@@ -890,10 +876,11 @@ static void remove_poll_user( struct fd *fd, int user )
     active_users--;
 }
 
-/* process pending timeouts and return the time until the next timeout, in milliseconds */
-static int get_next_timeout(void)
+/* process pending timeouts and return the time until the next timeout in milliseconds,
+ * and full nanosecond precision in the timespec parameter if given */
+static int get_next_timeout( struct timespec *ts )
 {
-    int ret = user_shared_data ? user_shared_data_timeout : -1;
+    timeout_t ret = user_shared_data ? (timeout_t)user_shared_data_timeout * 10000 : -1;
 
     if (!list_empty( &abs_timeout_list ) || !list_empty( &rel_timeout_list ))
     {
@@ -938,22 +925,34 @@ static int get_next_timeout(void)
         if ((ptr = list_head( &abs_timeout_list )) != NULL)
         {
             struct timeout_user *timeout = LIST_ENTRY( ptr, struct timeout_user, entry );
-            timeout_t diff = (timeout->when - current_time + 9999) / 10000;
-            if (diff > INT_MAX) diff = INT_MAX;
-            else if (diff < 0) diff = 0;
+            timeout_t diff = timeout->when - current_time;
+            if (diff < 0) diff = 0;
             if (ret == -1 || diff < ret) ret = diff;
         }
 
         if ((ptr = list_head( &rel_timeout_list )) != NULL)
         {
             struct timeout_user *timeout = LIST_ENTRY( ptr, struct timeout_user, entry );
-            timeout_t diff = (-timeout->when - monotonic_time + 9999) / 10000;
-            if (diff > INT_MAX) diff = INT_MAX;
-            else if (diff < 0) diff = 0;
+            timeout_t diff = -timeout->when - monotonic_time;
+            if (diff < 0) diff = 0;
             if (ret == -1 || diff < ret) ret = diff;
         }
     }
-    return ret;
+
+    /* infinite */
+    if (ret == -1) return -1;
+
+    if (ts)
+    {
+        ts->tv_sec = ret / TICKS_PER_SEC;
+        ts->tv_nsec = (ret % TICKS_PER_SEC) * 100;
+    }
+
+    /* convert to milliseconds, ceil to avoid spinning with 0 timeout */
+    ret = (ret + 9999) / 10000;
+    if (ret > INT_MAX) ret = INT_MAX;
+
+    return (int)ret;
 }
 
 /* server main poll() loop */
@@ -969,7 +968,7 @@ void main_loop(void)
 
     while (active_users)
     {
-        timeout = get_next_timeout();
+        timeout = get_next_timeout( NULL );
 
         if (!active_users) break;  /* last user removed by a timeout */
 
