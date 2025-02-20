@@ -106,6 +106,9 @@
 #if defined(HAVE_SYS_EPOLL_H) && defined(HAVE_EPOLL_CREATE)
 # include <sys/epoll.h>
 # define USE_EPOLL
+# ifdef HAVE_EPOLL_PWAIT2
+#  define USE_EPOLL_PWAIT2
+# endif
 #endif /* HAVE_SYS_EPOLL_H && HAVE_EPOLL_CREATE */
 
 #if defined(HAVE_PORT_H) && defined(HAVE_PORT_CREATE)
@@ -578,6 +581,7 @@ static inline void remove_epoll_user( struct fd *fd, int user )
 static inline void main_loop_epoll(void)
 {
     int i, ret, timeout;
+    struct timespec ts;
     struct epoll_event events[128];
 
     assert( POLLIN == EPOLLIN );
@@ -589,12 +593,17 @@ static inline void main_loop_epoll(void)
 
     while (active_users)
     {
-        timeout = get_next_timeout( NULL );
+        timeout = get_next_timeout( &ts );
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (epoll_fd == -1) break;  /* an error occurred with epoll */
 
+#ifdef USE_EPOLL_PWAIT2
+        ret = epoll_pwait2( epoll_fd, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts, NULL );
+#else
         ret = epoll_wait( epoll_fd, events, ARRAY_SIZE( events ), timeout );
+#endif
+
         set_current_time();
 
         /* put the events into the pollfd array first, like poll does */
