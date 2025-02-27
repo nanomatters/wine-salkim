@@ -108,6 +108,8 @@
 # define USE_EPOLL
 # ifdef HAVE_EPOLL_PWAIT2
 #  define USE_EPOLL_PWAIT2
+# else
+#  include <dlfcn.h>
 # endif
 #endif /* HAVE_SYS_EPOLL_H && HAVE_EPOLL_CREATE */
 
@@ -578,6 +580,42 @@ static inline void remove_epoll_user( struct fd *fd, int user )
     }
 }
 
+#ifdef USE_EPOLL_PWAIT2
+
+static int (*pepoll_pwait2)( int, struct epoll_event *, int, const struct timespec *, const sigset_t * ) = epoll_pwait2;
+
+static inline void init_epoll_pwait2(void)
+{
+}
+
+#else
+
+static int (*pepoll_pwait2)( int, struct epoll_event *, int, const struct timespec *, const sigset_t * );
+
+static inline void init_epoll_pwait2(void)
+{
+    void *self_handle;
+
+    if (!(self_handle = dlopen( NULL, RTLD_NOW )))
+    {
+        if (debug_level) fprintf( stderr, "wineserver: failed to dlopen self\n" );
+        return;
+    }
+
+#define LOAD_FUNCPTR(f) \
+    if (!(p##f = dlsym( self_handle, #f ))) \
+    { \
+        if (debug_level) fprintf( stderr, "wineserver: %s not found\n", #f ); \
+    }
+
+    LOAD_FUNCPTR(epoll_pwait2)
+#undef LOAD_FUNCPTR
+
+    dlclose( self_handle );
+}
+
+#endif
+
 static inline void main_loop_epoll(void)
 {
     int i, ret, timeout;
@@ -591,6 +629,8 @@ static inline void main_loop_epoll(void)
 
     if (epoll_fd == -1) return;
 
+    init_epoll_pwait2();
+
     while (active_users)
     {
         timeout = get_next_timeout( &ts );
@@ -598,11 +638,11 @@ static inline void main_loop_epoll(void)
         if (!active_users) break;  /* last user removed by a timeout */
         if (epoll_fd == -1) break;  /* an error occurred with epoll */
 
-#ifdef USE_EPOLL_PWAIT2
-        ret = epoll_pwait2( epoll_fd, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts, NULL );
-#else
-        ret = epoll_wait( epoll_fd, events, ARRAY_SIZE( events ), timeout );
+#ifndef USE_EPOLL_PWAIT2
+        if (!pepoll_pwait2) ret = epoll_wait( epoll_fd, events, ARRAY_SIZE( events ), timeout );
+        else
 #endif
+        ret = pepoll_pwait2( epoll_fd, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts, NULL );
 
         set_current_time();
 
