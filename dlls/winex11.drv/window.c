@@ -163,7 +163,7 @@ static int detect_wm(Display *dpy)
                     TRACE("Got WM name %s\n", wm_name);
 
                     if((strcmp(wm_name, "GNOME Shell") == 0) ||
-                            (strcmp(wm_name, "Mutter") == 0))
+                            strstr(wm_name, "Mutter"))
                         cached = WINE_WM_X11_MUTTER;
                     else if(strcmp(wm_name, "steamcompmgr") == 0)
                         cached = WINE_WM_X11_STEAMCOMPMGR;
