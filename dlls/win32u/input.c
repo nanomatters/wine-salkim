@@ -30,6 +30,8 @@
 #pragma makedep unix
 #endif
 
+#include <sys/prctl.h>
+#include <string.h>
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "win32u_private.h"
@@ -596,6 +598,41 @@ HWND get_focus(void)
 BOOL WINAPI NtUserAttachThreadInput( DWORD from, DWORD to, BOOL attach )
 {
     BOOL ret;
+    static int visited = 0;
+    static DWORD fromThreadForHack = 0;
+    static DWORD toThreadForHack = 0;
+    static char processNameForHack[16];
+    static const char* DAIprocessName = "DragonAgeInquis";
+    static const char* DAIGameLoopName = "GameLoop";
+    static int is_DragonAgeInquis = -1;
+    const char *sgi;
+
+    if (is_DragonAgeInquis)
+    {
+        if ((is_DragonAgeInquis == 1) ||
+            (is_DragonAgeInquis = ((sgi = getenv("SteamGameId")) && !strcmp(sgi, "1222690"))))
+        {
+            prctl(PR_GET_NAME, processNameForHack);
+            TRACE("Process Name: %s\n", processNameForHack);
+            if (strncmp(DAIprocessName, processNameForHack, 15) == 0 || strncmp(DAIGameLoopName, processNameForHack, 8) == 0)
+            {
+                if (!visited)
+                {
+                    TRACE("First Visit Process Name: %s\n", processNameForHack);
+                    fromThreadForHack = from;
+                    toThreadForHack = to;
+                    visited = 1;
+                }
+
+                if (from == 0 && to == 0 && visited)
+                {
+                    TRACE("00 Process Name: %s\n", processNameForHack);
+                    from = fromThreadForHack;
+                    to = toThreadForHack;
+                }
+            }
+        }
+    }
 
     SERVER_START_REQ( attach_thread_input )
     {
@@ -1290,11 +1327,7 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
  */
 UINT WINAPI NtUserGetKeyboardLayoutList( INT size, HKL *layouts )
 {
-    char buffer[4096];
-    KEY_NODE_INFORMATION *key_info = (KEY_NODE_INFORMATION *)buffer;
-    KEY_VALUE_PARTIAL_INFORMATION *value_info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
-    DWORD count, tmp, i = 0;
-    HKEY hkey, subkey;
+    DWORD count;
     HKL layout;
 
     TRACE_(keyboard)( "size %d, layouts %p.\n", size, layouts );
@@ -1308,33 +1341,6 @@ UINT WINAPI NtUserGetKeyboardLayoutList( INT size, HKL *layouts )
     if (size && layouts)
     {
         layouts[count - 1] = layout;
-        if (count == size) return count;
-    }
-
-    if ((hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) )))
-    {
-        while (!NtEnumerateKey( hkey, i++, KeyNodeInformation, key_info,
-                                sizeof(buffer) - sizeof(WCHAR), &tmp ))
-        {
-            if (!(subkey = reg_open_key( hkey, key_info->Name, key_info->NameLength ))) continue;
-            key_info->Name[key_info->NameLength / sizeof(WCHAR)] = 0;
-            tmp = wcstoul( key_info->Name, NULL, 16 );
-            if (query_reg_ascii_value( subkey, "Layout Id", value_info, sizeof(buffer) ) &&
-                value_info->Type == REG_SZ)
-                tmp = 0xf000 | (wcstoul( (const WCHAR *)value_info->Data, NULL, 16 ) & 0xfff);
-            NtClose( subkey );
-
-            tmp = MAKELONG( LOWORD( layout ), LOWORD( tmp ) );
-            if (layout == UlongToHandle( tmp )) continue;
-
-            count++;
-            if (size && layouts)
-            {
-                layouts[count - 1] = UlongToHandle( tmp );
-                if (count == size) break;
-            }
-        }
-        NtClose( hkey );
     }
 
     return count;
