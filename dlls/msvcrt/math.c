@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <fenv.h>
 #include <fpieee.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <locale.h>
 #include <math.h>
@@ -2083,6 +2084,20 @@ lldiv_t CDECL lldiv(__int64 num, __int64 denom)
   ret.quot = num / denom;
   ret.rem = num % denom;
 
+  return ret;
+}
+#endif
+
+#if _MSVCR_VER>=120
+/*********************************************************************
+ *              imaxdiv (MSVCR100.@)
+ */
+imaxdiv_t CDECL imaxdiv(intmax_t num, intmax_t denom)
+{
+  imaxdiv_t ret;
+
+  ret.quot = num / denom;
+  ret.rem = num % denom;
   return ret;
 }
 #endif
