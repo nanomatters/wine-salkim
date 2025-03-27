@@ -57,6 +57,7 @@
 
 extern char *process_name;
 extern struct wayland process_wayland;
+extern BOOL option_use_system_cursors;
 
 /**********************************************************************
  *          Definitions for wayland types
