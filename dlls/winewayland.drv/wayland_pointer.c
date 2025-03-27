@@ -707,6 +707,7 @@ static BOOL wayland_pointer_set_cursor_shape(HCURSOR hcursor)
     enum wp_cursor_shape_device_v1_shape shape = 0;
     uint32_t proto_version;
 
+    if (!option_use_system_cursors) return FALSE;
     if (!process_wayland.wp_cursor_shape_manager_v1) return FALSE;
     if (!hcursor) return FALSE;
     if (!get_icon_info(hcursor, &info)) return FALSE;
