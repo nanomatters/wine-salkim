@@ -99,6 +99,7 @@ struct wine_device
     uint64_t sem_poll_update_value; /* set to sem_poll_update.value by signaller thread once update is processed. */
     unsigned int allocated_fence_ops_count;
     BOOL keyed_mutexes_enabled;
+    BOOL low_latency_enabled;
 };
 
 static inline struct wine_device *wine_device_from_handle(VkDevice handle)
@@ -111,10 +112,18 @@ struct fs_hack_image
     uint32_t cmd_queue_idx;
     VkCommandBuffer cmd;
     VkImage swapchain_image;
+    VkImage fsr_image;
     VkImage user_image;
     VkSemaphore blit_finished;
-    VkImageView user_view, blit_view;
-    VkDescriptorSet descriptor_set;
+    VkImageView user_view, swapchain_view, fsr_view;
+    VkDescriptorSet descriptor_set, fsr_set;
+};
+
+struct fs_comp_pipeline
+{
+    VkPipelineLayout pipeline_layout;
+    VkPipeline pipeline;
+    uint32_t push_size;
 };
 
 struct wine_swapchain
@@ -127,15 +136,20 @@ struct wine_swapchain
     VkExtent2D real_extent;
     VkRect2D blit_dst;
     VkCommandPool *cmd_pools; /* VkCommandPool[device->queue_count] */
-    VkDeviceMemory user_image_memory;
+    VkDeviceMemory user_image_memory, fsr_image_memory;
     uint32_t n_images;
     struct fs_hack_image *fs_hack_images; /* struct fs_hack_image[n_images] */
     VkFilter fs_hack_filter;
     VkSampler sampler;
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;
-    VkPipelineLayout pipeline_layout;
-    VkPipeline pipeline;
+    VkFormat format;
+    BOOL fsr;
+    float sharpness;
+
+    struct fs_comp_pipeline blit_pipeline;
+    struct fs_comp_pipeline fsr_easu_pipeline;
+    struct fs_comp_pipeline fsr_rcas_pipeline;
 
     struct wine_vk_mapping mapping;
 };
@@ -372,6 +386,19 @@ static inline void free_conversion_context(struct conversion_context *pool)
     struct list *entry, *next;
     LIST_FOR_EACH_SAFE(entry, next, &pool->alloc_entries)
         free(entry);
+}
+
+/* see include/winnt.h */
+static FORCEINLINE LONG64 ReadAcquire64( LONG64 const volatile *src )
+{
+    LONG64 value;
+    __WINE_ATOMIC_LOAD_ACQUIRE( src, &value );
+    return value;
+}
+
+static FORCEINLINE void WriteRelease64( LONG64 volatile *dest, LONG64 value )
+{
+    __WINE_ATOMIC_STORE_RELEASE( dest, &value );
 }
 
 struct wine_semaphore
