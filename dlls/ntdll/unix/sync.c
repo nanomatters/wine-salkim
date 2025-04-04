@@ -1218,6 +1218,33 @@ NTSTATUS do_ntsync(void)
 #endif
 
 
+NTSTATUS WINAPI __wine_get_sync_type(void)
+{
+    static NTSTATUS result = STATUS_PENDING;
+    if (result == STATUS_PENDING)
+    {
+        result = STATUS_NO_WORK_DONE; /* server */
+        if (do_ntsync())
+            result = 3;
+        else if (do_fsync())
+            result = 2;
+        else if (do_esync())
+            result = 1;
+        if ((getenv( "WINE_DISABLE_FAST_SYNC" ) && atoi( getenv( "WINE_DISABLE_FAST_SYNC" ) )) ||
+            (getenv( "WINENTSYNC" ) && !atoi( getenv( "WINENTSYNC" ) )))
+            result = -result;
+    }
+    return result;
+}
+
+/***********************************************************************
+ *           unixcall_wine_get_sync_type
+ */
+NTSTATUS unixcall_wine_get_sync_type(void *args)
+{
+    return __wine_get_sync_type();
+}
+
 /******************************************************************************
  *              NtCreateSemaphore (NTDLL.@)
  */
