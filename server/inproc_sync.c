@@ -177,7 +177,6 @@ static struct linux_device *get_linux_device(void)
         return NULL;
     }
 
-    fprintf( stderr, "wine: using fast synchronization.\n" );
     linux_device_object = device;
     initialized = 1;
     return device;
@@ -193,7 +192,6 @@ int do_ntsync(void)
         if ((getenv( "WINE_DISABLE_FAST_SYNC" ) && atoi( getenv( "WINE_DISABLE_FAST_SYNC" ) )) ||
             (getenv( "WINENTSYNC" ) && !atoi( getenv( "WINENTSYNC" ) )))
         {
-            fprintf( stderr, "ntsync is explicitly disabled.\n" );
             do_ntsync_cached = 0;
         }
         /* lightweight permission check, full get_linux_device breaks when done at early startup */
