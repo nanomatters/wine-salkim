@@ -4625,7 +4625,7 @@ void loader_init( CONTEXT *context, void **entry )
 {
     OBJECT_ATTRIBUTES staging_event_attr;
     UNICODE_STRING staging_event_string;
-    HANDLE staging_event;
+    HANDLE staging_event = 0;
     static int attach_done;
     NTSTATUS status;
     ULONG_PTR cookie, port = 0;
@@ -4750,7 +4750,7 @@ void loader_init( CONTEXT *context, void **entry )
          * add a comment here to try to prevent that. */
     }
     RtlInitUnicodeString( &staging_event_string, L"\\__wine_staging_warn_event" );
-    InitializeObjectAttributes( &staging_event_attr, &staging_event_string, OBJ_OPENIF, NULL, NULL );
+    InitializeObjectAttributes( &staging_event_attr, &staging_event_string, OBJ_OPENIF | OBJ_PERMANENT, NULL, NULL );
     if (NtCreateEvent( &staging_event, EVENT_ALL_ACCESS, &staging_event_attr, NotificationEvent, FALSE ) == STATUS_SUCCESS)
     {
         FIXME_(winediag)("wine-cachyos %s is a testing version containing experimental patches.\n", wine_get_version());
@@ -4758,6 +4758,8 @@ void loader_init( CONTEXT *context, void **entry )
     }
     else
         WARN_(winediag)("wine-cachyos %s is a testing version containing experimental patches.\n", wine_get_version());
+
+    NtClose( staging_event );
 
     NtCurrentTeb()->FlsSlots = fls_alloc_data();
 
