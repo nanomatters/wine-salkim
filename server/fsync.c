@@ -117,8 +117,6 @@ void fsync_init(void)
 
     is_fsync_initialized = 1;
 
-    fprintf( stderr, "fsync: up and running.\n" );
-
     shm_idx_free_map_size = 256;
     shm_idx_free_map = malloc( shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
     memset( shm_idx_free_map, 0xff, shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
