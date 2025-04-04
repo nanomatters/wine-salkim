@@ -5450,6 +5450,8 @@ static inline PLIST_ENTRY RemoveTailList(PLIST_ENTRY le)
 
 NTSYSAPI NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait );
 
+NTSYSAPI NTSTATUS WINAPI __wine_get_sync_type(void);
+
 /* The thread information for 16-bit threads */
 /* NtCurrentTeb()->SubSystemTib points to this */
 typedef struct
