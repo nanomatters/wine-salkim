@@ -3772,7 +3772,7 @@ void virtual_init(void)
         kernel_writewatch_init();
 
     if (use_kernel_writewatch)
-        MESSAGE( "wine: using kernel write watches, use_kernel_writewatch %d.\n", use_kernel_writewatch );
+        TRACE( "wine: using kernel write watches, use_kernel_writewatch %d.\n", use_kernel_writewatch );
 
     if (preload_info && *preload_info)
         for (i = 0; (*preload_info)[i].size; i++)
@@ -5923,7 +5923,7 @@ static void fill_working_set_info( struct fill_working_set_info_data *d, struct 
         pagemap = d->pm_buffer[page - d->buffer_start];
 
         p->VirtualAttributes.Valid = !(vprot & VPROT_GUARD) && (vprot & 0x0f) && (pagemap >> 63);
-        p->VirtualAttributes.Shared = !is_view_valloc( view ) && ((pagemap >> 61) & 1);
+        p->VirtualAttributes.Shared = (!is_view_valloc( view ) && ((pagemap >> 61) & 1)) || ((view->protect & VPROT_WRITECOPY) && !(vprot & VPROT_COPIED));
         if (p->VirtualAttributes.Shared && p->VirtualAttributes.Valid)
             p->VirtualAttributes.ShareCount = 1; /* FIXME */
         if (p->VirtualAttributes.Valid)
