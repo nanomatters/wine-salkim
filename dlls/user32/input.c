@@ -489,6 +489,15 @@ HKL WINAPI LoadKeyboardLayoutA(LPCSTR pwszKLID, UINT Flags)
     return ret;
 }
 
+/***********************************************************************
+ *              LoadKeyboardLayoutEx (USER32.@)
+ */
+HKL WINAPI LoadKeyboardLayoutEx(DWORD unknown, const WCHAR *locale, UINT flags)
+{
+    FIXME("(%ld, %s, %x) semi-stub!\n", unknown, debugstr_w(locale), flags);
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return LoadKeyboardLayoutW(locale, flags);
+}
 
 /***********************************************************************
  *		UnloadKeyboardLayout (USER32.@)
@@ -499,7 +508,6 @@ BOOL WINAPI UnloadKeyboardLayout( HKL layout )
     SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
     return FALSE;
 }
-
 
 static DWORD CALLBACK devnotify_window_callbackW(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header)
 {
@@ -814,8 +822,28 @@ HWND WINAPI GetActiveWindow(void)
 HWND WINAPI GetFocus(void)
 {
     GUITHREADINFO info;
+    HWND retValueWindow;
+    static HWND prev = 0;
+    const char *sgi;
+    static int is_DragonAgeInquis = -1;
+
     info.cbSize = sizeof(info);
-    return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndFocus : 0;
+
+    retValueWindow = NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndFocus : 0;
+
+    if (is_DragonAgeInquis)
+    {
+        if ((is_DragonAgeInquis == 1) ||
+            (is_DragonAgeInquis = ((sgi = getenv("SteamGameId")) && !strcmp(sgi, "1222690"))))
+        {
+            if (retValueWindow == 0 && prev != 0)
+                NtUserAttachThreadInput(0, 0, 1);
+            else
+                prev = retValueWindow;
+        }
+    }
+
+    return retValueWindow;
 }
 
 

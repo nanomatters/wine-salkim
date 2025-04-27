@@ -163,7 +163,7 @@ static int detect_wm(Display *dpy)
                     TRACE("Got WM name %s\n", wm_name);
 
                     if((strcmp(wm_name, "GNOME Shell") == 0) ||
-                            (strcmp(wm_name, "Mutter") == 0))
+                            strstr(wm_name, "Mutter"))
                         cached = WINE_WM_X11_MUTTER;
                     else if(strcmp(wm_name, "steamcompmgr") == 0)
                         cached = WINE_WM_X11_STEAMCOMPMGR;
@@ -405,6 +405,10 @@ static unsigned long get_mwm_decorations( struct x11drv_win_data *data,
                                           const RECT *client_rect )
 {
     unsigned long ret = 0;
+    const char *decorate = NULL;
+
+    decorate = getenv( "WINE_NO_WM_DECORATION" );
+    if (decorate && decorate[0] == '1') decorated_mode = FALSE;
 
     if (!decorated_mode) return 0;
 

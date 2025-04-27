@@ -448,6 +448,8 @@ extern BOOL use_take_focus;
 extern BOOL use_primary_selection;
 extern BOOL use_system_cursors;
 extern BOOL grab_fullscreen;
+extern int keyboard_layout;
+extern BOOL keyboard_scancode_detect;
 extern BOOL usexcomposite;
 extern BOOL use_xfixes;
 extern BOOL managed_mode;
@@ -710,6 +712,7 @@ extern void *uri_list_to_drop_files( const void *data, size_t size, size_t *ret_
 extern BOOL fs_hack_enabled( HMONITOR monitor );
 extern BOOL fs_hack_mapping_required( HMONITOR monitor );
 extern BOOL fs_hack_is_integer(void);
+extern BOOL fs_hack_is_fsr(float *sharpness);
 extern HMONITOR fs_hack_monitor_from_hwnd( HWND hwnd );
 extern HMONITOR fs_hack_monitor_from_rect( const RECT *rect );
 extern BOOL fs_hack_is_window_rect_fullscreen( HMONITOR monitor, const RECT *rect );
@@ -768,6 +771,11 @@ extern void xinerama_init( unsigned int width, unsigned int height );
 extern void init_recursive_mutex( pthread_mutex_t *mutex );
 
 extern BOOL is_window_rect_full_virtual_screen( const RECT *rect );
+
+/* keyboard.c */
+
+extern int x11drv_find_keyboard_layout( const WCHAR *layout );
+extern WCHAR *x11drv_get_keyboard_layout_list( DWORD *size );
 
 #define DEPTH_COUNT 3
 extern const unsigned int *depths;

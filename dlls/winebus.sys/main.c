@@ -19,6 +19,7 @@
  */
 
 #include <stdarg.h>
+#include <stdlib.h>
 #include <assert.h>
 
 #include "ntstatus.h"
@@ -85,7 +86,7 @@ struct device_extension
 
     struct hid_report *last_reports[256];
     struct list reports;
-    IRP *pending_read;
+    IRP *pending_reads[256];
 
     UINT64 unix_device;
 };
@@ -262,13 +263,13 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
     return dst;
 }
 
-static IRP *pop_pending_read(struct device_extension *ext)
+static IRP *pop_pending_read(struct device_extension *ext, ULONG report_id)
 {
     IRP *pending;
 
     RtlEnterCriticalSection(&ext->cs);
-    pending = ext->pending_read;
-    ext->pending_read = NULL;
+    pending = ext->pending_reads[report_id];
+    ext->pending_reads[report_id] = NULL;
     RtlLeaveCriticalSection(&ext->cs);
 
     return pending;
@@ -278,12 +279,16 @@ static void remove_pending_irps(DEVICE_OBJECT *device)
 {
     struct device_extension *ext = device->DeviceExtension;
     IRP *pending;
+    UINT i;
 
-    if ((pending = pop_pending_read(ext)))
+    for (i = 0; i < ARRAY_SIZE(ext->pending_reads); ++i)
     {
-        pending->IoStatus.Status = STATUS_DELETE_PENDING;
-        pending->IoStatus.Information = 0;
-        IoCompleteRequest(pending, IO_NO_INCREMENT);
+        if ((pending = pop_pending_read(ext, i)))
+        {
+            pending->IoStatus.Status = STATUS_DELETE_PENDING;
+            pending->IoStatus.Information = 0;
+            IoCompleteRequest(pending, IO_NO_INCREMENT);
+        }
     }
 }
 
@@ -357,7 +362,14 @@ static DEVICE_OBJECT *bus_find_unix_device(UINT64 unix_device)
 
 static DEVICE_OBJECT *bus_find_device_from_vid_pid(const WCHAR *bus_name, struct device_desc *desc)
 {
+    static int once;
     struct device_extension *ext;
+
+    if (desc->prefer_sdl) {
+
+        if (!once++) FIXME("Preferring SDL for inputs!\n");
+        return NULL;
+    }
 
     LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
         if (!wcscmp(ext->bus_name, bus_name) && ext->desc.vid == desc->vid &&
@@ -479,7 +491,7 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
     else last_report = ext->last_reports[report_buf[0]];
     memcpy(last_report->buffer, report_buf, report_len);
 
-    if ((irp = pop_pending_read(ext)))
+    if ((irp = pop_pending_read(ext, report_buf[0])))
     {
         deliver_next_report(ext, irp);
         IoCompleteRequest(irp, IO_NO_INCREMENT);
@@ -1116,9 +1128,10 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
         {
             if (!deliver_next_report(ext, irp))
             {
+                BYTE *report_buf = (BYTE *)irp->UserBuffer;
                 /* hidclass.sys should guarantee this */
-                assert(!ext->pending_read);
-                ext->pending_read = irp;
+                assert(!ext->pending_reads[report_buf[0]]);
+                ext->pending_reads[report_buf[0]] = irp;
                 IoMarkIrpPending(irp);
                 irp->IoStatus.Status = STATUS_PENDING;
             }
