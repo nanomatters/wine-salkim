@@ -138,6 +138,55 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener =
     xdg_toplevel_handle_close
 };
 
+void wp_fractional_scale_handle_scale(void* user_data,
+                                      struct wp_fractional_scale_v1 *fractional_scale_v1,
+                                      uint32_t scale_fixed)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    HWND hwnd = user_data;
+    BOOL updated = FALSE;
+
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        if ((surface = data->wayland_surface))
+        {
+            double scale = scale_fixed / 120.0;
+
+            updated = (scale != surface->window.fractional_scale);
+            surface->window.scale = surface->window.fractional_scale = scale;
+
+            if (updated)
+            {
+                /* detach the client surface as its rect has changed */
+                if (data->client_surface)
+                {
+                    wayland_client_surface_attach(data->client_surface, NULL);
+                    data->client_surface = NULL;
+                }
+
+                /* the subsurface rect has changed */
+                if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
+                {
+                    surface->processing.serial = 1;
+                    surface->processing.processed = TRUE;
+                }
+            }
+
+            TRACE("Got scale %lf\n", scale);
+        }
+
+        wayland_win_data_release(data);
+    }
+
+    if (updated) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+}
+
+static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener =
+{
+    wp_fractional_scale_handle_scale
+};
+
 /**********************************************************************
  *          wayland_surface_create
  *
@@ -241,6 +290,28 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     free(surface);
 }
 
+static void wayland_surface_init_fractional_scale(struct wayland_surface *surface,
+                                                  double initial_scale)
+{
+    if (process_wayland.wp_fractional_scale_manager_v1)
+    {
+        surface->window.fractional_scale = initial_scale;
+        surface->wp_fractional_scale_v1 =
+            wp_fractional_scale_manager_v1_get_fractional_scale(
+                process_wayland.wp_fractional_scale_manager_v1,
+                surface->wl_surface);
+        if (!surface->wp_fractional_scale_v1)
+        {
+            ERR("Failed to create wp_fractional_scale_v1\n");
+            return;
+        }
+        wp_fractional_scale_v1_add_listener(
+            surface->wp_fractional_scale_v1,
+            &wp_fractional_scale_listener,
+            surface->hwnd);
+    }
+}
+
 /**********************************************************************
  *          wayland_surface_make_toplevel
  *
@@ -287,6 +358,8 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
 
     wayland_surface_assign_icon(surface);
 
+    wayland_surface_init_fractional_scale(surface, 1.0);
+
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
 
@@ -322,6 +395,8 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
         ERR("Failed to create client wl_subsurface\n");
         goto err;
     }
+
+    wayland_surface_init_fractional_scale(surface, parent->window.fractional_scale);
 
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     surface->toplevel_hwnd = parent->hwnd;
@@ -364,6 +439,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
             surface->xdg_toplevel_icon = NULL;
         }
 
+        if (surface->wp_fractional_scale_v1)
+        {
+            wp_fractional_scale_v1_destroy(surface->wp_fractional_scale_v1);
+            surface->wp_fractional_scale_v1 = NULL;
+        }
+
         if (surface->xdg_toplevel)
         {
             xdg_toplevel_destroy(surface->xdg_toplevel);
@@ -378,6 +459,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
         break;
 
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+        if (surface->wp_fractional_scale_v1)
+        {
+            wp_fractional_scale_v1_destroy(surface->wp_fractional_scale_v1);
+            surface->wp_fractional_scale_v1 = NULL;
+        }
+
         if (surface->wl_subsurface)
         {
             wl_subsurface_destroy(surface->wl_subsurface);
