@@ -744,6 +744,7 @@ SOURCES = \
 	srrestoreptapi.h \
 	sspi.h \
 	stamp-h.in \
+	stdole32.idl \
 	stgprop.h \
 	sti.h \
 	storage.h \
@@ -817,6 +818,7 @@ SOURCES = \
 	weakreference.idl \
 	webservices.h \
 	websocket.h \
+	webview2.idl \
 	werapi.h \
 	wfext.h \
 	wia.h \
