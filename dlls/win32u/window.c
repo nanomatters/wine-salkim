@@ -2038,7 +2038,9 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     if (IsRectEmpty( surface_rect )) needs_surface = FALSE;
     else if (create_layered || is_layered) needs_surface = TRUE;
 
-    if (is_opengl && !is_layered && !create_layered)
+    /* This is an winex11 specific workaround.
+        Detect wayland driver using pHasWindowManager  */
+    if (is_opengl && !is_layered && !create_layered && !user_driver->pHasWindowManager("waylanddrv"))
     {
         if (new_surface) window_surface_release( new_surface );
         new_surface = NULL;
