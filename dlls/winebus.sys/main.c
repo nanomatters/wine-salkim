@@ -40,6 +40,9 @@
 
 #include "unixlib.h"
 
+#include "initguid.h"
+DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+
 WINE_DEFAULT_DEBUG_CHANNEL(hid);
 
 static DRIVER_OBJECT *driver_obj;
@@ -196,6 +199,21 @@ static WCHAR *get_instance_id(DEVICE_OBJECT *device)
     }
 
     return dst;
+}
+
+static WCHAR *get_container_id(DEVICE_OBJECT *device)
+{
+    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+    UNICODE_STRING dst;
+
+    if (IsEqualGUID(&ext->desc.container_id, &GUID_NULL)) {
+        return NULL;
+    }
+
+    RtlZeroMemory(&dst, sizeof(dst));
+    RtlStringFromGUID(&ext->desc.container_id, &dst);
+
+    return dst.Buffer;
 }
 
 static WCHAR *get_device_id(DEVICE_OBJECT *device)
@@ -450,6 +468,20 @@ static const WCHAR *wcscasestr(const WCHAR *search, const WCHAR *needle)
     return NULL;
 }
 
+static BOOL is_fanatec_wheelbase(WORD pid)
+{
+    if (pid == 0x0e03) return TRUE; /* Fanatec CSL Elite */
+    if (pid == 0x0005) return TRUE; /* Fanatec CSL Elite PS4 */
+    if (pid == 0x0020) return TRUE; /* Fanatec CSL DD / DD Pro / ClubSport DD */
+    if (pid == 0x0001) return TRUE; /* Fanatec ClubSport V2 */
+    if (pid == 0x0004) return TRUE; /* Fanatec ClubSport V2.5 */
+    if (pid == 0x0006) return TRUE; /* Fanatec Podium DD1 */
+    if (pid == 0x0007) return TRUE; /* Fanatec Podium DD2 */
+    if (pid == 0x0011) return TRUE; /* Fanatec CSR Elite / Forza Motorsport */
+    if (pid == 0xe0fe) return TRUE; /* CS-WB-DD (FW update mode) */
+    return FALSE;
+}
+
 static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, UINT buttons)
 {
     char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
@@ -518,6 +550,7 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
     case 0x0eb7:
         if (pid == 0x183b) prefer_hidraw = TRUE; /* Fanatec ClubSport Pedals v3 */
         if (pid == 0x1839) prefer_hidraw = TRUE; /* Fanatec ClubSport Pedals v1/v2 */
+        if (is_fanatec_wheelbase(pid)) prefer_hidraw = TRUE;
         break;
     case 0x231d:
         /* comes with 128 buttons in the default configuration */
@@ -739,6 +772,10 @@ static NTSTATUS handle_IRP_MN_QUERY_ID(DEVICE_OBJECT *device, IRP *irp)
         case BusQueryInstanceID:
             TRACE("BusQueryInstanceID\n");
             irp->IoStatus.Information = (ULONG_PTR)get_instance_id(device);
+            break;
+        case BusQueryContainerID:
+            TRACE("BusQueryContainerID\n");
+            irp->IoStatus.Information = (ULONG_PTR)get_container_id(device);
             break;
         default:
             WARN("Unhandled type %08x\n", type);
