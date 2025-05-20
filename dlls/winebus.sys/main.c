@@ -475,13 +475,20 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
     char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
     struct device_options *device;
-    WCHAR vidpid[MAX_PATH], *tmp, value[1024];
+    struct hidraw_enabled_params params = {0};
+    WCHAR vidpid[MAX_PATH], *tmp;
     BOOL prefer_hidraw = FALSE;
     UNICODE_STRING str;
-    SIZE_T len;
     DWORD size;
 
     if (options.disable_hidraw) return FALSE;
+
+    params.vid = vid;
+    params.pid = pid;
+    if (!winebus_call(hidraw_enabled, &params) && params.env_set)
+    {
+        return params.enabled;
+    }
 
     LIST_FOR_EACH_ENTRY(device, &options.devices, struct device_options, entry)
     {
@@ -495,21 +502,6 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
     {
         WARN("Ignoring unsupported %04X:%04X hidraw touchscreen\n", vid, pid);
         return FALSE;
-    }
-
-    if (!RtlQueryEnvironmentVariable(NULL, L"PROTON_DISABLE_HIDRAW", 20, value, ARRAY_SIZE(value) - 1, &len))
-    {
-        value[len] = 0;
-        if (!wcscmp(value, L"1")) return FALSE;
-        swprintf(vidpid, ARRAY_SIZE(vidpid), L"0x%04X/0x%04X", vid, pid);
-        if (wcscasestr(value, vidpid)) return FALSE;
-    }
-    if (!RtlQueryEnvironmentVariable(NULL, L"PROTON_ENABLE_HIDRAW", 20, value, ARRAY_SIZE(value) - 1, &len))
-    {
-        value[len] = 0;
-        if (!wcscmp(value, L"1")) return TRUE;
-        swprintf(vidpid, ARRAY_SIZE(vidpid), L"0x%04X/0x%04X", vid, pid);
-        if (wcscasestr(value, vidpid)) return TRUE;
     }
 
     if (usages->UsagePage == HID_USAGE_PAGE_DIGITIZER)
