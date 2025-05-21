@@ -629,6 +629,10 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
         {L"RSI Launcher.exe", L" --in-process-gpu"}
     };
 
+    static const struct option wow64_options[] = {
+        {L"BlackDesertLauncher.exe", L" --disable-gpu --in-single-process"}
+    };
+
     unsigned int i;
     char sgi[64] = {0};
     char wayland_hack_enabled[64] = {0};
@@ -662,6 +666,20 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
             FIXME( "HACK: appending %s to command line.\n", debugstr_w(options[i].append) );
             return options[i].append;
         }
+    }
+
+    if ( is_wow64 )
+    {
+        for (i = 0; i < ARRAY_SIZE(wow64_options); ++i)
+        {
+            if (wcsstr( cmd, wow64_options[i].exe_name ))
+            {
+                if (wow64_options[i].steamgameid && strcmp( sgi, wow64_options[i].steamgameid ))
+                    continue;
+                FIXME( "HACK: appending %s to command line.\n", debugstr_w(wow64_options[i].append) );
+                return wow64_options[i].append;
+            }
+        }    
     }
 
     return NULL;
