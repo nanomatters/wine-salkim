@@ -822,6 +822,19 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
     return ret;
 }
 
+/**********************************************************************
+ *          WAYLAND_Beep
+ */
+void WAYLAND_Beep(void)
+{
+    if (!process_wayland.xdg_system_bell_v1) return;
+
+    TRACE("\n");
+
+    xdg_system_bell_v1_ring(process_wayland.xdg_system_bell_v1, NULL);
+    wl_display_flush(process_wayland.wl_display);
+}
+
 void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
