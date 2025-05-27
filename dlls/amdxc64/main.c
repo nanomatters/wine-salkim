@@ -82,25 +82,32 @@ typedef HRESULT (__stdcall *updateffxapi_pfn)(void*, unsigned int);
 
 HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, void* data, unsigned int size)
 {
+    static int once;
     const char *env;
     updateffxapi_pfn pfn;
-    HMODULE amdffx = LoadLibraryA("amdxcffx64");
+    HMODULE amdffx;
 
     TRACE("%p %p %u\n", iface, data, size);
 
-    if (!amdffx)
-    {
-        ERR("Failed to load FSR4 dll (amdxcffx)!\n");
-        return E_NOINTERFACE;
-    }
-
-    pfn = (updateffxapi_pfn)GetProcAddress(amdffx, "UpdateFfxApiProvider");
     env = getenv("FSR4_UPGRADE");
 
-    if(pfn && env && env[0] != '0')
+    if(env && !strcmp(env, "1"))
     {
-        FIXME("Replaced FSR3 with FSR4!\n");
-        return pfn(data, size);
+        amdffx = LoadLibraryA("amdxcffx64");
+        if (!amdffx)
+        {
+            ERR("Failed to load FSR4 dll (amdxcffx)!\n");
+            return E_NOINTERFACE;
+        }
+
+        pfn = (updateffxapi_pfn)GetProcAddress(amdffx, "UpdateFfxApiProvider");
+
+        if(pfn)
+        {
+            if (!once++)
+                FIXME("Replaced FSR3 with FSR4!\n");
+            return pfn(data, size);
+        }
     }
 
     return E_NOINTERFACE;
