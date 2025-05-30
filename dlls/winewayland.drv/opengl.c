@@ -219,7 +219,8 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
     /* Get the client surface for the HWND. If don't have a wayland surface
      * (e.g., HWND_MESSAGE windows) just create a dummy surface to act as the
      * target render surface. */
-    if (!(gl->client = get_client_surface(hwnd))) goto err;
+    if (!(gl->client = wayland_client_surface_create(hwnd))) goto err;
+    set_client_surface(hwnd, gl->client);
 
     gl->wl_egl_window = wl_egl_window_create(gl->client->wl_surface,
                                              client_width, client_height);
@@ -722,6 +723,8 @@ static BOOL wayland_wglSwapBuffers(HDC hdc)
 
     if (ctx) wgl_context_refresh(ctx);
     ensure_window_surface_contents(toplevel);
+    set_client_surface(hwnd, gl->client);
+
     /* Although all the EGL surfaces we create are double-buffered, we want to
      * use some as single-buffered, so avoid swapping those. */
     if (gl->double_buffered) p_eglSwapBuffers(egl_display, gl->surface);
