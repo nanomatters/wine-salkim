@@ -45,6 +45,7 @@ struct device_desc
     WCHAR manufacturer[MAX_PATH];
     WCHAR product[MAX_PATH];
     WCHAR serialnumber[MAX_PATH];
+    GUID container_id;
 };
 
 struct sdl_bus_options
@@ -125,6 +126,14 @@ struct device_report_params
     IO_STATUS_BLOCK *io;
 };
 
+struct hidraw_enabled_params
+{
+    unsigned short vid;
+    unsigned short pid;
+    BOOL env_set;
+    BOOL enabled;
+};
+
 enum unix_funcs
 {
     sdl_init,
@@ -144,6 +153,7 @@ enum unix_funcs
     device_set_output_report,
     device_get_feature_report,
     device_set_feature_report,
+    hidraw_enabled,
     unix_funcs_count,
 };
 
