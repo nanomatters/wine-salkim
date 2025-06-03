@@ -1679,10 +1679,10 @@ static void udev_add_device(struct udev_device *dev, int fd)
 
     if (desc.vid == 0x28de && desc.pid == 0x11ff && !strcmp(subsystem, "input"))
     {
-        char *env = getenv("PROTON_USE_SDL");
+        char *env = getenv("PROTON_NO_STEAMINPUT");
         if (env && !strcmp(env, "1"))
         {
-            TRACE("evdev %s: gnoring steam input virtual controller\n", debugstr_a(devnode));
+            TRACE("evdev %s: ignoring steam input virtual controller\n", debugstr_a(devnode));
             close(fd);
             return;
         }
