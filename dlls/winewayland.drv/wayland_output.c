@@ -39,6 +39,9 @@ static uint32_t next_output_id = 0;
 #define WAYLAND_OUTPUT_CHANGED_NAME       0x02
 #define WAYLAND_OUTPUT_CHANGED_LOGICAL_XY 0x04
 #define WAYLAND_OUTPUT_CHANGED_LOGICAL_WH 0x08
+#define WAYLAND_OUTPUT_CHANGED_TRANSFORM  0x10
+#define WAYLAND_OUTPUT_CHANGED_PRIMARIES  0x20
+#define WAYLAND_OUTPUT_CHANGED_LUMINANCE  0x40
 
 /**********************************************************************
  *          Output handling
@@ -128,6 +131,27 @@ static void wayland_output_mode_free_rb(struct rb_entry *entry, void *ctx)
     free(RB_ENTRY_VALUE(entry, struct wayland_output_mode, entry));
 }
 
+/* Check environment variables to look for coordinate offset */
+static void apply_user_coord_offset(int *x, int *y)
+{
+    const char *env;
+    int offset;
+
+    env = getenv("WAYLANDDRV_XOFFSET");
+    if (env && sscanf(env, "%d", &offset) == 1)
+    {
+        *x -= offset;
+        TRACE("x offset %d\n", offset);
+    }
+
+    env = getenv("WAYLANDDRV_YOFFSET");
+    if (env && sscanf(env, "%d", &offset) == 1)
+    {
+        *y -= offset;
+        TRACE("y offset %d\n", offset);
+    }
+}
+
 static void wayland_output_done(struct wayland_output *output)
 {
     struct wayland_output_mode *mode;
@@ -139,6 +163,13 @@ static void wayland_output_done(struct wayland_output *output)
     {
         RB_FOR_EACH_ENTRY(mode, &output->pending.modes, struct wayland_output_mode, entry)
         {
+            /* Need to flip w,h when the output is transformed by 90 or 270 degrees */
+            if (output->pending.transform & WL_OUTPUT_TRANSFORM_90)
+            {
+                const int32_t temp = mode->width;
+                mode->width = mode->height;
+                mode->height = temp;
+            }
             wayland_output_state_add_mode(&output->current,
                                           mode->width, mode->height, mode->refresh,
                                           mode == output->pending.current_mode);
@@ -159,12 +190,31 @@ static void wayland_output_done(struct wayland_output *output)
     {
         output->current.logical_x = output->pending.logical_x;
         output->current.logical_y = output->pending.logical_y;
+        apply_user_coord_offset(&output->current.logical_x, &output->current.logical_y);
     }
 
     if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_LOGICAL_WH)
     {
         output->current.logical_w = output->pending.logical_w;
         output->current.logical_h = output->pending.logical_h;
+    }
+
+    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_TRANSFORM)
+    {
+        output->current.transform = output->pending.transform;
+    }
+
+    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_PRIMARIES)
+    {
+        /* Copy here as well in case this gets called first */
+        output->current.primaries = output->pending.primaries;
+    }
+
+    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_LUMINANCE)
+    {
+        output->current.max_luminance = output->pending.max_luminance;
+        output->current.min_luminance = output->pending.min_luminance;
+
     }
 
     output->pending_flags = 0;
@@ -200,6 +250,11 @@ static void output_handle_geometry(void *data, struct wl_output *wl_output,
                                    const char *make, const char *model,
                                    int32_t output_transform)
 {
+    struct wayland_output *output = data;
+
+    output->pending.transform = output_transform;
+
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_TRANSFORM;
 }
 
 static void output_handle_mode(void *data, struct wl_output *wl_output,
@@ -299,6 +354,155 @@ static const struct zxdg_output_v1_listener zxdg_output_v1_listener = {
     zxdg_output_v1_handle_description,
 };
 
+static void wp_image_description_info_v1_done(void *data,
+                                              struct wp_image_description_info_v1 *info)
+{
+    struct wayland_output *output = data;
+    pthread_mutex_lock(&process_wayland.output_mutex);
+
+    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_PRIMARIES)
+    {
+        output->current.primaries = output->pending.primaries;
+        output->pending_flags &= ~WAYLAND_OUTPUT_CHANGED_PRIMARIES;
+    }
+
+    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_LUMINANCE)
+    {
+        output->current.max_luminance = output->pending.max_luminance;
+        output->current.min_luminance = output->pending.min_luminance;
+        output->pending_flags &= ~WAYLAND_OUTPUT_CHANGED_LUMINANCE;
+    }
+
+    TRACE("%p\n", output);
+
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+
+    maybe_init_display_devices();
+}
+
+static void wp_image_description_info_v1_icc_file(void *data,
+                                                  struct wp_image_description_info_v1 *info,
+                                                  int32_t icc, uint32_t icc_size)
+{
+
+}
+
+static void wp_image_description_info_v1_primaries(void *data,
+                                                   struct wp_image_description_info_v1 *info,
+                                                   int32_t r_x, int32_t r_y, int32_t g_x,
+			                                       int32_t g_y, int32_t b_x, int32_t b_y,
+                                                   int32_t w_x, int32_t w_y)
+{
+    struct wayland_output *output = data;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+
+#define COPY(name) output->pending.primaries.name = round((name * 1e-6) * 1024)
+    COPY(r_x);
+    COPY(r_y);
+    COPY(g_x);
+    COPY(g_y);
+    COPY(b_x);
+    COPY(b_y);
+    COPY(w_x);
+    COPY(w_y);
+#undef COPY
+
+    TRACE("primaries: {%lf, %lf, %lf, %lf, %lf, %lf, %lf, %lf}\n",
+        r_x * 1e-6, r_y * 1e-6, g_x * 1e-6, g_y * 1e-6, b_x * 1e-6, b_y * 1e-6, w_x * 1e-6, w_y * 1e-6);
+
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_PRIMARIES;
+
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+}
+
+static void wayland_image_description_info_v1_primaries_named(void *data,
+				            struct wp_image_description_info_v1 *info,
+				            uint32_t primaries)
+{
+
+}
+
+static void wayland_image_description_info_v1_tfpower(void *data,
+				            struct wp_image_description_info_v1 *info,
+				            uint32_t power)
+{
+
+}
+
+static void wayland_image_description_info_v1_tfnamed(void *data,
+				            struct wp_image_description_info_v1 *info,
+				            uint32_t named)
+{
+
+}
+
+static void wayland_image_description_info_v1_luminance(void *data,
+                            struct wp_image_description_info_v1 *info,
+                            uint32_t min, uint32_t max, uint32_t ref)
+{
+    struct wayland_output *output = data;
+    pthread_mutex_lock(&process_wayland.output_mutex);
+
+    output->pending.max_luminance = max;
+    output->pending.min_luminance = min;
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_LUMINANCE;
+
+    TRACE("min %lf max %u ref %u\n", min * 1e-4, max, ref);
+
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+
+}
+
+static void wayland_image_description_info_v1_target_primaries(void *data,
+				 struct wp_image_description_info_v1 *info,
+				 int32_t r_x,
+				 int32_t r_y,
+				 int32_t g_x,
+				 int32_t g_y,
+				 int32_t b_x,
+				 int32_t b_y,
+				 int32_t w_x,
+				 int32_t w_y)
+{
+
+}
+
+static void wayland_image_description_info_v1_target_luminance(void *data,
+                            struct wp_image_description_info_v1 *info,
+                            uint32_t min, uint32_t max)
+{
+
+}
+
+static void wayland_image_description_info_v1_target_max_cll(void *data,
+				            struct wp_image_description_info_v1 *info,
+				            uint32_t max)
+{
+
+}
+
+static void wayland_image_description_info_v1_target_max_fall(void *data,
+				            struct wp_image_description_info_v1 *info,
+				            uint32_t max)
+{
+
+}
+
+static const struct wp_image_description_info_v1_listener image_description_info_listener = {
+    wp_image_description_info_v1_done,
+    wp_image_description_info_v1_icc_file,
+    wp_image_description_info_v1_primaries,
+    wayland_image_description_info_v1_primaries_named,
+    wayland_image_description_info_v1_tfpower,
+    wayland_image_description_info_v1_tfnamed,
+    wayland_image_description_info_v1_luminance,
+    wayland_image_description_info_v1_target_primaries,
+    wayland_image_description_info_v1_target_luminance,
+    wayland_image_description_info_v1_target_max_cll,
+    wayland_image_description_info_v1_target_max_fall
+};
+
 /**********************************************************************
  *          wayland_output_create
  *
@@ -342,6 +546,24 @@ BOOL wayland_output_create(uint32_t id, uint32_t version)
 
     if (process_wayland.zxdg_output_manager_v1)
         wayland_output_use_xdg_extension(output);
+    if (process_wayland.wp_color_manager_v1)
+    {
+        output->wp_color_management_output_v1 =
+            wp_color_manager_v1_get_output(
+                        process_wayland.wp_color_manager_v1,
+                                     output->wl_output);
+        output->wp_image_description_v1 =
+            wp_color_management_output_v1_get_image_description(
+                output->wp_color_management_output_v1
+            );
+        output->wp_image_description_info_v1 =
+            wp_image_description_v1_get_information(
+                output->wp_image_description_v1
+            );
+        wp_image_description_info_v1_add_listener(
+            output->wp_image_description_info_v1,
+            &image_description_info_listener, output);
+    }
 
     pthread_mutex_lock(&process_wayland.output_mutex);
     wl_list_insert(process_wayland.output_list.prev, &output->link);
@@ -375,6 +597,12 @@ void wayland_output_destroy(struct wayland_output *output)
     wayland_output_state_deinit(&output->current);
     if (output->zxdg_output_v1)
         zxdg_output_v1_destroy(output->zxdg_output_v1);
+    if (output->wp_color_management_output_v1)
+        wp_color_management_output_v1_destroy(output->wp_color_management_output_v1);
+    if (output->wp_image_description_v1)
+        wp_image_description_v1_destroy(output->wp_image_description_v1);
+    if (output->wp_image_description_info_v1)
+        wp_image_description_info_v1_destroy(output->wp_image_description_info_v1);
     wl_output_destroy(output->wl_output);
     free(output);
 

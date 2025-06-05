@@ -40,6 +40,9 @@
 
 #include "unixlib.h"
 
+#include "initguid.h"
+DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+
 WINE_DEFAULT_DEBUG_CHANNEL(hid);
 
 static DRIVER_OBJECT *driver_obj;
@@ -196,6 +199,21 @@ static WCHAR *get_instance_id(DEVICE_OBJECT *device)
     }
 
     return dst;
+}
+
+static WCHAR *get_container_id(DEVICE_OBJECT *device)
+{
+    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+    UNICODE_STRING dst;
+
+    if (IsEqualGUID(&ext->desc.container_id, &GUID_NULL)) {
+        return NULL;
+    }
+
+    RtlZeroMemory(&dst, sizeof(dst));
+    RtlStringFromGUID(&ext->desc.container_id, &dst);
+
+    return dst.Buffer;
 }
 
 static WCHAR *get_device_id(DEVICE_OBJECT *device)
@@ -454,10 +472,10 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
 {
     char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
-    WCHAR vidpid[MAX_PATH], *tmp, value[1024];
+    struct hidraw_enabled_params params = {0};
+    WCHAR vidpid[MAX_PATH], *tmp;
     BOOL prefer_hidraw = FALSE;
     UNICODE_STRING str;
-    SIZE_T len;
     DWORD size;
 
     if (check_bus_option(L"DisableHidraw", FALSE)) return FALSE;
@@ -468,19 +486,11 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
         return FALSE;
     }
 
-    if (!RtlQueryEnvironmentVariable(NULL, L"PROTON_DISABLE_HIDRAW", 20, value, ARRAY_SIZE(value) - 1, &len))
+    params.vid = vid;
+    params.pid = pid;
+    if (!winebus_call(hidraw_enabled, &params) && params.env_set)
     {
-        value[len] = 0;
-        if (!wcscmp(value, L"1")) return FALSE;
-        swprintf(vidpid, ARRAY_SIZE(vidpid), L"0x%04X/0x%04X", vid, pid);
-        if (wcscasestr(value, vidpid)) return FALSE;
-    }
-    if (!RtlQueryEnvironmentVariable(NULL, L"PROTON_ENABLE_HIDRAW", 20, value, ARRAY_SIZE(value) - 1, &len))
-    {
-        value[len] = 0;
-        if (!wcscmp(value, L"1")) return TRUE;
-        swprintf(vidpid, ARRAY_SIZE(vidpid), L"0x%04X/0x%04X", vid, pid);
-        if (wcscasestr(value, vidpid)) return TRUE;
+        return params.enabled;
     }
 
     if (usages->UsagePage == HID_USAGE_PAGE_DIGITIZER)
@@ -748,6 +758,10 @@ static NTSTATUS handle_IRP_MN_QUERY_ID(DEVICE_OBJECT *device, IRP *irp)
         case BusQueryInstanceID:
             TRACE("BusQueryInstanceID\n");
             irp->IoStatus.Information = (ULONG_PTR)get_instance_id(device);
+            break;
+        case BusQueryContainerID:
+            TRACE("BusQueryContainerID\n");
+            irp->IoStatus.Information = (ULONG_PTR)get_container_id(device);
             break;
         default:
             WARN("Unhandled type %08x\n", type);
