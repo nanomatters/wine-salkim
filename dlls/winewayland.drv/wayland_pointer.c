@@ -362,22 +362,13 @@ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
         input.mi.dy = pointer->pointer_frame.y;
         input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
         NtUserSendHardwareInput(hwnd, SEND_HWMSG_NO_RAW, &input, 0);
+    }
 
-        if (pointer->pointer_frame.flags & WAYLAND_POINTER_FRAME_REL)
-        {
-            input.mi.dx = round(pointer->pointer_frame.dx);
-            input.mi.dy = round(pointer->pointer_frame.dy);
-            pointer->pointer_frame.dx -= input.mi.dx;
-            pointer->pointer_frame.dy -= input.mi.dy;
-            pointer->pointer_frame.dx_unaccel
-                -= round(pointer->pointer_frame.dx_unaccel);
-            pointer->pointer_frame.dy_unaccel
-                -= round(pointer->pointer_frame.dy_unaccel);
-            input.mi.dwFlags = MOUSEEVENTF_MOVE;
-            NtUserSendHardwareInput(hwnd, SEND_HWMSG_NO_MSG, &input, 0);
-        }
-    } else if (pointer->pointer_frame.flags & WAYLAND_POINTER_FRAME_REL) {
-        /* HACK: use raw input when there is only relative motion */
+    /*
+     * Always send raw input
+     * FIXME: is this correct behavior?
+    */
+    if (pointer->pointer_frame.flags & WAYLAND_POINTER_FRAME_REL) {
         input.mi.dx = round(pointer->pointer_frame.dx_unaccel);
         input.mi.dy = round(pointer->pointer_frame.dy_unaccel);
         pointer->pointer_frame.dx_unaccel -= input.mi.dx;
@@ -385,7 +376,8 @@ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
         pointer->pointer_frame.dx -= round(pointer->pointer_frame.dx);
         pointer->pointer_frame.dy -= round(pointer->pointer_frame.dy);
         input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        NtUserSendHardwareInput(hwnd, 0, &input, 0); /* FIXME: flags ? */
+        if (input.mi.dx != 0 || input.mi.dy != 0)
+            NtUserSendHardwareInput(hwnd, SEND_HWMSG_NO_MSG, &input, 0);
     }
 
     /* zero these values just in case */
