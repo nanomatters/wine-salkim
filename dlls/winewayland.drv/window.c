@@ -835,6 +835,23 @@ void WAYLAND_Beep(void)
     wl_display_flush(process_wayland.wl_display);
 }
 
+/**********************************************************************
+ *          WAYLAND_FlashWindowEx
+ */
+void WAYLAND_FlashWindowEx(FLASHWINFO *info)
+{
+    struct wayland_win_data *data;
+
+    TRACE("%p\n", info);
+
+    if ((data = wayland_win_data_get(info->hwnd)))
+    {
+        if (data->wayland_surface)
+            wayland_surface_set_activation(data->wayland_surface, info->dwFlags);
+        wayland_win_data_release(data);
+    }
+}
+
 void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
