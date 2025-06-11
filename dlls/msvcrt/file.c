@@ -1413,7 +1413,6 @@ void msvcrt_free_io(void)
     unsigned int i;
     int j;
 
-    _flushall();
     _fcloseall();
 
     for(i=0; i<ARRAY_SIZE(MSVCRT___pioinfo); i++)
