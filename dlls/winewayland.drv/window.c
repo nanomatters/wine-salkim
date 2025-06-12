@@ -842,7 +842,7 @@ void WAYLAND_FlashWindowEx(FLASHWINFO *info)
 {
     struct wayland_win_data *data;
 
-    TRACE("%p\n", info);
+    TRACE("hwnd=%p\n", info->hwnd);
 
     if ((data = wayland_win_data_get(info->hwnd)))
     {
