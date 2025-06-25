@@ -29,20 +29,11 @@
 #include "wine/debug.h"
 #include "wine/heap.h"
 
-#include "wine/vulkan.h"
-#include "wine/asm.h"
-
 #define COBJMACROS
 #include "initguid.h"
-#include "d3d11.h"
 #include "d3d12.h"
 
-#include "dxgi1_6.h"
-
-#include "dxvk_interfaces.h"
 #include "amdxc_interfaces.h"
-
-#include <wingdi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(amdxc);
 
@@ -91,7 +82,7 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
 
     env = getenv("FSR4_UPGRADE");
 
-    if(env && !strcmp(env, "1"))
+    if (env && !strcmp(env, "1"))
     {
         amdffx = LoadLibraryA("amdxcffx64");
         if (!amdffx)
@@ -102,10 +93,9 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
 
         pfn = (updateffxapi_pfn)GetProcAddress(amdffx, "UpdateFfxApiProvider");
 
-        if(pfn)
+        if (pfn)
         {
-            if (!once++)
-                FIXME("Replaced FSR3 with FSR4!\n");
+            if (!once++) WARN("Replaced FSR3 with FSR4!\n");
             return pfn(data, size);
         }
     }
@@ -118,65 +108,6 @@ static const struct IAmdExtFfxApiVtbl AMDFSR4FFX_vtable = {
     AMDFSR4FFX_AddRef,
     AMDFSR4FFX_Release,
     AMDFSR4FFX_UpdateFfxApiProvider
-};
-
-struct AMDAntiLag2
-{
-    IAmdExtAntiLagApi IAmdExtAntiLagApi_iface;
-    LONG ref;
-};
-
-static struct AMDAntiLag2* impl_from_IAmdExtAntiLagApi(IAmdExtAntiLagApi *iface)
-{
-    return CONTAINING_RECORD(iface, struct AMDAntiLag2, IAmdExtAntiLagApi_iface);
-}
-
-ULONG STDMETHODCALLTYPE AMDAntiLag2_AddRef(IAmdExtAntiLagApi *iface)
-{
-    struct AMDAntiLag2 *data = impl_from_IAmdExtAntiLagApi(iface);
-    return InterlockedIncrement(&data->ref);
-}
-
-ULONG STDMETHODCALLTYPE AMDAntiLag2_Release(IAmdExtAntiLagApi *iface)
-{
-    struct AMDAntiLag2 *data = impl_from_IAmdExtAntiLagApi(iface);
-    ULONG ret = InterlockedDecrement(&data->ref);
-    if (!ret) free(data);
-    return ret;
-}
-
-HRESULT STDMETHODCALLTYPE AMDAntiLag2_QueryInterface(IAmdExtAntiLagApi *iface, REFIID iid, void **out)
-{
-    FIXME("(%p %s %p) stub!\n", iface, debugstr_guid(iid), out);
-    return E_NOINTERFACE;
-}
-
-HRESULT STDMETHODCALLTYPE AMDAntiLag2_UpdateAntiLagState(IAmdExtAntiLagApi *iface, void* data)
-{
-    union {
-        struct APIData_v1 *v1;
-        struct APIData_v2 *v2;
-    } apidata = {data};
-    TRACE("(%p %p)!\n", iface, data);
-
-    if (!data) {
-        /* perform sleep */
-    } else if(apidata.v1->uiVersion == 1) {
-        /* access apidata v1 */
-        if(apidata.v1->uiSize != sizeof(struct APIData_v1)) return E_INVALIDARG;
-    } else if(apidata.v1->uiVersion == 2) {
-        /* access apidata v2 */
-        if(apidata.v2->uiSize != sizeof(struct APIData_v2)) return E_INVALIDARG;
-    }
-
-    return E_NOTIMPL;
-}
-
-static const struct IAmdExtAntiLagApiVtbl AMDANTILAG_vtable = {
-    AMDAntiLag2_QueryInterface,
-    AMDAntiLag2_AddRef,
-    AMDAntiLag2_Release,
-    AMDAntiLag2_UpdateAntiLagState
 };
 
 struct AMDExtStub2
@@ -302,11 +233,7 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
         *obj = &ffx->IAmdExtFfxApi_iface;
         return S_OK;
     } else if (IsEqualGUID(iid, &IID_IAmdExtAntiLagApi)) {
-        struct AMDAntiLag2 *out = calloc(1, sizeof(struct AMDAntiLag2));
-        out->IAmdExtAntiLagApi_iface.lpVtbl = &AMDANTILAG_vtable;
-        out->ref = 1;
-        *obj = &out->IAmdExtAntiLagApi_iface;
-        return S_OK;
+        return ID3D12Device_QueryInterface((ID3D12Device *)outer, &IID_IAmdExtAntiLagApi, obj);
     } else if(IsEqualGUID(iid, &IID_IAmdExtStub1)) {
         struct AMDExtStub1 *this = calloc(1, sizeof(struct AMDExtStub1));
         this->IAmdExtStub1_iface.lpVtbl = &AMDSTUB1_vtable;
