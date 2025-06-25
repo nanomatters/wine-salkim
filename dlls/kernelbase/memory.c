@@ -575,7 +575,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH  VirtualLock( void *addr, SIZE_T size )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH VirtualProtect( void *addr, SIZE_T size, DWORD new_prot, DWORD *old_prot )
 {
-    return VirtualProtectEx( GetCurrentProcess(), addr, size, new_prot, old_prot );
+    BOOL ret = VirtualProtectEx( GetCurrentProcess(), addr, size, new_prot, old_prot );
+    if (old_prot && *old_prot == PAGE_WRITECOPY) *old_prot = PAGE_READWRITE;
+    return ret;
 }
 
 
@@ -794,6 +796,58 @@ BOOL WINAPI HeapQueryInformation( HANDLE heap, HEAP_INFORMATION_CLASS info_class
 BOOL WINAPI HeapSetInformation( HANDLE heap, HEAP_INFORMATION_CLASS infoclass, PVOID info, SIZE_T size )
 {
     return set_ntstatus( RtlSetHeapInformation( heap, infoclass, info, size ));
+}
+
+
+/***********************************************************************
+ *           HeapSummary   (kernelbase.@)
+ */
+BOOL WINAPI HeapSummary( HANDLE heap, DWORD flags, LPHEAP_SUMMARY heap_summary )
+{
+    SIZE_T allocated = 0;
+    SIZE_T committed = 0;
+    SIZE_T uncommitted = 0;
+    PROCESS_HEAP_ENTRY entry;
+
+    if (heap_summary->cb != sizeof(*heap_summary))
+    {
+        /* needs to be set to the exact size by the caller */
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    memset( &entry, 0, sizeof(entry) );
+
+    if (!HeapLock( heap ))
+        return FALSE;
+
+    while (HeapWalk( heap, &entry ))
+    {
+        if (entry.wFlags & PROCESS_HEAP_ENTRY_BUSY)
+        {
+            allocated += entry.cbData;
+        }
+        else if (entry.wFlags & PROCESS_HEAP_REGION)
+        {
+            committed += entry.Region.dwCommittedSize;
+            uncommitted += entry.Region.dwUnCommittedSize;
+        }
+    }
+
+    if (GetLastError() != ERROR_NO_MORE_ITEMS)
+    {
+        /* HeapWalk unsuccessful */
+        HeapUnlock( heap );
+        return FALSE;
+    }
+
+    HeapUnlock( heap );
+    heap_summary->cbAllocated = allocated;
+    heap_summary->cbCommitted = committed;
+    heap_summary->cbReserved = committed + uncommitted;
+    heap_summary->cbMaxReserve = heap_summary->cbReserved;
+
+    return TRUE;
 }
 
 
