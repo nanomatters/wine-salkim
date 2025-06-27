@@ -199,6 +199,7 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
 {
     struct wayland_gl_drawable *gl;
     int client_width, client_height;
+    DWORD tid, pid;
     RECT client_rect = {0};
     const EGLint attribs[] = {EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE};
 
@@ -221,6 +222,12 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
      * target render surface. */
     if (!(gl->client = wayland_client_surface_create(hwnd))) goto err;
     set_client_surface(hwnd, gl->client);
+
+    tid = NtUserGetWindowThread(hwnd, &pid);
+    if (tid && pid != GetCurrentProcessId())
+    {
+        ERR("Cross process rendering is not supported!\n");
+    }
 
     gl->wl_egl_window = wl_egl_window_create(gl->client->wl_surface,
                                              client_width, client_height);
