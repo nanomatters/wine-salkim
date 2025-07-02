@@ -253,9 +253,9 @@
 @ stub SearchForInfFile
 @ stub SetArrayToMultiSzValue
 @ stdcall SetupAddInstallSectionToDiskSpaceListA(long long long str ptr long)
-@ stub SetupAddInstallSectionToDiskSpaceListW
-@ stub SetupAddSectionToDiskSpaceListA
-@ stub SetupAddSectionToDiskSpaceListW
+@ stdcall SetupAddInstallSectionToDiskSpaceListW(long long long wstr ptr long)
+@ stdcall SetupAddSectionToDiskSpaceListA(long long long str long ptr long)
+@ stdcall SetupAddSectionToDiskSpaceListW(long long long wstr long ptr long)
 @ stdcall SetupAddToDiskSpaceListA(long str int64 long ptr long)
 @ stdcall SetupAddToDiskSpaceListW(long wstr int64 long ptr long)
 @ stdcall SetupAddToSourceListA(long str)
@@ -358,6 +358,7 @@
 @ stdcall SetupDiGetDeviceInterfaceDetailA(long ptr ptr long ptr ptr)
 @ stdcall SetupDiGetDeviceInterfaceDetailW(long ptr ptr long ptr ptr)
 @ stdcall SetupDiGetDevicePropertyKeys(ptr ptr ptr long ptr long)
+@ stdcall SetupDiGetDeviceInterfacePropertyW(ptr ptr ptr ptr ptr long ptr long)
 @ stdcall SetupDiGetDevicePropertyW(ptr ptr ptr ptr ptr long ptr long)
 @ stdcall SetupDiGetDeviceRegistryPropertyA(long ptr long ptr ptr long ptr)
 @ stdcall SetupDiGetDeviceRegistryPropertyW(long ptr long ptr ptr long ptr)
