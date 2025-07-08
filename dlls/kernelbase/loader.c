@@ -553,6 +553,7 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
 {
     UNICODE_STRING str;
     HMODULE module;
+    WCHAR overrideW[MAX_PATH] = {0}, envW[40] = {0};
 
     if (!name)
     {
@@ -567,11 +568,28 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
         flags = 0;
     }
 
-    RtlInitUnicodeString( &str, name );
+    if ( GetEnvironmentVariableW( L"WINE_LOADDLL_REPLACE", envW, sizeof(envW)) )
+    {
+        if ( !wcscmp( envW, L"fsr4" ) )
+        {
+            /* HACK: override amdxcffx64 dll path to a non-standard location for FSR4 upgrade */
+            if (wcsstr( name, L"amdxcffx64.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amdxcffx64.dll" );
+        }
+        if ( !wcscmp( envW, L"dlss" ) )
+        {
+            /* HACK: override nvngx_dlss* dll paths to a non-standard location for DLSS upgrade */
+            if (wcsstr( name, L"nvngx_dlss.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlss.dll" );
+            if (wcsstr( name, L"nvngx_dlssd.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssd.dll" );
+            if (wcsstr( name, L"nvngx_dlssg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssg.dll" );
+        }
+        if ( overrideW[0] ) TRACE( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
+    }
+
+    RtlInitUnicodeString( &str, overrideW[0] ? overrideW : name );
     if (str.Length && str.Buffer[str.Length/sizeof(WCHAR) - 1] != ' ') return load_library( &str, flags );
 
     /* library name has trailing spaces */
-    RtlCreateUnicodeString( &str, name );
+    RtlCreateUnicodeString( &str, overrideW[0] ? overrideW : name );
     while (str.Length > sizeof(WCHAR) && str.Buffer[str.Length/sizeof(WCHAR) - 1] == ' ')
         str.Length -= sizeof(WCHAR);
 
