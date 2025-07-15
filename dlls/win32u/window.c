@@ -2040,7 +2040,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (create_layered || is_layered) needs_surface = TRUE;
 
     if (is_opengl && !is_layered && !create_layered
-        && !(!create_opaque && NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY))
+        && !(!create_opaque && NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY)
+        && !user_driver->pHasWindowManager("waylanddrv"))
     {
         if (new_surface) window_surface_release( new_surface );
         new_surface = NULL;
@@ -2096,10 +2097,55 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     WND *win;
     HWND owner_hint, surface_win = 0, parent = NtUserGetAncestor( hwnd, GA_PARENT );
     BOOL ret, is_fullscreen, is_layered, is_child;
-    struct window_rects old_rects;
+    struct window_rects old_rects, adjusted;
     RECT extra_rects[3];
     struct window_surface *old_surface;
     UINT raw_dpi_num, raw_dpi_den, monitor_dpi;
+
+    /* HACK: move windows within the virtual screen on winewayland */
+    if (user_driver->pHasWindowManager("waylanddrv"))
+    {
+        RECT temp;
+        RECT virtual_screen = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+
+        adjusted = *new_rects;
+
+        intersect_rect(&temp, &virtual_screen, &adjusted.window);
+
+        /* we aren't off screen */
+        if (!IsRectEmpty(&temp))
+        {
+            LONG offset_x = 0, offset_y = 0;
+
+            if (adjusted.window.bottom - adjusted.window.top <=
+                virtual_screen.bottom - virtual_screen.top)
+            {
+                if (adjusted.window.bottom > virtual_screen.bottom)
+                    offset_y = virtual_screen.bottom - adjusted.window.bottom;
+                else if (virtual_screen.top > adjusted.window.top)
+                    offset_y = virtual_screen.top - adjusted.window.top;
+            }
+
+            if (adjusted.window.right - adjusted.window.left <=
+                virtual_screen.right - virtual_screen.left)
+            {
+                if (adjusted.window.right > virtual_screen.right)
+                    offset_x = virtual_screen.right - adjusted.window.right;
+                else if (virtual_screen.left > adjusted.window.left)
+                    offset_x = virtual_screen.left - adjusted.window.left;
+            }
+
+
+            OffsetRect(&adjusted.client, offset_x, offset_y);
+            OffsetRect(&adjusted.visible, offset_x, offset_y);
+            OffsetRect(&adjusted.window, offset_x, offset_y);
+
+            TRACE("Adjusted window rects: %s\n", debugstr_window_rects(&adjusted));
+            TRACE("Original window rects: %s\n", debugstr_window_rects(new_rects));
+
+            new_rects = &adjusted;
+        }
+    }
 
     is_layered = new_surface && new_surface->alpha_mask;
     is_fullscreen = is_window_rect_full_screen( &new_rects->visible, get_thread_dpi() );
@@ -3673,8 +3719,11 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
     if (winpos->cy < 0) winpos->cy = 0;
     else if (winpos->cy > 32767) winpos->cy = 32767;
 
-    parent = NtUserGetAncestor( winpos->hwnd, GA_PARENT );
-    if (!is_window_visible( parent )) winpos->flags |= SWP_NOREDRAW;
+    if (win->dwStyle & WS_CHILD)
+    {
+        parent = NtUserGetAncestor( winpos->hwnd, GA_PARENT );
+        if (!is_window_visible( parent )) winpos->flags |= SWP_NOREDRAW;
+    }
 
     if (win->dwStyle & WS_VISIBLE) winpos->flags &= ~SWP_SHOWWINDOW;
     else
@@ -4803,8 +4852,8 @@ static BOOL show_window( HWND hwnd, INT cmd )
     }
     swp = new_swp;
 
-    parent = NtUserGetAncestor( hwnd, GA_PARENT );
-    if (parent && !is_window_visible( parent ) && !(swp & SWP_STATECHANGED))
+        if ((style & WS_CHILD) && (parent = NtUserGetAncestor( hwnd, GA_PARENT )) &&
+        !is_window_visible( parent ) && !(swp & SWP_STATECHANGED))
     {
         /* if parent is not visible simply toggle WS_VISIBLE and return */
         if (show_flag) set_window_style( hwnd, WS_VISIBLE, 0 );
@@ -5016,8 +5065,7 @@ BOOL WINAPI NtUserFlashWindowEx( FLASHWINFO *info )
         if (!win || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return FALSE;
         hwnd = win->obj.handle;  /* make it a full handle */
 
-        if (info->dwFlags) wparam = !(win->flags & WIN_NCACTIVATED);
-        else wparam = (hwnd == NtUserGetForegroundWindow());
+        wparam = (win->flags & WIN_NCACTIVATED) != 0;
 
         release_win_ptr( win );
 
@@ -5025,7 +5073,7 @@ BOOL WINAPI NtUserFlashWindowEx( FLASHWINFO *info )
             send_notify_message( hwnd, WM_NCACTIVATE, wparam, 0, 0 );
 
         user_driver->pFlashWindowEx( info );
-        return wparam;
+        return (info->dwFlags & FLASHW_CAPTION) ? TRUE : wparam;
     }
 }
 

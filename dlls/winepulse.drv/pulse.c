@@ -38,9 +38,13 @@
 #include "initguid.h"
 #include "audioclient.h"
 
+#include "wine/containerid.h"
 #include "wine/debug.h"
 #include "wine/list.h"
 #include "wine/unixlib.h"
+
+#include "initguid.h"
+#include "devpkey.h"
 
 #include "../mmdevapi/unixlib.h"
 
@@ -105,6 +109,7 @@ typedef struct _PhysDevice {
     UINT index;
     REFERENCE_TIME min_period, def_period;
     WAVEFORMATEXTENSIBLE fmt;
+    GUID container_id;
     char pulse_name[0];
 } PhysDevice;
 
@@ -454,9 +459,11 @@ static UINT pulse_channel_map_to_channel_mask(const pa_channel_map *map)
     for (i = 0; i < map->channels; ++i) {
         switch (map->map[i]) {
             default: FIXME("Unhandled channel %s\n", pa_channel_position_to_string(map->map[i])); break;
+            case PA_CHANNEL_POSITION_AUX0:
             case PA_CHANNEL_POSITION_FRONT_LEFT: mask |= SPEAKER_FRONT_LEFT; break;
             case PA_CHANNEL_POSITION_MONO:
             case PA_CHANNEL_POSITION_FRONT_CENTER: mask |= SPEAKER_FRONT_CENTER; break;
+            case PA_CHANNEL_POSITION_AUX1:
             case PA_CHANNEL_POSITION_FRONT_RIGHT: mask |= SPEAKER_FRONT_RIGHT; break;
             case PA_CHANNEL_POSITION_REAR_LEFT: mask |= SPEAKER_BACK_LEFT; break;
             case PA_CHANNEL_POSITION_REAR_CENTER: mask |= SPEAKER_BACK_CENTER; break;
@@ -561,6 +568,7 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
     dev->bus_type = phys_device_bus_invalid;
     dev->vendor_id = 0;
     dev->product_id = 0;
+    memset(&dev->container_id, 0, sizeof(GUID));
 
     if (!p)
         return;
@@ -577,6 +585,13 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
 
     if ((buffer = pa_proplist_gets(p, PA_PROP_DEVICE_PRODUCT_ID)))
         dev->product_id = strtol(buffer, NULL, 16);
+
+    if ((buffer = pa_proplist_gets(p, "sysfs.path"))) {
+        // The syspath is of the audio device. Resolve it up to the device level.
+        char sysfs_path[MAX_PATH];
+        snprintf(sysfs_path, sizeof(sysfs_path), "/sys%s/device", buffer);
+        container_id_for_sysfs(sysfs_path, &dev->container_id);
+    }
 }
 
 static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
@@ -714,7 +729,8 @@ static void convert_channel_map(const pa_channel_map *pa_map, WAVEFORMATEXTENSIB
     fmt->dwChannelMask = pa_mask;
 }
 
-static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATEXTENSIBLE *fmt, REFERENCE_TIME *def_period, REFERENCE_TIME *min_period)
+static void pulse_probe_settings(pa_mainloop *ml, pa_context *ctx, int render, const char *pulse_name,
+                                 WAVEFORMATEXTENSIBLE *fmt, REFERENCE_TIME *def_period, REFERENCE_TIME *min_period)
 {
     WAVEFORMATEX *wfx = &fmt->Format;
     pa_stream *stream;
@@ -737,7 +753,7 @@ static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATE
     attr.minreq = attr.fragsize = pa_frame_size(&ss);
     attr.prebuf = 0;
 
-    stream = pa_stream_new(pulse_ctx, "format test stream", &ss, &map);
+    stream = pa_stream_new(ctx, "format test stream", &ss, &map);
     if (stream)
         pa_stream_set_state_callback(stream, pulse_stream_state, NULL);
     if (!stream)
@@ -748,7 +764,7 @@ static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATE
     else
         ret = pa_stream_connect_record(stream, pulse_name, &attr, PA_STREAM_START_CORKED|PA_STREAM_FIX_RATE|PA_STREAM_FIX_CHANNELS|PA_STREAM_EARLY_REQUESTS);
     if (ret >= 0) {
-        while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
+        while (pa_mainloop_iterate(ml, 1, &ret) >= 0 &&
                 pa_stream_get_state(stream) == PA_STREAM_CREATING)
         {}
         if (pa_stream_get_state(stream) == PA_STREAM_READY) {
@@ -759,7 +775,7 @@ static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATE
             else
                 length = pa_stream_get_buffer_attr(stream)->fragsize;
             pa_stream_disconnect(stream);
-            while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
+            while (pa_mainloop_iterate(ml, 1, &ret) >= 0 &&
                     pa_stream_get_state(stream) == PA_STREAM_READY)
             {}
         }
@@ -801,34 +817,33 @@ static NTSTATUS pulse_test_connect(void *args)
     pa_operation *o;
     int ret;
     char *name = wstr_to_str(params->name);
+    pa_mainloop *ml;
+    pa_context *ctx;
 
     pulse_lock();
-    pulse_ml = pa_mainloop_new();
+    ml = pa_mainloop_new();
 
-    pa_mainloop_set_poll_func(pulse_ml, pulse_poll_func, NULL);
+    pa_mainloop_set_poll_func(ml, pulse_poll_func, NULL);
 
-    pulse_ctx = pa_context_new(pa_mainloop_get_api(pulse_ml), name);
-
+    ctx = pa_context_new(pa_mainloop_get_api(ml), name);
     free(name);
-
-    if (!pulse_ctx) {
+    if (!ctx) {
         ERR("Failed to create context\n");
-        pa_mainloop_free(pulse_ml);
-        pulse_ml = NULL;
+        pa_mainloop_free(ml);
         pulse_unlock();
         params->priority = Priority_Unavailable;
         return STATUS_SUCCESS;
     }
 
-    pa_context_set_state_callback(pulse_ctx, pulse_contextcallback, NULL);
+    pa_context_set_state_callback(ctx, pulse_contextcallback, NULL);
 
-    TRACE("libpulse protocol version: %u. API Version %u\n", pa_context_get_protocol_version(pulse_ctx), PA_API_VERSION);
-    if (pa_context_connect(pulse_ctx, NULL, 0, NULL) < 0)
+    TRACE("libpulse protocol version: %u. API Version %u\n", pa_context_get_protocol_version(ctx), PA_API_VERSION);
+    if (pa_context_connect(ctx, NULL, 0, NULL) < 0)
         goto fail;
 
     /* Wait for connection */
-    while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0) {
-        pa_context_state_t state = pa_context_get_state(pulse_ctx);
+    while (pa_mainloop_iterate(ml, 1, &ret) >= 0) {
+        pa_context_state_t state = pa_context_get_state(ctx);
 
         if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED)
             goto fail;
@@ -837,12 +852,12 @@ static NTSTATUS pulse_test_connect(void *args)
             break;
     }
 
-    if (pa_context_get_state(pulse_ctx) != PA_CONTEXT_READY)
+    if (pa_context_get_state(ctx) != PA_CONTEXT_READY)
         goto fail;
 
     TRACE("Test-connected to server %s with protocol version: %i.\n",
-        pa_context_get_server(pulse_ctx),
-        pa_context_get_server_protocol_version(pulse_ctx));
+        pa_context_get_server(ctx),
+        pa_context_get_server_protocol_version(ctx));
 
     free_phys_device_lists();
     list_init(&g_phys_speakers);
@@ -852,34 +867,32 @@ static NTSTATUS pulse_test_connect(void *args)
     pulse_add_device(&g_phys_speakers, NULL, 0, Speakers, 0, "", "PulseAudio Output");
     pulse_add_device(&g_phys_sources, NULL, 0, Microphone, 0, "", "PulseAudio Input");
 
-    o = pa_context_get_sink_info_list(pulse_ctx, &pulse_phys_speakers_cb, NULL);
+    o = pa_context_get_sink_info_list(ctx, &pulse_phys_speakers_cb, NULL);
     if (o) {
-        while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
+        while (pa_mainloop_iterate(ml, 1, &ret) >= 0 &&
                 pa_operation_get_state(o) == PA_OPERATION_RUNNING)
         {}
         pa_operation_unref(o);
     }
 
-    o = pa_context_get_source_info_list(pulse_ctx, &pulse_phys_sources_cb, NULL);
+    o = pa_context_get_source_info_list(ctx, &pulse_phys_sources_cb, NULL);
     if (o) {
-        while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
+        while (pa_mainloop_iterate(ml, 1, &ret) >= 0 &&
                 pa_operation_get_state(o) == PA_OPERATION_RUNNING)
         {}
         pa_operation_unref(o);
     }
 
     LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry) {
-        pulse_probe_settings(1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+        pulse_probe_settings(ml, ctx, 1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
     }
 
     LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
-        pulse_probe_settings(0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+        pulse_probe_settings(ml, ctx, 0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
     }
 
-    pa_context_unref(pulse_ctx);
-    pulse_ctx = NULL;
-    pa_mainloop_free(pulse_ml);
-    pulse_ml = NULL;
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
 
     pulse_unlock();
 
@@ -887,10 +900,8 @@ static NTSTATUS pulse_test_connect(void *args)
     return STATUS_SUCCESS;
 
 fail:
-    pa_context_unref(pulse_ctx);
-    pulse_ctx = NULL;
-    pa_mainloop_free(pulse_ml);
-    pulse_ml = NULL;
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
     pulse_unlock();
     params->priority = Priority_Unavailable;
     return STATUS_SUCCESS;
@@ -940,7 +951,9 @@ static const enum pa_channel_position pulse_pos_from_wfx[] = {
     PA_CHANNEL_POSITION_TOP_FRONT_RIGHT,
     PA_CHANNEL_POSITION_TOP_REAR_LEFT,
     PA_CHANNEL_POSITION_TOP_REAR_CENTER,
-    PA_CHANNEL_POSITION_TOP_REAR_RIGHT
+    PA_CHANNEL_POSITION_TOP_REAR_RIGHT,
+    PA_CHANNEL_POSITION_AUX0,
+    PA_CHANNEL_POSITION_AUX1
 };
 
 static HRESULT pulse_spec_from_waveformat(struct pulse_stream *stream, const WAVEFORMATEX *fmt)
@@ -2633,6 +2646,21 @@ static NTSTATUS pulse_get_prop_value(void *args)
                 params->result = S_OK;
                 return STATUS_SUCCESS;
             }
+        } else if (IsEqualGUID(&params->prop->fmtid, &DEVPKEY_Device_ContainerId)) {
+            params->value->vt = VT_CLSID;
+            if (*params->buffer_size < sizeof(GUID))
+            {
+                params->result = E_NOT_SUFFICIENT_BUFFER;
+                *params->buffer_size = sizeof(GUID);
+            }
+            else if (!params->buffer)
+                params->result = E_INVALIDARG;
+            else {
+                params->result = S_OK;
+                params->value->puuid = params->buffer;
+                *params->value->puuid = dev->container_id;
+            }
+            return STATUS_SUCCESS;
         }
 
         params->result = E_NOTIMPL;
@@ -3130,6 +3158,7 @@ static NTSTATUS pulse_wow64_get_prop_value(void *args)
         switch (value.vt)
         {
         case VT_UI4:
+        case VT_CLSID:
             value32->ulVal = value.ulVal;
             break;
         case VT_LPWSTR:

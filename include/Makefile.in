@@ -325,6 +325,7 @@ SOURCES = \
 	fci.h \
 	fdi.h \
 	featurestagingapi.h \
+	fibersapi.h \
 	fileapi.h \
 	filter.idl \
 	fltdefs.h \
@@ -456,6 +457,8 @@ SOURCES = \
 	minidumpapiset.h \
 	minmax.h \
 	minschannel.h \
+	minwinbase.h \
+	minwindef.h \
 	mlang.idl \
 	mmc.idl \
 	mmddk.h \
@@ -744,6 +747,7 @@ SOURCES = \
 	srrestoreptapi.h \
 	sspi.h \
 	stamp-h.in \
+	stdole32.idl \
 	stgprop.h \
 	sti.h \
 	storage.h \
@@ -753,6 +757,7 @@ SOURCES = \
 	structuredquerycondition.idl \
 	svrapi.h \
 	synchapi.h \
+	sysinfoapi.h \
 	systemmediatransportcontrolsinterop.idl \
 	t2embapi.h \
 	tapi.h \
@@ -817,6 +822,7 @@ SOURCES = \
 	weakreference.idl \
 	webservices.h \
 	websocket.h \
+	webview2.idl \
 	werapi.h \
 	wfext.h \
 	wia.h \
@@ -918,6 +924,7 @@ SOURCES = \
 	wine/afd.h \
 	wine/asm.h \
 	wine/atsvc.idl \
+	wine/containerid.h \
 	wine/condrv.h \
 	wine/dcetypes.idl \
 	wine/debug.h \
