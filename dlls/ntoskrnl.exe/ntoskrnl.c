@@ -3300,6 +3300,14 @@ TEB *WINAPI PsGetCurrentThreadTeb(void)
 }
 
 /***********************************************************************
+ *           PsGetCurrentThreadProcess   (NTOSKRNL.EXE.@)
+ */
+PEPROCESS WINAPI PsGetCurrentThreadProcess(void)
+{
+    return KeGetCurrentThread()->process;
+}
+
+/***********************************************************************
  *           PsIsSystemThread   (NTOSKRNL.EXE.@)
  */
 BOOLEAN WINAPI PsIsSystemThread(PETHREAD thread)
