@@ -919,6 +919,7 @@
 @ stdcall PsGetCurrentThreadTeb()
 @ stub PsGetCurrentThreadPreviousMode
 @ stdcall PsGetCurrentThreadProcess()
+@ stdcall PsGetCurrentThreadProcessId()
 @ stub PsGetCurrentThreadStackBase
 @ stub PsGetCurrentThreadStackLimit
 @ stub PsGetJobLock
