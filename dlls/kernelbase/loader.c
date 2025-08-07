@@ -572,15 +572,22 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
     {
         if ( !wcscmp( envW, L"fsr4" ) )
         {
-            /* HACK: override amdxcffx64 dll path to a non-standard location for FSR4 upgrade */
+            /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 upgrade */
             if (wcsstr( name, L"amdxcffx64.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amdxcffx64.dll" );
         }
         if ( !wcscmp( envW, L"dlss" ) )
         {
-            /* HACK: override nvngx_dlss* dll paths to a non-standard location for DLSS upgrade */
+            /* HACK: override nvngx_dlss*.dll paths to a non-standard location for DLSS upgrade */
             if (wcsstr( name, L"nvngx_dlss.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlss.dll" );
             if (wcsstr( name, L"nvngx_dlssd.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssd.dll" );
             if (wcsstr( name, L"nvngx_dlssg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssg.dll" );
+        }
+        if ( !wcscmp( envW, L"xess" ) )
+        {
+            /* HACK: override libxe*.dll paths to a non-standard location for XeSS upgrade */
+            if (wcsstr( name, L"libxess.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess.dll" );
+            if (wcsstr( name, L"libxell.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxell.dll" );
+            if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess_fg.dll" );
         }
         if ( overrideW[0] ) TRACE( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
     }
