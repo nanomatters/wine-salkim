@@ -3002,6 +3002,7 @@ HKCU,Software\Wine\DllOverrides,"nvcuda",0x2,"disabled"
 HKCU,Software\Wine\DllOverrides,"vcruntime140_1",0x2,"native,builtin"
 HKCU,Software\Wine\AppDefaults\ShadowOfWar.exe\DllOverrides,"amd_ags_x64",,"disabled"
 HKCU,Software\Wine\AppDefaults\TDUSC.exe\DllOverrides,"xinput1_3",,"native,builtin"
+HKCU,Software\Wine\AppDefaults\WRC9.exe\DllOverrides,"xinput1_3",,"native,builtin"
 HKCU,Software\Wine\AppDefaults\WRCG.exe\DllOverrides,"xinput1_3",,"native,builtin"
 HKCU,Software\Wine\AppDefaults\diabotical.exe\DllOverrides,"xaudio2_9",,"disabled"
 ;;App-specific overrides for atiadlxx.dll.
