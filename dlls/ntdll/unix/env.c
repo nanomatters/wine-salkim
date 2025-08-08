@@ -1916,6 +1916,7 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
     peb->ImageSubSystem             = main_image_info.SubSystemType;
     peb->ImageSubSystemMajorVersion = main_image_info.MajorSubsystemVersion;
     peb->ImageSubSystemMinorVersion = main_image_info.MinorSubsystemVersion;
+    peb->IsLongPathAwareProcess     = TRUE;
 
 #ifdef _WIN64
     switch (main_image_info.Machine)
@@ -1959,6 +1960,7 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
         wow_peb->ImageSubSystemMajorVersion      = peb->ImageSubSystemMajorVersion;
         wow_peb->ImageSubSystemMinorVersion      = peb->ImageSubSystemMinorVersion;
         wow_peb->SessionId                       = peb->SessionId;
+        wow_peb->IsLongPathAwareProcess          = peb->IsLongPathAwareProcess;
     }
 }
 
