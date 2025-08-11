@@ -836,7 +836,7 @@ static void test_ip_interface( int family )
 
     err = GetIpInterfaceTable( family, &table );
     ok( !err, "got %lu.\n", err );
-    err = NsiAllocateAndGetTable( 1, mod, 7, (void **)&key_tbl, sizeof(*key_tbl),
+    err = NsiAllocateAndGetTable( 1, mod, NSI_IP_INTERFACE_TABLE, (void **)&key_tbl, sizeof(*key_tbl),
                                   (void **)&rw_tbl, sizeof(*rw_tbl), (void **)&dyn_tbl, sizeof(*dyn_tbl),
                                   (void **)&stat_tbl, sizeof(*stat_tbl), &count, 0 );
     ok( !err, "got %lu.\n", err );
