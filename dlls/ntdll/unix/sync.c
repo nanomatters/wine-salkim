@@ -71,6 +71,11 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
+#define SECSPERDAY         86400
+/* 1601 to 1970 is 369 years plus 89 leap days */
+#define SECS_1601_TO_1970  ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
+#define TICKS_1601_TO_1970 (SECS_1601_TO_1970 * TICKSPERSEC)
+
 HANDLE keyed_event = 0;
 
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
@@ -1764,54 +1769,90 @@ NTSTATUS WINAPI NtYieldExecution(void)
  */
 NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
+    unsigned int status = STATUS_SUCCESS;
+
     /* if alertable, we need to query the server */
     if (alertable)
     {
         if (do_fsync())
         {
-            NTSTATUS ret = fsync_wait_objects( 0, NULL, TRUE, TRUE, timeout );
-            if (ret != STATUS_NOT_IMPLEMENTED)
-                return ret;
+            status = fsync_wait_objects( 0, NULL, TRUE, TRUE, timeout );
+            if (status != STATUS_NOT_IMPLEMENTED)
+                goto alert_waited;
         }
 
         if (do_esync())
         {
-            NTSTATUS ret = esync_wait_objects( 0, NULL, TRUE, TRUE, timeout );
-            if (ret != STATUS_NOT_IMPLEMENTED)
-                return ret;
+            status = esync_wait_objects( 0, NULL, TRUE, TRUE, timeout );
+            if (status != STATUS_NOT_IMPLEMENTED)
+                goto alert_waited;
         }
 
-        return server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout );
+        /* Since server_wait will result in an unconditional implicit yield,
+           we never return STATUS_NO_YIELD_PERFORMED */
+        status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout );
+
+alert_waited:
+        if (status == STATUS_TIMEOUT)
+            status = STATUS_SUCCESS;
+
+        return status;
     }
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
-        for (;;) select( 0, NULL, NULL, NULL, NULL );
+        struct timespec ts = { .tv_sec = ~0UL >> 1, .tv_nsec = 0 };
+        while (clock_nanosleep( CLOCK_MONOTONIC, 0, &ts, &ts ) == EINTR);
     }
     else
     {
-        LARGE_INTEGER now;
-        timeout_t when, diff;
+        timeout_t when;
+        struct timespec ts;
+        when = timeout->QuadPart;
 
-        if ((when = timeout->QuadPart) < 0)
+        /* Note that we only care about the result of the yield for zero timeouts */
+        status = NtYieldExecution();
+        if (!when)
+            return status;
+
+        if (when < 0)
         {
-            NtQuerySystemTime( &now );
-            when = now.QuadPart - when;
+            when = -when;
+            when -= 450; /* rough overhead adjustment */
+
+            if (when <= 0)
+                return status;
+
+            ts.tv_sec  = when / TICKSPERSEC;
+            ts.tv_nsec = (when % TICKSPERSEC) * 100;
+
+            while (clock_nanosleep( CLOCK_MONOTONIC, 0, &ts, &ts ) == EINTR);
         }
-
-        /* Note that we yield after establishing the desired timeout */
-        NtYieldExecution();
-        if (!when) return STATUS_SUCCESS;
-
-        for (;;)
+        else
         {
-            struct timeval tv;
+            LARGE_INTEGER now;
+            unsigned int ret;
+
+            when -= 450;
+
             NtQuerySystemTime( &now );
-            diff = (when - now.QuadPart + 9) / 10;
-            if (diff <= 0) break;
-            tv.tv_sec  = diff / 1000000;
-            tv.tv_usec = diff % 1000000;
-            if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+            if (when <= now.QuadPart)
+                return status;
+
+            when -= TICKS_1601_TO_1970;
+            ts.tv_sec  = when / TICKSPERSEC;
+            ts.tv_nsec = (when % TICKSPERSEC) * 100;
+
+            do
+            {
+                ret = clock_nanosleep( CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL );
+                if (ret == EINTR)
+                {
+                    LARGE_INTEGER now;
+                    NtQuerySystemTime( &now );
+                    if (when <= now.QuadPart) break;
+                }
+            } while (ret == EINTR);
         }
     }
     return STATUS_SUCCESS;
@@ -1836,22 +1877,7 @@ NTSTATUS WINAPI NtQuerySystemTime( LARGE_INTEGER *time )
 {
 #ifdef HAVE_CLOCK_GETTIME
     struct timespec ts;
-    static clockid_t clock_id = CLOCK_MONOTONIC; /* placeholder */
-
-    if (clock_id == CLOCK_MONOTONIC)
-    {
-#ifdef CLOCK_REALTIME_COARSE
-        struct timespec res;
-
-        /* Use CLOCK_REALTIME_COARSE if it has 1 ms or better resolution */
-        if (!clock_getres( CLOCK_REALTIME_COARSE, &res ) && res.tv_sec == 0 && res.tv_nsec <= 1000000)
-            clock_id = CLOCK_REALTIME_COARSE;
-        else
-#endif /* CLOCK_REALTIME_COARSE */
-            clock_id = CLOCK_REALTIME;
-    }
-
-    if (!clock_gettime( clock_id, &ts ))
+    if (!clock_gettime( CLOCK_REALTIME, &ts ))
     {
         time->QuadPart = ticks_from_time_t( ts.tv_sec ) + (ts.tv_nsec + 50) / 100;
     }
