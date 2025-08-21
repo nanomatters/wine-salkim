@@ -589,7 +589,7 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
             if (wcsstr( name, L"libxell.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxell.dll" );
             if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess_fg.dll" );
         }
-        if ( overrideW[0] ) TRACE( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
+        if ( overrideW[0] ) FIXME( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
     }
 
     RtlInitUnicodeString( &str, overrideW[0] ? overrideW : name );
