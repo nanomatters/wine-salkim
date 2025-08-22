@@ -570,6 +570,12 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
 
     if ( GetEnvironmentVariableW( L"WINE_LOADDLL_REPLACE", envW, sizeof(envW)) )
     {
+        if ( !wcscmp( envW, L"fsr3" ) )
+        {
+            /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR3 upgrade */
+            if (wcsstr( name, L"amd_fidelityfx_vk.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amd_fidelityfx_vk.dll" );
+            if (wcsstr( name, L"amd_fidelityfx_dx12.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amd_fidelityfx_dx12.dll" );
+        }
         if ( !wcscmp( envW, L"fsr4" ) )
         {
             /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 upgrade */
