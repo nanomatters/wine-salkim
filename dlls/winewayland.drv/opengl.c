@@ -199,6 +199,7 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
 {
     struct wayland_gl_drawable *gl;
     int client_width, client_height;
+    DWORD tid, pid;
     RECT client_rect = {0};
     const EGLint attribs[] = {EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE};
 
@@ -221,6 +222,13 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
      * target render surface. */
     if (!(gl->client = wayland_client_surface_create(hwnd))) goto err;
     set_client_surface(hwnd, gl->client);
+
+    tid = NtUserGetWindowThread(hwnd, &pid);
+    if (tid && pid != GetCurrentProcessId())
+    {
+        ERR("Cross process rendering is not supported!\n");
+        return NULL;
+    }
 
     gl->wl_egl_window = wl_egl_window_create(gl->client->wl_surface,
                                              client_width, client_height);
@@ -1247,6 +1255,7 @@ static BOOL init_opengl_funcs(void)
     opengl_funcs.ext.p_wglCreateContextAttribsARB = wayland_wglCreateContextAttribsARB;
 
     register_extension("WGL_EXT_swap_control");
+    register_extension("WGL_EXT_swap_control_tear");
     opengl_funcs.ext.p_wglGetSwapIntervalEXT = wayland_wglGetSwapIntervalEXT;
     opengl_funcs.ext.p_wglSwapIntervalEXT = wayland_wglSwapIntervalEXT;
 
@@ -1386,7 +1395,7 @@ static void init_opengl(void)
     egl_display = p_eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,
                                           process_wayland.wl_display,
                                           NULL);
-    if (egl_display == EGL_NO_DISPLAY)
+    if (egl_display == EGL_NO_DISPLAY || egl_display == (void *)EGL_BAD_PARAMETER)
     {
         ERR("Failed to get EGLDisplay\n");
         goto err;

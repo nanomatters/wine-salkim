@@ -529,3 +529,20 @@ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_re
     wayland_win_data_release(data);
     return TRUE;
 }
+
+/***********************************************************************
+ *           WAYLAND_HasWindowManager
+ */
+BOOL WAYLAND_HasWindowManager(const char *name)
+{
+    static int once;
+    const char *env = getenv("XDG_CURRENT_DESKTOP");
+
+    if (!once++)
+        TRACE("DE: %s\n", debugstr_a(env));
+
+    if (!strcmp("waylanddrv", name)) return TRUE;
+    if (env && !strcmp(env, name)) return TRUE;
+
+    return FALSE;
+}
