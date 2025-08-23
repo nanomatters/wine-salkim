@@ -4766,8 +4766,6 @@ void loader_init( CONTEXT *context, void **entry )
             if (FIXME_ON(sync))
             {
                 NTSTATUS sync = __wine_get_sync_type();
-                if (sync < 0)
-                    MESSAGE("ntsync: explicitly disabled.\n");
                 switch (abs(sync))
                 {
                 case 1:
@@ -4777,12 +4775,14 @@ void loader_init( CONTEXT *context, void **entry )
                     MESSAGE("fsync: up and running.\n");
                     break;
                 case 3:
-                    MESSAGE("wine: using fast synchronization.\n");
+                    MESSAGE("ntsync: up and running.\n");
                     break;
                 default:
                     MESSAGE("wineserver: using server-side synchronization.\n");
                     break;
                 }
+                if (sync < 0)
+                    MESSAGE("ntsync: explicitly disabled.\n");
             }
             if (FIXME_ON(winediag))
             {
