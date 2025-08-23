@@ -586,7 +586,8 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
             /* HACK: override nvngx_dlss*.dll paths to a non-standard location for DLSS upgrade */
             if (wcsstr( name, L"nvngx_dlss.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlss.dll" );
             if (wcsstr( name, L"nvngx_dlssd.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssd.dll" );
-            if (wcsstr( name, L"nvngx_dlssg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssg.dll" );
+            if (wcsstr( name, L"nvngx_dlssg.dll" ) && !wcsstr( name, L"nvidia/wine/nvngx_dlssg.dll" ))
+                wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssg.dll" );
         }
         if ( wcsstr( envW, L"xess" ) )
         {
