@@ -301,6 +301,7 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_CreateComputePipelineCrossCompile(IAm
 HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_GetWaveMatrixProperties(IAmdExtD3DDevice8 *iface,
                                                                    SIZE_T *pCount, AmdExtWaveMatrixProperties *pProperties)
 {
+    /* FIXME: this needs an interface vkd3d-proton side */
     static AmdExtWaveMatrixProperties prop[1] = {{
         16, 16, 16, AMD_EXT_WMMA_TYPE_FP8, AMD_EXT_WMMA_TYPE_FP8,
         AMD_EXT_WMMA_TYPE_FP32, AMD_EXT_WMMA_TYPE_FP32, FALSE}};
