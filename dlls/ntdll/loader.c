@@ -45,6 +45,7 @@ WINE_DECLARE_DEBUG_CHANNEL(snoop);
 WINE_DECLARE_DEBUG_CHANNEL(loaddll);
 WINE_DECLARE_DEBUG_CHANNEL(imports);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
+WINE_DECLARE_DEBUG_CHANNEL(sync);
 
 #ifdef _WIN64
 #define DEFAULT_SECURITY_COOKIE_64  (((ULONGLONG)0x00002b99 << 32) | 0x2ddfa232)
@@ -3665,6 +3666,13 @@ unsigned int CDECL wine_server_call( void *req_ptr )
     return WINE_UNIX_CALL( unix_wine_server_call, req_ptr );
 }
 
+/***********************************************************************
+ *           __wine_get_sync_type
+ */
+NTSTATUS WINAPI __wine_get_sync_type(void)
+{
+    return WINE_UNIX_CALL( unix_wine_get_sync_type, NULL );
+}
 
 /***********************************************************************
  *           wine_server_fd_to_handle
@@ -4690,9 +4698,9 @@ static void release_address_space(void)
  */
 void loader_init( CONTEXT *context, void **entry )
 {
-    OBJECT_ATTRIBUTES staging_event_attr;
-    UNICODE_STRING staging_event_string;
-    HANDLE staging_event;
+    OBJECT_ATTRIBUTES startup_event_attr;
+    UNICODE_STRING startup_event_string;
+    HANDLE startup_event = 0;
     static int attach_done;
     NTSTATUS status;
     ULONG_PTR cookie, port = 0;
@@ -4807,15 +4815,38 @@ void loader_init( CONTEXT *context, void **entry )
         /* This hunk occasionally applies in the wrong place;
          * add a comment here to try to prevent that. */
     }
-    RtlInitUnicodeString( &staging_event_string, L"\\__wine_staging_warn_event" );
-    InitializeObjectAttributes( &staging_event_attr, &staging_event_string, OBJ_OPENIF, NULL, NULL );
-    if (NtCreateEvent( &staging_event, EVENT_ALL_ACCESS, &staging_event_attr, NotificationEvent, FALSE ) == STATUS_SUCCESS)
+    if (FIXME_ON(winediag) || FIXME_ON(sync))
     {
-        FIXME_(winediag)("wine-staging %s is a testing version containing experimental patches.\n", wine_get_version());
-        FIXME_(winediag)("Please mention your exact version when filing bug reports on winehq.org.\n");
+        RtlInitUnicodeString( &startup_event_string, L"\\__wine_startup_event" );
+        InitializeObjectAttributes( &startup_event_attr, &startup_event_string, OBJ_OPENIF | OBJ_PERMANENT, NULL, NULL );
+        if (NtCreateEvent( &startup_event, EVENT_ALL_ACCESS, &startup_event_attr, NotificationEvent, FALSE ) == STATUS_SUCCESS)
+        {
+            if (FIXME_ON(sync))
+            {
+                NTSTATUS sync = __wine_get_sync_type();
+                switch (abs(sync))
+                {
+                case 1:
+                    MESSAGE("esync: up and running.\n");
+                    break;
+                case 2:
+                    MESSAGE("fsync: up and running.\n");
+                    break;
+                case 3:
+                    MESSAGE("ntsync: up and running.\n");
+                    break;
+                default:
+                    MESSAGE("wineserver: using server-side synchronization.\n");
+                    break;
+                }
+                if (sync < 0)
+                    MESSAGE("ntsync is explicitly disabled.\n");
+            }
+            if (FIXME_ON(winediag))
+                MESSAGE("winediag: this wine %s contains many experimental patches, please don't report bugs to winehq.org.\n", wine_get_version());
+        }
+        NtClose( startup_event );
     }
-    else
-        WARN_(winediag)("wine-staging %s is a testing version containing experimental patches.\n", wine_get_version());
 
     NtCurrentTeb()->FlsSlots = fls_alloc_data();
 
