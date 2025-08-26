@@ -589,6 +589,13 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
             /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 upgrade */
             if (wcsstr( name, L"amdxcffx64.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amdxcffx64.dll" );
         }
+        if ( wcsstr( envW, L"fsr_sdk2" ) )
+        {
+            /* HACK: override amd_fidelityfx_dx12.dll to load amd_fidelityfx_loader_dx12 instead for FSR2/3/4 upgrade */
+            if (wcsstr( name, L"amd_fidelityfx_dx12.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amd_fidelityfx_loader_dx12.dll" );
+            /* HACK: override amd_fidelityfx_loader_*.dll path to a non-standard location for FSR2/3/4 upgrade */
+            if (wcsstr( name, L"amd_fidelityfx_loader_dx12.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amd_fidelityfx_loader_dx12.dll" );
+        }
         if ( wcsstr( envW, L"dlss" ) )
         {
             /* HACK: override nvngx_dlss*.dll paths to a non-standard location for DLSS upgrade */
