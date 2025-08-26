@@ -567,26 +567,10 @@ HWND WINAPI NtUserGetForegroundWindow(void)
     return hwnd;
 }
 
-/* see GetActiveWindow */
-HWND get_active_window(void)
-{
-    GUITHREADINFO info;
-    info.cbSize = sizeof(info);
-    return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndActive : 0;
-}
-
-/* see GetCapture */
-HWND get_capture(void)
-{
-    GUITHREADINFO info;
-    info.cbSize = sizeof(info);
-    return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndCapture : 0;
-}
-
 static int is_DragonAgeInquis = -1;
 
-/* see GetFocus */
-HWND get_focus(void)
+/* see GetActiveWindow */
+HWND get_active_window(void)
 {
     GUITHREADINFO info;
     HWND retValueWindow;
@@ -594,7 +578,7 @@ HWND get_focus(void)
     const char *sgi;
     
     info.cbSize = sizeof(info);
-    retValueWindow = NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndFocus : 0;
+    retValueWindow = NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndActive : 0;
 
     if (is_DragonAgeInquis)
     {
@@ -609,6 +593,22 @@ HWND get_focus(void)
     }
 
     return retValueWindow;
+}
+
+/* see GetCapture */
+HWND get_capture(void)
+{
+    GUITHREADINFO info;
+    info.cbSize = sizeof(info);
+    return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndCapture : 0;
+}
+
+/* see GetFocus */
+HWND get_focus(void)
+{
+    GUITHREADINFO info;
+    info.cbSize = sizeof(info);
+    return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndFocus : 0;
 }
 
 /**********************************************************************
