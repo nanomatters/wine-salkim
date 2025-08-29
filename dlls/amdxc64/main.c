@@ -28,6 +28,7 @@
 #include "winternl.h"
 #include "wine/debug.h"
 #include "wine/heap.h"
+#include "wine/vulkan.h"
 
 #define COBJMACROS
 #include "initguid.h"
@@ -178,6 +179,7 @@ struct AmdExtD3DDevice8
 {
     IAmdExtD3DDevice8 IAmdExtD3DDevice8_iface;
     LONG ref;
+    BOOL fsr4_supported;
 };
 
 struct AmdExtD3DDevice8 *impl_from_IAmdExtD3DDevice8(IAmdExtD3DDevice8 *iface)
@@ -301,7 +303,7 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_CreateComputePipelineCrossCompile(IAm
 HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_GetWaveMatrixProperties(IAmdExtD3DDevice8 *iface,
                                                                    SIZE_T *pCount, AmdExtWaveMatrixProperties *pProperties)
 {
-    /* FIXME: this needs an interface vkd3d-proton side */
+    struct AmdExtD3DDevice8 *this = impl_from_IAmdExtD3DDevice8(iface);
     static AmdExtWaveMatrixProperties prop[1] = {{
         16, 16, 16, AMD_EXT_WMMA_TYPE_FP8, AMD_EXT_WMMA_TYPE_FP8,
         AMD_EXT_WMMA_TYPE_FP32, AMD_EXT_WMMA_TYPE_FP32, FALSE}};
@@ -312,9 +314,15 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_GetWaveMatrixProperties(IAmdExtD3DDev
 
     if (*pCount >= 1)
     {
-        *pCount = 1;
-        memcpy(pProperties, prop, sizeof(prop));
-        return S_OK;
+        if (this->fsr4_supported)
+        {
+            *pCount = 1;
+            memcpy(pProperties, prop, sizeof(prop));
+            return S_OK;
+        } else {
+            *pCount = 0;
+            return S_OK;
+        }
     } /* FIXME: Handle pCount == 0 */
 
     return S_OK;
@@ -365,6 +373,75 @@ ULONG STDMETHODCALLTYPE AmdExtD3DFactory_Release(IAmdExtD3DFactory *iface)
     return ret;
 }
 
+static BOOL check_fsr4_supported(ID3D12Device *device)
+{
+    ID3D12DXVKInteropDevice *interop;
+    VkInstance instance;
+    VkDevice vk_device;
+    VkPhysicalDevice phys_device;
+    VkPhysicalDeviceProperties2 prop = {0};
+    VkPhysicalDeviceDriverProperties driver_prop = {0};
+    const char **extensions;
+    UINT extension_count = 0;
+    UINT major, minor;
+    BOOL has_float8 = FALSE, has_coopmat2 = FALSE;
+
+    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DXVKInteropDevice, (void **)&interop)))
+        return FALSE;
+
+    if (FAILED(ID3D12DXVKInteropDevice_GetVulkanHandles(interop, &instance, &phys_device, &vk_device)))
+        return FALSE;
+
+    prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    prop.pNext = &driver_prop;
+    driver_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
+    vkGetPhysicalDeviceProperties2(phys_device, &prop);
+
+    if (prop.properties.vendorID != 0x1002) return FALSE;
+    /* amdvlk is too slow to be relevant (on rdna3 & doesn't work at all on rdna4) */
+    if (driver_prop.driverID != VK_DRIVER_ID_MESA_RADV) return FALSE;
+
+    major = VK_API_VERSION_MAJOR(prop.properties.driverVersion);
+    minor = VK_API_VERSION_MINOR(prop.properties.driverVersion);
+
+    if (major > 25 || (major == 25 && minor >= 2))
+    {
+
+        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
+            return FALSE;
+
+        extensions = malloc(sizeof(*extensions) * extension_count);
+
+        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
+            return FALSE;
+
+        for (UINT i = 0; i < extension_count; i++)
+        {
+            if (!strcmp("VK_NV_cooperative_matrix2", extensions[i]))
+                has_coopmat2 = TRUE;
+            if (!strcmp("VK_EXT_shader_float8", extensions[i]))
+                has_float8 = TRUE;
+        }
+
+        /* trivial cases */
+        if (!has_coopmat2) return FALSE;
+        if (has_coopmat2 && has_float8) return TRUE;
+
+        /* probably RDNA3, ensure the user is doing stuff correctly */
+        {
+            const char *env = getenv("DXIL_SPIRV_CONFIG");
+
+            if (env && strstr(env, "wmma_rdna3_workaround"))
+                return TRUE;
+
+            return FALSE;
+        }
+    }
+
+    return FALSE;
+}
+
 HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *iface, IUnknown *outer, REFIID iid, void **out)
 {
     TRACE("%p %p %s %p\n", iface, outer, debugstr_guid(iid), out);
@@ -380,6 +457,8 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *if
         struct AmdExtD3DDevice8 *this = calloc(1, sizeof(struct AmdExtD3DDevice8));
         this->IAmdExtD3DDevice8_iface.lpVtbl = &AmdExtD3DDevice8_vtable;
         this->ref = 1;
+        this->fsr4_supported = check_fsr4_supported((ID3D12Device *)outer);
+        TRACE("FSR 4 supported: %d\n", this->fsr4_supported);
         *out = &this->IAmdExtD3DDevice8_iface;
         return S_OK;
     } else {
