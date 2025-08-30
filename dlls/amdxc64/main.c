@@ -38,10 +38,82 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(amdxc);
 
+static BOOL check_fsr4_supported(ID3D12Device *device)
+{
+    ID3D12DXVKInteropDevice *interop;
+    VkInstance instance;
+    VkDevice vk_device;
+    VkPhysicalDevice phys_device;
+    VkPhysicalDeviceProperties2 prop = {0};
+    VkPhysicalDeviceDriverProperties driver_prop = {0};
+    const char **extensions;
+    UINT extension_count = 0;
+    UINT major, minor;
+    BOOL has_float8 = FALSE, has_coopmat2 = FALSE;
+
+    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DXVKInteropDevice, (void **)&interop)))
+        return FALSE;
+
+    if (FAILED(ID3D12DXVKInteropDevice_GetVulkanHandles(interop, &instance, &phys_device, &vk_device)))
+        return FALSE;
+
+    prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    prop.pNext = &driver_prop;
+    driver_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
+    vkGetPhysicalDeviceProperties2(phys_device, &prop);
+
+    if (prop.properties.vendorID != 0x1002) return FALSE;
+    /* amdvlk is too slow to be relevant (on rdna3 & doesn't work at all on rdna4) */
+    if (driver_prop.driverID != VK_DRIVER_ID_MESA_RADV) return FALSE;
+
+    major = VK_API_VERSION_MAJOR(prop.properties.driverVersion);
+    minor = VK_API_VERSION_MINOR(prop.properties.driverVersion);
+
+    if (major > 25 || (major == 25 && minor >= 2))
+    {
+
+        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
+            return FALSE;
+
+        extensions = malloc(sizeof(*extensions) * extension_count);
+
+        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
+            return FALSE;
+
+        for (UINT i = 0; i < extension_count; i++)
+        {
+            if (!strcmp("VK_NV_cooperative_matrix2", extensions[i]))
+                has_coopmat2 = TRUE;
+            if (!strcmp("VK_EXT_shader_float8", extensions[i]))
+                has_float8 = TRUE;
+        }
+
+        free(extensions);
+
+        /* trivial cases */
+        if (!has_coopmat2) return FALSE;
+        if (has_coopmat2 && has_float8) return TRUE;
+
+        /* probably RDNA3, ensure the user is doing stuff correctly */
+        {
+            const char *env = getenv("DXIL_SPIRV_CONFIG");
+
+            if (env && strstr(env, "wmma_rdna3_workaround"))
+                return TRUE;
+
+            return FALSE;
+        }
+    }
+
+    return FALSE;
+}
+
 struct AMDFSR4FFX
 {
     IAmdExtFfxApi IAmdExtFfxApi_iface;
     LONG ref;
+    ID3D12Device *device;
 };
 
 static struct AMDFSR4FFX* impl_from_IAmdExtFfxApi(IAmdExtFfxApi* iface)
@@ -78,6 +150,7 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
     const char *env;
     updateffxapi_pfn pfn;
     HMODULE amdffx;
+    struct AMDFSR4FFX *this = impl_from_IAmdExtFfxApi(iface);
 
     TRACE("%p %p %u\n", iface, data, size);
 
@@ -88,7 +161,13 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
         amdffx = LoadLibraryA("amdxcffx64");
         if (!amdffx)
         {
-            ERR("Failed to load FSR4 dll (amdxcffx)!\n");
+            ERR("Failed to load FSR4 dll (amdxcffx64)!\n");
+            return E_NOINTERFACE;
+        }
+
+        if (!check_fsr4_supported(this->device))
+        {
+            ERR("FSR4 not supported on this system!\n");
             return E_NOINTERFACE;
         }
 
@@ -373,75 +452,6 @@ ULONG STDMETHODCALLTYPE AmdExtD3DFactory_Release(IAmdExtD3DFactory *iface)
     return ret;
 }
 
-static BOOL check_fsr4_supported(ID3D12Device *device)
-{
-    ID3D12DXVKInteropDevice *interop;
-    VkInstance instance;
-    VkDevice vk_device;
-    VkPhysicalDevice phys_device;
-    VkPhysicalDeviceProperties2 prop = {0};
-    VkPhysicalDeviceDriverProperties driver_prop = {0};
-    const char **extensions;
-    UINT extension_count = 0;
-    UINT major, minor;
-    BOOL has_float8 = FALSE, has_coopmat2 = FALSE;
-
-    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DXVKInteropDevice, (void **)&interop)))
-        return FALSE;
-
-    if (FAILED(ID3D12DXVKInteropDevice_GetVulkanHandles(interop, &instance, &phys_device, &vk_device)))
-        return FALSE;
-
-    prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    prop.pNext = &driver_prop;
-    driver_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-
-    vkGetPhysicalDeviceProperties2(phys_device, &prop);
-
-    if (prop.properties.vendorID != 0x1002) return FALSE;
-    /* amdvlk is too slow to be relevant (on rdna3 & doesn't work at all on rdna4) */
-    if (driver_prop.driverID != VK_DRIVER_ID_MESA_RADV) return FALSE;
-
-    major = VK_API_VERSION_MAJOR(prop.properties.driverVersion);
-    minor = VK_API_VERSION_MINOR(prop.properties.driverVersion);
-
-    if (major > 25 || (major == 25 && minor >= 2))
-    {
-
-        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
-            return FALSE;
-
-        extensions = malloc(sizeof(*extensions) * extension_count);
-
-        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
-            return FALSE;
-
-        for (UINT i = 0; i < extension_count; i++)
-        {
-            if (!strcmp("VK_NV_cooperative_matrix2", extensions[i]))
-                has_coopmat2 = TRUE;
-            if (!strcmp("VK_EXT_shader_float8", extensions[i]))
-                has_float8 = TRUE;
-        }
-
-        /* trivial cases */
-        if (!has_coopmat2) return FALSE;
-        if (has_coopmat2 && has_float8) return TRUE;
-
-        /* probably RDNA3, ensure the user is doing stuff correctly */
-        {
-            const char *env = getenv("DXIL_SPIRV_CONFIG");
-
-            if (env && strstr(env, "wmma_rdna3_workaround"))
-                return TRUE;
-
-            return FALSE;
-        }
-    }
-
-    return FALSE;
-}
-
 HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *iface, IUnknown *outer, REFIID iid, void **out)
 {
     TRACE("%p %p %s %p\n", iface, outer, debugstr_guid(iid), out);
@@ -490,6 +500,7 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
         struct AMDFSR4FFX* ffx = calloc(1, sizeof(struct AMDFSR4FFX));
         ffx->IAmdExtFfxApi_iface.lpVtbl = &AMDFSR4FFX_vtable;
         ffx->ref = 1;
+        ffx->device = (ID3D12Device *)outer;
         *obj = &ffx->IAmdExtFfxApi_iface;
         return S_OK;
     } else if (IsEqualGUID(iid, &IID_IAmdExtAntiLagApi)) {
