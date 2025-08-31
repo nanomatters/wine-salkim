@@ -49,7 +49,9 @@ static BOOL check_fsr4_supported(ID3D12Device *device)
     const char **extensions;
     UINT extension_count = 0;
     UINT major, minor;
-    BOOL has_float8 = FALSE, has_coopmat2 = FALSE;
+    BOOL has_float8 = FALSE, has_coopmat2 = FALSE, has_coopmat = FALSE;
+    BOOL rdna3_workaround = FALSE;
+    const char *env = getenv("DXIL_SPIRV_CONFIG");
 
     if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DXVKInteropDevice, (void **)&interop)))
         return FALSE;
@@ -70,40 +72,69 @@ static BOOL check_fsr4_supported(ID3D12Device *device)
     major = VK_API_VERSION_MAJOR(prop.properties.driverVersion);
     minor = VK_API_VERSION_MINOR(prop.properties.driverVersion);
 
+    if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
+        return FALSE;
+
+    extensions = malloc(sizeof(*extensions) * extension_count);
+
+    if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
+        return FALSE;
+
+    for (UINT i = 0; i < extension_count; i++)
+    {
+        if (!strcmp("VK_NV_cooperative_matrix2", extensions[i]))
+            has_coopmat2 = TRUE;
+        if (!strcmp("VK_KHR_cooperative_matrix", extensions[i]))
+            has_coopmat = TRUE;
+        if (!strcmp("VK_EXT_shader_float8", extensions[i]))
+            has_float8 = TRUE;
+    }
+
+    if (env && strstr(env, "wmma_rdna3_workaround"))
+        rdna3_workaround = TRUE;
+
+    free(extensions);
+
     if (major > 25 || (major == 25 && minor >= 2))
     {
-
-        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
-            return FALSE;
-
-        extensions = malloc(sizeof(*extensions) * extension_count);
-
-        if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
-            return FALSE;
-
-        for (UINT i = 0; i < extension_count; i++)
-        {
-            if (!strcmp("VK_NV_cooperative_matrix2", extensions[i]))
-                has_coopmat2 = TRUE;
-            if (!strcmp("VK_EXT_shader_float8", extensions[i]))
-                has_float8 = TRUE;
-        }
-
-        free(extensions);
-
         /* trivial cases */
-        if (!has_coopmat2) return FALSE;
+        if (!has_coopmat2 && !has_coopmat) return FALSE;
+        /* RDNA 4+ */
         if (has_coopmat2 && has_float8) return TRUE;
+        /* RDNA3, ensure the user is doing stuff correctly */
+        if (has_coopmat2 && rdna3_workaround) return TRUE;
+    }
 
-        /* probably RDNA3, ensure the user is doing stuff correctly */
+    /* RDNA2/1 with layer */
+    if (has_coopmat)
+    {
+        static int once;
+        UINT count = 0;
+        BOOL has_layer = FALSE;
+        VkLayerProperties *properties = NULL;
+
+        vkEnumerateDeviceLayerProperties(phys_device, &count, properties);
+
+        properties = calloc(count, sizeof(*properties));
+
+        vkEnumerateDeviceLayerProperties(phys_device, &count, properties);
+
+        for (int i = 0; i < count; i++)
         {
-            const char *env = getenv("DXIL_SPIRV_CONFIG");
-
-            if (env && strstr(env, "wmma_rdna3_workaround"))
-                return TRUE;
-
-            return FALSE;
+            if (!strcmp("VK_LAYER_FROG_cooperative_matrix", properties[i].layerName))
+                has_layer = TRUE;
         }
+
+        free(properties);
+
+        if (has_layer && rdna3_workaround)
+        {
+            if (!once++) ERR("Emulated WMMA: Expect FSR4 performance issues!\n");
+        }
+        /* ensure people do not use mesa 25.1 and older */
+        else return FALSE;
+
+        return TRUE;
     }
 
     return FALSE;
