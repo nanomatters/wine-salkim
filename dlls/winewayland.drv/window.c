@@ -301,7 +301,6 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
             !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MINIMIZED))
         {
             xdg_toplevel_set_minimized(surface->xdg_toplevel);
-            surface->requested_output = NULL;
         }
     }
     else
