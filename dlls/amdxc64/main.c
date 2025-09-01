@@ -144,7 +144,7 @@ struct AMDFSR4FFX
 {
     IAmdExtFfxApi IAmdExtFfxApi_iface;
     LONG ref;
-    ID3D12Device *device;
+    BOOL fsr4_supported;
 };
 
 static struct AMDFSR4FFX* impl_from_IAmdExtFfxApi(IAmdExtFfxApi* iface)
@@ -196,7 +196,7 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
             return E_NOINTERFACE;
         }
 
-        if (!check_fsr4_supported(this->device))
+        if (!this->fsr4_supported)
         {
             ERR("FSR4 not supported on this system!\n");
             return E_NOINTERFACE;
@@ -531,7 +531,8 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
         struct AMDFSR4FFX* ffx = calloc(1, sizeof(struct AMDFSR4FFX));
         ffx->IAmdExtFfxApi_iface.lpVtbl = &AMDFSR4FFX_vtable;
         ffx->ref = 1;
-        ffx->device = (ID3D12Device *)outer;
+        ffx->fsr4_supported = check_fsr4_supported((ID3D12Device *)outer);
+        TRACE("FSR 4 supported: %d\n", ffx->fsr4_supported);
         *obj = &ffx->IAmdExtFfxApi_iface;
         return S_OK;
     } else if (IsEqualGUID(iid, &IID_IAmdExtAntiLagApi)) {
