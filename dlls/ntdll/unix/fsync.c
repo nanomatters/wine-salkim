@@ -163,7 +163,7 @@ static inline int futex_wake( int *addr, int val )
     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
 }
 
-int do_fsync(void)
+NTSTATUS do_fsync(void)
 {
 #ifdef __linux__
     static int do_fsync_cached = -1;
@@ -171,7 +171,7 @@ int do_fsync(void)
     if (do_fsync_cached == -1)
     {
         syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
-        do_fsync_cached = getenv("WINEFSYNC") && atoi(getenv("WINEFSYNC")) && errno != ENOSYS && errno != EPERM;
+        do_fsync_cached = !(getenv("WINEFSYNC") && !atoi(getenv("WINEFSYNC"))) && errno != ENOSYS && errno != EPERM && !do_ntsync();
     }
 
     return do_fsync_cached;
