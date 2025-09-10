@@ -2115,6 +2115,7 @@ AC_CHECK_FUNCS(\
         dladdr1 \
 	dlinfo \
 	epoll_create \
+	epoll_pwait2 \
 	fstatfs \
 	futimens \
 	futimes \
@@ -3226,6 +3227,8 @@ WINE_CONFIG_MAKEFILE(dlls/uxtheme)
 WINE_CONFIG_MAKEFILE(dlls/uxtheme/tests)
 WINE_CONFIG_MAKEFILE(dlls/vbscript)
 WINE_CONFIG_MAKEFILE(dlls/vbscript/tests)
+WINE_CONFIG_MAKEFILE(dlls/vccorlib140)
+WINE_CONFIG_MAKEFILE(dlls/vccorlib140/tests)
 WINE_CONFIG_MAKEFILE(dlls/vcomp)
 WINE_CONFIG_MAKEFILE(dlls/vcomp/tests)
 WINE_CONFIG_MAKEFILE(dlls/vcomp100)
