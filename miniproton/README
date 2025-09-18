@@ -1,0 +1,13 @@
+Copy this directory to ~/.steam/root/compatibilitytools.d/.
+
+Link your Wine build directory inside as `wine`, e.g.
+
+    ~/.steam/root/compatibilitytools.d/ $ ls -l miniproton/
+    total 16
+    -rw-r--r-- 1 ivyl ivyl 688 Sep 18 15:30 compatibilitytool.vdf
+    -rwxr-xr-x 1 ivyl ivyl 495 Sep 18 15:30 proton
+    -rw-r--r-- 1 ivyl ivyl 114 Sep 18 15:30 README
+    -rw-r--r-- 1 ivyl ivyl 123 Sep 18 15:30 toolmanifest.vdf
+    lrwxrwxrwx 1 ivyl ivyl  21 Sep 18 15:31 wine -> /home/ivyl/build/wine
+
+Tested with a new Wow64 build, i.e. `~/src/wine/configure --enable-archs=i386,x86_64 && make`
