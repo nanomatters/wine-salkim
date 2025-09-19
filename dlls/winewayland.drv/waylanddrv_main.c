@@ -35,10 +35,12 @@ char *process_name = NULL;
 
 static const struct user_driver_funcs waylanddrv_funcs =
 {
+    .pBeep = WAYLAND_Beep,
     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
     .pClipCursor = WAYLAND_ClipCursor,
     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
     .pDestroyWindow = WAYLAND_DestroyWindow,
+    .pFlashWindowEx = WAYLAND_FlashWindowEx,
     .pSetIMECompositionRect = WAYLAND_SetIMECompositionRect,
     .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
@@ -54,6 +56,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
     .pWindowPosChanged = WAYLAND_WindowPosChanged,
     .pWindowPosChanging = WAYLAND_WindowPosChanging,
     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
+    .pHasWindowManager = WAYLAND_HasWindowManager,
     .pVulkanInit = WAYLAND_VulkanInit,
     .pwine_get_wgl_driver = WAYLAND_wine_get_wgl_driver,
 };
