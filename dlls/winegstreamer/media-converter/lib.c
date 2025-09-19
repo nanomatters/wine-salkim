@@ -21,16 +21,7 @@
 #pragma makedep unix
 #endif
 
-#include "config.h"
 #include "media-converter.h"
-
-#ifdef _WINEDMO
-
-#include <errno.h>
-#include "wine/debug.h"
-WINE_DEFAULT_DEBUG_CHANNEL(dmo);
-
-#else /*  _WINEDMO */
 
 GST_ELEMENT_REGISTER_DECLARE(protonvideoconverter);
 GST_ELEMENT_REGISTER_DECLARE(protonaudioconverter);
@@ -38,8 +29,6 @@ GST_ELEMENT_REGISTER_DECLARE(protonaudioconverterbin);
 GST_ELEMENT_REGISTER_DECLARE(protondemuxer);
 
 GST_DEBUG_CATEGORY(media_converter_debug);
-
-#endif /* _WINEDMO */
 
 static void get_dirname(const char *path, char *result)
 {
@@ -316,38 +305,54 @@ void dump_fozdb_close(struct dump_fozdb *db)
     }
 }
 
-#ifndef _WINEDMO
-
 bool media_converter_init(void)
 {
     GST_DEBUG_CATEGORY_INIT(media_converter_debug,
             "protonmediaconverter", GST_DEBUG_FG_YELLOW, "Proton media converter");
 
+    // Disable protonvideoconverter by default unless PROTON_VIDEO_CONVERT envvar is set to 1
+    const char *proton_video_convert = getenv("PROTON_VIDEO_CONVERT");
+    if (proton_video_convert && !strcmp(proton_video_convert, "1"))
+    {
     if (!GST_ELEMENT_REGISTER(protonvideoconverter, NULL))
     {
         GST_ERROR("Failed to register protonvideoconverter.");
         return false;
     }
+    } else GST_WARNING("Skipped \"protonvideoconverter\" registration.");
 
+    // Disable protonaudioconverter by default unless PROTON_AUDIO_CONVERT envvar is set to 1
+    const char *proton_audio_convert = getenv("PROTON_AUDIO_CONVERT");
+    if (proton_audio_convert && !strcmp(proton_audio_convert, "1"))
+    {
     if (!GST_ELEMENT_REGISTER(protonaudioconverter, NULL))
     {
         GST_ERROR("Failed to register protonaudioconverter.");
         return false;
     }
+    } else GST_WARNING("Skipped \"protonaudioconverter\" registration.");
 
+    // Disable protonaudioconverterbin by default unless PROTON_AUDIO_CONVERT_BIN envvar is set to 1
+    const char *proton_audio_convert_bin = getenv("PROTON_AUDIO_CONVERT_BIN");
+    if (proton_audio_convert_bin && !strcmp(proton_audio_convert_bin, "1"))
+    {
     if (!GST_ELEMENT_REGISTER(protonaudioconverterbin, NULL))
     {
         GST_ERROR("Failed to register protonaudioconverterbin.");
         return false;
     }
+    } else GST_WARNING("Skipped \"protonaudioconverterbin\" registration.");
 
+    // Disable protondemuxer by default unless PROTON_DEMUX envvar is set to 1
+    const char *proton_demuxer = getenv("PROTON_DEMUX");
+    if (proton_demuxer && !strcmp(proton_demuxer, "1"))
+    {
     if (!GST_ELEMENT_REGISTER(protondemuxer, NULL))
     {
         GST_ERROR("Failed to register protondemuxer.");
         return false;
     }
+    } else GST_WARNING("Skipped \"protondemuxer\" registration.");
 
     return true;
 }
-
-#endif /* _WINEDMO */
