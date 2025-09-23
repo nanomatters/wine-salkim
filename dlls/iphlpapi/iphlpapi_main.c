@@ -4140,6 +4140,19 @@ ULONG WINAPI GetPerTcpConnectionEStats(MIB_TCPROW *row, TCP_ESTATS_TYPE stats, U
     return ERROR_CALL_NOT_IMPLEMENTED;
 }
 
+/***********************************************************************
+ *    GetPerTcp6ConnectionEStats (IPHLPAPI.@)
+ */
+ULONG WINAPI GetPerTcp6ConnectionEStats(MIB_TCP6ROW *row, TCP_ESTATS_TYPE stats, UCHAR *rw, ULONG rw_version,
+                                        ULONG rw_size, UCHAR *ro_static, ULONG ro_static_version,
+                                        ULONG ro_static_size, UCHAR *ro_dynamic, ULONG ro_dynamic_version,
+                                        ULONG ro_dynamic_size)
+{
+    FIXME( "(%p, %d, %p, %ld, %ld, %p, %ld, %ld, %p, %ld, %ld): stub\n", row, stats, rw, rw_version, rw_size,
+           ro_static, ro_static_version, ro_static_size, ro_dynamic, ro_dynamic_version, ro_dynamic_size );
+    return ERROR_CALL_NOT_IMPLEMENTED;
+}
+
 /******************************************************************
  *    SetPerTcpConnectionEStats (IPHLPAPI.@)
  */
@@ -4151,6 +4164,16 @@ DWORD WINAPI SetPerTcpConnectionEStats(PMIB_TCPROW row, TCP_ESTATS_TYPE state, P
   return ERROR_NOT_SUPPORTED;
 }
 
+/******************************************************************
+ *    SetPerTcp6ConnectionEStats (IPHLPAPI.@)
+ */
+DWORD WINAPI SetPerTcp6ConnectionEStats(MIB_TCP6ROW *row, TCP_ESTATS_TYPE state, BYTE *rw,
+                                        ULONG version, ULONG size, ULONG offset)
+{
+    FIXME("(row %p, state %d, rw %p, version %lu, size %lu, offset %lu): stub\n",
+          row, state, rw, version, size, offset);
+    return ERROR_NOT_SUPPORTED;
+}
 
 /******************************************************************
  *    UnenableRouter (IPHLPAPI.@)
@@ -4660,7 +4683,6 @@ DWORD WINAPI GetIpInterfaceEntry( MIB_IPINTERFACE_ROW *row )
     fill_ip_interface_table_row( row->Family, row, &key, &rw, &dyn );
     return ERROR_SUCCESS;
 }
-
 
 /******************************************************************
  *    GetBestRoute2 (IPHLPAPI.@)

@@ -830,7 +830,6 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
     struct nsi_ip_interface_rw *rw = rw_data;
     struct ifaddrs *addrs, *entry, *entry2;
     UINT num = 0, scope_id = 0xffffffff;
-    char path[256];
     NET_LUID luid;
 
     if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
@@ -846,8 +845,8 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
         {
             scope_id = find_ipv6_addr_scope( (IN6_ADDR*)&((struct sockaddr_in6 *)entry->ifa_addr)->sin6_addr, addr_scopes,
                                              addr_scopes_size );
-            /* Info in IP interface table entry correspons to link local IPV6 address, while reported info for loopback
-             * is different on Windows. */
+            /* Info in the IP interface table entry corresponds to link local IPv6 address, while reported info for
+             * loopback is different on Windows. */
             if (scope_id != 0xffffffff && scope_id != 0x1000 /* loopback */ && scope_id != 0x2000 /* link_local */)
                 continue;
         }
@@ -890,6 +889,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
 #if __linux__
             if (rw || dyn)
             {
+                char path[256];
                 sprintf( path, "/proc/sys/net/%s/neigh/%s/base_reachable_time_ms",
                          (fam == AF_INET) ? "ipv4" : "ipv6",  entry->ifa_name);
                 read_sysctl_int( path, &base_reachable_time );
@@ -898,6 +898,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
             {
                 if (fam == AF_INET6 && iface_static.type != MIB_IF_TYPE_LOOPBACK)
                 {
+                    char path[256];
                     sprintf( path, "/proc/sys/net/ipv6/conf/%s/dad_transmits", entry->ifa_name);
                     read_sysctl_int( path, &dad_transmits );
                 }
