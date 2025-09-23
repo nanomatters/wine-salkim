@@ -3956,7 +3956,6 @@ typedef void (CALLBACK *PLDR_DLL_NOTIFICATION_FUNCTION)(ULONG, LDR_DLL_NOTIFICAT
 /* these ones is Wine specific */
 #define LDR_DONT_RESOLVE_REFS           0x40000000
 #define LDR_WINE_INTERNAL               0x80000000
-#define LDR_DONT_CALL_DLLMAIN           0x20000000
 
 /* flag for LdrAddRefDll */
 #define LDR_ADDREF_DLL_PIN              0x00000001
@@ -5274,7 +5273,6 @@ NTSYSAPI NTSTATUS  WINAPI RtlLargeIntegerToChar(const ULONGLONG *,ULONG,ULONG,PC
 
 /* Wine internal functions */
 
-NTSYSAPI NTSTATUS WINAPI __wine_set_unix_env( const char *var, const char *val );
 NTSYSAPI NTSTATUS WINAPI wine_nt_to_unix_file_name( const OBJECT_ATTRIBUTES *attr, char *nameA, ULONG *size,
                                                     UINT disposition );
 NTSYSAPI NTSTATUS WINAPI wine_unix_to_nt_file_name( const char *name, WCHAR *buffer, ULONG *size );
