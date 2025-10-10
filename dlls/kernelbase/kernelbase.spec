@@ -192,6 +192,7 @@
 @ stdcall CreateFiberEx(long long long ptr ptr)
 @ stdcall CreateFile2(wstr long long long ptr)
 @ stdcall CreateFileA(str long long ptr long long long)
+@ stdcall CreateFileMapping2(long ptr long long long int64 wstr ptr long)
 @ stdcall CreateFileMappingFromApp(long ptr long int64 wstr)
 @ stdcall CreateFileMappingNumaW(long ptr long long long wstr long)
 @ stdcall CreateFileMappingW(long ptr long long long wstr)
@@ -820,7 +821,7 @@
 @ stdcall HeapReAlloc(long long ptr long) ntdll.RtlReAllocateHeap
 @ stdcall HeapSetInformation(ptr long ptr long)
 @ stdcall HeapSize(long long ptr) ntdll.RtlSizeHeap
-@ stub HeapSummary
+@ stdcall HeapSummary(long long ptr)
 @ stdcall HeapUnlock(long)
 @ stdcall HeapValidate(long long ptr)
 @ stdcall HeapWalk(long ptr)
