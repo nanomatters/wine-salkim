@@ -86,6 +86,23 @@ static const struct wl_seat_listener seat_listener =
     wl_seat_handle_name
 };
 
+static BOOL check_ime_disabled(void)
+{
+    static volatile int cached = -1;
+
+    if (cached == -1)
+    {
+        const char *env = getenv("WAYLANDDRV_NO_IME");
+
+        if (env && !strcmp(env, "1"))
+            cached = 1;
+        else
+            cached = 0;
+    }
+
+    return cached;
+}
+
 /**********************************************************************
  *          Registry handling
  */
@@ -175,6 +192,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     }
     else if (strcmp(interface, "zwp_text_input_manager_v3") == 0)
     {
+        if (check_ime_disabled()) return;
         process_wayland.zwp_text_input_manager_v3 =
             wl_registry_bind(registry, id, &zwp_text_input_manager_v3_interface, 1);
         if (process_wayland.seat.wl_seat) wayland_text_input_init();
@@ -199,6 +217,42 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_cursor_shape_manager_v1 =
             wl_registry_bind(registry, id, &wp_cursor_shape_manager_v1_interface,
                              version < 2 ? version : 2);
+    }
+    else if (strcmp(interface, "wp_fractional_scale_manager_v1") == 0)
+    {
+        process_wayland.wp_fractional_scale_manager_v1 =
+            wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "wp_color_manager_v1") == 0)
+    {
+        process_wayland.wp_color_manager_v1 =
+            wl_registry_bind(registry, id, &wp_color_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "xdg_system_bell_v1") == 0)
+    {
+        process_wayland.xdg_system_bell_v1 =
+            wl_registry_bind(registry, id, &xdg_system_bell_v1_interface, 1);
+    }
+    else if (strcmp(interface, "xdg_activation_v1") == 0)
+    {
+        process_wayland.xdg_activation_v1 =
+            wl_registry_bind(registry, id, &xdg_activation_v1_interface, 1);
+    }
+    else if (strcmp(interface, "wp_content_type_manager_v1") == 0)
+    {
+        process_wayland.wp_content_type_manager_v1 =
+            wl_registry_bind(registry, id, &wp_content_type_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)
+    {
+        if (version >= 4)
+            process_wayland.zwp_linux_dmabuf_v1 =
+                wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, version);
+    }
+    else if (strcmp(interface, "xdg_toplevel_tag_manager_v1") == 0)
+    {
+        process_wayland.xdg_toplevel_tag_manager_v1 =
+            wl_registry_bind(registry, id, &xdg_toplevel_tag_manager_v1_interface, 1);
     }
 }
 
@@ -238,6 +292,30 @@ static const struct wl_registry_listener registry_listener = {
     registry_handle_global,
     registry_handle_global_remove
 };
+
+static void init_overlay_event(void)
+{
+    OBJECT_ATTRIBUTES attr;
+    WCHAR buffer[MAX_PATH] = {0};
+    char path[MAX_PATH];
+    UNICODE_STRING str;
+
+    RtlInitUnicodeString( &str, buffer );
+    str.MaximumLength = sizeof(buffer);
+    InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE | OBJ_OPENIF, 0, NULL );
+
+    str.Length = sprintf( path, "\\Sessions\\%u\\BaseNamedObjects\\__wine_steamclient_GameOverlayActivated",
+                          (int)NtCurrentTeb()->Peb->SessionId );
+    ascii_to_unicode( buffer, path, str.Length + 1 );
+    str.Length *= sizeof(WCHAR);
+    NtCreateEvent( &process_wayland.overlay_event, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+}
+
+BOOL wayland_is_overlay_active(void)
+{
+    LARGE_INTEGER timeout = {0};
+    return NtWaitForSingleObject(process_wayland.overlay_event, FALSE, &timeout) == WAIT_OBJECT_0;
+}
 
 /**********************************************************************
  *          wayland_process_init
@@ -285,6 +363,8 @@ BOOL wayland_process_init(void)
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
 
+    init_overlay_event();
+
     /* Check for required protocol globals. */
     if (!process_wayland.wl_compositor)
     {
@@ -331,7 +411,28 @@ BOOL wayland_process_init(void)
     }
 
     if (!process_wayland.xdg_toplevel_icon_manager_v1)
-        ERR("Wayland compositor doesn't support xdg_toplevel_icon_manager_v1 (window icons will not be supported)\n");
+        ERR("Wayland compositor doesn't support optional xdg_toplevel_icon_manager_v1 (window icons will not be supported)\n");
+
+    if (!process_wayland.wp_fractional_scale_manager_v1)
+        ERR("Wayland compositor doesn't support optional wp_fractional_scale_manager_v1 (fractional scaling will be broken)\n");
+
+    if (!process_wayland.wp_color_manager_v1)
+        ERR("Wayland compositor doesn't support optional wp_color_manager_v1 (HDR metadata will not be supported)\n");
+
+    if (!process_wayland.xdg_system_bell_v1)
+        ERR("Wayland compositor doesn't optional xdg_system_bell_v1! (Beep will not be supported)\n");
+
+    if (!process_wayland.xdg_activation_v1)
+        ERR("Wayland compositor doesn't support optional xdg_activation_v1! (Flash Window will not be supported)\n");
+
+    if (!process_wayland.wp_content_type_manager_v1)
+        WARN("Wayland compositor doesn't support optional wp_content_type_manager_v1!\n");
+
+    if (!process_wayland.zwp_linux_dmabuf_v1)
+        ERR("Wayland compositor doesn't support optional zwp_linux_dmabuf_v1 version 4 (Cross process rendering will not be supported)!");
+
+    if (!process_wayland.xdg_toplevel_tag_manager_v1)
+        WARN("Wayland compositor doesn't support optional xdg_toplevel_tag_manager_v1!\n");
 
     process_wayland.initialized = TRUE;
 

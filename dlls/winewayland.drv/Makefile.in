@@ -5,9 +5,13 @@ UNIX_LIBS = -lwin32u $(WAYLAND_CLIENT_LIBS) $(WAYLAND_EGL_LIBS) $(XKBCOMMON_LIBS
 IMPORTS = user32 win32u
 
 SOURCES = \
+	content-type-v1.xml \
+	color-management-v1.xml \
 	cursor-shape-v1.xml \
 	display.c \
 	dllmain.c \
+	fractional-scale-v1.xml \
+	linux-dmabuf-v1.xml \
 	opengl.c \
 	pointer-constraints-unstable-v1.xml \
 	relative-pointer-unstable-v1.xml \
@@ -26,6 +30,9 @@ SOURCES = \
 	window.c \
 	window_surface.c \
 	wlr-data-control-unstable-v1.xml \
+	xdg-activation-v1.xml \
 	xdg-output-unstable-v1.xml \
 	xdg-shell.xml \
-	xdg-toplevel-icon-v1.xml
+	xdg-system-bell-v1.xml \
+	xdg-toplevel-icon-v1.xml \
+	xdg-toplevel-tag-v1.xml
