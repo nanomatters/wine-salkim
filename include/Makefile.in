@@ -823,6 +823,7 @@ SOURCES = \
 	weakreference.idl \
 	webservices.h \
 	websocket.h \
+	webview2.idl \
 	werapi.h \
 	wfext.h \
 	wia.h \
@@ -924,6 +925,7 @@ SOURCES = \
 	wine/afd.h \
 	wine/asm.h \
 	wine/atsvc.idl \
+	wine/containerid.h \
 	wine/condrv.h \
 	wine/dcetypes.idl \
 	wine/debug.h \
