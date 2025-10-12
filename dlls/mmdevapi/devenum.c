@@ -310,7 +310,7 @@ static HRESULT set_driver_prop_value(GUID *id, const EDataFlow flow, const PROPE
         if (params.result != E_NOT_SUFFICIENT_BUFFER)
             break;
 
-        CoTaskMemFree(params.buffer);
+        if (params.buffer) CoTaskMemFree(params.buffer);
         params.buffer = CoTaskMemAlloc(*params.buffer_size);
         if (!params.buffer) {
             free(dev_name);
