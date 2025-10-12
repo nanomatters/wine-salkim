@@ -2675,8 +2675,14 @@ static NTSTATUS pulse_get_prop_value(void *args)
                 *params->buffer_size = sizeof(GUID);
             }
             else if (!params->buffer)
-                params->result = E_INVALIDARG;
-            else {
+            {
+                /*
+                 * if alloc fails then mmdevapi will return E_NOMEMORY
+                 */
+                params->result = E_NOT_SUFFICIENT_BUFFER;
+            }
+            else
+            {
                 params->result = S_OK;
                 params->value->puuid = params->buffer;
                 *params->value->puuid = dev->container_id;
