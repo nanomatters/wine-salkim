@@ -1,3 +1,0 @@
-MODULE  = embeddedbrowserwebview.dll
-
-EXTRADLLFLAGS = -Wb,--prefer-native
