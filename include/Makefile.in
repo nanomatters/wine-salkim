@@ -826,7 +826,6 @@ SOURCES = \
 	weakreference.idl \
 	webservices.h \
 	websocket.h \
-	webview2.idl \
 	werapi.h \
 	wfext.h \
 	wia.h \
