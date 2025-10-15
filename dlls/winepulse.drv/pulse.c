@@ -38,9 +38,13 @@
 #include "initguid.h"
 #include "audioclient.h"
 
+#include "wine/containerid.h"
 #include "wine/debug.h"
 #include "wine/list.h"
 #include "wine/unixlib.h"
+
+#include "initguid.h"
+#include "devpkey.h"
 
 #include "../mmdevapi/unixlib.h"
 
@@ -118,6 +122,7 @@ typedef struct _PhysDevice {
     UINT index;
     REFERENCE_TIME min_period, def_period;
     WAVEFORMATEXTENSIBLE fmt;
+    GUID container_id;
     char pulse_name[0];
 } PhysDevice;
 
@@ -576,6 +581,7 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
     dev->bus_type = phys_device_bus_invalid;
     dev->vendor_id = 0;
     dev->product_id = 0;
+    memset(&dev->container_id, 0, sizeof(GUID));
 
     if (!p)
         return;
@@ -592,6 +598,13 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
 
     if ((buffer = pa_proplist_gets(p, PA_PROP_DEVICE_PRODUCT_ID)))
         dev->product_id = strtol(buffer, NULL, 16);
+
+    if ((buffer = pa_proplist_gets(p, "sysfs.path"))) {
+        // The syspath is of the audio device. Resolve it up to the device level.
+        char sysfs_path[MAX_PATH];
+        snprintf(sysfs_path, sizeof(sysfs_path), "/sys%s/device", buffer);
+        container_id_for_sysfs(sysfs_path, &dev->container_id);
+    }
 }
 
 static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
@@ -2654,6 +2667,27 @@ static NTSTATUS pulse_get_prop_value(void *args)
                 params->result = S_OK;
                 return STATUS_SUCCESS;
             }
+        } else if (IsEqualGUID(&params->prop->fmtid, &DEVPKEY_Device_ContainerId)) {
+            params->value->vt = VT_CLSID;
+            if (*params->buffer_size < sizeof(GUID))
+            {
+                params->result = E_NOT_SUFFICIENT_BUFFER;
+                *params->buffer_size = sizeof(GUID);
+            }
+            else if (!params->buffer)
+            {
+                /*
+                 * if alloc fails then mmdevapi will return E_NOMEMORY
+                 */
+                params->result = E_NOT_SUFFICIENT_BUFFER;
+            }
+            else
+            {
+                params->result = S_OK;
+                params->value->puuid = params->buffer;
+                *params->value->puuid = dev->container_id;
+            }
+            return STATUS_SUCCESS;
         }
 
         params->result = E_NOTIMPL;
@@ -3151,6 +3185,7 @@ static NTSTATUS pulse_wow64_get_prop_value(void *args)
         switch (value.vt)
         {
         case VT_UI4:
+        case VT_CLSID:
             value32->ulVal = value.ulVal;
             break;
         case VT_LPWSTR:
