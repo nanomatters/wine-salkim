@@ -1150,3 +1150,25 @@ int CDECL ADL_Display_ODClockInfo_Get(int adapter_index, ADLAdapterODClockInfo *
     clock_info->sEngineClock = clock_info->sMemoryClock;
     return ADL_OK;
 }
+
+int CDECL ADL2_Display_SLSMapIndex_Get(ADL_CONTEXT_HANDLE ctx, int adapter_index, int display_target_count, ADLDisplayTarget *display_target,
+        int *sls_index)
+{
+    TRACE("ctx %p, adapter_index %d, display_target_count %d, display_target %p, sls_index %p.\n",
+            ctx, adapter_index, display_target_count, display_target, sls_index);
+
+    if (!ctx || !display_target || !sls_index) return ADL_ERR_INVALID_PARAM;
+
+    *sls_index = 0;
+
+    return ADL_OK;
+}
+
+int CDECL ADL_Display_SLSMapIndex_Get(int adapter_index, int display_target_count, ADLDisplayTarget *display_target,
+        int *sls_index)
+{
+    TRACE("adapter_index %d, display_target_count %d, display_target %p, sls_index %p.\n",
+            adapter_index, display_target_count, display_target, sls_index);
+
+    return ADL2_Display_SLSMapIndex_Get(default_ctx, adapter_index, display_target_count, display_target, sls_index);
+}
