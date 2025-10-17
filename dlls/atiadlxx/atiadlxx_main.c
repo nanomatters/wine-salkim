@@ -940,6 +940,25 @@ int CDECL ADL_Adapter_ObservedClockInfo_Get(int adapter_index, int *core_clock, 
     return ADL2_Adapter_ObservedClockInfo_Get(default_ctx, adapter_index, core_clock, memory_clock);
 }
 
+int CDECL ADL2_Display_SLSMapIndex_Get(ADL_CONTEXT_HANDLE ctx, int adapter_index, int *display_target_count, ADLDisplayTarget **display_targets, int *ret)
+{
+    TRACE("ctx %p, adapter_index %d, display_target_count %p, display_targets %p.\n",
+            ctx, adapter_index, display_target_count, display_targets);
+
+    if(!ctx || !display_targets || !ret)
+        return ADL_ERR;
+
+    *ret = 0;
+    return ADL_OK;
+}
+
+int CDECL ADL_Display_SLSMapIndex_Get(int adapter_index, int *display_target_count, ADLDisplayTarget **display_targets, int *ret)
+{
+    TRACE("adapter_index %d, display_target_count %p, display_targets %p.\n",
+            adapter_index, display_target_count, display_targets);
+
+    return ADL2_Display_SLSMapIndex_Get(default_ctx, adapter_index, display_target_count, display_targets, ret);
+}
 
 int CDECL ADL2_Adapter_Graphic_Core_Info_Get(ADL_CONTEXT_HANDLE context, int adapter_index, ADLGraphicCoreInfo *info)
 {
