@@ -227,7 +227,6 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
     if (tid && pid != GetCurrentProcessId())
     {
         ERR("Cross process rendering is not supported!\n");
-        return NULL;
     }
 
     gl->wl_egl_window = wl_egl_window_create(gl->client->wl_surface,
