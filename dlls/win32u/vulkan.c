@@ -67,6 +67,22 @@ static struct surface *surface_from_handle( VkSurfaceKHR handle )
     return CONTAINING_RECORD( obj, struct surface, obj );
 }
 
+struct fs_hack_upscaler
+{
+    BOOL is_blit, is_fsr, is_nis;
+    union {
+        struct {
+        } blit;
+        struct {
+            BOOL fp16;
+            BOOL lite;
+            float sharpness;
+        } fsr;
+        struct {
+        } nis;
+    };
+};
+
 /* Return whether integer scaling is on */
 static BOOL fs_hack_is_integer(void)
 {
@@ -78,20 +94,6 @@ static BOOL fs_hack_is_integer(void)
         TRACE( "is_integer_scaling: %s\n", is_int ? "TRUE" : "FALSE" );
     }
     return is_int;
-}
-
-static float fs_hack_fsr_sharpness(void)
-{
-    static float sharpness = -1.0f;
-    if (sharpness < 0.0f)
-    {
-        int value = 2;
-        const char *e = getenv("WINE_FULLSCREEN_FSR_STRENGTH");
-        if (e) value = atoi(e);
-        sharpness = (float) value / 10.0f;
-    }
-    TRACE("using sharpness: %2.4f\n", sharpness);
-    return sharpness;
 }
 
 struct fs_hack_image
@@ -137,8 +139,7 @@ struct swapchain
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;
     VkFormat format;
-    BOOL fsr;
-    float sharpness;
+    struct fs_hack_upscaler upscaler;
 
     struct fs_comp_pipeline blit_pipeline;
     struct fs_comp_pipeline fsr_easu_pipeline;
@@ -570,7 +571,7 @@ static VkResult create_descriptor_set( struct vulkan_device *device, struct swap
     userDescriptorImageInfo.sampler = swapchain->sampler;
 
     realDescriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    realDescriptorImageInfo.imageView = swapchain->fsr ? hack->fsr_view : hack->swapchain_view;
+    realDescriptorImageInfo.imageView = swapchain->upscaler.is_fsr ? hack->fsr_view : hack->swapchain_view;
 
     descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     descriptorWrites[0].dstSet = hack->descriptor_set;
@@ -590,7 +591,7 @@ static VkResult create_descriptor_set( struct vulkan_device *device, struct swap
 
     device->p_vkUpdateDescriptorSets( device->host.device, 2, descriptorWrites, 0, NULL );
 
-    if (swapchain->fsr)
+    if (swapchain->upscaler.is_fsr)
     {
         if ((res = device->p_vkAllocateDescriptorSets(device->host.device, &descriptorAllocInfo, &hack->fsr_set)))
         {
@@ -648,9 +649,9 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
 
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = samplerInfo.minFilter = fs_hack_is_integer() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    samplerInfo.addressModeU = swapchain->fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    samplerInfo.addressModeV = swapchain->fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    samplerInfo.addressModeW = swapchain->fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeU = swapchain->upscaler.is_fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = swapchain->upscaler.is_fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = swapchain->upscaler.is_fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     samplerInfo.anisotropyEnable = VK_FALSE;
     samplerInfo.maxAnisotropy = 1;
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -678,7 +679,7 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
     poolInfo.pPoolSizes = poolSizes;
     poolInfo.maxSets = swapchain->n_images;
 
-    if (swapchain->fsr)
+    if (swapchain->upscaler.is_fsr)
     {
         poolSizes[0].descriptorCount *= 2;
         poolSizes[1].descriptorCount *= 2;
@@ -718,11 +719,19 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
                                 4 * sizeof(float) /* 2 * vec2 */, &swapchain->blit_pipeline )))
         goto fail;
 
-    if (swapchain->fsr)
+    if (swapchain->upscaler.is_fsr)
     {
-        if ((res = create_pipeline( device, swapchain, fsr_easu_comp_spv, sizeof(fsr_easu_comp_spv),
-                                    16 * sizeof(uint32_t) /* 4 * uvec4 */, &swapchain->fsr_easu_pipeline )))
-            goto fail;
+        if (swapchain->upscaler.fsr.lite) {
+            if ((res = create_pipeline( device, swapchain, fsr_easu_lite_comp_spv, sizeof(fsr_easu_lite_comp_spv),
+                                        16 * sizeof(uint32_t) /* 4 * uvec4 */, &swapchain->fsr_easu_pipeline )))
+                goto fail;
+        }
+        else
+        {
+            if ((res = create_pipeline( device, swapchain, fsr_easu_comp_spv, sizeof(fsr_easu_comp_spv),
+                                        16 * sizeof(uint32_t) /* 4 * uvec4 */, &swapchain->fsr_easu_pipeline )))
+                goto fail;
+        }
         if ((res = create_pipeline( device, swapchain, fsr_rcas_comp_spv, sizeof(fsr_rcas_comp_spv),
                                     8 * sizeof(uint32_t) /* uvec4 + ivec4 */, &swapchain->fsr_rcas_pipeline )))
             goto fail;
@@ -841,7 +850,7 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = hack->swapchain_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = swapchain->fsr ? srgb_to_unorm(swapchain->format) : VK_FORMAT_B8G8R8A8_UNORM;
+        viewInfo.format = swapchain->upscaler.is_fsr ? srgb_to_unorm(swapchain->format) : VK_FORMAT_B8G8R8A8_UNORM;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -1045,7 +1054,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = swapchain->fs_hack_images[i].user_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = swapchain->fsr ? srgb_to_unorm(createinfo->imageFormat) : VK_FORMAT_B8G8R8A8_SRGB;
+        viewInfo.format = swapchain->upscaler.is_fsr ? srgb_to_unorm(createinfo->imageFormat) : VK_FORMAT_B8G8R8A8_SRGB;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -1102,6 +1111,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
     VkResult res;
+    BOOL lite;
+    float sharpness;
 
     if (!NtUserIsWindow( surface->hwnd ))
     {
@@ -1139,16 +1150,17 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
 
-        swapchain->fsr = fs_hack_is_fsr();
-        swapchain->sharpness = fs_hack_fsr_sharpness();
+        swapchain->upscaler.is_fsr = fs_hack_is_fsr(&lite, &sharpness);
+        swapchain->upscaler.fsr.lite = lite;
+        swapchain->upscaler.fsr.sharpness = sharpness;
         swapchain->host_extents = capabilities.minImageExtent;
         create_info_host.imageExtent = capabilities.minImageExtent;
-        create_info_host.imageFormat = swapchain->fsr ? VK_FORMAT_B8G8R8A8_SRGB: VK_FORMAT_B8G8R8A8_UNORM;
+        create_info_host.imageFormat = swapchain->upscaler.is_fsr ? VK_FORMAT_B8G8R8A8_SRGB: VK_FORMAT_B8G8R8A8_UNORM;
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
 
         swapchain->format = create_info_host.imageFormat;
 
-        if (swapchain->fsr) {
+        if (swapchain->upscaler.is_fsr) {
             swapchain->format = srgb_to_unorm(swapchain->format);
             create_info_host.imageFormat = srgb_to_unorm(create_info_host.imageFormat);
             create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; /* XXX: check if supported by surface */
@@ -1573,7 +1585,7 @@ static VkResult record_fsr_cmd(struct vulkan_device *device, struct swapchain *s
 
     /* 2nd pass (rcas) */
 
-    c.fp[0] = exp2f(-swapchain->sharpness);
+    c.fp[0] = exp2f(-swapchain->upscaler.fsr.sharpness);
     c.uint[2] = swapchain->host_extents.width;
     c.uint[3] = swapchain->host_extents.height;
     c.uint[4] = 0;
@@ -1704,7 +1716,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 }
 
                 if (queue->device->queue_props[queue_idx].queueFlags & VK_QUEUE_COMPUTE_BIT) /* TODO */
-                    res = swapchain->fsr ? record_fsr_cmd(queue->device, swapchain, hack) : record_compute_cmd(queue->device, swapchain, hack);
+                    res = swapchain->upscaler.is_fsr ? record_fsr_cmd(queue->device, swapchain, hack) : record_compute_cmd(queue->device, swapchain, hack);
                 else
                 {
                     ERR( "Present queue does not support compute!\n" );
