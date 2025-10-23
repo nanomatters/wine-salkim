@@ -1707,15 +1707,31 @@ static void add_monitor( const struct gdi_monitor *gdi_monitor, void *param )
 }
 
 /* Return whether fsr should be used */
-BOOL fs_hack_is_fsr(void)
+BOOL fs_hack_is_fsr(BOOL *lite, float *sharpness)
 {
     static int is_fsr = -1;
+    static int is_fsr_lite = 0;
+    static int strength = 2;
     if (is_fsr < 0)
     {
         const char *e = getenv("WINE_FULLSCREEN_FSR");
+        const char *v = getenv("WINE_FULLSCREEN_FSR_STRENGTH");
+
         is_fsr = e && strcmp(e, "0");
+        is_fsr_lite = e && !strcmp(e, "lite");
+        if (v) {
+            strength = atoi(v);
+        }
     }
-    TRACE("is_fsr: %s\n", is_fsr ? "TRUE" : "FALSE");
+    if (lite) {
+        *lite = is_fsr_lite;
+    }
+    if (sharpness) {
+        *sharpness = (float) strength / 10.0f;
+    }
+
+    TRACE("is_fsr: %s, is_lite = %s, sharpness: %2.4f\n",
+        is_fsr ? "TRUE" : "FALSE", *lite ? "TRUE" : "FALSE", sharpness ? *sharpness : 0.0f);
     return is_fsr;
 }
 
@@ -1865,11 +1881,13 @@ static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, U
     UINT i, count;
 
     const char *env;
+    BOOL lite;
+    float sharpness;
 
     static SIZE fsr_sizes[4] = {0};
     SIZE fsr_custom_size = {0, 0};
-    UINT fsr_single_mode;
-    const BOOL is_fsr = fs_hack_is_fsr();
+    UINT fsr_single_mode = 1;
+    const BOOL is_fsr = fs_hack_is_fsr(&lite, &sharpness);
     const BOOL is_custom_mode = get_fsr_custom_mode( &fsr_custom_size );
     const BOOL is_single_mode = get_fsr_single_mode( &fsr_single_mode );
 
