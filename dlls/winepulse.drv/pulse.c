@@ -2743,11 +2743,15 @@ static NTSTATUS pulse_get_prop_value(void *args)
             }
         } else if (IsEqualGUID(&params->prop->fmtid, &DEVPKEY_Device_ContainerId)) {
             params->value->vt = VT_CLSID;
-            params->value->puuid = malloc(sizeof(*params->value->puuid));
-            if (!params->value->puuid)
-                params->result = E_OUTOFMEMORY;
+            /* allow mmdevapi to allocate a uuid for us */
+            if (*params->buffer_size < sizeof(dev->container_id) || !params->buffer)
+            {
+                params->result = E_NOT_SUFFICIENT_BUFFER;
+                *params->buffer_size = sizeof(dev->container_id);
+            }
             else {
                 params->result = S_OK;
+                params->value->puuid = params->buffer;
                 *params->value->puuid = dev->container_id;
             }
             return STATUS_SUCCESS;
@@ -3248,6 +3252,7 @@ static NTSTATUS pulse_wow64_get_prop_value(void *args)
         switch (value.vt)
         {
         case VT_UI4:
+        case VT_CLSID:
             value32->ulVal = value.ulVal;
             break;
         case VT_LPWSTR:
