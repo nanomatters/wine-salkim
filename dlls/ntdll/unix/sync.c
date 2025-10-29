@@ -1037,7 +1037,8 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, BOOLEAN wait_an
     if ((device = get_linux_sync_device()) < 0)
         return STATUS_NOT_IMPLEMENTED;
 
-    for (i = 0; i < count; ++i)
+    objs[0] = -1;  /* make gcc happy, otherwise it thinks objs is not initialized */
+    for (int i = 0; i < count; ++i)
     {
         if ((ret = get_inproc_sync_obj( handles[i], 0, SYNCHRONIZE, &stack_cache[i], &cache[i] )))
         {
@@ -2733,7 +2734,36 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, BO
  */
 NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
-    return NtWaitForMultipleObjects( 1, &handle, FALSE, alertable, timeout );
+    union select_op select_op;
+    UINT flags = SELECT_INTERRUPTIBLE;
+    unsigned int ret;
+
+    if (do_fsync())
+    {
+        if ((ret = fsync_wait_objects(1, &handle, TRUE, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+            return ret;
+    }
+
+    if (do_esync())
+    {
+        if ((ret = esync_wait_objects(1, &handle, TRUE, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+            return ret;
+    }
+
+    TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+
+    if ((ret = inproc_wait( 1, &handle, TRUE, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+    {
+        TRACE( "-> %#x\n", ret );
+        return ret;
+    }
+
+    if (alertable) flags |= SELECT_ALERTABLE;
+    select_op.wait.op = SELECT_WAIT;
+    select_op.wait.handles[0] = wine_server_obj_handle( handle );
+    ret = server_wait( &select_op, offsetof( union select_op, wait.handles[1] ), flags, timeout );
+    TRACE( "-> %#x\n", ret );
+    return ret;
 }
 
 NTSTATUS wait_internal_server( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
