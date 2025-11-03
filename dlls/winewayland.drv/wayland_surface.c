@@ -127,9 +127,41 @@ static void xdg_toplevel_handle_configure(void *private,
     wayland_win_data_release(data);
 }
 
+static inline HWND get_active_window(void)
+{
+    GUITHREADINFO info;
+    info.cbSize = sizeof(info);
+    return NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) ? info.hwndActive : 0;
+}
+
 static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_toplevel)
 {
-    NtUserPostMessage((HWND)data, WM_SYSCOMMAND, SC_CLOSE, 0);
+    HWND hwnd = (HWND)data;
+
+    /* borrowed from winex11/winemac */
+    if (get_active_window() != hwnd)
+    {
+        LRESULT ma = send_message(hwnd, WM_MOUSEACTIVATE,
+                                  (WPARAM)NtUserGetAncestor(hwnd, GA_ROOT),
+                                  MAKELPARAM( HTCLOSE, WM_NCLBUTTONDOWN));
+        switch(ma)
+        {
+            case MA_NOACTIVATEANDEAT:
+            case MA_ACTIVATEANDEAT:
+                return;
+            case MA_NOACTIVATE:
+                break;
+            case MA_ACTIVATE:
+            case 0:
+                NtUserSetActiveWindow(hwnd);
+                break;
+            default:
+                WARN("unknown WM_MOUSEACTIVATE code %d\n", (int) ma);
+                break;
+        }
+    }
+
+    NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
 }
 
 static const struct xdg_toplevel_listener xdg_toplevel_listener =
