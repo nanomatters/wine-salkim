@@ -7637,6 +7637,7 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
     {
         DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO *color_info = (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO *)packet;
         struct monitor *monitor;
+        const char *env;
         static int once;
 
         if (!once++)
@@ -7644,6 +7645,18 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         if (packet->size < sizeof(*color_info))
             return STATUS_INVALID_PARAMETER;
+
+        if ((env = getenv("DXVK_HDR")) && *env == '1')
+        {
+            color_info->advancedColorSupported = 1;
+            color_info->advancedColorEnabled = 1;
+            color_info->wideColorEnforced = 0;
+            color_info->advancedColorForceDisabled = 0;
+            color_info->colorEncoding = DISPLAYCONFIG_COLOR_ENCODING_RGB;
+            color_info->bitsPerColorChannel = 10;
+
+            return STATUS_SUCCESS;
+        }
 
         if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
