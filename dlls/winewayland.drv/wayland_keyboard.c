@@ -995,6 +995,7 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
                                 uint32_t serial, uint32_t time, uint32_t key,
                                 uint32_t state)
 {
+    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
     UINT scan = key2scan(key);
     INPUT input = {0};
     HWND hwnd;
@@ -1015,10 +1016,14 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 
     input.type = INPUT_KEYBOARD;
     input.ki.wScan = (scan & 0x300) ? scan + 0xdf00 : scan;
-    input.ki.dwFlags = KEYEVENTF_SCANCODE;
-    if (scan & ~0xff) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
 
+    pthread_mutex_lock(&keyboard->mutex);
+    input.ki.wVk = NtUserMapVirtualKeyEx(input.ki.wScan, MAPVK_VSC_TO_VK_EX, keyboard_hkl);
+    pthread_mutex_unlock(&keyboard->mutex);
+
+    if (scan & ~0xff) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     if (state == WL_KEYBOARD_KEY_STATE_RELEASED) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+
     NtUserSendHardwareInput(hwnd, 0, &input, 0);
 }
 
