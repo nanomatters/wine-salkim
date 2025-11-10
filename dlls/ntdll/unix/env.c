@@ -349,7 +349,7 @@ static BOOL is_special_env_var( const char *var )
             STARTS_WITH( var, "SDL_AUDIODRIVER=" ) ||
             STARTS_WITH( var, "VK_" ) ||
             STARTS_WITH( var, "XR_" ) ||
-            STARTS_WITH( var, "XDG_SESSION_TYPE=" ));
+            STARTS_WITH( var, "XDG_" ));
 }
 
 /* check if an environment variable changes dynamically in every new process */
@@ -495,11 +495,9 @@ const char *ntdll_get_data_dir(void)
  */
 char **build_envp( const WCHAR *envW )
 {
-    static const char * const unix_vars[] = { "PATH", "TEMP", "TMP", "HOME" };
     char **envp;
     char *env, *p;
     int count = 1, length, lenW;
-    unsigned int i;
 
     lenW = get_env_length( envW );
     if (!(env = malloc( lenW * 3 ))) return NULL;
@@ -511,29 +509,11 @@ char **build_envp( const WCHAR *envW )
         if (is_special_env_var( p )) length += 4; /* prefix it with "WINE" */
     }
 
-    for (i = 0; i < ARRAY_SIZE( unix_vars ); i++)
-    {
-        if (!(p = getenv(unix_vars[i]))) continue;
-        length += strlen(unix_vars[i]) + strlen(p) + 2;
-        count++;
-    }
-
     if ((envp = malloc( count * sizeof(*envp) + length )))
     {
         char **envptr = envp;
         char *dst = (char *)(envp + count);
 
-        /* some variables must not be modified, so we get them directly from the unix env */
-        for (i = 0; i < ARRAY_SIZE( unix_vars ); i++)
-        {
-            if (!(p = getenv( unix_vars[i] ))) continue;
-            *envptr++ = strcpy( dst, unix_vars[i] );
-            strcat( dst, "=" );
-            strcat( dst, p );
-            dst += strlen(dst) + 1;
-        }
-
-        /* now put the Windows environment strings */
         for (p = env; *p; p += strlen(p) + 1)
         {
             if (*p == '=') continue;  /* skip drive curdirs, this crashes some unix apps */
@@ -545,6 +525,7 @@ char **build_envp( const WCHAR *envW )
             }
             else
             {
+                if (STARTS_WITH( p, "UNIX_" )) p += 5;
                 *envptr++ = strcpy( dst, p );
             }
             dst += strlen(dst) + 1;
@@ -954,7 +935,14 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
 
     /* estimate needed size */
     *size = 1;
-    for (e = environ; *e; e++) *size += strlen(*e) + 1;
+    for (e = environ; *e; e++) *size += strlen(*e) + 6;
+
+    if (*size > 30000)  /* Windows is limited to 32767, and we need some space for the Wine variables */
+    {
+        ERR( "Unix environment too large, not importing it.\n");
+        *size = *pos = 0;
+        return NULL;
+    }
 
     env = malloc( *size * sizeof(WCHAR) );
     ptr = env;
@@ -964,7 +952,7 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
         char *str = *e;
 
         /* skip Unix special variables and use the Wine variants instead */
-        if (!strncmp( str, "WINE", 4 ))
+        if (STARTS_WITH( str, "WINE" ))
         {
             if (is_special_env_var( str + 4 )) str += 4;
             else if (!strcmp( str, "WINEDLLOVERRIDES=help" ))
@@ -973,7 +961,12 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
                 exit(0);
             }
         }
-        else if (is_special_env_var( str )) continue;  /* skip it */
+        else if (is_special_env_var( str )) /* prefix it with UNIX_ */
+        {
+            static const WCHAR unixW[] = {'U','N','I','X','_'};
+            memcpy( ptr, unixW, sizeof(unixW) );
+            ptr += ARRAY_SIZE(unixW);
+        }
 
         if (is_dynamic_env_var( str )) continue;
         ptr += ntdll_umbstowcs( str, strlen(str) + 1, ptr, end - ptr );

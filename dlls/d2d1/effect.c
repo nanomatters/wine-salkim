@@ -1007,6 +1007,10 @@ L"<?xml version='1.0'?>                                                      \
     <Inputs>                                                                 \
       <Input name='Source'/>                                                 \
     </Inputs>                                                                \
+    <Property name='InterpolationMode' type='enum' />                        \
+    <Property name='BorderMode' type='enum' />                               \
+    <Property name='TransformMatrix' type='matrix3x2' />                     \
+    <Property name='Sharpness' type='float' />                               \
   </Effect>";
 
 static const WCHAR _3d_perspective_transform_description[] =
@@ -1057,6 +1061,9 @@ L"<?xml version='1.0'?>                                                   \
     <Inputs >                                                             \
       <Input name='Source'/>                                              \
     </Inputs>                                                             \
+    <Property name='BlurStandardDeviation' type='float' />                \
+    <Property name='Color' type='vector4' />                              \
+    <Property name='Optimization' type='enum' />                          \
   </Effect>";
 
 static const WCHAR grayscale_description[] =
@@ -1069,6 +1076,79 @@ L"<?xml version='1.0'?>                                                   \
     <Inputs >                                                             \
       <Input name='Source'/>                                              \
     </Inputs>                                                             \
+  </Effect>";
+
+static const WCHAR color_matrix_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Color Matrix'/>     \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Color Matrix'/>     \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+  </Effect>";
+
+static const WCHAR flood_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Flood'/>            \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Flood'/>            \
+    <Inputs minimum='0' maximum='0' >                                     \
+    </Inputs>                                                             \
+    <Property name='Color' type='vector4' />                              \
+  </Effect>";
+
+static const WCHAR gaussian_blur_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Gaussian Blur'/>    \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Gaussian Blur'/>    \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='StandardDeviation' type='float' />                    \
+    <Property name='Optimization' type='enum' />                          \
+    <Property name='BorderMode' type='enum' />                            \
+  </Effect>";
+
+static const WCHAR point_specular_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Point Specular'/>   \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Point Specular'/>   \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='LightPosition' type='vector3' />                      \
+    <Property name='SpecularExponent' type='float' />                     \
+    <Property name='SpecularConstant' type='float' />                     \
+    <Property name='SurfaceScale' type='float' />                         \
+    <Property name='Color' type='vector3' />                              \
+    <Property name='KernelUnitLength' type='vector2' />                   \
+    <Property name='ScaleMode' type='enum' />                             \
+  </Effect>";
+
+static const WCHAR arithmetic_composite_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Arithmetic Composite'/> \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Arithmetic Composite'/> \
+    <Inputs minimum='2' maximum='2' >                                     \
+      <Input name='Source1'/>                                             \
+      <Input name='Source2'/>                                             \
+    </Inputs>                                                             \
+    <Property name='Coefficients' type='vector4' />                       \
+    <Property name='ClampOutput' type='bool' />                           \
   </Effect>";
 
 void d2d_effects_init_builtins(struct d2d_factory *factory)
@@ -1086,6 +1166,11 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D1Crop, crop_description },
         { &CLSID_D2D1Shadow, shadow_description },
         { &CLSID_D2D1Grayscale, grayscale_description },
+        { &CLSID_D2D1ColorMatrix, color_matrix_description },
+        { &CLSID_D2D1Flood, flood_description },
+        { &CLSID_D2D1GaussianBlur, gaussian_blur_description },
+        { &CLSID_D2D1PointSpecular, point_specular_description },
+        { &CLSID_D2D1ArithmeticComposite, arithmetic_composite_description },
     };
     unsigned int i;
     HRESULT hr;
@@ -1215,6 +1300,7 @@ static HRESULT d2d_effect_properties_internal_add(struct d2d_effect_properties *
     else
     {
         void *src = NULL;
+        WCHAR *end_ptr;
         UINT32 _uint32;
         float _vec[20];
         CLSID _clsid;
@@ -1232,6 +1318,10 @@ static HRESULT d2d_effect_properties_internal_add(struct d2d_effect_properties *
                 case D2D1_PROPERTY_TYPE_INT32:
                     _uint32 = wcstoul(value, NULL, 0);
                     src = &_uint32;
+                    break;
+                case D2D1_PROPERTY_TYPE_FLOAT:
+                    _vec[0] = wcstof(value, &end_ptr);
+                    src = &_vec[0];
                     break;
                 case D2D1_PROPERTY_TYPE_ENUM:
                     _uint32 = wcstoul(value, NULL, 10);

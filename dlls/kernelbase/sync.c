@@ -399,7 +399,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH UnregisterWaitEx( HANDLE handle, HANDLE event )
  */
 DWORD WINAPI DECLSPEC_HOTPATCH WaitForSingleObject( HANDLE handle, DWORD timeout )
 {
-    return WaitForMultipleObjectsEx( 1, &handle, FALSE, timeout, FALSE );
+    return WaitForSingleObjectEx( handle, timeout, FALSE );
 }
 
 
@@ -408,7 +408,18 @@ DWORD WINAPI DECLSPEC_HOTPATCH WaitForSingleObject( HANDLE handle, DWORD timeout
  */
 DWORD WINAPI DECLSPEC_HOTPATCH WaitForSingleObjectEx( HANDLE handle, DWORD timeout, BOOL alertable )
 {
-    return WaitForMultipleObjectsEx( 1, &handle, FALSE, timeout, alertable );
+    NTSTATUS status;
+    LARGE_INTEGER time;
+
+    status = NtWaitForSingleObject( normalize_std_handle( handle ), alertable,
+                                    get_nt_timeout( &time, timeout ) );
+
+    if (NT_ERROR(status))
+    {
+        SetLastError( RtlNtStatusToDosError(status) );
+        status = WAIT_FAILED;
+    }
+    return status;
 }
 
 
@@ -442,7 +453,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH WaitForMultipleObjectsEx( DWORD count, const HAND
 
     status = NtWaitForMultipleObjects( count, hloc, !wait_all, alertable,
                                        get_nt_timeout( &time, timeout ) );
-    if (HIWORD(status))  /* is it an error code? */
+    if (NT_ERROR(status))
     {
         SetLastError( RtlNtStatusToDosError(status) );
         status = WAIT_FAILED;
@@ -1079,6 +1090,35 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileMappingW( HANDLE file, LPSECURITY_ATTR
     get_create_object_attributes( &attr, &nameW, sa, name );
 
     status = NtCreateSection( &ret, access, &attr, &size, protect, sec_type, file );
+    if (status == STATUS_OBJECT_NAME_EXISTS)
+        SetLastError( ERROR_ALREADY_EXISTS );
+    else
+        SetLastError( RtlNtStatusToDosError(status) );
+    return ret;
+}
+
+
+/***********************************************************************
+ *             CreateFileMapping2   (kernelbase.@)
+ */
+HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileMapping2( HANDLE file, SECURITY_ATTRIBUTES *sa, ULONG access,
+                                                    ULONG protect, ULONG sec_type, ULONG64 max_size,
+                                                    const WCHAR *name, MEM_EXTENDED_PARAMETER *params,
+                                                    ULONG count )
+{
+    HANDLE ret;
+    NTSTATUS status;
+    LARGE_INTEGER size;
+    UNICODE_STRING nameW;
+    OBJECT_ATTRIBUTES attr;
+
+    if (!sec_type) sec_type = SEC_COMMIT;
+    size.QuadPart = max_size;
+    if (file == INVALID_HANDLE_VALUE) file = 0;
+
+    get_create_object_attributes( &attr, &nameW, sa, name );
+
+    status = NtCreateSectionEx( &ret, access, &attr, &size, protect, sec_type, file, params, count );
     if (status == STATUS_OBJECT_NAME_EXISTS)
         SetLastError( ERROR_ALREADY_EXISTS );
     else
