@@ -529,6 +529,7 @@
 @ stdcall RtlAreAnyAccessesGranted(long long)
 @ stdcall RtlAreBitsClear(ptr long long)
 @ stdcall RtlAreBitsSet(ptr long long)
+@ stdcall RtlAreLongPathsEnabled()
 # @ stub RtlAssert2
 @ stdcall RtlAssert(ptr ptr long str)
 @ stdcall RtlBarrier(ptr long)
