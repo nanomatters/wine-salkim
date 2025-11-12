@@ -1096,7 +1096,6 @@ static void add_system_dll_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size )
  */
 static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
 {
-    const char *overrides = getenv( "WINEDLLOVERRIDES" );
     const char *wineloader = getenv( "WINELOADER" );
     const char *var;
     unsigned int i;
@@ -1116,7 +1115,6 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     add_system_dll_path_var( env, pos, size );
     append_envA( env, pos, size, "WINELOADER", wineloader );
     append_envA( env, pos, size, "WINEUSERNAME", user_name );
-    append_envA( env, pos, size, "WINEDLLOVERRIDES", overrides );
     if (unix_cp.CodePage != CP_UTF8)
     {
         snprintf( str, sizeof(str), "%u", unix_cp.CodePage );
