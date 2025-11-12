@@ -586,7 +586,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
 {
     pid_t pid;
     int fd[2], stdin_fd = -1, stdout_fd = -1;
-    char **argv, **envp;
+    char **argv;
     NTSTATUS status;
 
 #ifdef HAVE_PIPE2
@@ -629,13 +629,12 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
             signal( SIGPIPE, SIG_DFL );
 
             argv = build_argv( &params->CommandLine, 0 );
-            envp = build_envp( params->Environment );
             if (unixdir != -1)
             {
                 fchdir( unixdir );
                 close( unixdir );
             }
-            execve( unix_name, argv, envp );
+            execv( unix_name, argv );
         }
 
         if (pid <= 0)  /* grandchild if exec failed or child if fork failed */
