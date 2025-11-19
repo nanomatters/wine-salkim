@@ -49,6 +49,15 @@ WINE_DEFAULT_DEBUG_CHANNEL(iphlpapi);
 
 static const WCHAR *device_tcpip = L"\\DEVICE\\TCPIP_";
 
+typedef enum _TCPIP_OWNER_MODULE_INFO_CLASS {
+    TCPIP_OWNER_MODULE_INFO_BASIC = 0
+} TCPIP_OWNER_MODULE_INFO_CLASS, *PTCPIP_OWNER_MODULE_INFO_CLASS;
+
+typedef struct _TCPIP_OWNER_MODULE_BASIC_INFO {
+    PWCHAR pModuleName;
+    PWCHAR pModulePath;
+} TCPIP_OWNER_MODULE_BASIC_INFO, *PTCPIP_OWNER_MODULE_BASIC_INFO;
+
 DWORD WINAPI AllocateAndGetIpAddrTableFromStack( MIB_IPADDRTABLE **table, BOOL sort, HANDLE heap, DWORD flags );
 
 static const NPI_MODULEID *ip_module_id( USHORT family )
@@ -5291,4 +5300,43 @@ DWORD WINAPI SetCurrentThreadCompartmentId( NET_IF_COMPARTMENT_ID id )
 {
     FIXME( "(%x): stub\n", id );
     return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+*    GetOwnerModuleFromTcpEntry (IPHLPAPI.@)
+*/
+DWORD WINAPI GetOwnerModuleFromTcpEntry(
+    PMIB_TCPROW_OWNER_MODULE pTcpEntry,
+    TCPIP_OWNER_MODULE_INFO_CLASS Class,
+    PVOID pBuffer,
+    PDWORD pdwSize)
+{
+    TCPIP_OWNER_MODULE_BASIC_INFO *info;
+    DWORD needed;
+    
+    TRACE("(%p, %d, %p, %p)\n", pTcpEntry, Class, pBuffer, pdwSize);
+
+    if (!pTcpEntry || !pdwSize)
+        return ERROR_INVALID_PARAMETER;
+    
+    if (Class != TCPIP_OWNER_MODULE_INFO_BASIC)
+        return ERROR_INVALID_PARAMETER;
+
+    needed = sizeof(TCPIP_OWNER_MODULE_BASIC_INFO) + 2 * sizeof(WCHAR);
+
+    if (!pBuffer || *pdwSize < needed)
+    {
+        *pdwSize = needed;
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+
+    info = (TCPIP_OWNER_MODULE_BASIC_INFO *)pBuffer;
+    memset(info, 0, sizeof(*info));
+    
+    info->pModuleName = (WCHAR *)((BYTE *)pBuffer + sizeof(TCPIP_OWNER_MODULE_BASIC_INFO));
+    info->pModulePath = info->pModuleName;
+    info->pModuleName[0] = L'\0';
+    info->pModulePath[0] = L'\0';
+    
+    return NO_ERROR;
 }
