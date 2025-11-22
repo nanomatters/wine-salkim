@@ -3853,7 +3853,7 @@ void virtual_init(void)
         kernel_writewatch_init();
 
     if (use_kernel_writewatch)
-        WARN( "using kernel write watches, use_kernel_writewatch %d.\n", use_kernel_writewatch );
+        TRACE( "using kernel write watches, use_kernel_writewatch %d.\n", use_kernel_writewatch );
 
     if (preload_info && *preload_info)
         for (i = 0; (*preload_info)[i].size; i++)
