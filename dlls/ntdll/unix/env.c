@@ -336,7 +336,7 @@ static inline SIZE_T get_env_length( const WCHAR *env )
  *           is_special_env_var
  *
  * Check if an environment variable needs to be handled specially when
- * passed through the Unix environment (i.e. prefixed with "WINE").
+ * imported from the Unix environment (i.e. prefixed with "WINE_HOST_").
  */
 static BOOL is_special_env_var( const char *var )
 {
@@ -345,11 +345,28 @@ static BOOL is_special_env_var( const char *var )
             STARTS_WITH( var, "HOME=" ) ||
             STARTS_WITH( var, "TEMP=" ) ||
             STARTS_WITH( var, "TMP=" ) ||
+            STARTS_WITH( var, "TMPDIR=" ) ||
+            STARTS_WITH( var, "XDG_" ));
+}
+
+
+/***********************************************************************
+ *           is_ignored_env_var
+ *
+ * Check if an environment variable needs to be skipped when importing
+ * from the Unix environment, either because it would confuse Windows
+ * apps, or make the Windows environment grow too large.
+ */
+static BOOL is_ignored_env_var( const char *var )
+{
+    return (STARTS_WITH( var, "NIXPKGS_" ) ||
             STARTS_WITH( var, "QT_" ) ||
             STARTS_WITH( var, "SDL_AUDIODRIVER=" ) ||
+            STARTS_WITH( var, "SDL_AUDIO_DRIVER=" ) ||
+            STARTS_WITH( var, "SDL_VIDEODRIVER=" ) ||
+            STARTS_WITH( var, "SDL_VIDEO_DRIVER=" ) ||
             STARTS_WITH( var, "VK_" ) ||
-            STARTS_WITH( var, "XR_" ) ||
-            STARTS_WITH( var, "XDG_SESSION_TYPE=" ));
+            STARTS_WITH( var, "XR_" ));
 }
 
 /* check if an environment variable changes dynamically in every new process */
@@ -495,11 +512,9 @@ const char *ntdll_get_data_dir(void)
  */
 char **build_envp( const WCHAR *envW )
 {
-    static const char * const unix_vars[] = { "PATH", "TEMP", "TMP", "HOME" };
     char **envp;
     char *env, *p;
     int count = 1, length, lenW;
-    unsigned int i;
 
     lenW = get_env_length( envW );
     if (!(env = malloc( lenW * 3 ))) return NULL;
@@ -511,29 +526,11 @@ char **build_envp( const WCHAR *envW )
         if (is_special_env_var( p )) length += 4; /* prefix it with "WINE" */
     }
 
-    for (i = 0; i < ARRAY_SIZE( unix_vars ); i++)
-    {
-        if (!(p = getenv(unix_vars[i]))) continue;
-        length += strlen(unix_vars[i]) + strlen(p) + 2;
-        count++;
-    }
-
     if ((envp = malloc( count * sizeof(*envp) + length )))
     {
         char **envptr = envp;
         char *dst = (char *)(envp + count);
 
-        /* some variables must not be modified, so we get them directly from the unix env */
-        for (i = 0; i < ARRAY_SIZE( unix_vars ); i++)
-        {
-            if (!(p = getenv( unix_vars[i] ))) continue;
-            *envptr++ = strcpy( dst, unix_vars[i] );
-            strcat( dst, "=" );
-            strcat( dst, p );
-            dst += strlen(dst) + 1;
-        }
-
-        /* now put the Windows environment strings */
         for (p = env; *p; p += strlen(p) + 1)
         {
             if (*p == '=') continue;  /* skip drive curdirs, this crashes some unix apps */
@@ -545,6 +542,7 @@ char **build_envp( const WCHAR *envW )
             }
             else
             {
+                if (STARTS_WITH( p, "UNIX_" )) p += 5;
                 *envptr++ = strcpy( dst, p );
             }
             dst += strlen(dst) + 1;
@@ -931,6 +929,20 @@ void init_environment(void)
 }
 
 
+/* check if a WINE_HOST_ prefixed variable already exists in the environment */
+static BOOL host_var_exists( const char *name )
+{
+    char *end = strchr( name, '=' );
+
+    if (!end) return FALSE;
+    for (char **e = environ; *e; e++)
+    {
+        if (!STARTS_WITH( *e, "WINE_HOST_" )) continue;
+        if (!strncmp( *e + 10, name, end + 1 - name )) return TRUE;
+    }
+    return FALSE;
+}
+
 static const char overrides_help_message[] =
     "Syntax:\n"
     "  WINEDLLOVERRIDES=\"entry;entry;entry...\"\n"
@@ -954,7 +966,7 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
 
     /* estimate needed size */
     *size = 1;
-    for (e = environ; *e; e++) *size += strlen(*e) + 1;
+    for (e = environ; *e; e++) *size += strlen(*e) + 6;
 
     env = malloc( *size * sizeof(WCHAR) );
     ptr = env;
@@ -964,16 +976,23 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
         char *str = *e;
 
         /* skip Unix special variables and use the Wine variants instead */
-        if (!strncmp( str, "WINE", 4 ))
+        if (STARTS_WITH( str, "WINE" ))
         {
-            if (is_special_env_var( str + 4 )) str += 4;
+            if (is_special_env_var( str + 4 ) || is_ignored_env_var( str + 4 )) str += 4;
             else if (!strcmp( str, "WINEDLLOVERRIDES=help" ))
             {
                 MESSAGE( overrides_help_message );
                 exit(0);
             }
         }
-        else if (is_special_env_var( str )) continue;  /* skip it */
+        else if (is_ignored_env_var( str )) continue;
+        else if (host_var_exists( str )) continue;
+        else if (is_special_env_var( str )) /* prefix it with WINE_HOST_ */
+        {
+            static const WCHAR hostW[] = {'W','I','N','E','_','H','O','S','T','_'};
+            memcpy( ptr, hostW, sizeof(hostW) );
+            ptr += ARRAY_SIZE(hostW);
+        }
 
         if (is_dynamic_env_var( str )) continue;
         ptr += ntdll_umbstowcs( str, strlen(str) + 1, ptr, end - ptr );
