@@ -989,6 +989,7 @@ typedef volatile struct
     int                  cursor_count;
     unsigned char        keystate[256];
     int                  keystate_lock;
+    unsigned __int64     keystate_serial;
 } input_shm_t;
 
 typedef volatile union
@@ -4072,6 +4073,29 @@ struct get_thread_desktop_reply
 };
 
 
+struct get_thread_layout_request
+{
+    struct request_header __header;
+    thread_id_t tid;
+};
+struct get_thread_layout_reply
+{
+    struct reply_header __header;
+    client_ptr_t layout;
+};
+
+
+struct set_thread_layout_request
+{
+    struct request_header __header;
+    thread_id_t tid;
+    client_ptr_t layout;
+};
+struct set_thread_layout_reply
+{
+    struct reply_header __header;
+};
+
 
 struct set_thread_desktop_request
 {
@@ -6082,6 +6106,8 @@ enum request
     REQ_set_input_desktop,
     REQ_close_desktop,
     REQ_get_thread_desktop,
+    REQ_get_thread_layout,
+    REQ_set_thread_layout,
     REQ_set_thread_desktop,
     REQ_set_user_object_info,
     REQ_register_hotkey,
@@ -6382,6 +6408,8 @@ union generic_request
     struct set_input_desktop_request set_input_desktop_request;
     struct close_desktop_request close_desktop_request;
     struct get_thread_desktop_request get_thread_desktop_request;
+    struct get_thread_layout_request get_thread_layout_request;
+    struct set_thread_layout_request set_thread_layout_request;
     struct set_thread_desktop_request set_thread_desktop_request;
     struct set_user_object_info_request set_user_object_info_request;
     struct register_hotkey_request register_hotkey_request;
@@ -6680,6 +6708,8 @@ union generic_reply
     struct set_input_desktop_reply set_input_desktop_reply;
     struct close_desktop_reply close_desktop_reply;
     struct get_thread_desktop_reply get_thread_desktop_reply;
+    struct get_thread_layout_reply get_thread_layout_reply;
+    struct set_thread_layout_reply set_thread_layout_reply;
     struct set_thread_desktop_reply set_thread_desktop_reply;
     struct set_user_object_info_reply set_user_object_info_reply;
     struct register_hotkey_reply register_hotkey_reply;
@@ -6794,6 +6824,6 @@ union generic_reply
     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 856
+#define SERVER_PROTOCOL_VERSION 864
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
