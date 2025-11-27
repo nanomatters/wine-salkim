@@ -1774,6 +1774,8 @@
 @ cdecl -norelay __wine_dbg_strdup(str)
 @ stdcall -norelay __wine_dbg_ftrace(ptr long long)
 
+@ stdcall __wine_get_sync_type()
+
 # Version
 @ cdecl wine_get_version()
 @ cdecl wine_get_build_id()
