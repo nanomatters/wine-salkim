@@ -54,6 +54,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(pulse);
 
 #define MAX_PULSE_NAME_LEN 256
 
+static CRITICAL_SECTION g_devices_cache_cs;
+static CRITICAL_SECTION_DEBUG g_devices_cache_cs_debug =
+{
+    0, 0, &g_devices_cache_cs,
+    { &g_devices_cache_cs_debug.ProcessLocksList, &g_devices_cache_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": g_devices_cache_cs") }
+};
+static CRITICAL_SECTION g_devices_cache_cs = { &g_devices_cache_cs_debug, -1, 0, 0, 0, 0 };
 static struct list g_devices_cache = LIST_INIT(g_devices_cache);
 
 struct device_cache {
@@ -95,8 +103,11 @@ BOOL WINAPI DllMain(HINSTANCE dll, DWORD reason, void *reserved)
         {
             struct device_cache *device, *device_next;
 
+            EnterCriticalSection(&g_devices_cache_cs);
             LIST_FOR_EACH_ENTRY_SAFE(device, device_next, &g_devices_cache, struct device_cache, entry)
                 free(device);
+            list_init(&g_devices_cache);
+            LeaveCriticalSection(&g_devices_cache_cs);
         }
         break;
     }
@@ -174,15 +185,20 @@ BOOL WINAPI get_device_name_from_guid(GUID *guid, char **name, EDataFlow *flow)
     }
 
     /* Check the cache first */
+    EnterCriticalSection(&g_devices_cache_cs);
     LIST_FOR_EACH_ENTRY(device, &g_devices_cache, struct device_cache, entry) {
         if (!IsEqualGUID(guid, &device->guid))
             continue;
         *flow = device->dataflow;
-        if ((*name = strdup(device->pulse_name)))
+        if ((*name = strdup(device->pulse_name))) {
+            LeaveCriticalSection(&g_devices_cache_cs);
             return TRUE;
+        }
 
+        LeaveCriticalSection(&g_devices_cache_cs);
         return FALSE;
     }
+    LeaveCriticalSection(&g_devices_cache_cs);
 
     if (RegOpenKeyExW(HKEY_CURRENT_USER, drv_key_devicesW, 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
         WARN("No devices found in registry\n");
@@ -238,7 +254,9 @@ BOOL WINAPI get_device_name_from_guid(GUID *guid, char **name, EDataFlow *flow)
                 device->guid = reg_guid;
                 device->dataflow = *flow;
                 memcpy(device->pulse_name, *name, len);
+                EnterCriticalSection(&g_devices_cache_cs);
                 list_add_tail(&g_devices_cache, &device->entry);
+                LeaveCriticalSection(&g_devices_cache_cs);
             }
             return TRUE;
         }
