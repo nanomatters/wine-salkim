@@ -324,6 +324,7 @@ struct wayland_window_config
 struct wayland_client_surface
 {
     LONG ref;
+    RECT rect;
     HWND hwnd;
     HWND toplevel;
     struct wl_surface *wl_surface;
