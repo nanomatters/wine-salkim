@@ -145,6 +145,24 @@ static void wayland_vulkan_surface_detach(HWND hwnd, void *private)
 
 static void wayland_vulkan_surface_update(HWND hwnd, void *private)
 {
+    struct wayland_win_data *data;
+    struct wayland_client_surface *client = private;
+    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+
+    TRACE("%p %p\n", hwnd, private);
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+
+    if (toplevel && NtUserIsWindowVisible(hwnd))
+    {
+        /* proton updates vulkan surface in some vk query* methods, requiring this to be here */
+        if (!EqualRect(&data->rects.client, &client->rect))
+            wayland_client_surface_attach(client, toplevel);
+    }
+    else
+        wayland_client_surface_detach(client);
+
+    wayland_win_data_release(data);
 }
 
 static void wayland_vulkan_surface_presented(HWND hwnd, void *private, VkResult result)
