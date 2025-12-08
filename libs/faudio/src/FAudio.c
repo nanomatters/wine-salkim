@@ -781,7 +781,7 @@ static uint32_t CreateMasteringVoiceImpl(
 	if (audio->platform == NULL)
 	{
 		FAudioVoice_DestroyVoice(*ppMasteringVoice);
-		*ppMasteringVoice = NULL;
+		audio->master = *ppMasteringVoice = NULL;
 
 		/* Not the best code, but it's probably true? */
 		return FAUDIO_E_DEVICE_INVALIDATED;
