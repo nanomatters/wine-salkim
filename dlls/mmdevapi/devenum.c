@@ -1424,6 +1424,9 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD 
     }
     LeaveCriticalSection(&device_list_cs);
 
+    /* Delay create thread as much as possible. */
+    create_update_thread();
+
     return S_OK;
 }
 
@@ -1547,9 +1550,6 @@ static HRESULT WINAPI MMDevEnum_QueryInterface(IMMDeviceEnumerator *iface, REFII
     if (!*ppv)
         return E_NOINTERFACE;
     IUnknown_AddRef((IUnknown*)*ppv);
-
-    create_update_thread();
-
     return S_OK;
 }
 
@@ -1878,6 +1878,9 @@ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEn
     }
 
     LeaveCriticalSection(&g_notif_lock);
+
+    /* Delay create thread as much as possible. */
+    create_update_thread();
 
     return S_OK;
 }
