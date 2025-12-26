@@ -766,6 +766,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
                                                    width, height,
                                                    window->state))
     {
+        WARN("Failed to configure surface %p\n", surface);
         return FALSE;
     }
 
