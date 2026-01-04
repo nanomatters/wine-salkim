@@ -154,6 +154,4 @@ static inline void set_win32_error( unsigned int err ) { set_error( 0xc0010000 |
 
 static inline thread_id_t get_thread_id( struct thread *thread ) { return thread->id; }
 
-extern void set_server_priority(void);
-
 #endif  /* __WINE_SERVER_THREAD_H */

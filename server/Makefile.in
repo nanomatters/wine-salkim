@@ -26,7 +26,6 @@ SOURCES = \
 	mutex.c \
 	named_pipe.c \
 	object.c \
-	priority.c \
 	process.c \
 	procfs.c \
 	ptrace.c \
