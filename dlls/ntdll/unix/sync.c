@@ -71,11 +71,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
-#define SECSPERDAY         86400
-/* 1601 to 1970 is 369 years plus 89 leap days */
-#define SECS_1601_TO_1970  ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
-#define TICKS_1601_TO_1970 (SECS_1601_TO_1970 * TICKSPERSEC)
-
 HANDLE keyed_event = 0;
 
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
@@ -1801,58 +1796,33 @@ alert_waited:
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
-        struct timespec ts = { .tv_sec = ~0UL >> 1, .tv_nsec = 0 };
-        while (clock_nanosleep( CLOCK_MONOTONIC, 0, &ts, &ts ) == EINTR);
+        for (;;) select( 0, NULL, NULL, NULL, NULL );
     }
     else
     {
-        timeout_t when;
-        struct timespec ts;
-        when = timeout->QuadPart;
+        LARGE_INTEGER now;
+        timeout_t when, diff;
 
-        /* Note that we only care about the result of the yield for zero timeouts */
-        status = NtYieldExecution();
-        if (!when)
-            return status;
-
-        if (when < 0)
+        if ((when = timeout->QuadPart) < 0)
         {
-            when = -when;
-            when -= 450; /* rough overhead adjustment */
-
-            if (when <= 0)
-                return status;
-
-            ts.tv_sec  = when / TICKSPERSEC;
-            ts.tv_nsec = (when % TICKSPERSEC) * 100;
-
-            while (clock_nanosleep( CLOCK_MONOTONIC, 0, &ts, &ts ) == EINTR);
-        }
-        else
-        {
-            LARGE_INTEGER now;
-            unsigned int ret;
-
-            when -= 450;
-
             NtQuerySystemTime( &now );
-            if (when <= now.QuadPart)
-                return status;
+            when = now.QuadPart - when;
+        }
 
-            when -= TICKS_1601_TO_1970;
-            ts.tv_sec  = when / TICKSPERSEC;
-            ts.tv_nsec = (when % TICKSPERSEC) * 100;
+        /* Note that we yield after establishing the desired timeout, but
+           we only care about the result of the yield for zero timeouts */
+        status = NtYieldExecution();
+        if (!when) return status;
 
-            do
-            {
-                ret = clock_nanosleep( CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL );
-                if (ret == EINTR)
-                {
-                    LARGE_INTEGER now;
-                    NtQuerySystemTime( &now );
-                    if (when <= now.QuadPart) break;
-                }
-            } while (ret == EINTR);
+        for (;;)
+        {
+            struct timeval tv;
+            NtQuerySystemTime( &now );
+            diff = (when - now.QuadPart + 9) / 10;
+            if (diff <= 0) break;
+            tv.tv_sec  = diff / 1000000;
+            tv.tv_usec = diff % 1000000;
+            if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
         }
     }
     return STATUS_SUCCESS;
