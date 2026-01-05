@@ -601,6 +601,7 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
         {
             /* HACK: override libxe*.dll paths to a non-standard location for XeSS upgrade */
             if (wcsstr( name, L"libxess.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess.dll" );
+            if (wcsstr( name, L"libxess_dx11.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess_dx11.dll" );
             if (wcsstr( name, L"libxell.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxell.dll" );
             if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess_fg.dll" );
         }
