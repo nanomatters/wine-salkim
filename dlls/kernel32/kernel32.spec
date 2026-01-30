@@ -959,7 +959,7 @@
 @ stub HeapSetFlags
 @ stdcall -import HeapSetInformation(ptr long ptr long)
 @ stdcall HeapSize(long long ptr) NTDLL.RtlSizeHeap
-@ stub HeapSummary
+@ stdcall -import HeapSummary(long long ptr)
 @ stdcall -import HeapUnlock(long)
 @ stub HeapUsage
 @ stdcall -import HeapValidate(long long ptr)
@@ -1286,7 +1286,7 @@
 @ stub RegisterConsoleVDM
 @ stdcall RegisterServiceProcess(long long)
 @ stub RegisterSysMsgHandler
-@ stub RegisterWaitForInputIdle
+@ stdcall RegisterWaitForInputIdle(ptr)
 @ stdcall RegisterWaitForSingleObject(ptr long ptr ptr long long)
 @ stdcall -import RegisterWaitForSingleObjectEx(long ptr ptr long long)
 @ stub RegisterWowBaseHandlers
