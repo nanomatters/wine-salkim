@@ -48,14 +48,7 @@ DEFINE_MEDIATYPE_GUID(MFAudioFormat_XMAudio2, FAUDIO_FORMAT_XMAUDIO2);
 
 static CRITICAL_SECTION faudio_cs = { NULL, -1, 0, 0, 0, 0 };
 static IMMDeviceEnumerator *device_enumerator;
-static HRESULT init_hr;
-
-struct FAudioWin32PlatformData
-{
-	IAudioClient *client;
-	HANDLE audioThread;
-	HANDLE stopEvent;
-};
+static HRESULT init_hr = -1;
 
 struct FAudioAudioClientThreadArgs
 {
@@ -64,6 +57,17 @@ struct FAudioAudioClientThreadArgs
 	HANDLE events[2];
 	FAudio *audio;
 	UINT updateSize;
+};
+
+struct FAudioWin32PlatformData
+{
+	struct FAudioAudioClientThreadArgs *args;
+	FAudio *audio;
+	IAudioClient *client;
+	HANDLE audioThread;
+	HANDLE stopEvent;
+	CRITICAL_SECTION threadCs;
+	REFERENCE_TIME duration;
 };
 
 void FAudio_Log(char const *msg)
@@ -76,6 +80,12 @@ static HRESULT (WINAPI *my_SetThreadDescription)(HANDLE, PCWSTR) = NULL;
 
 static void FAudio_resolve_SetThreadDescription(void)
 {
+	EnterCriticalSection(&faudio_cs);
+	if (my_SetThreadDescription) {
+		LeaveCriticalSection(&faudio_cs);
+		return;
+	}
+
 	kernelbase = LoadLibraryA("kernelbase.dll");
 	if (!kernelbase)
 		return;
@@ -86,12 +96,16 @@ static void FAudio_resolve_SetThreadDescription(void)
 		FreeLibrary(kernelbase);
 		kernelbase = NULL;
 	}
+	LeaveCriticalSection(&faudio_cs);
 }
 
 static void FAudio_set_thread_name(char const *name)
 {
 	int ret;
 	WCHAR *nameW;
+
+	if (!my_SetThreadDescription)
+		FAudio_resolve_SetThreadDescription();
 
 	if (!my_SetThreadDescription)
 		return;
@@ -167,35 +181,51 @@ static DWORD WINAPI FAudio_AudioClientThread(void *user)
 		&IID_IAudioRenderClient,
 		(void **)&render_client
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to get IAudioRenderClient service!");
+	if (FAILED(hr))
+		/* Failed to get IAudioRenderClient service! */
+		goto fail_free;
 
 	hr = IAudioClient_GetBufferSize(args->client, &frames);
-	FAudio_assert(!FAILED(hr) && "Failed to get IAudioClient buffer size!");
+	if (FAILED(hr))
+		/* Failed to get IAudioClient buffer size! */
+		goto fail_release;
 
 	hr = FAudio_FillAudioClientBuffer(args, render_client, frames, 0);
-	FAudio_assert(!FAILED(hr) && "Failed to initialize IAudioClient buffer!");
+	if (FAILED(hr))
+		/* Failed to initialize IAudioClient buffer! */
+		goto fail_release;
 
 	hr = IAudioClient_Start(args->client);
-	FAudio_assert(!FAILED(hr) && "Failed to start IAudioClient!");
+	if (FAILED(hr))
+		/* Failed to start IAudioClient! */
+		goto fail_release;
 
 	while (WaitForMultipleObjects(2, args->events, FALSE, INFINITE) == WAIT_OBJECT_0)
 	{
 		hr = IAudioClient_GetCurrentPadding(args->client, &padding);
 		if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
-		{
 			/* Device was removed, just exit */
 			break;
-		}
-		FAudio_assert(!FAILED(hr) && "Failed to get IAudioClient current padding!");
+		if (FAILED(hr))
+			/* Failed to get IAudioClient current padding! */
+			goto fail_release;
 
 		hr = FAudio_FillAudioClientBuffer(args, render_client, frames, padding);
-		FAudio_assert(!FAILED(hr) && "Failed to fill IAudioClient buffer!");
+		if (FAILED(hr))
+			/* Failed to fill IAudioClient buffer! */
+			goto fail_release;
 	}
 
 	hr = IAudioClient_Stop(args->client);
-	FAudio_assert(!FAILED(hr) && "Failed to stop IAudioClient!");
+	if (FAILED(hr))
+		/* Failed to stop IAudioClient! */
+		goto fail_release;
 
+fail_release:
 	IAudioRenderClient_Release(render_client);
+fail_free:
+	CloseHandle(args->events[0]);
+	IAudioClient_Release(args->client);
 	FAudio_free(args);
 	return 0;
 }
@@ -284,7 +314,7 @@ static HRESULT FAudio_DefaultDeviceIndex(
  * default device is always at index 0, so we mimick this behavior here by
  * swapping the devices at indexes 0 and `defaultDeviceIndex`.
  */
-static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, IMMDevice **device)
+static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, const uint16_t *deviceId, IMMDevice **device)
 {
 	IMMDeviceCollection *deviceCollection;
 	HRESULT hr;
@@ -292,6 +322,62 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, IMMDevice **device)
 	uint32_t actualIndex;
 
 	*device = NULL;
+
+#define MMDEV_ID_FLOW_IDX 5
+/* strlen("{0.0.1.00000000}.{fd47d9cc-4218-4135-9ce2-0c195c87405b}") + 1 */
+#define MMDEV_ID_LEN 56
+/* ARRAY_SIZE(MMDEV_PATH_PREFIX) */
+#define MMDEV_PREFIX_LEN 18
+/* (MMDEV_PREFIX_LEN - 1) + (MMDEV_ID_LEN - 1) + 1 + (ARRAY_SIZE(DEVINTERFACE_AUDIO_RENDER_WSTR) - 1) + 1 */
+#define MMDEV_PATH_LEN 112
+
+	if (deviceId)
+	{
+		ULONG deviceLen = wcslen(deviceId);
+		WCHAR idFromPath[MMDEV_ID_LEN];
+		WCHAR prefixFromPath[MMDEV_PREFIX_LEN];
+		const WCHAR *id = NULL;
+
+		static const WCHAR RENDER_GUID_SUFFIX_STR[] = L"#{E6327CAD-DCEC-4949-AE8A-991E976A79D2}";
+		static const WCHAR CAPTURE_GUID_SUFFIX_STR[] = L"#{2EEF81BE-33FA-4800-9670-1CD474972C3F}";
+		static const WCHAR MMDEV_PATH_PREFIX[] = L"\\\\?\\SWD#MMDEVAPI#";
+
+		if (deviceLen == MMDEV_ID_LEN - 1) {
+			id = deviceId;
+		} else if (deviceLen == MMDEV_PATH_LEN - 1) {
+			memcpy(prefixFromPath, deviceId, (MMDEV_PREFIX_LEN - 1) * sizeof(WCHAR));
+			prefixFromPath[MMDEV_PREFIX_LEN - 1] = 0;
+
+			if (!lstrcmpiW(prefixFromPath, MMDEV_PATH_PREFIX)) {
+				const WCHAR *suffixFromPath = deviceId + (MMDEV_PREFIX_LEN - 1) + (MMDEV_ID_LEN - 1);
+				lstrcpynW(idFromPath, deviceId + (MMDEV_PREFIX_LEN - 1), MMDEV_ID_LEN);
+				if (
+					(idFromPath[MMDEV_ID_FLOW_IDX] == L'0' && !lstrcmpiW(suffixFromPath, RENDER_GUID_SUFFIX_STR)) ||
+					(idFromPath[MMDEV_ID_FLOW_IDX] == L'1' && !lstrcmpiW(suffixFromPath, CAPTURE_GUID_SUFFIX_STR))
+				)
+					id = idFromPath;
+			}
+		}
+
+		if (!id)
+			return E_INVALIDARG;
+
+		return IMMDeviceEnumerator_GetDevice(
+			device_enumerator,
+			id,
+			device
+		);
+	}
+
+	if (deviceIndex == 0) {
+		/* Default device. */
+		return IMMDeviceEnumerator_GetDefaultAudioEndpoint(
+			device_enumerator,
+			eRender,
+			eConsole,
+			device
+		);
+	}
 
 	hr = IMMDeviceEnumerator_EnumAudioEndpoints(
 		device_enumerator,
@@ -312,10 +398,7 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, IMMDevice **device)
 		return hr;
 	}
 
-	if (deviceIndex == 0) {
-		/* Default device. */
-		actualIndex = defaultDeviceIndex;
-	} else if (deviceIndex == defaultDeviceIndex) {
+	if (deviceIndex == defaultDeviceIndex) {
 		/* Open the device at index 0 instead of the "correct" one. */
 		actualIndex = 0;
 	} else {
@@ -335,21 +418,107 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, IMMDevice **device)
 	return hr;
 }
 
+uint32_t FAudio_PlatformStatus(void* platformDevice) {
+	struct FAudioWin32PlatformData *data = platformDevice;
+	uint32_t status = 0;
+	DWORD threadStatus = 0;
+	EnterCriticalSection(&data->threadCs);
+	if (
+		!data->args ||
+		(
+			data->audioThread &&
+			(!GetExitCodeThread(data->audioThread, &threadStatus) || threadStatus != STILL_ACTIVE)
+		)
+	)
+		status = FAUDIO_E_DEVICE_INVALIDATED;
+	LeaveCriticalSection(&data->threadCs);
+	return status;
+}
+
+void FAudio_PlatformAudioThread(void* platformDevice) {
+	HRESULT hr;
+	struct FAudioWin32PlatformData *data = platformDevice;
+	struct FAudioAudioClientThreadArgs *args = data->args;
+
+	HANDLE audioEvent = NULL;
+
+	EnterCriticalSection(&data->threadCs);
+	if (!data->args || data->audioThread) {
+		LeaveCriticalSection(&data->threadCs);
+		return;
+	}
+
+	audioEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (!audioEvent)
+		/* Failed to create FAudio thread buffer event! */
+		goto fail_args;
+
+	data->stopEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (!data->stopEvent)
+		/* Failed to create FAudio thread stop event! */
+		goto fail_close_audio_evt;
+
+	args->client = data->client;
+	args->events[0] = audioEvent;
+	args->events[1] = data->stopEvent;
+	args->audio = data->audio;
+
+	hr = IAudioClient_Initialize(
+		data->client,
+		AUDCLNT_SHAREMODE_SHARED,
+		AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+		data->duration * 3,
+		0,
+		&args->format.Format,
+		&GUID_NULL
+	);
+	if (FAILED(hr))
+		/* Failed to initialize audio client! */
+		goto fail_close_stop_evt;
+
+	hr = IAudioClient_SetEventHandle(data->client, audioEvent);
+	if (FAILED(hr))
+		/* Failed to set audio client event! */
+		goto fail_close_stop_evt;
+
+
+	data->audioThread = CreateThread(NULL, 0, &FAudio_AudioClientThread, args, 0, NULL);
+	if (!data->audioThread)
+		/* Failed to create audio client thread! */
+		goto fail_close_stop_evt;
+
+	data->client = NULL;
+	LeaveCriticalSection(&data->threadCs);
+	return;
+
+fail_close_stop_evt:
+	CloseHandle(data->stopEvent);
+	data->stopEvent = NULL;
+fail_close_audio_evt:
+	CloseHandle(audioEvent);
+fail_args:
+	IAudioClient_Release(data->client);
+	data->client = NULL;
+	FAudio_free(data->args);
+	data->args = NULL;
+	LeaveCriticalSection(&data->threadCs);
+	return;
+}
+
 void FAudio_PlatformInit(
 	FAudio *audio,
 	uint32_t flags,
 	uint32_t deviceIndex,
+	const uint16_t *deviceId,
 	FAudioWaveFormatExtensible *mixFormat,
 	uint32_t *updateSize,
 	void** platformDevice
 ) {
 	struct FAudioAudioClientThreadArgs *args;
 	struct FAudioWin32PlatformData *data;
-	REFERENCE_TIME duration;
 	WAVEFORMATEX *closest;
 	IMMDevice *device = NULL;
 	HRESULT hr;
-	HANDLE audioEvent = NULL;
 	BOOL has_sse2 = IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE);
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm64ec__) || defined(_M_ARM64EC)
 	BOOL has_neon = TRUE;
@@ -359,17 +528,20 @@ void FAudio_PlatformInit(
 	BOOL has_neon = FALSE;
 #endif
 	FAudio_INTERNAL_InitSIMDFunctions(has_sse2, has_neon);
-	FAudio_resolve_SetThreadDescription();
 
 	FAudio_PlatformAddRef();
 
 	*platformDevice = NULL;
 
 	args = FAudio_malloc(sizeof(*args));
-	FAudio_assert(!!args && "Failed to allocate FAudio thread args!");
+	if (!args)
+		/* Failed to allocate FAudio thread args! */
+		goto fail_release;
 
 	data = FAudio_malloc(sizeof(*data));
-	FAudio_assert(!!data && "Failed to allocate FAudio platform data!");
+	if (!data)
+		/* Failed to allocate FAudio platform data! */
+		goto fail_free_args;
 	FAudio_zero(data, sizeof(*data));
 
 	args->format.Format.wFormatTag = mixFormat->Format.wFormatTag;
@@ -391,14 +563,10 @@ void FAudio_PlatformInit(
 		);
 	}
 
-	audioEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-	FAudio_assert(!!audioEvent && "Failed to create FAudio thread buffer event!");
-
-	data->stopEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-	FAudio_assert(!!data->stopEvent && "Failed to create FAudio thread stop event!");
-
-	hr = FAudio_OpenDevice(deviceIndex, &device);
-	FAudio_assert(!FAILED(hr) && "Failed to get audio device!");
+	hr = FAudio_OpenDevice(deviceIndex, deviceId, &device);
+	if (!device)
+		/* Failed to get audio device! */
+		goto fail_free_data;
 
 	hr = IMMDevice_Activate(
 		device,
@@ -407,11 +575,13 @@ void FAudio_PlatformInit(
 		NULL,
 		(void **)&data->client
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to create audio client!");
+	if (FAILED(hr))
+		/* Failed to create audio client! */
+		goto fail_device;
 	IMMDevice_Release(device);
 
-	if (flags & FAUDIO_1024_QUANTUM) duration = 213333;
-	else duration = 100000;
+	if (flags & FAUDIO_1024_QUANTUM) data->duration = 213333;
+	else data->duration = 100000;
 
 	hr = IAudioClient_IsFormatSupported(
 		data->client,
@@ -419,7 +589,9 @@ void FAudio_PlatformInit(
 		&args->format.Format,
 		&closest
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to find supported audio format!");
+	if (FAILED(hr))
+		/* Failed to find supported audio format! */
+		goto fail_audio;
 
 	if (closest)
 	{
@@ -427,20 +599,6 @@ void FAudio_PlatformInit(
 		else args->format = *(WAVEFORMATEXTENSIBLE *)closest;
 		CoTaskMemFree(closest);
 	}
-
-	hr = IAudioClient_Initialize(
-		data->client,
-		AUDCLNT_SHAREMODE_SHARED,
-		AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-		duration * 3,
-		0,
-		&args->format.Format,
-		&GUID_NULL
-	);
-	FAudio_assert(!FAILED(hr) && "Failed to initialize audio client!");
-
-	hr = IAudioClient_SetEventHandle(data->client, audioEvent);
-	FAudio_assert(!FAILED(hr) && "Failed to set audio client event!");
 
 	mixFormat->Format.wFormatTag = args->format.Format.wFormatTag;
 	mixFormat->Format.nChannels = args->format.Format.nChannels;
@@ -465,18 +623,27 @@ void FAudio_PlatformInit(
 		mixFormat->Format.cbSize = sizeof(FAudioWaveFormatEx);
 	}
 
-	args->client = data->client;
-	args->events[0] = audioEvent;
-	args->events[1] = data->stopEvent;
-	args->audio = audio;
+	data->audio = audio;
+	data->args = args;
+	InitializeCriticalSection(&data->threadCs);
+
 	if (flags & FAUDIO_1024_QUANTUM) args->updateSize = args->format.Format.nSamplesPerSec / (1000.0 / (64.0 / 3.0));
 	else args->updateSize = args->format.Format.nSamplesPerSec / 100;
 
-	data->audioThread = CreateThread(NULL, 0, &FAudio_AudioClientThread, args, 0, NULL);
-	FAudio_assert(!!data->audioThread && "Failed to create audio client thread!");
-
 	*updateSize = args->updateSize;
 	*platformDevice = data;
+	return;
+
+fail_audio:
+	IAudioClient_Release(data->client);
+fail_device:
+	IMMDevice_Release(device);
+fail_free_data:
+	FAudio_free(data);
+fail_free_args:
+	FAudio_free(args);
+fail_release:
+	FAudio_PlatformRelease();
 	return;
 }
 
@@ -484,9 +651,25 @@ void FAudio_PlatformQuit(void* platformDevice)
 {
 	struct FAudioWin32PlatformData *data = platformDevice;
 
-	SetEvent(data->stopEvent);
-	WaitForSingleObject(data->audioThread, INFINITE);
-	if (data->client) IAudioClient_Release(data->client);
+	EnterCriticalSection(&data->threadCs);
+	if (data->audioThread) {
+		if (data->stopEvent)
+			SetEvent(data->stopEvent);
+		WaitForSingleObject(data->audioThread, INFINITE);
+		CloseHandle(data->audioThread);
+		data->audioThread = NULL;
+	}
+	LeaveCriticalSection(&data->threadCs);
+	DeleteCriticalSection(&data->threadCs);
+	if (data->stopEvent) {
+		CloseHandle(data->stopEvent);
+		data->stopEvent = NULL;
+	}
+	if (data->client) {
+		IAudioClient_Release(data->client);
+		data->client = NULL;
+	}
+	FAudio_free(data);
 	if (kernelbase)
 	{
 		my_SetThreadDescription = NULL;
@@ -500,8 +683,7 @@ void FAudio_PlatformAddRef()
 {
 	HRESULT hr;
 	EnterCriticalSection(&faudio_cs);
-	if (!device_enumerator)
-	{
+	if (!device_enumerator) {
 		init_hr = CoInitialize(NULL);
 		hr = CoCreateInstance(
 			&CLSID_MMDeviceEnumerator,
@@ -510,19 +692,29 @@ void FAudio_PlatformAddRef()
 			&IID_IMMDeviceEnumerator,
 			(void**)&device_enumerator
 		);
-		FAudio_assert(!FAILED(hr) && "CoCreateInstance failed!");
+		if (FAILED(hr)) {
+			/* CoCreateInstance failed! */
+			device_enumerator = NULL;
+			if (SUCCEEDED(init_hr)) {
+				CoUninitialize();
+				init_hr = -1;
+			}
+		}
 	}
-	else IMMDeviceEnumerator_AddRef(device_enumerator);
+	else
+		IMMDeviceEnumerator_AddRef(device_enumerator);
 	LeaveCriticalSection(&faudio_cs);
 }
 
 void FAudio_PlatformRelease()
 {
 	EnterCriticalSection(&faudio_cs);
-	if (!IMMDeviceEnumerator_Release(device_enumerator))
-	{
+	if (device_enumerator && !IMMDeviceEnumerator_Release(device_enumerator)) {
 		device_enumerator = NULL;
-		if (SUCCEEDED(init_hr)) CoUninitialize();
+		if (SUCCEEDED(init_hr)) {
+			CoUninitialize();
+			init_hr = -1;
+		}
 	}
 	LeaveCriticalSection(&faudio_cs);
 }
@@ -530,7 +722,7 @@ void FAudio_PlatformRelease()
 uint32_t FAudio_PlatformGetDeviceCount(void)
 {
 	IMMDeviceCollection *device_collection;
-	uint32_t count;
+	uint32_t count = 0;
 	HRESULT hr;
 
 	FAudio_PlatformAddRef();
@@ -542,75 +734,122 @@ uint32_t FAudio_PlatformGetDeviceCount(void)
 		&device_collection
 	);
 	if (FAILED(hr)) {
-		FAudio_PlatformRelease();
-		return 0;
+		goto fail_release;
 	}
 
 	hr = IMMDeviceCollection_GetCount(device_collection, &count);
 	if (FAILED(hr)) {
-		IMMDeviceCollection_Release(device_collection);
-		FAudio_PlatformRelease();
-		return 0;
+		count = 0;
+		goto fail_col_release;
 	}
 
+fail_col_release:
 	IMMDeviceCollection_Release(device_collection);
-
+fail_release:
 	FAudio_PlatformRelease();
-
 	return count;
 }
 
 uint32_t FAudio_PlatformGetDeviceDetails(
 	uint32_t index,
+	const uint16_t *deviceId,
 	FAudioDeviceDetails *details
 ) {
 	WAVEFORMATEX *format, *obtained;
 	WAVEFORMATEXTENSIBLE *ext;
-	IAudioClient *client;
-	IMMDevice *device;
-	IPropertyStore* properties;
+	IAudioClient *client = NULL;
+	IMMDevice *device = NULL;
+	IPropertyStore* properties = NULL;
 	PROPVARIANT deviceName;
 	uint32_t count = 0;
 	uint32_t ret = 0;
 	HRESULT hr;
 	WCHAR *str;
 	GUID sub;
+	WCHAR *default_guid = NULL;
 
 	FAudio_memset(details, 0, sizeof(FAudioDeviceDetails));
 
 	FAudio_PlatformAddRef();
 
-	count = FAudio_PlatformGetDeviceCount();
-	if (index >= count)
+	if (deviceId)
 	{
-		FAudio_PlatformRelease();
-		return FAUDIO_E_INVALID_CALL;
+		/* Open the default device and get its GUID. */
+		hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(
+			device_enumerator,
+			eRender,
+			eConsole,
+			&device
+		);
+		if (FAILED(hr))
+		{
+			ret = FAUDIO_E_INVALID_CALL;
+			goto fail_release;
+		}
+		hr = IMMDevice_GetId(device, &default_guid);
+		if (FAILED(hr))
+		{
+			ret = FAUDIO_E_INVALID_CALL;
+			default_guid = NULL;
+			goto fail_device;
+		}
+
+		/* Free the default device. */
+		IMMDevice_Release(device);
+		device = NULL;
 	}
 
-	hr = FAudio_OpenDevice(index, &device);
-	FAudio_assert(!FAILED(hr) && "Failed to get audio endpoint!");
-
-	if (index == 0)
+	hr = FAudio_OpenDevice(index, deviceId, &device);
+	if (FAILED(hr))
 	{
-		details->Role = FAudioGlobalDefaultDevice;
+		/* Failed to get audio endpoint! */
+		ret = FAUDIO_E_INVALID_CALL;
+		goto fail_defguid;
+	}
+
+	if (deviceId)
+	{
+		if (lstrcmpiW(default_guid, deviceId) == 0)
+			details->Role = FAudioGlobalDefaultDevice;
+		else
+			details->Role = FAudioNotDefaultDevice;
+
+		CoTaskMemFree(default_guid);
+		default_guid = NULL;
 	}
 	else
 	{
-		details->Role = FAudioNotDefaultDevice;
+		if (index == 0)
+			details->Role = FAudioGlobalDefaultDevice;
+		else
+			details->Role = FAudioNotDefaultDevice;
 	}
 
 	/* Set the Device Display Name */
 	hr = IMMDevice_OpenPropertyStore(device, STGM_READ, &properties);
-	FAudio_assert(!FAILED(hr) && "Failed to open device property store!");
+	if (FAILED(hr)) {
+		/* Failed to open device property store! */
+		ret = FAUDIO_E_INVALID_CALL;
+		goto fail_propstore;
+	}
 	hr = IPropertyStore_GetValue(properties, (PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &deviceName);
-	FAudio_assert(!FAILED(hr) && "Failed to get audio device friendly name!");
+	if (FAILED(hr)) {
+		/* Failed to get audio device friendly name! */
+		ret = FAUDIO_E_INVALID_CALL;
+		goto fail_propstore;
+	}
 	lstrcpynW((LPWSTR)details->DisplayName, deviceName.pwszVal, ARRAYSIZE(details->DisplayName) - 1);
 	PropVariantClear(&deviceName);
 	IPropertyStore_Release(properties);
+	properties = NULL;
 
 	/* Set the Device ID */
 	hr = IMMDevice_GetId(device, &str);
-	FAudio_assert(!FAILED(hr) && "Failed to get audio endpoint id!");
+	if (FAILED(hr)) {
+		/* Failed to get audio endpoint id! */
+		ret = FAUDIO_E_INVALID_CALL;
+		goto fail_device;
+	}
 	lstrcpynW((LPWSTR)details->DeviceID, str, ARRAYSIZE(details->DeviceID) - 1);
 	CoTaskMemFree(str);
 
@@ -621,10 +860,18 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 		NULL,
 		(void **)&client
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to activate audio client!");
+	if (FAILED(hr)) {
+		/* Failed to activate audio client! */
+		ret = FAUDIO_E_INVALID_CALL;
+		goto fail_device;
+	}
 
 	hr = IAudioClient_GetMixFormat(client, &format);
-	FAudio_assert(!FAILED(hr) && "Failed to get audio client mix format!");
+	if (FAILED(hr)) {
+		/* Failed to get audio client mix format! */
+		ret = FAUDIO_E_INVALID_CALL;
+		goto fail_client;
+	}
 
 	if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
 	{
@@ -638,9 +885,7 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 
 		hr = IAudioClient_IsFormatSupported(client, AUDCLNT_SHAREMODE_SHARED, format, &obtained);
 		if (FAILED(hr))
-		{
 			ext->SubFormat = sub;
-		}
 		else if (obtained)
 		{
 			CoTaskMemFree(format);
@@ -668,18 +913,24 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 		);
 	}
 	else
-	{
 		details->OutputFormat.dwChannelMask = GetMask(format->nChannels);
-	}
 
 	CoTaskMemFree(format);
 
-	IAudioClient_Release(client);
-
-	IMMDevice_Release(device);
-
+fail_client:
+	if (client)
+		IAudioClient_Release(client);
+fail_propstore:
+	if (properties)
+		IPropertyStore_Release(properties);
+fail_device:
+	if (device)
+		IMMDevice_Release(device);
+fail_defguid:
+	if (default_guid)
+		CoTaskMemFree(default_guid);
+fail_release:
 	FAudio_PlatformRelease();
-
 	return ret;
 }
 
@@ -953,19 +1204,21 @@ static void XNA_SongSubmitBuffer(FAudioVoiceCallback *callback, void *pBufferCon
 		NULL,
 		&sample
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to read audio sample!");
+	if (FAILED(hr))
+		/* Failed to read audio sample! */
+		goto fail_exit;
 
 	if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
-	{
 		buffer.Flags = FAUDIO_END_OF_STREAM;
-	}
 	else
 	{
 		hr = IMFSample_ConvertToContiguousBuffer(
 			sample,
 			&media_buffer
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to get sample buffer!");
+		if (FAILED(hr))
+			/* Failed to get sample buffer! */
+			goto fail_release;
 
 		hr = IMFMediaBuffer_Lock(
 			media_buffer,
@@ -973,20 +1226,31 @@ static void XNA_SongSubmitBuffer(FAudioVoiceCallback *callback, void *pBufferCon
 			NULL,
 			&buffer_size
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to lock buffer bytes!");
+		if (FAILED(hr))
+			/* Failed to lock buffer bytes! */
+			goto fail_media_release;
 
 		if (songBufferSize < buffer_size)
 		{
-			songBufferSize = buffer_size;
 			songBuffer = FAudio_realloc(songBuffer, songBufferSize);
-			FAudio_assert(songBuffer != NULL && "Failed to allocate song buffer!");
+			if (!songBuffer) {
+				/* Failed to allocate song buffer! */
+				songBufferSize = 0;
+				goto fail_media_unlock;
+			}
+			songBufferSize = buffer_size;
 		}
 		FAudio_memcpy(songBuffer, buffer_ptr, buffer_size);
 
+fail_media_unlock:
 		hr = IMFMediaBuffer_Unlock(media_buffer);
-		FAudio_assert(!FAILED(hr) && "Failed to unlock buffer bytes!");
+		if (FAILED(hr))
+			/* Failed to unlock buffer bytes! */
+			goto fail_media_release;
 
+fail_media_release:
 		IMFMediaBuffer_Release(media_buffer);
+fail_release:
 		IMFSample_Release(sample);
 	}
 
@@ -1007,12 +1271,13 @@ static void XNA_SongSubmitBuffer(FAudioVoiceCallback *callback, void *pBufferCon
 		);
 	}
 
+fail_exit:
 	LOG_FUNC_EXIT(songAudio);
 }
 
 static void XNA_SongKill()
 {
-	if (songVoice != NULL)
+	if (songVoice)
 	{
 		FAudioSourceVoice_Stop(songVoice, 0, 0);
 		FAudioVoice_DestroyVoice(songVoice);
@@ -1023,19 +1288,22 @@ static void XNA_SongKill()
 		IMFSourceReader_Release(activeSong);
 		activeSong = NULL;
 	}
-	FAudio_free(songBuffer);
-	songBuffer = NULL;
-	songBufferSize = 0;
+	if (songBuffer) {
+		FAudio_free(songBuffer);
+		songBuffer = NULL;
+		songBufferSize = 0;
+	}
 }
 
 /* "Public" API */
 
+static HRESULT mf_init_hr = -1;
 FAUDIOAPI void XNA_SongInit()
 {
-	HRESULT hr;
-
-	hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-	FAudio_assert(!FAILED(hr) && "Failed to initialize Media Foundation!");
+	mf_init_hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+	if (FAILED(mf_init_hr))
+		/* Failed to initialize Media Foundation! */
+		return;
 
 	FAudioCreate(&songAudio, 0, FAUDIO_DEFAULT_PROCESSOR);
 	FAudio_CreateMasteringVoice(
@@ -1052,9 +1320,18 @@ FAUDIOAPI void XNA_SongInit()
 FAUDIOAPI void XNA_SongQuit()
 {
 	XNA_SongKill();
-	FAudioVoice_DestroyVoice(songMaster);
-	FAudio_Release(songAudio);
-        MFShutdown();
+	if (songMaster) {
+		FAudioVoice_DestroyVoice(songMaster);
+		songMaster = NULL;
+	}
+	if (songAudio) {
+		FAudio_Release(songAudio);
+		songAudio = NULL;
+	}
+	if (SUCCEEDED(mf_init_hr)) {
+		MFShutdown();
+		mf_init_hr = -1;
+	}
 }
 
 FAUDIOAPI float XNA_PlaySong(const char *name)
@@ -1074,63 +1351,95 @@ FAUDIOAPI float XNA_PlaySong(const char *name)
 	MultiByteToWideChar(CP_UTF8, 0, name, -1, filename_w, MAX_PATH);
 
 	hr = MFCreateAttributes(&attributes, 1);
-	FAudio_assert(!FAILED(hr) && "Failed to create attributes!");
+	if (FAILED(hr))
+		/* Failed to create attributes! */
+		goto fail_exit;
+
 	hr = MFCreateSourceReaderFromURL(
 		filename_w,
 		attributes,
 		&activeSong
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to create source reader!");
+	if (FAILED(hr))
+		/* Failed to create source reader! */
+		goto fail_attributes;
+
 	IMFAttributes_Release(attributes);
+	attributes = NULL;
 
 	hr = MFCreateMediaType(&media_type);
-	FAudio_assert(!FAILED(hr) && "Failed to create media type!");
+	if (FAILED(hr))
+		/* Failed to create media type! */
+		goto fail_exit;
 	hr = IMFMediaType_SetGUID(
 		media_type,
 		&MF_MT_MAJOR_TYPE,
 		&MFMediaType_Audio
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to set major type!");
+	if (FAILED(hr))
+		/* Failed to set major type! */
+		goto fail_media_type;
+
 	hr = IMFMediaType_SetGUID(
 		media_type,
 		&MF_MT_SUBTYPE,
 		&MFAudioFormat_Float
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to set sub type!");
+	if (FAILED(hr))
+		/* Failed to set sub type! */
+		goto fail_media_type;
+
 	hr = IMFSourceReader_SetCurrentMediaType(
 		activeSong,
 		MF_SOURCE_READER_FIRST_AUDIO_STREAM,
 		NULL,
 		media_type
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to set source media type!");
+	if (FAILED(hr))
+		/* Failed to set source media type! */
+		goto fail_media_type;
+
 	hr = IMFSourceReader_SetStreamSelection(
 		activeSong,
 		MF_SOURCE_READER_FIRST_AUDIO_STREAM,
 		TRUE
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to select source stream!");
+	if (FAILED(hr))
+		/* Failed to select source stream! */
+		goto fail_media_type;
+
 	IMFMediaType_Release(media_type);
+	media_type = NULL;
 
 	hr = IMFSourceReader_GetCurrentMediaType(
 		activeSong,
 		MF_SOURCE_READER_FIRST_AUDIO_STREAM,
 		&media_type
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to get current media type!");
+	if (FAILED(hr))
+		/* Failed to get current media type! */
+		goto fail_exit;
+
 	hr = IMFMediaType_GetUINT32(
 		media_type,
 		&MF_MT_AUDIO_NUM_CHANNELS,
 		&channels
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to get channel count!");
+	if (FAILED(hr))
+		/* Failed to get channel count! */
+		goto fail_media_type;
+
 	hr = IMFMediaType_GetUINT32(
 		media_type,
 		&MF_MT_AUDIO_SAMPLES_PER_SECOND,
 		&samplerate
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to get sample rate!");
+	if (FAILED(hr))
+		/* Failed to get sample rate! */
+		goto fail_media_type;
+
 	IMFMediaType_Release(media_type);
+	media_type = NULL;
 
 	hr = IMFSourceReader_GetPresentationAttribute(
 		activeSong,
@@ -1138,10 +1447,17 @@ FAUDIOAPI float XNA_PlaySong(const char *name)
 		&MF_PD_DURATION,
 		&var
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to get song duration!");
-        hr = PropVariantToInt64(&var, &duration);
-	FAudio_assert(!FAILED(hr) && "Failed to get song duration!");
-        PropVariantClear(&var);
+	if (FAILED(hr))
+		/* Failed to get song duration! */
+		goto fail_exit;
+
+	hr = PropVariantToInt64(&var, &duration);
+	if (FAILED(hr)) {
+		/* Failed to get song duration! */
+		PropVariantClear(&var);
+		goto fail_exit;
+	}
+    PropVariantClear(&var);
 
 	activeSongFormat.wFormatTag = FAUDIO_FORMAT_IEEE_FLOAT;
 	activeSongFormat.nChannels = channels;
@@ -1164,11 +1480,21 @@ FAUDIOAPI float XNA_PlaySong(const char *name)
 		NULL,
 		NULL
 	);
-	FAudioVoice_SetVolume(songVoice, songVolume, 0);
-	XNA_SongSubmitBuffer(NULL, NULL);
+	if (songVoice) {
+		FAudioVoice_SetVolume(songVoice, songVolume, 0);
+		XNA_SongSubmitBuffer(NULL, NULL);
 
-	/* Finally. */
-	FAudioSourceVoice_Start(songVoice, 0, 0);
+		/* Finally. */
+		FAudioSourceVoice_Start(songVoice, 0, 0);
+	}
+
+fail_media_type:
+	if (media_type)
+		IMFMediaType_Release(media_type);
+fail_attributes:
+	if (attributes)
+		IMFAttributes_Release(attributes);
+fail_exit:
 	LOG_FUNC_EXIT(songAudio);
 	return duration / 10000000.;
 }
@@ -1254,7 +1580,7 @@ static HRESULT FAudio_WMAMF_ProcessInput(
 	FAudioBuffer *buffer
 ) {
 	struct FAudioWMADEC *impl = voice->src.wmadec;
-	IMFMediaBuffer *media_buffer;
+	IMFMediaBuffer *media_buffer = NULL;
 	IMFSample *sample;
 	DWORD copy_size;
 	BYTE *copy_buf;
@@ -1265,28 +1591,44 @@ static HRESULT FAudio_WMAMF_ProcessInput(
 	LOG_INFO(voice->audio, "pushing %lx bytes at %Ix", copy_size, impl->input_pos);
 
 	hr = MFCreateSample(&sample);
-	FAudio_assert(!FAILED(hr) && "Failed to create sample!");
+	if (FAILED(hr))
+		/* Failed to create sample! */
+		goto fail;
 	hr = MFCreateMemoryBuffer(copy_size, &media_buffer);
-	FAudio_assert(!FAILED(hr) && "Failed to create buffer!");
+	if (FAILED(hr))
+		/* Failed to create buffer! */
+		goto fail_sample;
 	hr = IMFMediaBuffer_SetCurrentLength(media_buffer, copy_size);
-	FAudio_assert(!FAILED(hr) && "Failed to set buffer length!");
+	if (FAILED(hr))
+		/* Failed to set buffer length! */
+		goto fail_mem;
 	hr = IMFMediaBuffer_Lock(
 		media_buffer,
 		&copy_buf,
 		NULL,
 		&copy_size
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to lock buffer bytes!");
+	if (FAILED(hr))
+		/* Failed to lock buffer bytes! */
+		goto fail_mem;
 	FAudio_memcpy(copy_buf, buffer->pAudioData + impl->input_pos, copy_size);
 	hr = IMFMediaBuffer_Unlock(media_buffer);
-	FAudio_assert(!FAILED(hr) && "Failed to unlock buffer bytes!");
+	if (FAILED(hr))
+		/* Failed to unlock buffer bytes! */
+		goto fail_mem;
 
 	hr = IMFSample_AddBuffer(sample, media_buffer);
-	FAudio_assert(!FAILED(hr) && "Failed to buffer to sample!");
+	if (FAILED(hr))
+		/* Failed to buffer to sample! */
+		goto fail_mem;
+
 	IMFMediaBuffer_Release(media_buffer);
+	media_buffer = NULL;
 
 	hr = IMFTransform_ProcessInput(impl->decoder, 0, sample, 0);
 	IMFSample_Release(sample);
+	sample = NULL;
+
 	if (hr == MF_E_NOTACCEPTING) return S_OK;
 	if (FAILED(hr))
 	{
@@ -1295,7 +1637,16 @@ static HRESULT FAudio_WMAMF_ProcessInput(
 	}
 
 	impl->input_pos += copy_size;
-	return S_OK;
+	hr = S_OK;
+
+fail_mem:
+	if (media_buffer)
+		IMFMediaBuffer_Release(media_buffer);
+fail_sample:
+	if (sample)
+		IMFSample_Release(sample);
+fail:
+	return hr;
 };
 
 static HRESULT FAudio_WMAMF_ProcessOutput(
@@ -1304,7 +1655,7 @@ static HRESULT FAudio_WMAMF_ProcessOutput(
 ) {
 	struct FAudioWMADEC *impl = voice->src.wmadec;
 	MFT_OUTPUT_DATA_BUFFER output;
-	IMFMediaBuffer *media_buffer;
+	IMFMediaBuffer *media_buffer = NULL;
 	DWORD status, copy_size;
 	BYTE *copy_buf;
 	HRESULT hr;
@@ -1327,14 +1678,18 @@ static HRESULT FAudio_WMAMF_ProcessOutput(
 			output.pSample,
 			&media_buffer
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to get sample buffer!");
+		if (FAILED(hr))
+			/* Failed to get sample buffer! */
+			goto fail_mem;
 		hr = IMFMediaBuffer_Lock(
 			media_buffer,
 			&copy_buf,
 			NULL,
 			&copy_size
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to lock buffer bytes!");
+		if (FAILED(hr))
+			/* Failed to lock buffer bytes! */
+			goto fail_mem;
 		if (impl->output_pos + copy_size > impl->output_size)
 		{
 			impl->output_size = max(
@@ -1345,19 +1700,30 @@ static HRESULT FAudio_WMAMF_ProcessOutput(
 				impl->output_buf,
 				impl->output_size
 			);
-			FAudio_assert(impl->output_buf && "Failed to resize output buffer!");
+			if (!impl->output_buf) {
+				/* Failed to resize output buffer! */
+				impl->output_size = 0;
+				goto fail_mem;
+			}
 		}
 		FAudio_memcpy(impl->output_buf + impl->output_pos, copy_buf, copy_size);
 		impl->output_pos += copy_size;
 		LOG_INFO(voice->audio, "pulled %lx bytes at %Ix", copy_size, impl->output_pos);
 		hr = IMFMediaBuffer_Unlock(media_buffer);
-		FAudio_assert(!FAILED(hr) && "Failed to unlock buffer bytes!");
+		if (FAILED(hr))
+			/* Failed to unlock buffer bytes! */
+			goto fail_mem;
 
 		IMFMediaBuffer_Release(media_buffer);
-		if (!impl->output_sample) IMFSample_Release(output.pSample);
+		media_buffer = NULL;
+		if (!impl->output_sample)
+			IMFSample_Release(output.pSample);
 	}
 
-	return S_OK;
+fail_mem:
+	if (media_buffer)
+		IMFMediaBuffer_Release(media_buffer);
+	return hr;
 };
 
 static void FAudio_INTERNAL_DecodeWMAMF(
@@ -1403,7 +1769,11 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 			impl->output_buf,
 			impl->output_size
 		);
-		FAudio_assert(impl->output_buf && "Failed to allocate output buffer!");
+		if (!impl->output_buf) {
+			/* Failed to allocate output buffer! */
+			impl->output_size = 0;
+			goto fail;
+		}
 
 		LOG_INFO(voice->audio, "sending BOS to %p", impl->decoder);
 		hr = IMFTransform_ProcessMessage(
@@ -1411,7 +1781,10 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 			MFT_MESSAGE_NOTIFY_START_OF_STREAM,
 			0
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to notify decoder stream start!");
+		if (FAILED(hr)) {
+			/* Failed to notify decoder stream start! */
+			goto fail;
+		}
 		FAudio_WMAMF_ProcessInput(voice, buffer);
 	}
 
@@ -1421,11 +1794,11 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 	while (impl->output_pos < samples_pos + samples_size)
 	{
 		hr = FAudio_WMAMF_ProcessOutput(voice, buffer);
-		if (FAILED(hr)) goto error;
+		if (FAILED(hr)) goto fail;
 		if (hr == S_OK) continue;
 
 		hr  = FAudio_WMAMF_ProcessInput(voice, buffer);
-		if (FAILED(hr)) goto error;
+		if (FAILED(hr)) goto fail;
 		if (hr == S_OK) continue;
 
 		if (!impl->input_size) break;
@@ -1436,7 +1809,9 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 			MFT_MESSAGE_NOTIFY_END_OF_STREAM,
 			0
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to send EOS!");
+		if (FAILED(hr))
+			/* Failed to send EOS! */
+			goto fail;
 		impl->input_size = 0;
 	}
 
@@ -1458,7 +1833,7 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 	LOG_FUNC_EXIT(voice->audio)
 	return;
 
-error:
+fail:
 	FAudio_zero(decodeCache, samples * voice->src.format->nChannels * sizeof(float));
 	LOG_FUNC_EXIT(voice->audio)
 }
@@ -1470,9 +1845,9 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 	const FAudioWaveFormatExtensible *wfx = (FAudioWaveFormatExtensible *)voice->src.format;
 	struct FAudioWMADEC *impl;
 	MFT_OUTPUT_STREAM_INFO info = {0};
-	IMFMediaBuffer *media_buffer;
-	IMFMediaType *media_type;
-	IMFTransform *decoder;
+	IMFMediaBuffer *media_buffer = NULL;
+	IMFMediaType *media_type = NULL;
+	IMFTransform *decoder = NULL;
 	HRESULT hr;
 	UINT32 i, value;
 	GUID guid;
@@ -1491,18 +1866,22 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 	);
 	if (FAILED(hr))
 	{
-		voice->audio->pFree(impl->output_buf);
+		voice->audio->pFree(impl);
 		return -2;
 	}
 
 	hr = MFCreateMediaType(&media_type);
-	FAudio_assert(!FAILED(hr) && "Failed create media type!");
+	if (FAILED(hr))
+		/* Failed to create media type! */
+		goto fail_dec;
 	hr = IMFMediaType_SetGUID(
 		media_type,
 		&MF_MT_MAJOR_TYPE,
 		&MFMediaType_Audio
 	);
-	FAudio_assert(!FAILED(hr) && "Failed set media major type!");
+	if (FAILED(hr))
+		/* Failed to set media major type! */
+		goto fail_dec_type;
 
 	switch (type)
 	{
@@ -1513,46 +1892,58 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 			(void *)fake_codec_data,
 			sizeof(fake_codec_data)
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set codec private data!");
+		if (FAILED(hr))
+			/* Failed set codec private data! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetGUID(
 			media_type,
 			&MF_MT_SUBTYPE,
 			&MFAudioFormat_WMAudioV8
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set media sub type!");
+		if (FAILED(hr))
+			/* Failed set media sub type! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetUINT32(
 			media_type,
 			&MF_MT_AUDIO_BLOCK_ALIGNMENT,
 			wfx->Format.nBlockAlign
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set input block align!");
+		if (FAILED(hr))
+			/* Failed set input block align! */
+			goto fail_dec_type;
 		break;
 	case FAUDIO_FORMAT_WMAUDIO3:
-                *(uint16_t *)fake_codec_data_wma3  = voice->src.format->wBitsPerSample;
-                for (i = 0; i < voice->src.format->nChannels; i++)
-                {
-                    fake_codec_data_wma3[2] <<= 1;
-                    fake_codec_data_wma3[2] |= 1;
-                }
+		*(uint16_t *)fake_codec_data_wma3  = voice->src.format->wBitsPerSample;
+		for (i = 0; i < voice->src.format->nChannels; i++)
+		{
+			fake_codec_data_wma3[2] <<= 1;
+			fake_codec_data_wma3[2] |= 1;
+		}
 		hr = IMFMediaType_SetBlob(
 			media_type,
 			&MF_MT_USER_DATA,
 			(void *)fake_codec_data_wma3,
 			sizeof(fake_codec_data_wma3)
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set codec private data!");
+		if (FAILED(hr))
+			/* Failed set codec private data! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetGUID(
 			media_type,
 			&MF_MT_SUBTYPE,
 			&MFAudioFormat_WMAudioV9
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set media sub type!");
+		if (FAILED(hr))
+			/* Failed set media sub type! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetUINT32(
 			media_type,
 			&MF_MT_AUDIO_BLOCK_ALIGNMENT,
 			wfx->Format.nBlockAlign
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set input block align!");
+		if (FAILED(hr))
+			/* Failed set input block align! */
+			goto fail_dec_type;
 		break;
 	case FAUDIO_FORMAT_WMAUDIO_LOSSLESS:
 		hr = IMFMediaType_SetBlob(
@@ -1561,19 +1952,25 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 			(void *)&wfx->Samples,
 			wfx->Format.cbSize
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set codec private data!");
+		if (FAILED(hr))
+			/* Failed set codec private data! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetGUID(
 			media_type,
 			&MF_MT_SUBTYPE,
 			&MFAudioFormat_WMAudio_Lossless
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set media sub type!");
+		if (FAILED(hr))
+			/* Failed set media sub type! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetUINT32(
 			media_type,
 			&MF_MT_AUDIO_BLOCK_ALIGNMENT,
 			wfx->Format.nBlockAlign
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set input block align!");
+		if (FAILED(hr))
+			/* Failed set input block align! */
+			goto fail_dec_type;
 		break;
 	case FAUDIO_FORMAT_XMAUDIO2:
 	{
@@ -1584,24 +1981,30 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 			(void *)&wfx->Samples,
 			wfx->Format.cbSize
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set codec private data!");
+		if (FAILED(hr))
+			/* Failed set codec private data! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetGUID(
 			media_type,
 			&MF_MT_SUBTYPE,
 			&MFAudioFormat_XMAudio2
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set media sub type!");
+		if (FAILED(hr))
+			/* Failed set media sub type! */
+			goto fail_dec_type;
 		hr = IMFMediaType_SetUINT32(
 			media_type,
 			&MF_MT_AUDIO_BLOCK_ALIGNMENT,
 			xwf->dwBytesPerBlock
 		);
-		FAudio_assert(!FAILED(hr) && "Failed set input block align!");
+		if (FAILED(hr))
+			/* Failed set input block align! */
+			goto fail_dec_type;
 		break;
 	}
 	default:
-		FAudio_assert(0 && "Unsupported type!");
-		break;
+		/* Unsupported type! */
+		goto fail_dec_type;
 	}
 
 	hr = IMFMediaType_SetUINT32(
@@ -1609,25 +2012,33 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 		&MF_MT_AUDIO_BITS_PER_SAMPLE,
 		wfx->Format.wBitsPerSample
 	);
-	FAudio_assert(!FAILED(hr) && "Failed set input bits per sample!");
+	if (FAILED(hr))
+		/* Failed set input bits per sample! */
+		goto fail_dec_type;
 	hr = IMFMediaType_SetUINT32(
 		media_type,
 		&MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
 		wfx->Format.nAvgBytesPerSec
 	);
-	FAudio_assert(!FAILED(hr) && "Failed set input bytes per sample!");
+	if (FAILED(hr))
+		/* Failed set input bytes per sample! */
+		goto fail_dec_type;
 	hr = IMFMediaType_SetUINT32(
 		media_type,
 		&MF_MT_AUDIO_NUM_CHANNELS,
 		wfx->Format.nChannels
 	);
-	FAudio_assert(!FAILED(hr) && "Failed set input channel count!");
+	if (FAILED(hr))
+		/* Failed set input channel count! */
+		goto fail_dec_type;
 	hr = IMFMediaType_SetUINT32(
 		media_type,
 		&MF_MT_AUDIO_SAMPLES_PER_SECOND,
 		wfx->Format.nSamplesPerSec
 	);
-	FAudio_assert(!FAILED(hr) && "Failed set input sample rate!");
+	if (FAILED(hr))
+		/* Failed set input sample rate! */
+		goto fail_dec_type;
 
 	hr = IMFTransform_SetInputType(
 		decoder,
@@ -1635,8 +2046,11 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 		media_type,
 		0
 	);
-	FAudio_assert(!FAILED(hr) && "Failed set decoder input type!");
+	if (FAILED(hr))
+		/* Failed set decoder input type! */
+		goto fail_dec_type;
 	IMFMediaType_Release(media_type);
+	media_type = NULL;
 
 	i = 0;
 	while (SUCCEEDED(hr))
@@ -1647,14 +2061,18 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 			i++,
 			&media_type
 		);
-		FAudio_assert(!FAILED(hr) && "Failed get output media type!");
+		if (FAILED(hr))
+			/* Failed get output media type! */
+			goto fail_dec_type;
 
 		hr = IMFMediaType_GetGUID(
 			media_type,
 			&MF_MT_MAJOR_TYPE,
 			&guid
 		);
-		FAudio_assert(!FAILED(hr) && "Failed get media major type!");
+		if (FAILED(hr))
+			/* Failed get media major type! */
+			goto fail_dec_type;
 		if (!IsEqualGUID(&MFMediaType_Audio, &guid)) goto next;
 
 		hr = IMFMediaType_GetGUID(
@@ -1662,7 +2080,9 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 			&MF_MT_SUBTYPE,
 			&guid
 		);
-		FAudio_assert(!FAILED(hr) && "Failed get media major type!");
+		if (FAILED(hr))
+			/* Failed get media sub type! */
+			goto fail_dec_type;
 		if (!IsEqualGUID(&MFAudioFormat_Float, &guid)) goto next;
 
 		hr = IMFMediaType_GetUINT32(
@@ -1679,7 +2099,9 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 				value
 			);
 		}
-		FAudio_assert(!FAILED(hr) && "Failed get bits per sample!");
+		if (FAILED(hr))
+			/* Failed get bits per sample! */
+			goto fail_dec_type;
 		if (value != 32) goto next;
 
 		hr = IMFMediaType_GetUINT32(
@@ -1696,7 +2118,9 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 				value
 			);
 		}
-		FAudio_assert(!FAILED(hr) && "Failed get channel count!");
+		if (FAILED(hr))
+			/* Failed get channel count! */
+			goto fail_dec_type;
 		if (value != wfx->Format.nChannels) goto next;
 
 		hr = IMFMediaType_GetUINT32(
@@ -1713,7 +2137,9 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 				value
 			);
 		}
-		FAudio_assert(!FAILED(hr) && "Failed get sample rate!");
+		if (FAILED(hr))
+			/* Failed get sample rate! */
+			goto fail_dec_type;
 		if (value != wfx->Format.nSamplesPerSec) goto next;
 
 		hr = IMFMediaType_GetUINT32(
@@ -1730,30 +2156,50 @@ uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 				value
 			);
 		}
-		FAudio_assert(!FAILED(hr) && "Failed get block align!");
+		if (FAILED(hr))
+			/* Failed get block align! */
+			goto fail_dec_type;
+
 		if (value == wfx->Format.nChannels * sizeof(float)) break;
 
 next:
 		IMFMediaType_Release(media_type);
+		media_type = NULL;
 	}
-	FAudio_assert(!FAILED(hr) && "Failed to find output media type!");
+
+	if (FAILED(hr))
+		/* Failed to find output media type! */
+		goto fail_dec_type;
+
 	hr = IMFTransform_SetOutputType(decoder, 0, media_type, 0);
-	FAudio_assert(!FAILED(hr) && "Failed set decoder output type!");
+	if (FAILED(hr))
+		/* Failed to set decoder output type! */
+		goto fail_dec_type;
 	IMFMediaType_Release(media_type);
+	media_type = NULL;
 
 	hr = IMFTransform_GetOutputStreamInfo(decoder, 0, &info);
-	FAudio_assert(!FAILED(hr) && "Failed to get output stream info!");
+	if (FAILED(hr))
+		/* Failed to get output stream info! */
+		goto fail_dec_type;
 
 	impl->decoder = decoder;
 	if (!(info.dwFlags & MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))
 	{
 		hr = MFCreateSample(&impl->output_sample);
-		FAudio_assert(!FAILED(hr) && "Failed to create sample!");
+		if (FAILED(hr))
+			/* Failed to create sample! */
+			goto fail_dec;
 		hr = MFCreateMemoryBuffer(info.cbSize, &media_buffer);
-		FAudio_assert(!FAILED(hr) && "Failed to create buffer!");
+		if (FAILED(hr))
+			/* Failed to create buffer! */
+			goto fail_dec_samp;
 		hr = IMFSample_AddBuffer(impl->output_sample, media_buffer);
-		FAudio_assert(!FAILED(hr) && "Failed to buffer to sample!");
+		if (FAILED(hr))
+			/* Failed to buffer to sample! */
+			goto fail_dec_mem;
 		IMFMediaBuffer_Release(media_buffer);
+		media_buffer = NULL;
 	}
 
 	hr = IMFTransform_ProcessMessage(
@@ -1761,13 +2207,30 @@ next:
 		MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
 		0
 	);
-	FAudio_assert(!FAILED(hr) && "Failed to start decoder stream!");
+	if (FAILED(hr))
+		/* Failed to start decoder stream! */
+		goto fail_dec_samp;
 
 	voice->src.wmadec = impl;
 	voice->src.decode = FAudio_INTERNAL_DecodeWMAMF;
 
 	LOG_FUNC_EXIT(voice->audio);
 	return 0;
+
+fail_dec_mem:
+	if (media_buffer)
+		IMFMediaBuffer_Release(media_buffer);
+fail_dec_type:
+	if (media_type)
+		IMFMediaType_Release(media_type);
+fail_dec_samp:
+	if (impl->output_sample)
+		IMFSample_Release(impl->output_sample);
+fail_dec:
+	if (decoder)
+		IMFTransform_Release(decoder);
+	voice->audio->pFree(impl);
+	return -1;
 }
 
 void FAudio_WMADEC_free(FAudioSourceVoice *voice)
@@ -1787,7 +2250,9 @@ void FAudio_WMADEC_free(FAudioSourceVoice *voice)
 			MFT_MESSAGE_NOTIFY_END_OF_STREAM,
 			0
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to send EOS!");
+		if (FAILED(hr))
+			/* Failed to send EOS! */
+		{}
 		impl->input_size = 0;
 	}
 	if (impl->output_pos)
@@ -1798,7 +2263,9 @@ void FAudio_WMADEC_free(FAudioSourceVoice *voice)
 			MFT_MESSAGE_COMMAND_DRAIN,
 			0
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to send DRAIN!");
+		if (FAILED(hr))
+			/* Failed to send DRAIN! */
+		{}
 		impl->output_pos = 0;
 	}
 
@@ -1829,7 +2296,9 @@ void FAudio_WMADEC_end_buffer(FAudioSourceVoice *voice)
 			MFT_MESSAGE_NOTIFY_END_OF_STREAM,
 			0
 		);
-		FAudio_assert(!FAILED(hr) && "Failed to send EOS!");
+		if (FAILED(hr))
+			/* Failed to send EOS! */
+		{}
 		impl->input_size = 0;
 	}
 	impl->output_pos = 0;
