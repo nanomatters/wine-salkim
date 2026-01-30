@@ -726,8 +726,6 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
     int client_x, client_y, x, y;
     int client_width, client_height, width, height;
 
-    client->rect = *client_rect;
-
     /* The offset of the client area origin relatively to the window origin. */
     client_x = client_rect->left + window->client_rect.left - window->rect.left;
     client_y = client_rect->top + window->client_rect.top - window->rect.top;
