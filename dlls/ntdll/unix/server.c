@@ -821,6 +821,21 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
 }
 
 
+/* helper function to perform a server-side wait on an internal handle without
+ * using the fast synchronization path */
+unsigned int server_wait_for_object( HANDLE handle, BOOL alertable, const LARGE_INTEGER *timeout )
+{
+    union select_op select_op;
+    UINT flags = SELECT_INTERRUPTIBLE;
+
+    if (alertable) flags |= SELECT_ALERTABLE;
+
+    select_op.wait.op = SELECT_WAIT;
+    select_op.wait.handles[0] = wine_server_obj_handle( handle );
+    return server_wait( &select_op, offsetof( union select_op, wait.handles[1] ), flags, timeout );
+}
+
+
 /***********************************************************************
  *              NtContinue  (NTDLL.@)
  */
@@ -897,7 +912,10 @@ unsigned int server_queue_process_apc( HANDLE process, const union apc_call *cal
         }
         else
         {
-            NtWaitForSingleObject( handle, FALSE, NULL );
+            if (!(do_fsync() || do_esync()))
+                server_wait_for_object( handle, FALSE, NULL );
+            else
+                NtWaitForSingleObject( handle, FALSE, NULL );
 
             SERVER_START_REQ( get_apc_result )
             {
@@ -1030,7 +1048,7 @@ union fd_cache_entry
 C_ASSERT( sizeof(union fd_cache_entry) == sizeof(LONG64) );
 
 #define FD_CACHE_BLOCK_SIZE  (65536 / sizeof(union fd_cache_entry))
-#define FD_CACHE_ENTRIES     128
+#define FD_CACHE_ENTRIES     256
 
 static union fd_cache_entry *fd_cache[FD_CACHE_ENTRIES];
 static union fd_cache_entry fd_cache_initial_block[FD_CACHE_BLOCK_SIZE];
@@ -1856,12 +1874,17 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         return result.dup_handle.status;
     }
 
+    /* hold fd_cache_mutex to prevent the fd from being added again between the
+     * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
 
     /* always remove the cached fd; if the server request fails we'll just
      * retrieve it again */
     if (options & DUPLICATE_CLOSE_SOURCE)
+    {
         fd = remove_fd_from_cache( source );
+        close_inproc_sync_obj( source );
+    }
 
     SERVER_START_REQ( dup_handle )
     {
@@ -1927,6 +1950,8 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 
+    /* hold fd_cache_mutex to prevent the fd from being added again between the
+     * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
 
     /* always remove the cached fd; if the server request fails we'll just
@@ -1938,6 +1963,8 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
 
     if (do_esync())
         esync_close( handle );
+
+    close_inproc_sync_obj( handle );
 
     SERVER_START_REQ( close_handle )
     {
