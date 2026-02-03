@@ -18,6 +18,7 @@
  */
 
 #include <stdarg.h>
+#include <stdint.h>
 
 #define COBJMACROS
 #include "windef.h"
@@ -2402,6 +2403,37 @@ static HRESULT set_default_video_attributes(struct source_reader *reader, IMFMed
     return hr;
 }
 
+static HRESULT apply_pixel_aspect_ratio(IMFMediaType *dst_type, IMFMediaType *src_type)
+{
+    UINT64 frame_size, aspect_ratio, width, height;
+    UINT32 numerator, denominator;
+
+    if (SUCCEEDED(IMFMediaType_GetUINT64(dst_type, &MF_MT_FRAME_SIZE, &frame_size))
+            || FAILED(IMFMediaType_GetUINT64(src_type, &MF_MT_FRAME_SIZE, &frame_size))
+            || FAILED(IMFMediaType_GetUINT64(src_type, &MF_MT_PIXEL_ASPECT_RATIO, &aspect_ratio)))
+        return S_OK;
+
+    width = frame_size >> 32;
+    height = (UINT32)frame_size;
+    numerator = aspect_ratio >> 32;
+    denominator = (UINT32)aspect_ratio;
+    if (!width || !height || !numerator || !denominator)
+        return MF_E_INVALIDMEDIATYPE;
+
+    /* Request square pixels by expanding the frame, unless the caller specified its size. */
+    if (numerator < denominator)
+        height = height * denominator / numerator;
+    else
+        width = width * numerator / denominator;
+
+    width = (width + 1) & ~(UINT64)1;
+    height = (height + 1) & ~(UINT64)1;
+    if (width > UINT32_MAX || height > UINT32_MAX)
+        return MF_E_INVALIDMEDIATYPE;
+
+    return IMFMediaType_SetUINT64(dst_type, &MF_MT_FRAME_SIZE, (width << 32) | height);
+}
+
 static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL decoder, BOOL allow_processor,
         IMFMediaType *input_type, IMFMediaType *output_type, struct transform_entry **out)
 {
@@ -2520,6 +2552,8 @@ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL
 
                 source_reader_allow_video_processor(reader, &enable_advanced);
 
+                if (SUCCEEDED(hr) && enable_advanced)
+                    hr = apply_pixel_aspect_ratio(output_type_copy, media_type);
                 if (SUCCEEDED(hr))
                     hr = update_media_type_from_upstream(output_type_copy, media_type, enable_advanced);
                 IMFMediaType_Release(media_type);
@@ -2531,6 +2565,7 @@ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL
                     struct transform_entry *converter;
 
                     if (SUCCEEDED(hr = IMFTransform_SetOutputType(transform, 0, media_type, 0))
+                            && (!enable_advanced || SUCCEEDED(hr = apply_pixel_aspect_ratio(output_type_copy, media_type)))
                             && SUCCEEDED(hr = update_media_type_from_upstream(output_type_copy, media_type, enable_advanced))
                             && (enable_advanced || SUCCEEDED(hr = set_default_video_attributes(reader, output_type_copy)))
                             && SUCCEEDED(hr = source_reader_create_transform(reader, FALSE, FALSE, media_type, output_type_copy, &converter)))
