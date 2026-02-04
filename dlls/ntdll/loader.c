@@ -2343,7 +2343,6 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     {
         struct steamclient_setup_trampolines_params params = {.src_mod = *module, .tgt_mod = lsteamclient};
         WINE_UNIX_CALL( unix_steamclient_setup_trampolines, &params );
-        NtFlushInstructionCache( NtCurrentProcess(), *module, map_size );
         if (is_steamclient32)
         {
             OBJECT_ATTRIBUTES attr;
