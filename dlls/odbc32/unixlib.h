@@ -205,6 +205,7 @@ struct environment
     UINT32 sources_idx;
     void  *sources_key;
     BOOL   sources_system;
+    UINT32 driver_ver;
 };
 
 struct connection
