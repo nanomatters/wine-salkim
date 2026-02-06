@@ -404,6 +404,7 @@ SOURCES = \
 	inseng.idl \
 	inspectable.idl \
 	interactioncontext.h \
+	intsafe.h \
 	intshcut.h \
 	ioringapi.h \
 	ip2string.h \
