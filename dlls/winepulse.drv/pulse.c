@@ -2320,6 +2320,8 @@ static NTSTATUS pulse_is_format_supported(void *args)
                                              AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
         else if (params->result == S_FALSE)
             params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
+
+        WARN("Exclusive mode requested but winepulse.drv does not support exclusive mode.\n");
     }
 
     return STATUS_SUCCESS;
