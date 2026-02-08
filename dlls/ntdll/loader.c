@@ -1154,7 +1154,6 @@ static BOOL import_dll( HMODULE module, const IMAGE_IMPORT_DESCRIPTOR *descr, LP
     {
         TRACE("%s -> ntdll.\n", name);
         name = "ntdll.dll";
-        len = strlen(name);
     }
 
     status = build_import_name( buffer, name, len );
