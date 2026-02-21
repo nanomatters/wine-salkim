@@ -1566,7 +1566,9 @@ static struct file *open_include_file( const struct makefile *make, struct incl_
 
     /* check for generated files in global includes */
     if ((file = open_global_generated_file( make, pFile, ".h", ".idl" ))) return file;
-    if ((file = open_global_generated_file( make, pFile, ".h", ".h.in" ))) return file;
+    if ((strcmp( pFile->name, "config.h" ) || !pFile->use_msvcrt ||
+         !pFile->included_by || !pFile->included_by->is_external) &&
+        (file = open_global_generated_file( make, pFile, ".h", ".h.in" ))) return file;
     if (strendswith( pFile->name, "tmpl.h" ) &&
         (file = open_global_generated_file( make, pFile, ".h", ".x" ))) return file;
 
