@@ -192,6 +192,8 @@ static LRESULT WID_Close(HWAVEIN hwave);
 static MMRESULT WINMM_BeginPlaying(WINMM_Device *device);
 static void WOD_PushData(WINMM_Device *device);
 
+static IMMNotificationClient g_notif;
+
 void WINMM_DeleteWaveform(void)
 {
     UINT i, j;
@@ -233,6 +235,11 @@ void WINMM_DeleteWaveform(void)
         CoTaskMemFree(mmdevice->dev_id);
         mmdevice->lock.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection(&mmdevice->lock);
+    }
+
+    if (g_devenum){
+        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(g_devenum, &g_notif);
+        IMMDeviceEnumerator_Release(g_devenum);
     }
 
     free(g_out_mmdevices);
@@ -834,21 +841,20 @@ static IMMNotificationClient g_notif = { &g_notif_vtbl };
 static BOOL WINAPI WINMM_InitMMDevices(INIT_ONCE *once, void *param, void **context)
 {
     HRESULT hr, init_hr;
-    IMMDeviceEnumerator *devenum = NULL;
 
     init_hr = CoInitialize(NULL);
 
     hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL,
-            CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator, (void**)&devenum);
+            CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator, (void**)&g_devenum);
     if(FAILED(hr))
         goto exit;
 
-    hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(devenum, &g_notif);
+    hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(g_devenum, &g_notif);
     if(FAILED(hr))
-        WARN("RegisterEndpointNotificationCallback failed: %08lx\n", hr);
+        goto exit;
 
     hr = WINMM_EnumDevices(&g_out_mmdevices, &g_out_map, &g_outmmdevices_count,
-            eRender, devenum);
+            eRender, g_devenum);
     if(FAILED(hr)){
         g_outmmdevices_count = 0;
         g_inmmdevices_count = 0;
@@ -856,15 +862,18 @@ static BOOL WINAPI WINMM_InitMMDevices(INIT_ONCE *once, void *param, void **cont
     }
 
     hr = WINMM_EnumDevices(&g_in_mmdevices, &g_in_map, &g_inmmdevices_count,
-            eCapture, devenum);
+            eCapture, g_devenum);
     if(FAILED(hr)){
         g_inmmdevices_count = 0;
         goto exit;
     }
 
 exit:
-    if(devenum)
-        IMMDeviceEnumerator_Release(devenum);
+    if(FAILED(hr) && g_devenum){
+        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(g_devenum, &g_notif);
+        IMMDeviceEnumerator_Release(g_devenum);
+        g_devenum = NULL;
+    }
     if(SUCCEEDED(init_hr))
         CoUninitialize();
 
@@ -2419,8 +2428,6 @@ static BOOL WINMM_DevicesThreadDone(void)
 
     DestroyWindow(g_devices_hwnd);
     g_devices_hwnd = NULL;
-    IMMDeviceEnumerator_Release(g_devenum);
-    g_devenum = NULL;
     CoUninitialize();
 
     LeaveCriticalSection(&g_devthread_lock);
@@ -2440,14 +2447,6 @@ static DWORD WINAPI WINMM_DevicesThreadProc(void *arg)
     }
 
     if(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL)){
-        CoUninitialize();
-        FreeLibraryAndExitThread(g_devthread_module, 1);
-    }
-
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL,
-            CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator, (void**)&g_devenum);
-    if(FAILED(hr)){
-        WARN("CoCreateInstance failed: %08lx\n", hr);
         CoUninitialize();
         FreeLibraryAndExitThread(g_devthread_module, 1);
     }
