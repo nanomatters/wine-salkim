@@ -70,6 +70,7 @@ MAKE_FUNCPTR(gnutls_pkcs12_deinit);
 MAKE_FUNCPTR(gnutls_pkcs12_get_bag);
 MAKE_FUNCPTR(gnutls_pkcs12_import);
 MAKE_FUNCPTR(gnutls_pkcs12_init);
+MAKE_FUNCPTR(gnutls_pkcs12_verify_mac);
 MAKE_FUNCPTR(gnutls_x509_crt_deinit);
 MAKE_FUNCPTR(gnutls_x509_crt_export);
 MAKE_FUNCPTR(gnutls_x509_crt_import);
@@ -129,6 +130,7 @@ static NTSTATUS process_attach( void *args )
     LOAD_FUNCPTR(gnutls_pkcs12_get_bag)
     LOAD_FUNCPTR(gnutls_pkcs12_import)
     LOAD_FUNCPTR(gnutls_pkcs12_init)
+    LOAD_FUNCPTR(gnutls_pkcs12_verify_mac)
     LOAD_FUNCPTR(gnutls_x509_crt_deinit)
     LOAD_FUNCPTR(gnutls_x509_crt_export)
     LOAD_FUNCPTR(gnutls_x509_crt_import)
@@ -437,6 +439,7 @@ static NTSTATUS open_cert_store( void *args )
     pfx_data.data = params->pfx->pbData;
     pfx_data.size = params->pfx->cbData;
     if ((ret = pgnutls_pkcs12_import( p12, &pfx_data, GNUTLS_X509_FMT_DER, 0 )) < 0) goto error;
+    if ((ret = pgnutls_pkcs12_verify_mac( p12, pwd ? pwd : "" )) < 0) goto error;
 
     status = parse_pkcs12_bags( p12, pwd ? pwd : "", &certs, &cert_count, &key );
     if (status)
