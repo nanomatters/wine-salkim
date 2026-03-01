@@ -188,6 +188,8 @@ DECL_HANDLER(open_input_desktop);
 DECL_HANDLER(set_input_desktop);
 DECL_HANDLER(close_desktop);
 DECL_HANDLER(get_thread_desktop);
+DECL_HANDLER(get_thread_layout);
+DECL_HANDLER(set_thread_layout);
 DECL_HANDLER(set_thread_desktop);
 DECL_HANDLER(set_user_object_info);
 DECL_HANDLER(register_hotkey);
@@ -485,6 +487,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_input_desktop,
     (req_handler)req_close_desktop,
     (req_handler)req_get_thread_desktop,
+    (req_handler)req_get_thread_layout,
+    (req_handler)req_set_thread_layout,
     (req_handler)req_set_thread_desktop,
     (req_handler)req_set_user_object_info,
     (req_handler)req_register_hotkey,
@@ -1671,6 +1675,13 @@ C_ASSERT( sizeof(struct get_thread_desktop_request) == 16 );
 C_ASSERT( offsetof(struct get_thread_desktop_reply, locator) == 8 );
 C_ASSERT( offsetof(struct get_thread_desktop_reply, handle) == 24 );
 C_ASSERT( sizeof(struct get_thread_desktop_reply) == 32 );
+C_ASSERT( offsetof(struct get_thread_layout_request, tid) == 12 );
+C_ASSERT( sizeof(struct get_thread_layout_request) == 16 );
+C_ASSERT( offsetof(struct get_thread_layout_reply, layout) == 8 );
+C_ASSERT( sizeof(struct get_thread_layout_reply) == 16 );
+C_ASSERT( offsetof(struct set_thread_layout_request, tid) == 12 );
+C_ASSERT( offsetof(struct set_thread_layout_request, layout) == 16 );
+C_ASSERT( sizeof(struct set_thread_layout_request) == 24 );
 C_ASSERT( offsetof(struct set_thread_desktop_request, handle) == 12 );
 C_ASSERT( sizeof(struct set_thread_desktop_request) == 16 );
 C_ASSERT( offsetof(struct set_thread_desktop_reply, locator) == 8 );
