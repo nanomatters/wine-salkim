@@ -202,6 +202,7 @@ extern void reset_monitor_update_serial(void);
 extern void user_lock(void);
 extern void user_unlock(void);
 extern void user_check_not_lock(void);
+extern BOOL fs_hack_is_fsr(BOOL *lite, float *sharpness);
 
 struct vulkan_gpu
 {
