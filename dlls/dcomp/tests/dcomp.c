@@ -1512,29 +1512,23 @@ static void test_device_CreateSurfaceFactory(void)
 
     /* NULL rendering device pointer */
     hr = IDCompositionDevice2_CreateSurfaceFactory(dcomp_device2, NULL, &surface_factory);
-    todo_wine
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
     /* Rendering device pointer is not an IDXGIDevice or ID2D1Device */
     hr = IDCompositionDevice2_CreateSurfaceFactory(dcomp_device2, (IUnknown *)dcomp_device, &surface_factory);
-    todo_wine
     ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
 
     /* Rendering device pointer is an IDXGIDevice */
     hr = IDCompositionDevice2_CreateSurfaceFactory(dcomp_device2, (IUnknown *)dxgi_device, &surface_factory);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (hr == S_OK)
-        IDCompositionSurfaceFactory_Release(surface_factory);
+    IDCompositionSurfaceFactory_Release(surface_factory);
 
      /* Rendering device pointer is an ID2D1Device */
     hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     hr = IDCompositionDevice2_CreateSurfaceFactory(dcomp_device2, (IUnknown *)d2d_device, &surface_factory);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (hr == S_OK)
-        IDCompositionSurfaceFactory_Release(surface_factory);
+    IDCompositionSurfaceFactory_Release(surface_factory);
     ID2D1Device_Release(d2d_device);
 
     IDCompositionDevice2_Release(dcomp_device2);

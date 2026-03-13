@@ -563,9 +563,11 @@ static HRESULT STDMETHODCALLTYPE desktop_device_CreateVisual(IDCompositionDevice
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurfaceFactory(IDCompositionDeviceUnknown *iface,
         IUnknown *rendering_device, IDCompositionSurfaceFactory **surface_factory)
 {
-    FIXME("iface %p, rendering_device %p, surface_factory %p stub!\n", iface, rendering_device,
-            surface_factory);
-    return E_NOTIMPL;
+    struct composition_device *device = impl_from_IDCompositionDesktopDevicePartner(iface);
+
+    TRACE("iface %p, rendering_device %p, surface_factory %p.\n", iface, rendering_device, surface_factory);
+
+    return create_surface_factory(device, rendering_device, surface_factory);
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurface(IDCompositionDeviceUnknown *iface,

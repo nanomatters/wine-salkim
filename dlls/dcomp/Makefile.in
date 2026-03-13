@@ -6,6 +6,7 @@ EXTRADLLFLAGS = -Wb,--prefer-native
 SOURCES = \
 	dcomp_private_iface.idl \
 	device.c \
+	surface.c \
 	target.c \
 	visual.c \
 	version.rc
