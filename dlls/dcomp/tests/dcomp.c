@@ -314,20 +314,15 @@ static void test_device_CreateVisual(void)
 
     /* Parameter checks */
     hr = IDCompositionDevice_CreateVisual(dcomp_device, NULL);
-    todo_wine
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionDevice_CreateVisual(dcomp_device, &visual);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        /* IDCompositionVisual objects created from a device from DCompositionCreateDevice() doesn't
-         * support IDCompositionVisual2 */
-        hr = IDCompositionVisual_QueryInterface(visual, &IID_IDCompositionVisual2, (void *)&visual2);
-        ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
-        IDCompositionVisual_Release(visual);
-    }
+    /* IDCompositionVisual objects created from a device from DCompositionCreateDevice() doesn't
+     * support IDCompositionVisual2 */
+    hr = IDCompositionVisual_QueryInterface(visual, &IID_IDCompositionVisual2, (void *)&visual2);
+    ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
+    IDCompositionVisual_Release(visual);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);

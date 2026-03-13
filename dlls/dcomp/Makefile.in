@@ -6,4 +6,5 @@ EXTRADLLFLAGS = -Wb,--prefer-native
 SOURCES = \
 	device.c \
 	target.c \
+	visual.c \
 	version.rc

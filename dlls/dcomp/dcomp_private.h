@@ -36,6 +36,12 @@ struct composition_target
     LONG ref;
 };
 
+struct composition_visual
+{
+    IDCompositionVisual IDCompositionVisual_iface;
+    LONG ref;
+};
+
 static inline struct composition_device *impl_from_IDCompositionDevice(IDCompositionDevice *iface)
 {
     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice_iface);
@@ -51,6 +57,12 @@ static inline struct composition_target *impl_from_IDCompositionTarget(IDComposi
     return CONTAINING_RECORD(iface, struct composition_target, IDCompositionTarget_iface);
 }
 
+static inline struct composition_visual *impl_from_IDCompositionVisual(IDCompositionVisual *iface)
+{
+    return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisual_iface);
+}
+
 HRESULT create_target(HWND hwnd, BOOL topmost, IDCompositionTarget **target);
+HRESULT create_visual(IDCompositionVisual **visual);
 
 #endif /* __WINE_DCOMP_PRIVATE_H */

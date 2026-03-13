@@ -110,8 +110,9 @@ static HRESULT STDMETHODCALLTYPE device_CreateTargetForHwnd(IDCompositionDevice 
 static HRESULT STDMETHODCALLTYPE device_CreateVisual(IDCompositionDevice *iface,
         IDCompositionVisual **visual)
 {
-    FIXME("iface %p, visual %p stub!\n", iface, visual);
-    return E_NOTIMPL;
+    TRACE("iface %p, visual %p\n", iface, visual);
+
+    return create_visual(visual);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateSurface(IDCompositionDevice *iface,
