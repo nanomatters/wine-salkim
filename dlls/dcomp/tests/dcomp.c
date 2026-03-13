@@ -168,7 +168,6 @@ static void test_DCompositionCreateDevice2(void)
     check_interface(dcomp_device, &IID_IUnknown, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
-    todo_wine
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
@@ -194,13 +193,9 @@ static void test_DCompositionCreateDevice2(void)
 
     hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDesktopDevice,
             (void **)&desktop_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        refcount = IDCompositionDesktopDevice_Release(desktop_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+    refcount = IDCompositionDesktopDevice_Release(desktop_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
 
     hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDevice, NULL);
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
