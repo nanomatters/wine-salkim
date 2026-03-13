@@ -292,6 +292,76 @@ done:
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_device_CreateVisual(void)
+{
+    IDCompositionDesktopDevice *desktop_device;
+    IDCompositionDevice *dcomp_device;
+    IDCompositionVisual2 *visual2;
+    IDCompositionVisual *visual;
+    IDXGIDevice *dxgi_device;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    /* Test CreateVisual() with IDCompositionDevice */
+    hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, (void **)&dcomp_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Parameter checks */
+    hr = IDCompositionDevice_CreateVisual(dcomp_device, NULL);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionDevice_CreateVisual(dcomp_device, &visual);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        /* IDCompositionVisual objects created from a device from DCompositionCreateDevice() doesn't
+         * support IDCompositionVisual2 */
+        hr = IDCompositionVisual_QueryInterface(visual, &IID_IDCompositionVisual2, (void *)&visual2);
+        ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
+        IDCompositionVisual_Release(visual);
+    }
+
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+    /* Test CreateVisual() with IDCompositionDesktopDevice */
+    if (!pDCompositionCreateDevice2)
+    {
+        win_skip("DCompositionCreateDevice2() is unavailable.\n");
+        goto done;
+    }
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDesktopDevice,
+            (void **)&desktop_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Parameter checks */
+    hr = IDCompositionDesktopDevice_CreateVisual(desktop_device, NULL);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionDesktopDevice_CreateVisual(desktop_device, &visual2);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        IDCompositionVisual2_Release(visual2);
+
+    refcount = IDCompositionDesktopDevice_Release(desktop_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+done:
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 START_TEST(dcomp)
 {
     HMODULE module;
@@ -316,6 +386,7 @@ START_TEST(dcomp)
     test_DCompositionCreateDevice();
     test_DCompositionCreateDevice2();
     test_device_CreateTargetForHwnd();
+    test_device_CreateVisual();
 
     FreeLibrary(module);
 }
