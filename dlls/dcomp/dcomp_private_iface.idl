@@ -56,7 +56,7 @@ interface IDCompositionDeviceUnknown : IDCompositionDesktopDevicePartner
     HRESULT Unknown13();
     HRESULT Unknown14();
     HRESULT Unknown15();
-    HRESULT Unknown16();
+    HRESULT Unknown16(void **parameter1);
     HRESULT Unknown17(void **parameter1);
     HRESULT Unknown18();
     HRESULT Unknown19();
