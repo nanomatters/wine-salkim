@@ -400,10 +400,11 @@ static HRESULT WINAPI visual_unknown_method19(IDCompositionVisualUnknown *iface,
     return S_OK;
 }
 
-static HRESULT WINAPI visual_unknown_method20(IDCompositionVisualUnknown *iface)
+static HRESULT WINAPI visual_unknown_method20(IDCompositionVisualUnknown *iface, float parameter1)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    FIXME("iface %p parameter1 %f stub!\n", iface, parameter1);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI visual_unknown_method21(IDCompositionVisualUnknown *iface)
