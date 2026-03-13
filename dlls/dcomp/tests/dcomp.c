@@ -485,20 +485,16 @@ static void test_target_SetRoot(void)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionTarget_SetRoot(target, visual);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     /* SetRoot with a visual already bound to a target */
     hr = IDCompositionTarget_SetRoot(target2, visual);
-    todo_wine
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionTarget_SetRoot(target, NULL);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionTarget_SetRoot(target2, visual);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     DestroyWindow(hwnd3);

@@ -31,6 +31,7 @@ struct composition_device
 struct composition_target
 {
     IDCompositionTarget IDCompositionTarget_iface;
+    IDCompositionVisual *root;
     BOOL topmost;
     HWND hwnd;
     LONG ref;
@@ -40,6 +41,7 @@ struct composition_visual
 {
     IDCompositionVisual2 IDCompositionVisual2_iface;
     IUnknown *content;
+    BOOL is_root;
     int version;
     LONG ref;
 };

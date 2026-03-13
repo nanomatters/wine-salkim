@@ -59,6 +59,7 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
 {
     struct composition_target *target = impl_from_IDCompositionTarget(iface);
     ULONG ref = InterlockedDecrement(&target->ref);
+    struct composition_visual *root_visual;
     const WCHAR *prop;
 
     TRACE("iface %p, ref %lu.\n", iface, ref);
@@ -67,6 +68,12 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
     {
         prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
         RemovePropW(target->hwnd, prop);
+        if (target->root)
+        {
+            root_visual = impl_from_IDCompositionVisual(target->root);
+            root_visual->is_root = FALSE;
+            IDCompositionVisual_Release(target->root);
+        }
         free(target);
     }
 
@@ -76,8 +83,29 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
 static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
         IDCompositionVisual *visual)
 {
-    FIXME("iface %p, visual %p stub!\n", iface, visual);
-    return E_NOTIMPL;
+    struct composition_target *target = impl_from_IDCompositionTarget(iface);
+    struct composition_visual *composition_visual;
+
+    TRACE("iface %p, visual %p\n", iface, visual);
+
+    if (visual)
+    {
+        composition_visual = impl_from_IDCompositionVisual(visual);
+        if (composition_visual->is_root)
+            return E_INVALIDARG;
+
+        composition_visual->is_root = TRUE;
+        IDCompositionVisual_AddRef(visual);
+    }
+
+    if (target->root)
+    {
+        composition_visual = impl_from_IDCompositionVisual(target->root);
+        composition_visual->is_root = FALSE;
+        IDCompositionVisual_Release(target->root);
+    }
+    target->root = visual;
+    return S_OK;
 }
 
 static const struct IDCompositionTargetVtbl target_vtbl =
