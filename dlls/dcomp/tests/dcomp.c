@@ -1096,6 +1096,14 @@ static void test_IDCompositionVisualUnknown(void)
 
     old_stack_pointer = get_stack_pointer();
 
+    hr = IDCompositionVisualUnknown_Unknown14(visual_unknown, 0);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    stack_pointer = get_stack_pointer();
+    ok(stack_pointer == old_stack_pointer, "Got unexpected stack pointer.\n");
+
+    old_stack_pointer = get_stack_pointer();
+
     hr = IDCompositionVisualUnknown_Unknown19(visual_unknown, 0);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
