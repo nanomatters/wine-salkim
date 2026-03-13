@@ -906,7 +906,6 @@ static void test_device_Commit(void)
 
     hr = IDCompositionDevice_Commit(dcomp_device);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    todo_wine
     expect_rendered_color(hwnd, RGB(0, 0xff, 0x00));
 
     /* Render surface yellow */
@@ -922,12 +921,10 @@ static void test_device_Commit(void)
     }
 
     /* Remains green before calling Commit() */
-    todo_wine
     expect_rendered_color(hwnd, RGB(0, 0xff, 0x00));
 
     hr = IDCompositionDevice_Commit(dcomp_device);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    todo_wine
     expect_rendered_color(hwnd, RGB(0xff, 0xff, 0x00));
 
     /* Test Commit() after two draws. Render surface white and then magenta. */
@@ -952,7 +949,6 @@ static void test_device_Commit(void)
 
     hr = IDCompositionDevice_Commit(dcomp_device);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    todo_wine
     expect_rendered_color(hwnd, RGB(0xff, 0x00, 0xff));
 
     hr = IDCompositionVisual_SetContent(visual, NULL);
