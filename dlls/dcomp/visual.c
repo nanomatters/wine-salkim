@@ -64,7 +64,11 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisual2 *iface)
     TRACE("iface %p, ref %lu.\n", iface, ref);
 
     if (!ref)
+    {
+        if (visual->content)
+            IUnknown_Release(visual->content);
         free(visual);
+    }
 
     return ref;
 }
@@ -153,8 +157,22 @@ static HRESULT STDMETHODCALLTYPE visual_SetClip(IDCompositionVisual2 *iface, con
 
 static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisual2 *iface, IUnknown *content)
 {
-    FIXME("iface %p, content %p stub!\n", iface, content);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisual2(iface);
+    IDXGISwapChain1 *dxgi_swapchain;
+
+    FIXME("iface %p, content %p semi-stub!\n", iface, content);
+
+    if (content && FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1,
+            (void **)&dxgi_swapchain)))
+    {
+        FIXME("Only IDXGISwapChain1 is supported currently.\n");
+        return E_INVALIDARG;
+    }
+
+    if (visual->content)
+        IUnknown_Release(visual->content);
+    visual->content = content;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_AddVisual(IDCompositionVisual2 *iface,

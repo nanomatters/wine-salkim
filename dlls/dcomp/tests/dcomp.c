@@ -433,16 +433,13 @@ static void test_visual_SetContent(void)
 
     /* Obviously IDCompositionDevice doesn't have IDXGISwapChain1 */
     hr = IDCompositionVisual_SetContent(visual, (IUnknown *)dcomp_device);
-    todo_wine
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionVisual_SetContent(visual, (IUnknown *)swapchain);
-    todo_wine
     ok(hr == S_OK || broken(hr == DXGI_ERROR_UNSUPPORTED) /* win8 and win10 v1507 TestBot */,
             "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionVisual_SetContent(visual, NULL);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     IDCompositionVisual_Release(visual);

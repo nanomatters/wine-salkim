@@ -39,6 +39,7 @@ struct composition_target
 struct composition_visual
 {
     IDCompositionVisual2 IDCompositionVisual2_iface;
+    IUnknown *content;
     int version;
     LONG ref;
 };
