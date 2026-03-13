@@ -115,7 +115,6 @@ static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
             WaitForSingleObject(device->thread, INFINITE);
             CloseHandle(device->thread);
         }
-        DeleteCriticalSection(&device->cs);
         free(device);
     }
 
@@ -621,7 +620,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
 
     while (TRUE)
     {
-        EnterCriticalSection(&device->cs);
+        dcomp_lock();
 
         count = 0;
         LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
@@ -641,11 +640,11 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         {
             TRACE("Composition thread exited.\n");
             device->thread_exited = TRUE;
-            LeaveCriticalSection(&device->cs);
+            dcomp_unlock();
             break;
         }
 
-        LeaveCriticalSection(&device->cs);
+        dcomp_unlock();
 
         if (device->exit_thread)
             break;
@@ -663,7 +662,7 @@ static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
 
     FIXME("iface %p semi-stub!\n", iface);
 
-    EnterCriticalSection(&device->cs);
+    dcomp_lock();
 
     if (!device->thread || device->thread_exited)
     {
@@ -678,7 +677,7 @@ static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
         device->thread = CreateThread(NULL, 0, composite_thread_proc, iface, 0, NULL);
     }
 
-    LeaveCriticalSection(&device->cs);
+    dcomp_unlock();
 
     return hr;
 }
@@ -1903,7 +1902,6 @@ static HRESULT create_device(int version, REFIID iid, void **out)
     if (!device)
         return E_OUTOFMEMORY;
 
-    InitializeCriticalSection(&device->cs);
     list_init(&device->targets);
     device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
     device->IDCompositionDeviceUnknown_iface.lpVtbl = &desktop_device_vtbl;

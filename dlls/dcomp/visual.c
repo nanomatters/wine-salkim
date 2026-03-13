@@ -208,6 +208,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
 
     FIXME("iface %p, content %p semi-stub!\n", iface, content);
 
+    dcomp_lock();
 
     if (content)
     {
@@ -221,6 +222,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
             if (FAILED(hr))
             {
                 ERR("Failed to get the swapchain device, hr %#lx.\n", hr);
+                dcomp_unlock();
                 return hr;
             }
         }
@@ -238,6 +240,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
                 if (FAILED(hr))
                 {
                     ERR("Failed to get the dxgi surface device, hr %#lx.\n", hr);
+                    dcomp_unlock();
                     return hr;
                 }
             }
@@ -245,12 +248,14 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
             {
                 FIXME("Only IDCompositionSurface from IDXGISurface is currently supported.\n");
                 IDCompositionSurface_Release(suface);
+                dcomp_unlock();
                 return E_INVALIDARG;
             }
         }
         else
         {
             FIXME("Only IDXGISwapChain1 or IDCompositionSurface are currently supported.\n");
+            dcomp_unlock();
             return E_INVALIDARG;
         }
 
@@ -259,6 +264,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         if (FAILED(hr))
         {
             ERR("Failed to create a D2D device, hr %#lx.\n", hr);
+            dcomp_unlock();
             return hr;
         }
 
@@ -268,6 +274,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         if (FAILED(hr))
         {
             ERR("Failed to create a D2D device context, hr %#lx.\n", hr);
+            dcomp_unlock();
             return hr;
         }
 
@@ -276,6 +283,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         {
             ERR("Failed to get a ID2D1GdiInteropRenderTarget, hr %#lx.\n", hr);
             ID2D1DeviceContext_Release(device_context);
+            dcomp_unlock();
             return hr;
         }
     }
@@ -305,6 +313,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         visual->interop = interop;
     }
 
+    dcomp_unlock();
     return S_OK;
 }
 

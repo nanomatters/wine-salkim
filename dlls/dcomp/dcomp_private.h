@@ -29,7 +29,6 @@ struct composition_device
     IDCompositionDevice IDCompositionDevice_iface;
     IDCompositionDeviceUnknown IDCompositionDeviceUnknown_iface;
     IDCompositionSurface *drawing_surface;
-    CRITICAL_SECTION cs;
     struct list targets;
     HANDLE thread;
     BOOL exit_thread;
