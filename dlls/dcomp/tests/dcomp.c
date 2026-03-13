@@ -204,6 +204,107 @@ static void test_DCompositionCreateDevice2(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_device_CreateTargetForHwnd(void)
+{
+    IDCompositionTarget *target, *target2, *target3;
+    IDCompositionDesktopDevice *desktop_device;
+    IDCompositionDevice *dcomp_device;
+    IDXGIDevice *dxgi_device;
+    HRESULT hr, hr2, hr3;
+    ULONG refcount;
+    HWND hwnd;
+
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hwnd = CreateWindowW(L"static", L"test", WS_POPUP, 0, 0, 1, 1, 0, 0, 0, 0);
+    ok(!!hwnd, "Failed to create a test window.\n");
+
+    /* Test CreateTargetForHwnd() with IDCompositionDevice */
+    hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, (void **)&dcomp_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Parameter checks */
+    hr = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, NULL, FALSE, &target);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, GetDesktopWindow(), FALSE, &target);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, hwnd, FALSE, &target);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr2 = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, hwnd, TRUE, &target2);
+    todo_wine
+    ok(hr2 == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr3 = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, hwnd, FALSE, &target3);
+    todo_wine
+    ok(hr3 == DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED, "Got unexpected hr %#lx.\n", hr);
+
+    hr3 = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, hwnd, TRUE, &target3);
+    todo_wine
+    ok(hr3 == DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED, "Got unexpected hr %#lx.\n", hr);
+
+    if (SUCCEEDED(hr))
+        IDCompositionTarget_Release(target);
+    if (SUCCEEDED(hr2))
+        IDCompositionTarget_Release(target2);
+
+    hr = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, hwnd, FALSE, NULL);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+    /* Test CreateTargetForHwnd() with IDCompositionDesktopDevice */
+    if (!pDCompositionCreateDevice2)
+    {
+        win_skip("DCompositionCreateDevice2() is unavailable.\n");
+        goto done;
+    }
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDesktopDevice,
+            (void **)&desktop_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Parameter checks */
+    hr = IDCompositionDesktopDevice_CreateTargetForHwnd(desktop_device, NULL, FALSE, &target);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionDesktopDevice_CreateTargetForHwnd(desktop_device, hwnd, FALSE, &target);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        IDCompositionTarget_Release(target);
+
+    hr = IDCompositionDesktopDevice_CreateTargetForHwnd(desktop_device, hwnd, TRUE, &target);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        IDCompositionTarget_Release(target);
+
+    hr = IDCompositionDesktopDevice_CreateTargetForHwnd(desktop_device, hwnd, FALSE, NULL);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    refcount = IDCompositionDesktopDevice_Release(desktop_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+done:
+    DestroyWindow(hwnd);
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 START_TEST(dcomp)
 {
     HMODULE module;
@@ -227,6 +328,7 @@ START_TEST(dcomp)
 
     test_DCompositionCreateDevice();
     test_DCompositionCreateDevice2();
+    test_device_CreateTargetForHwnd();
 
     FreeLibrary(module);
 }
