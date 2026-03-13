@@ -1322,6 +1322,65 @@ static void test_visual_SetOffsetX(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_visual_SetOffsetXAnimation(void)
+{
+    IDCompositionAnimation *animation;
+    IDCompositionDevice *dcomp_device;
+    IDCompositionVisual *visual;
+    IDXGISwapChain *swapchain;
+    IDXGIDevice *dxgi_device;
+    ULONG refcount;
+    HRESULT hr;
+    HWND hwnd;
+
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hwnd = create_window();
+    swapchain = create_swapchain(dxgi_device, hwnd);
+    hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, (void **)&dcomp_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDCompositionDevice_CreateVisual(dcomp_device, &visual);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDCompositionDevice_CreateAnimation(dcomp_device, &animation);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    /* NULL animation pointer */
+    hr = IDCompositionVisual_SetOffsetXAnimation(visual, NULL);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    /* An animation which didn't end */
+    hr = IDCompositionVisual_SetOffsetXAnimation(visual, animation);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    /* Normal animation */
+    hr = IDCompositionAnimation_End(animation, 1, 1);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionVisual_SetOffsetXAnimation(visual, animation);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    IDCompositionAnimation_Release(animation);
+done:
+    IDCompositionVisual_Release(visual);
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+    IDXGISwapChain_Release(swapchain);
+    DestroyWindow(hwnd);
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 static void test_visual_AddVisual(void)
 {
     IDCompositionVisual *parent_visual, *parent_visual2, *child_visual, *ref_visual;
@@ -1472,6 +1531,7 @@ START_TEST(dcomp)
     test_visual_SetBorderMode();
     test_visual_SetBackFaceVisibility();
     test_visual_SetOffsetX();
+    test_visual_SetOffsetXAnimation();
     test_visual_AddVisual();
 
     FreeLibrary(module);
