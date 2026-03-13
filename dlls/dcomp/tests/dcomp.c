@@ -313,6 +313,7 @@ static void test_DCompositionCreateDevice2(void)
     /* Parameter checks */
     hr = pDCompositionCreateDevice2(NULL, &IID_IDCompositionDevice, (void **)&dcomp_device);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
 
@@ -993,6 +994,49 @@ static void test_IDCompositionDesktopDevicePartner(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_IDCompositionDeviceUnknown(void)
+{
+    IDCompositionDeviceUnknown *device_unknown;
+    void *stack_pointer, *old_stack_pointer;
+    IDCompositionDevice *dcomp_device;
+    IDXGIDevice *dxgi_device;
+    ULONG refcount;
+    HRESULT hr;
+    void *object;
+
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = pDCompositionCreateDevice3((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
+            (void **)&dcomp_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionDevice_QueryInterface(dcomp_device, &IID_IDCompositionDeviceUnknown, (void **)&device_unknown);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    old_stack_pointer = get_stack_pointer();
+
+    hr = IDCompositionDeviceUnknown_Unknown17(device_unknown, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    stack_pointer = get_stack_pointer();
+    ok(stack_pointer == old_stack_pointer, "Got unexpected stack pointer.\n");
+
+    object = (void *)0xdeadbeef;
+    hr = IDCompositionDeviceUnknown_Unknown17(device_unknown, &object);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(object == NULL, "Got object %p.\n", object);
+
+    IDCompositionDeviceUnknown_Release(device_unknown);
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 static void test_IDCompositionVisualUnknown(void)
 {
     IDCompositionDesktopDevice *desktop_device;
@@ -1083,6 +1127,7 @@ START_TEST(dcomp)
     test_DCompositionCreateSharedVisualHandle();
     test_DCompositionWaitForCompositorClock();
     test_IDCompositionDesktopDevicePartner();
+    test_IDCompositionDeviceUnknown();
     test_IDCompositionVisualUnknown();
     test_device_Commit();
     test_device_CreateTargetForHwnd();
