@@ -48,7 +48,7 @@ struct composition_target
 
 struct composition_visual
 {
-    IDCompositionVisual2 IDCompositionVisual2_iface;
+    IDCompositionVisualUnknown IDCompositionVisualUnknown_iface;
     ID2D1GdiInteropRenderTarget *interop;
     ID2D1DeviceContext *device_context;
     IUnknown *content;
@@ -74,12 +74,12 @@ static inline struct composition_target *impl_from_IDCompositionTarget(IDComposi
 
 static inline struct composition_visual *impl_from_IDCompositionVisual(IDCompositionVisual *iface)
 {
-    return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisual2_iface);
+    return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisualUnknown_iface);
 }
 
-static inline struct composition_visual *impl_from_IDCompositionVisual2(IDCompositionVisual2 *iface)
+static inline struct composition_visual *impl_from_IDCompositionVisualUnknown(IDCompositionVisualUnknown *iface)
 {
-    return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisual2_iface);
+    return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisualUnknown_iface);
 }
 
 HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
