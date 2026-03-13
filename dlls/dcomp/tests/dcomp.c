@@ -340,14 +340,11 @@ static void test_device_CreateVisual(void)
 
     /* Parameter checks */
     hr = IDCompositionDesktopDevice_CreateVisual(desktop_device, NULL);
-    todo_wine
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionDesktopDevice_CreateVisual(desktop_device, &visual2);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-        IDCompositionVisual2_Release(visual2);
+    IDCompositionVisual2_Release(visual2);
 
     refcount = IDCompositionDesktopDevice_Release(desktop_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);

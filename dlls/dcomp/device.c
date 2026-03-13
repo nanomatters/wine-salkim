@@ -112,7 +112,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateVisual(IDCompositionDevice *iface,
 {
     TRACE("iface %p, visual %p\n", iface, visual);
 
-    return create_visual(visual);
+    return create_visual(1, &IID_IDCompositionVisual, (void **)visual);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateSurface(IDCompositionDevice *iface,
@@ -339,8 +339,9 @@ static HRESULT STDMETHODCALLTYPE desktop_device_GetFrameStatistics(IDComposition
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateVisual(IDCompositionDesktopDevice *iface,
         IDCompositionVisual2 **visual)
 {
-    FIXME("iface %p, visual %p stub!\n", iface, visual);
-    return E_NOTIMPL;
+    TRACE("iface %p, visual %p\n", iface, visual);
+
+    return create_visual(2, &IID_IDCompositionVisual2, (void **)visual);
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurfaceFactory(IDCompositionDesktopDevice *iface,
