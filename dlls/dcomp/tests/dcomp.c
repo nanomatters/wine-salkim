@@ -355,6 +355,18 @@ static void test_DCompositionCreateSharedVisualHandle(void)
     }
 }
 
+static void test_DCompositionWaitForCompositorClock(void)
+{
+    DWORD (WINAPI *pDCompositionWaitForCompositorClock)(UINT count, const HANDLE *handles, DWORD timeout);
+    HMODULE module;
+
+    module = GetModuleHandleW(L"dcomp.dll");
+    ok(!!module, "GetModuleHandleW failed.\n");
+
+    pDCompositionWaitForCompositorClock = (void *)GetProcAddress(module, "DCompositionWaitForCompositorClock");
+    ok(!pDCompositionWaitForCompositorClock, "GetProcAddress() succeeded.\n");
+}
+
 static void test_device_CreateTargetForHwnd(void)
 {
     IDCompositionTarget *target, *target2, *target3;
@@ -816,6 +828,7 @@ START_TEST(dcomp)
     test_DCompositionCreateDevice();
     test_DCompositionCreateDevice2();
     test_DCompositionCreateSharedVisualHandle();
+    test_DCompositionWaitForCompositorClock();
     test_device_Commit();
     test_device_CreateTargetForHwnd();
     test_device_CreateVisual();
