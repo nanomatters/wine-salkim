@@ -358,6 +358,7 @@ static void test_DCompositionCreateSharedVisualHandle(void)
     char buffer[1024] = {0};
     OBJECT_TYPE_INFORMATION *type = (OBJECT_TYPE_INFORMATION *)buffer;
     void *stack_pointer, *old_stack_pointer;
+    OBJECT_BASIC_INFORMATION info;
     NTSTATUS status;
     HMODULE module;
     HANDLE handle;
@@ -389,6 +390,11 @@ static void test_DCompositionCreateSharedVisualHandle(void)
     if (!status)
     {
         ok(!wcscmp(type->TypeName.Buffer, L"Composition"), "Got %s.\n", debugstr_w(type->TypeName.Buffer));
+
+        status = NtQueryObject(handle, ObjectBasicInformation, &info, sizeof(info), NULL);
+        ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
+        ok(info.Attributes == 0, "Got attributes %#lx\n", info.Attributes);
+        ok(info.GrantedAccess == 0x1, "Got access %#lx\n", info.GrantedAccess);
 
         ret = CloseHandle(handle);
         ok(ret, "CloseHandle failed.\n");

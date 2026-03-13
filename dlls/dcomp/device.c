@@ -35,6 +35,7 @@
 #include "dwmapi.h"
 #include "d3d11_4.h"
 #include "d3dcompiler.h"
+#include "wine/server.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
@@ -586,11 +587,37 @@ done:
         ID3D11Device1_Release(d3d11_device);
 }
 
+static struct composition_visual * shared_visual_target_get_root(HANDLE shared_visual_handle)
+{
+    struct composition_visual *visual = NULL;
+    NTSTATUS status;
+
+    SERVER_START_REQ(dcomp_get_shared_visual_info)
+    {
+        req->handle = wine_server_obj_handle(shared_visual_handle);
+        if (!(status = wine_server_call(req)))
+            visual = impl_from_IDCompositionVisual(wine_server_get_ptr(reply->target_root));
+    }
+    SERVER_END_REQ;
+
+    if (status)
+        ERR("dcomp_get_shared_visual_info failed, not in the same process? status %#lx.\n", status);
+
+    return visual;
+}
+
 static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual)
 {
     struct composition_visual *child_visual;
     IDXGISurface *dxgi_surface;
     HRESULT hr;
+
+    if (visual->shared_visual_handle)
+    {
+        struct composition_visual *root = shared_visual_target_get_root(visual->shared_visual_handle);
+        if (root)
+            do_composite(target, root);
+    }
 
     /* Render content */
     if (visual->content)
@@ -698,6 +725,11 @@ static DWORD WINAPI composite_thread_proc(void *iface)
                 FIXME("Target %p has no root.\n", &target->IDCompositionTarget_iface);
                 continue;
             }
+
+            /* Skip targets created from a shared visual handle. Composition for such targets will
+             * be done for the visual tree where the visual created from the shared visual handle is at */
+            if (target->shared_visual_handle)
+                continue;
 
             visual = impl_from_IDCompositionVisual(target->root);
             if (SUCCEEDED(do_composite(target, visual)))
@@ -1190,21 +1222,20 @@ static HRESULT STDMETHODCALLTYPE desktop_device_CreateFromSharedVisualHandle(IDC
 
     /* visual_handle is from DCompositionCreateSharedVisualHandle(). iid is IID_IDCompositionVisual
     * or IDCompositionTarget */
-    assert(visual_handle == (HANDLE)0xdeadbee1);
     assert(IsEqualGUID(iid, &IID_IDCompositionVisual) || IsEqualGUID(iid, &IID_IDCompositionTarget));
     assert(out);
 
     if (IsEqualGUID(iid, &IID_IDCompositionVisual))
     {
-        hr = create_visual(2, iid, (void **)out);
+        hr = create_visual_from_shared_visual_handle(visual_handle, out);
         FIXME("Created a IDCompositionVisual %p from a shared visual handle %p, hr %#lx.\n", *out,
               visual_handle, hr);
         return hr;
     }
     else if (IsEqualGUID(iid, &IID_IDCompositionTarget))
     {
-        HWND hwnd = CreateWindowA("static", "dummy_window", WS_VISIBLE, 0, 0, 800, 800, NULL, NULL, NULL, NULL);
-        hr = desktop_device_CreateTargetForHwnd(iface, hwnd, TRUE, (IDCompositionTarget **)out);
+        hr = create_target_from_shared_visual_handle(impl_from_IDCompositionDeviceUnknown(iface),
+                                                     visual_handle, (void **)out);
         FIXME("Created a IDCompositionTarget %p from a shared visual handle %p, hr %#lx.\n", *out,
               visual_handle, hr);
         return hr;
@@ -2012,14 +2043,21 @@ HRESULT WINAPI DCompositionCreateDevice3(IUnknown *rendering_device, REFIID iid,
     return create_device(3, iid, device);
 }
 
-HRESULT WINAPI DCompositionCreateSharedVisualHandle(void **handle)
+HRESULT WINAPI DCompositionCreateSharedVisualHandle(HANDLE *handle)
 {
+    NTSTATUS status;
+
     FIXME("handle %p stub!\n", handle);
 
     if (!handle)
         return STATUS_INVALID_PARAMETER;
 
-    *handle = (void*)0xdeadbee1;
-    FIXME("--- returning a fake handle %p.\n", *handle);
-    return S_OK;
+    SERVER_START_REQ( dcomp_create_shared_visual )
+    {
+        if (!(status = wine_server_call( req )))
+            *handle = wine_server_ptr_handle( reply->handle );
+    }
+    SERVER_END_REQ;
+
+    return (HRESULT)status;
 }

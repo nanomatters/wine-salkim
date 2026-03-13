@@ -22,6 +22,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "dcomp_private.h"
+#include "wine/server.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
@@ -79,10 +80,28 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
             root_visual->is_root = FALSE;
             IDCompositionVisual_Release(target->root);
         }
+        if (target->shared_visual_handle)
+            CloseHandle(target->shared_visual_handle);
         free(target);
     }
 
     return ref;
+}
+
+static void shared_visual_target_set_root(HANDLE shared_visual_handle, IDCompositionVisual *root)
+{
+    NTSTATUS status;
+
+    SERVER_START_REQ(dcomp_set_shared_visual_info)
+    {
+        req->handle = wine_server_obj_handle(shared_visual_handle);
+        req->target_root = wine_server_client_ptr(root);
+        status = wine_server_call(req);
+    }
+    SERVER_END_REQ;
+
+    if (status)
+        ERR("dcomp_set_shared_visual_info failed, not in the same process? status %#lx.\n", status);
 }
 
 static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
@@ -115,6 +134,9 @@ static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
         IDCompositionVisual_Release(target->root);
     }
     target->root = visual;
+
+    if (target->shared_visual_handle)
+        shared_visual_target_set_root(target->shared_visual_handle, target->root);
 
     dcomp_unlock();
     return S_OK;
@@ -165,5 +187,37 @@ HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost
 
     prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
     SetPropW(target->hwnd, prop, (HANDLE)1);
+    return S_OK;
+}
+
+
+HRESULT create_target_from_shared_visual_handle(struct composition_device *device, HANDLE shared_visual_handle, void **new_target)
+{
+    struct composition_target *target;
+    HANDLE handle;
+
+    if (!DuplicateHandle(GetCurrentProcess(), shared_visual_handle, GetCurrentProcess(), &handle, 0,
+                         FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        ERR("Cannot duplicate handle, last error %lu.\n", GetLastError());
+        return E_FAIL;
+    }
+
+    target = calloc(1, sizeof(*target));
+    if (!target)
+    {
+        CloseHandle(handle);
+        return E_OUTOFMEMORY;
+    }
+
+    IDCompositionDevice_AddRef(&device->IDCompositionDevice_iface);
+    dcomp_lock();
+    list_add_tail(&device->targets, &target->entry);
+    dcomp_unlock();
+    target->IDCompositionTarget_iface.lpVtbl = &target_vtbl;
+    target->ref = 1;
+    target->device = &device->IDCompositionDevice_iface;
+    target->shared_visual_handle = handle;
+    *new_target = &target->IDCompositionTarget_iface;
     return S_OK;
 }

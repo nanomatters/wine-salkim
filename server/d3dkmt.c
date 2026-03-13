@@ -792,3 +792,138 @@ DECL_HANDLER(d3dkmt_mutex_release)
 
     release_object( mutex );
 }
+
+#define COMPOSITION_QUERY_STATE  0x1
+#define COMPOSITION_MODIFY_STATE 0x2
+
+static const WCHAR composition_name[] = {'C','o','m','p','o','s','i','t','i','o','n',0};
+
+struct type_descr composition_type =
+{
+    { composition_name, sizeof(composition_name) },                     /* name */
+    COMPOSITION_QUERY_STATE,                                            /* valid_access */
+    {                                                                   /* mapping */
+        STANDARD_RIGHTS_READ | COMPOSITION_QUERY_STATE,
+        STANDARD_RIGHTS_READ | COMPOSITION_MODIFY_STATE,
+        STANDARD_RIGHTS_READ,
+        STANDARD_RIGHTS_REQUIRED | COMPOSITION_QUERY_STATE | COMPOSITION_MODIFY_STATE,
+    },
+};
+
+struct composition
+{
+    struct object obj;                      /* object header */
+    struct process *process;                /* owner process */
+    client_ptr_t target_root;               /* root IDCompositionVisual pointer for the target created from this shared visual */
+};
+
+static void composition_dump( struct object *obj, int verbose );
+static void composition_destroy( struct object *obj );
+
+static const struct object_ops composition_ops =
+{
+    sizeof(struct composition),             /* size */
+    &composition_type,                      /* type */
+    composition_dump,                       /* dump */
+    no_add_queue,                           /* add_queue */
+    NULL,                                   /* remove_queue */
+    NULL,                                   /* signaled */
+    NULL,                                   /* satisfied */
+    no_signal,                              /* signal */
+    no_get_fd,                              /* get_fd */
+    default_get_sync,                       /* get_sync */
+    default_map_access,                     /* map_access */
+    default_get_sd,                         /* get_sd */
+    default_set_sd,                         /* set_sd */
+    default_get_full_name,                  /* get_full_name */
+    no_lookup_name,                         /* lookup_name */
+    directory_link_name,                    /* link_name */
+    default_unlink_name,                    /* unlink_name */
+    no_open_file,                           /* open_file */
+    no_kernel_obj_list,                     /* get_kernel_obj_list */
+    no_close_handle,                        /* close_handle */
+    composition_destroy,                    /* destroy */
+};
+
+static void composition_dump( struct object *obj, int verbose )
+{
+    assert( obj->ops == &composition_ops );
+    fprintf( stderr, "Compositon\n" );
+}
+
+static void composition_destroy( struct object *obj )
+{
+    struct composition *composition = (struct composition *)obj;
+
+    release_object( composition->process );
+}
+
+static struct composition *get_composition_obj( struct process *process, obj_handle_t handle, unsigned int access )
+{
+    return (struct composition *)get_handle_obj( process, handle, access, &composition_ops );
+}
+
+static struct composition *create_composition(void)
+{
+    struct composition *composition;
+
+    if ((composition = alloc_object( &composition_ops )))
+    {
+        composition->target_root = 0;
+        composition->process = (struct process *)grab_object( current->process );
+    }
+
+    return composition;
+}
+
+/* Create a DirectComposition shared visual handle */
+DECL_HANDLER(dcomp_create_shared_visual)
+{
+    struct composition *composition;
+
+    if ((composition = create_composition()))
+    {
+        reply->handle = alloc_handle_no_access_check( current->process, composition, 0, 0 );
+        release_object( composition );
+    }
+}
+
+
+/* Set info for a DirectComposition shared visual object */
+DECL_HANDLER(dcomp_set_shared_visual_info)
+{
+    struct composition *composition;
+
+    composition = get_composition_obj( current->process, req->handle, 0);
+    if (!composition) return;
+
+    if (composition->process != current->process)
+    {
+        release_object( composition );
+        set_error(STATUS_NOT_IMPLEMENTED);
+        return;
+    }
+
+    composition->target_root = req->target_root;
+    release_object( composition );
+}
+
+
+/* Get info for a DirectComposition shared visual */
+DECL_HANDLER(dcomp_get_shared_visual_info)
+{
+    struct composition *composition;
+
+    composition = get_composition_obj( current->process, req->handle, 0);
+    if (!composition) return;
+
+    if (composition->process != current->process)
+    {
+        release_object( composition );
+        set_error(STATUS_NOT_IMPLEMENTED);
+        return;
+    }
+
+    reply->target_root = composition->target_root;
+    release_object( composition );
+}

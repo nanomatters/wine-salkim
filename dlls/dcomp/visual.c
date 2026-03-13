@@ -74,6 +74,8 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
             ID2D1DeviceContext_Release(visual->device_context);
         if (visual->content)
             IUnknown_Release(visual->content);
+        if (visual->shared_visual_handle)
+            CloseHandle(visual->shared_visual_handle);
         dcomp_lock();
         if (visual->is_child)
             list_remove(&visual->entry);
@@ -1181,4 +1183,29 @@ HRESULT create_visual(int version, REFIID iid, void **new_visual)
     hr = IUnknown_QueryInterface(&visual->IDCompositionVisualUnknown_iface, iid, new_visual);
     IUnknown_Release(&visual->IDCompositionVisualUnknown_iface);
     return hr;
+}
+
+HRESULT create_visual_from_shared_visual_handle(HANDLE shared_visual_handle, void **new_visual)
+{
+    struct composition_visual *visual_impl;
+    HANDLE handle;
+    HRESULT hr;
+
+    if (!DuplicateHandle(GetCurrentProcess(), shared_visual_handle, GetCurrentProcess(), &handle, 0,
+                         FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        ERR("Cannot duplicate handle, last error %lu.\n", GetLastError());
+        return E_FAIL;
+    }
+
+    hr = create_visual(2, &IID_IDCompositionVisual, (void **)new_visual);
+    if (FAILED(hr))
+    {
+        CloseHandle(handle);
+        return hr;
+    }
+
+    visual_impl = impl_from_IDCompositionVisualUnknown(*new_visual);
+    visual_impl->shared_visual_handle = handle;
+    return S_OK;
 }

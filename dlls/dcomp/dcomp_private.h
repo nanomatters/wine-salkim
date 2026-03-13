@@ -68,6 +68,7 @@ struct composition_target
     IDCompositionVisual *root;
     BOOL topmost;
     HWND hwnd;
+    HANDLE shared_visual_handle;
     struct list entry;
     LONG ref;
 };
@@ -88,6 +89,7 @@ struct composition_visual
     struct composition_visual *parent;
     BOOL is_root;
     BOOL is_child;
+    HANDLE shared_visual_handle;
     int version;
     LONG ref;
 };
@@ -135,6 +137,9 @@ HRESULT create_surface(struct composition_surface_factory *factory, UINT width, 
         DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **dcomp_surface);
 HRESULT create_surface_factory(struct composition_device *device, IUnknown *rendering_device, IDCompositionSurfaceFactory **factory);
 HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
+HRESULT create_target_from_shared_visual_handle(struct composition_device *device, HANDLE shared_visual_handle, void **new_target);
 HRESULT create_visual(int version, REFIID iid, void **visual);
+HRESULT create_visual_from_shared_visual_handle(HANDLE shared_visual_handle, void **new_visual);
+
 
 #endif /* __WINE_DCOMP_PRIVATE_H */
