@@ -99,8 +99,12 @@ static HRESULT STDMETHODCALLTYPE visual_SetOffsetXAnimation(IDCompositionVisualU
 
 static HRESULT STDMETHODCALLTYPE visual_SetOffsetX(IDCompositionVisualUnknown *iface, float offset_x)
 {
-    FIXME("iface %p, offset_x %f stub!\n", iface, offset_x);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, offset_x %f.\n", iface, offset_x);
+
+    visual->offset_x = offset_x;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetOffsetYAnimation(IDCompositionVisualUnknown *iface,
