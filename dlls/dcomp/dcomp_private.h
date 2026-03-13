@@ -21,12 +21,14 @@
 #include "dcomp.h"
 #include "dcomp_private_iface.h"
 #include "d2d1_1.h"
+#include <d3d11.h>
 #include "wine/list.h"
 
 struct composition_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
     IDCompositionDeviceUnknown IDCompositionDeviceUnknown_iface;
+    IDCompositionSurface *drawing_surface;
     CRITICAL_SECTION cs;
     struct list targets;
     HANDLE thread;
@@ -48,6 +50,8 @@ struct composition_surface
 {
     IDCompositionSurface IDCompositionSurface_iface;
     IDCompositionSurfaceFactory *factory;
+    ID3D11Texture2D *draw_surface;
+    RECT draw_rect;
     IUnknown *physical_surface;
     GUID physical_surface_iid;
     UINT width;

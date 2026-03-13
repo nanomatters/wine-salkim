@@ -63,6 +63,8 @@ static ULONG STDMETHODCALLTYPE surface_Release(IDCompositionSurface *iface)
     {
         IUnknown_Release(surface->physical_surface);
         IDCompositionSurfaceFactory_Release(surface->factory);
+        if (surface->draw_surface)
+            ID3D11Texture2D_Release(surface->draw_surface);
         free(surface);
     }
 
@@ -72,15 +74,178 @@ static ULONG STDMETHODCALLTYPE surface_Release(IDCompositionSurface *iface)
 static HRESULT STDMETHODCALLTYPE surface_BeginDraw(IDCompositionSurface *iface,
         const RECT *rect, REFIID iid, void **object, POINT *offset)
 {
-    FIXME("iface %p, rect %s, iid %s, object %p, offset %p stub!\n", iface, wine_dbgstr_rect(rect),
+    struct composition_surface *surface = impl_from_IDCompositionSurface(iface);
+    struct composition_surface_factory *factory = impl_from_IDCompositionSurfaceFactory(surface->factory);
+    struct composition_device *device = impl_from_IDCompositionDevice(factory->device);
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11Texture2D *draw_surface;
+    ID3D11Device *d3d11_device;
+    RECT whole_rect;
+    HRESULT hr;
+
+    TRACE("iface %p, rect %s, iid %s, object %p, offset %p.\n", iface, wine_dbgstr_rect(rect),
             debugstr_guid(iid), object, offset);
-    return E_NOTIMPL;
+
+    if (IsEqualGUID(iid, &IID_ID2D1DeviceContext))
+    {
+        FIXME("ID2D1DeviceContext draw surface is currently unsupported.\n");
+        return E_NOTIMPL;
+    }
+
+    if (!rect)
+    {
+        SetRect(&whole_rect, 0, 0, surface->width, surface->height);
+        rect = &whole_rect;
+    }
+
+    /* TODO: Check if IDCompositionSurface is virtual when virtual IDCompositionSurface is implemented */
+
+    /* The first BeginDraw must use the whole surface for non-virtual IDCompositionSurface */
+    if (!surface->draw_surface && !(rect->left == 0 && rect->top == 0
+            && rect->right == surface->width && rect->bottom == surface->height))
+        return E_INVALIDARG;
+
+    if (rect->left < 0 || rect->top < 0 || rect->right > surface->width
+            || rect->bottom > surface->height)
+        return E_INVALIDARG;
+
+    if (!object || !offset)
+        return E_INVALIDARG;
+
+    if (!surface->draw_surface)
+    {
+        if (!IsEqualGUID(&factory->rendering_device_iid, &IID_IDXGIDevice))
+        {
+            ERR("Only IDCompositionSurfaceFactory created with an IDXGIDevice rendering device is "
+                    "currently supported, rendering device guid %s.\n",
+                    wine_dbgstr_guid(&factory->rendering_device_iid));
+            return E_NOTIMPL;
+        }
+
+        hr = IUnknown_QueryInterface(factory->rendering_device, &IID_ID3D11Device, (void **)&d3d11_device);
+        if (FAILED(hr))
+        {
+            FIXME("Failed to get a d3d11 device, should a new one be created?\n");
+            return hr;
+        }
+
+        texture_desc.Width = surface->width;
+        texture_desc.Height = surface->height;
+        texture_desc.MipLevels = 1;
+        texture_desc.ArraySize = 1;
+        texture_desc.Format = surface->pixel_format;
+        texture_desc.SampleDesc.Count = 1;
+        texture_desc.SampleDesc.Quality = 0;
+        texture_desc.Usage = D3D11_USAGE_DEFAULT;
+        texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        texture_desc.CPUAccessFlags = 0;
+        texture_desc.MiscFlags = D3D11_RESOURCE_MISC_GUARDED;
+        if (surface->pixel_format == DXGI_FORMAT_B8G8R8A8_UNORM)
+            texture_desc.MiscFlags |= D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+        hr = ID3D11Device_CreateTexture2D(d3d11_device, &texture_desc, NULL, &draw_surface);
+        ID3D11Device_Release(d3d11_device);
+        if (FAILED(hr))
+        {
+            ERR("Failed to create a draw surface.\n");
+            return hr;
+        }
+
+        if (InterlockedCompareExchangePointer((void **)&surface->draw_surface, draw_surface, 0))
+            ID3D11Texture2D_Release(draw_surface);
+    }
+
+    dcomp_lock();
+    if (device->drawing_surface && device->drawing_surface != &surface->IDCompositionSurface_iface)
+    {
+        dcomp_unlock();
+        return DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED;
+    }
+    device->drawing_surface = &surface->IDCompositionSurface_iface;
+    dcomp_unlock();
+
+    hr = IUnknown_QueryInterface(surface->draw_surface, iid, object);
+    if (FAILED(hr))
+        return hr;
+
+    offset->x = rect->left;
+    offset->y = rect->top;
+    surface->draw_rect = *rect;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE surface_EndDraw(IDCompositionSurface *iface)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    struct composition_surface *surface = impl_from_IDCompositionSurface(iface);
+    struct composition_surface_factory *factory = impl_from_IDCompositionSurfaceFactory(surface->factory);
+    struct composition_device *device = impl_from_IDCompositionDevice(factory->device);
+    ID3D11Resource *dst_resource, *src_resource;
+    ID3D11DeviceContext *d3d11_device_context;
+    ID3D11Device *d3d11_device;
+    D3D11_BOX box;
+    HRESULT hr;
+
+    TRACE("iface %p.\n", iface);
+
+    dcomp_lock();
+    if (!(device->drawing_surface && device->drawing_surface == &surface->IDCompositionSurface_iface))
+    {
+        dcomp_unlock();
+        return DCOMPOSITION_ERROR_SURFACE_NOT_BEING_RENDERED;
+    }
+    device->drawing_surface = NULL;
+    dcomp_unlock();
+
+    /* TODO: Copy data after Commit() is called instead of doing it immediately here */
+
+    if (!IsEqualGUID(&factory->rendering_device_iid, &IID_IDXGIDevice))
+    {
+        ERR("Only IDCompositionSurfaceFactory created with an IDXGIDevice rendering device is "
+                "currently supported, rendering device guid %s.\n",
+                wine_dbgstr_guid(&factory->rendering_device_iid));
+        return E_NOTIMPL;
+    }
+
+    hr = IUnknown_QueryInterface(factory->rendering_device, &IID_ID3D11Device, (void **)&d3d11_device);
+    if (FAILED(hr))
+    {
+        FIXME("Failed to get a d3d11 device, should a new one be created?\n");
+        return hr;
+    }
+
+    hr = ID3D11Texture2D_QueryInterface(surface->draw_surface, &IID_ID3D11Resource, (void **)&src_resource);
+    if (FAILED(hr))
+    {
+        FIXME("Failed to get the source ID3D11Resource.\n");
+        ID3D11Device_Release(d3d11_device);
+        return hr;
+    }
+
+    hr = IUnknown_QueryInterface(surface->physical_surface, &IID_ID3D11Resource, (void **)&dst_resource);
+    if (FAILED(hr))
+    {
+        FIXME("Failed to get the destination ID3D11Resource.\n");
+        ID3D11Resource_Release(src_resource);
+        ID3D11Device_Release(d3d11_device);
+        return hr;
+    }
+
+    box.left = surface->draw_rect.left;
+    box.top = surface->draw_rect.top;
+    box.front = 0;
+    box.right = surface->draw_rect.right;
+    box.bottom = surface->draw_rect.bottom;
+    box.back = 1;
+
+    ID3D11Device_GetImmediateContext(d3d11_device, &d3d11_device_context);
+    ID3D11DeviceContext_CopySubresourceRegion(d3d11_device_context, dst_resource, 0,
+            surface->draw_rect.left, surface->draw_rect.top, 0, src_resource, 0, &box);
+    ID3D11DeviceContext_Release(d3d11_device_context);
+    ID3D11Resource_Release(dst_resource);
+    ID3D11Resource_Release(src_resource);
+    ID3D11Device_Release(d3d11_device);
+
+    SetRectEmpty(&surface->draw_rect);
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE surface_SuspendDraw(IDCompositionSurface *iface)
