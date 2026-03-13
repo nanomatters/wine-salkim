@@ -1016,7 +1016,21 @@ static void test_IDCompositionDeviceUnknown(void)
 
     hr = IDCompositionDevice_QueryInterface(dcomp_device, &IID_IDCompositionDeviceUnknown, (void **)&device_unknown);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    /* Test IDCompositionDeviceUnknown_Unknown16() */
+    old_stack_pointer = get_stack_pointer();
 
+    hr = IDCompositionDeviceUnknown_Unknown16(device_unknown, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    stack_pointer = get_stack_pointer();
+    ok(stack_pointer == old_stack_pointer, "Got unexpected stack pointer.\n");
+
+    object = (void *)0xdeadbeef;
+    hr = IDCompositionDeviceUnknown_Unknown16(device_unknown, &object);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(object == NULL, "Got object %p.\n", object);
+
+    /* Test IDCompositionDeviceUnknown_Unknown17() */
     old_stack_pointer = get_stack_pointer();
 
     hr = IDCompositionDeviceUnknown_Unknown17(device_unknown, NULL);
