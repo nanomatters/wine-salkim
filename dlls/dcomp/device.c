@@ -19,6 +19,8 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #define COBJMACROS
 #include "windef.h"
 #include "winbase.h"
@@ -767,4 +769,16 @@ HRESULT WINAPI DCompositionCreateDevice3(IUnknown *rendering_device, REFIID iid,
     FIXME("%p, %s, %p.\n", rendering_device, debugstr_guid(iid), device);
 
     return E_NOTIMPL;
+}
+
+HRESULT WINAPI DCompositionCreateSharedVisualHandle(void **handle)
+{
+    FIXME("handle %p stub!\n", handle);
+
+    if (!handle)
+        return STATUS_INVALID_PARAMETER;
+
+    *handle = (void*)0xdeadbee1;
+    FIXME("--- returning a fake handle %p.\n", *handle);
+    return S_OK;
 }
