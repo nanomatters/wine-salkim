@@ -776,9 +776,9 @@ static void test_device_Commit(void)
 {
     static const DXGI_FORMAT surface_formats[] =
     {
-        DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_R16G16B16A16_FLOAT
+       DXGI_FORMAT_B8G8R8A8_UNORM,
+       DXGI_FORMAT_R8G8B8A8_UNORM,
+       DXGI_FORMAT_R16G16B16A16_FLOAT
     };
     IDCompositionSurfaceFactory *surface_factory;
     IDCompositionVisual *visual, *root_visual;
@@ -924,7 +924,7 @@ static void test_device_Commit(void)
 
         hr = IDCompositionDevice_Commit(dcomp_device);
         ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-        todo_wine_if(surface_formats[i] != DXGI_FORMAT_B8G8R8A8_UNORM)
+        todo_wine_if(surface_formats[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)
         expect_rendered_color(hwnd, RGB(0, 0xff, 0x00));
 
         /* Render surface yellow */
@@ -940,12 +940,12 @@ static void test_device_Commit(void)
         }
 
         /* Remains green before calling Commit() */
-        todo_wine_if(surface_formats[i] != DXGI_FORMAT_B8G8R8A8_UNORM)
+        todo_wine_if(surface_formats[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)
         expect_rendered_color(hwnd, RGB(0, 0xff, 0x00));
 
         hr = IDCompositionDevice_Commit(dcomp_device);
         ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-        todo_wine_if(surface_formats[i] != DXGI_FORMAT_B8G8R8A8_UNORM)
+        todo_wine_if(surface_formats[i] == DXGI_FORMAT_R16G16B16A16_FLOAT)
         expect_rendered_color(hwnd, RGB(0xff, 0xff, 0x00));
 
         /* Test Commit() after two draws. Render surface white and then magenta. */
@@ -970,7 +970,6 @@ static void test_device_Commit(void)
 
         hr = IDCompositionDevice_Commit(dcomp_device);
         ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-        todo_wine_if(surface_formats[i] != DXGI_FORMAT_B8G8R8A8_UNORM)
         expect_rendered_color(hwnd, RGB(0xff, 0x00, 0xff));
 
         hr = IDCompositionVisual_SetContent(visual, NULL);

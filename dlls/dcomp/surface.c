@@ -324,7 +324,7 @@ HRESULT create_surface(struct composition_surface_factory *factory, UINT width, 
         /* TODO: What about alpha_mode ? */
 
         hr = IDXGIDevice_CreateSurface((IDXGIDevice *)factory->rendering_device, &desc, 1,
-                DXGI_USAGE_BACK_BUFFER, NULL, &dxgi_surface);
+                DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_SHADER_INPUT, NULL, &dxgi_surface);
         if (FAILED(hr))
         {
             ERR("Failed to create a IDXGISurface.\n");
