@@ -775,13 +775,13 @@ static void _expect_rendered_color(int line, HWND hwnd, COLORREF expected_color)
 static void test_device_Commit(void)
 {
     IDCompositionSurfaceFactory *surface_factory;
+    IDCompositionVisual *visual, *root_visual;
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
     IDCompositionDevice2 *dcomp_device2;
     IDCompositionDevice *dcomp_device;
     IDCompositionSurface *surface;
     ID3D10Device1 *d3d10_device;
     IDCompositionTarget *target;
-    IDCompositionVisual *visual;
     IDXGISurface *dxgi_surface;
     IDXGISwapChain1 *swapchain;
     IDXGIDevice *dxgi_device;
@@ -839,7 +839,13 @@ static void test_device_Commit(void)
             (void *)&dcomp_device2);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
+    hr = IDCompositionDevice_CreateVisual(dcomp_device, &root_visual);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
     hr = IDCompositionDevice_CreateVisual(dcomp_device, &visual);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionVisual_AddVisual(root_visual, visual, TRUE, NULL);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     /* Test Commit() when visual content is a IDXGISwapChain1 */
@@ -851,7 +857,7 @@ static void test_device_Commit(void)
 
     hr = IDCompositionDevice_CreateTargetForHwnd(dcomp_device, hwnd, TRUE, &target);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    hr = IDCompositionTarget_SetRoot(target, visual);
+    hr = IDCompositionTarget_SetRoot(target, root_visual);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     /* Commit() is not called, swapchain presentation shouldn't affect window content */
@@ -959,6 +965,7 @@ static void test_device_Commit(void)
 
     DestroyWindow(hwnd);
     IDCompositionTarget_Release(target);
+    IDCompositionVisual_Release(root_visual);
     IDCompositionVisual_Release(visual);
     IDCompositionDevice2_Release(dcomp_device2);
     refcount = IDCompositionDevice_Release(dcomp_device);
