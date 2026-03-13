@@ -905,6 +905,7 @@ static void test_IDCompositionDesktopDevicePartner(void)
 {
     HRESULT (WINAPI *pDCompositionCreateSharedVisualHandle)(HANDLE *ret_handle);
     IDCompositionDesktopDevicePartner *partner;
+    IDCompositionVisualUnknown *visual_unknown;
     void *stack_pointer, *old_stack_pointer;
     IDCompositionDevice *dcomp_device;
     HANDLE shared_visual_handle;
@@ -951,6 +952,14 @@ static void test_IDCompositionDesktopDevicePartner(void)
     check_interface(visual, &IID_IDCompositionVisual2, TRUE);
     check_interface(visual, &IID_IDCompositionTarget, FALSE);
 
+    hr = IDCompositionVisual_QueryInterface(visual, &IID_IDCompositionVisualUnknown, (void **)&visual_unknown);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionVisualUnknown_Unknown19(visual_unknown, 0);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    IDCompositionVisualUnknown_Release(visual_unknown);
+
     IDCompositionVisual_Release(visual);
     CloseHandle(shared_visual_handle);
 
@@ -971,6 +980,60 @@ static void test_IDCompositionDesktopDevicePartner(void)
     IDCompositionDesktopDevicePartner_Release(partner);
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
+static void test_IDCompositionVisualUnknown(void)
+{
+    IDCompositionDesktopDevice *desktop_device;
+    IDCompositionVisual2 *visual2;
+    IDCompositionVisualUnknown *visual_unknown;
+    void *stack_pointer, *old_stack_pointer;
+    IDXGIDevice *dxgi_device;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    /* Test CreateVisual() with IDCompositionDesktopDevice */
+    if (!pDCompositionCreateDevice2)
+    {
+        win_skip("DCompositionCreateDevice2() is unavailable.\n");
+        goto done;
+    }
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDesktopDevice,
+            (void **)&desktop_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+
+    hr = IDCompositionDesktopDevice_CreateVisual(desktop_device, &visual2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = IDCompositionVisual2_QueryInterface(visual2, &IID_IDCompositionVisualUnknown, (void **)&visual_unknown);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    old_stack_pointer = get_stack_pointer();
+
+    hr = IDCompositionVisualUnknown_Unknown19(visual_unknown, 0);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    stack_pointer = get_stack_pointer();
+    ok(stack_pointer == old_stack_pointer, "Got unexpected stack pointer.\n");
+
+    IDCompositionVisualUnknown_Release(visual_unknown);
+
+    IDCompositionVisual2_Release(visual2);
+
+    refcount = IDCompositionDesktopDevice_Release(desktop_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+done:
     refcount = IDXGIDevice_Release(dxgi_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
@@ -1003,6 +1066,7 @@ START_TEST(dcomp)
     test_DCompositionCreateSharedVisualHandle();
     test_DCompositionWaitForCompositorClock();
     test_IDCompositionDesktopDevicePartner();
+    test_IDCompositionVisualUnknown();
     test_device_Commit();
     test_device_CreateTargetForHwnd();
     test_device_CreateVisual();
