@@ -1610,7 +1610,7 @@ static void test_surface_factory_CreateSurface(void)
 
             hr = IDCompositionSurfaceFactory_CreateSurface(surface_factories[i], tests[j].width,
                     tests[j].height, tests[j].pixel_format, tests[j].alpha_mode, &surface);
-            todo_wine
+            todo_wine_if(i == 1 && tests[j].hr == S_OK)
             ok(hr == tests[j].hr, "Got unexpected hr %#lx.\n", hr);
             if (hr == S_OK)
                 IDCompositionSurface_Release(surface);

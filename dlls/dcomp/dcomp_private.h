@@ -44,6 +44,19 @@ struct composition_surface_factory
     LONG ref;
 };
 
+struct composition_surface
+{
+    IDCompositionSurface IDCompositionSurface_iface;
+    IDCompositionSurfaceFactory *factory;
+    IUnknown *physical_surface;
+    GUID physical_surface_iid;
+    UINT width;
+    UINT height;
+    DXGI_FORMAT pixel_format;
+    DXGI_ALPHA_MODE alpha_mode;
+    LONG ref;
+};
+
 struct composition_target
 {
     IDCompositionTarget IDCompositionTarget_iface;
@@ -84,6 +97,11 @@ static inline struct composition_device *impl_from_IDCompositionDeviceUnknown(ID
     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDeviceUnknown_iface);
 }
 
+static inline struct composition_surface *impl_from_IDCompositionSurface(IDCompositionSurface *iface)
+{
+    return CONTAINING_RECORD(iface, struct composition_surface, IDCompositionSurface_iface);
+}
+
 static inline struct composition_surface_factory *impl_from_IDCompositionSurfaceFactory(IDCompositionSurfaceFactory *iface)
 {
     return CONTAINING_RECORD(iface, struct composition_surface_factory, IDCompositionSurfaceFactory_iface);
@@ -106,6 +124,8 @@ static inline struct composition_visual *impl_from_IDCompositionVisualUnknown(ID
 
 void dcomp_lock(void);
 void dcomp_unlock(void);
+HRESULT create_surface(struct composition_surface_factory *factory, UINT width, UINT height,
+        DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **dcomp_surface);
 HRESULT create_surface_factory(struct composition_device *device, IUnknown *rendering_device, IDCompositionSurfaceFactory **factory);
 HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
 HRESULT create_visual(int version, REFIID iid, void **visual);
