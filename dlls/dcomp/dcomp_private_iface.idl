@@ -157,7 +157,7 @@ interface IDCompositionVisualUnknown : IDCompositionVisual2
     HRESULT Unknown16();
     HRESULT Unknown17();
     HRESULT Unknown18();
-    HRESULT Unknown19();
+    HRESULT Unknown19(float parameter1);
     HRESULT Unknown20();
     HRESULT Unknown21();
     HRESULT Unknown22();
