@@ -65,6 +65,10 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisual2 *iface)
 
     if (!ref)
     {
+        if (visual->interop)
+            ID2D1GdiInteropRenderTarget_Release(visual->interop);
+        if (visual->device_context)
+            ID2D1DeviceContext_Release(visual->device_context);
         if (visual->content)
             IUnknown_Release(visual->content);
         free(visual);
@@ -158,20 +162,82 @@ static HRESULT STDMETHODCALLTYPE visual_SetClip(IDCompositionVisual2 *iface, con
 static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisual2 *iface, IUnknown *content)
 {
     struct composition_visual *visual = impl_from_IDCompositionVisual2(iface);
+    ID2D1GdiInteropRenderTarget *interop;
+    ID2D1DeviceContext *device_context;
     IDXGISwapChain1 *dxgi_swapchain;
+    IDXGIDevice *dxgi_device;
+    ID2D1Device *d2d_device;
+    HRESULT hr;
 
     FIXME("iface %p, content %p semi-stub!\n", iface, content);
 
-    if (content && FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1,
-            (void **)&dxgi_swapchain)))
+    if (content)
     {
-        FIXME("Only IDXGISwapChain1 is supported currently.\n");
-        return E_INVALIDARG;
+        if (FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1,
+                (void **)&dxgi_swapchain)))
+        {
+            FIXME("Only IDXGISwapChain1 is currently supported.\n");
+            return E_INVALIDARG;
+        }
+
+        hr = IDXGISwapChain1_GetDevice(dxgi_swapchain, &IID_IDXGIDevice, (void **)&dxgi_device);
+        IDXGISwapChain1_Release(dxgi_swapchain);
+        if (FAILED(hr))
+        {
+            ERR("Failed to get the swapchain device, hr %#lx.\n", hr);
+            return hr;
+        }
+
+        hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
+        IDXGIDevice_Release(dxgi_device);
+        if (FAILED(hr))
+        {
+            ERR("Failed to create a D2D device, hr %#lx.\n", hr);
+            return hr;
+        }
+
+        hr = ID2D1Device_CreateDeviceContext(d2d_device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                &device_context);
+        ID2D1Device_Release(d2d_device);
+        if (FAILED(hr))
+        {
+            ERR("Failed to create a D2D device context, hr %#lx.\n", hr);
+            return hr;
+        }
+
+        if (FAILED(hr = ID2D1DeviceContext_QueryInterface(device_context,
+                &IID_ID2D1GdiInteropRenderTarget, (void **)&interop)))
+        {
+            ERR("Failed to get a ID2D1GdiInteropRenderTarget, hr %#lx.\n", hr);
+            ID2D1DeviceContext_Release(device_context);
+            return hr;
+        }
     }
 
+    if (visual->interop)
+    {
+        ID2D1GdiInteropRenderTarget_Release(visual->interop);
+        visual->interop = NULL;
+    }
+    if (visual->device_context)
+    {
+        ID2D1DeviceContext_Release(visual->device_context);
+        visual->device_context = NULL;
+    }
     if (visual->content)
+    {
         IUnknown_Release(visual->content);
-    visual->content = content;
+        visual->content = NULL;
+    }
+
+    if (content)
+    {
+        IUnknown_AddRef(content);
+        visual->content = content;
+        visual->device_context = device_context;
+        visual->interop = interop;
+    }
+
     return S_OK;
 }
 

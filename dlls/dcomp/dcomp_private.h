@@ -19,11 +19,17 @@
 #define __WINE_DCOMP_PRIVATE_H
 
 #include "dcomp.h"
+#include "d2d1_1.h"
+#include "wine/list.h"
 
 struct composition_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
     IDCompositionDesktopDevice IDCompositionDesktopDevice_iface;
+    CRITICAL_SECTION cs;
+    struct list targets;
+    HANDLE thread;
+    BOOL thread_exited;
     int version;
     LONG ref;
 };
@@ -31,15 +37,19 @@ struct composition_device
 struct composition_target
 {
     IDCompositionTarget IDCompositionTarget_iface;
+    IDCompositionDevice *device;
     IDCompositionVisual *root;
     BOOL topmost;
     HWND hwnd;
+    struct list entry;
     LONG ref;
 };
 
 struct composition_visual
 {
     IDCompositionVisual2 IDCompositionVisual2_iface;
+    ID2D1GdiInteropRenderTarget *interop;
+    ID2D1DeviceContext *device_context;
     IUnknown *content;
     BOOL is_root;
     int version;
@@ -71,7 +81,7 @@ static inline struct composition_visual *impl_from_IDCompositionVisual2(IDCompos
     return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisual2_iface);
 }
 
-HRESULT create_target(HWND hwnd, BOOL topmost, IDCompositionTarget **target);
+HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
 HRESULT create_visual(int version, REFIID iid, void **visual);
 
 #endif /* __WINE_DCOMP_PRIVATE_H */

@@ -699,18 +699,15 @@ static void test_device_Commit(void)
 
     /* Call Commit() */
     hr = IDCompositionDevice_Commit(dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     /* Render swapchain red */
     set_color(&color, 1.0f, 0.0f, 0.0f, 1.0f);
-    todo_wine
     render_color_swapchain(swapchain, &color);
     expect_rendered_color(hwnd, RGB(0xff, 0, 0));
 
     /* Render swapchain blue */
     set_color(&color, 0.0f, 0.0f, 1.0f, 1.0f);
-    todo_wine
     render_color_swapchain(swapchain, &color);
     expect_rendered_color(hwnd, RGB(0, 0, 0xff));
 

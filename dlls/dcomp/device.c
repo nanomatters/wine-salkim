@@ -22,10 +22,13 @@
 #define COBJMACROS
 #include "windef.h"
 #include "winbase.h"
+#include "wingdi.h"
+#include "winternl.h"
 #include "initguid.h"
 #include "objidl.h"
 #include "dcomp_private.h"
 #include "dxgi.h"
+#include "dwmapi.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
@@ -75,15 +78,195 @@ static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
     TRACE("iface %p, ref %lu.\n", iface, ref);
 
     if (!ref)
+    {
+        if (device->thread)
+        {
+            WaitForSingleObject(device->thread, INFINITE);
+            CloseHandle(device->thread);
+        }
+        DeleteCriticalSection(&device->cs);
         free(device);
+    }
 
     return ref;
 }
 
+static void do_composite(const struct composition_target *target, IDXGISwapChain1 *swapchain)
+{
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    DXGI_SWAP_CHAIN_DESC swapchain_desc;
+    ID2D1Bitmap1 *target_bitmap = NULL;
+    struct composition_visual *visual;
+    ID2D1Bitmap *src_bitmap = NULL;
+    IDXGISurface1 *surface = NULL;
+    ID2D1Image *old_target = NULL;
+    HDC dst_dc, src_dc;
+    D2D1_SIZE_U size;
+    DWORD style;
+    HRESULT hr;
+
+    static const BLENDFUNCTION blend_func =
+    {
+      AC_SRC_OVER, /* BlendOp */
+      0,           /* BlendFlag */
+      255,         /* SourceConstantAlpha */
+      AC_SRC_ALPHA /* AlphaFormat */
+    };
+
+    /* The front buffer is the last back buffer because the composition swapchain must be created
+     * with DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL */
+    if (FAILED(hr = IDXGISwapChain1_GetDesc(swapchain, &swapchain_desc)))
+    {
+        ERR("Failed to get the swapchain description, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    size.width = swapchain_desc.BufferDesc.Width;
+    size.height = swapchain_desc.BufferDesc.Height;
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.dpiX = 0;
+    bitmap_desc.dpiY = 0;
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_GDI_COMPATIBLE;
+    bitmap_desc.colorContext = NULL;
+    visual = impl_from_IDCompositionVisual(target->root);
+    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(visual->device_context, size, NULL, 0,
+            &bitmap_desc, &target_bitmap)))
+    {
+        ERR("Failed to create a bitmap, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = IDXGISwapChain1_GetBuffer(swapchain, swapchain_desc.BufferCount - 1,
+            &IID_IDXGISurface1, (void **)&surface)))
+    {
+        ERR("Failed to get the swapchain front buffer, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = ID2D1DeviceContext_CreateSharedBitmap(visual->device_context, &IID_IDXGISurface,
+            surface, NULL, &src_bitmap)))
+    {
+        ERR("Failed to create a bitmap from dxgi surface, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = ID2D1Bitmap1_CopyFromBitmap(target_bitmap, NULL, src_bitmap, NULL)))
+    {
+        ERR("Failed to copy bitmap, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    ID2D1DeviceContext_GetTarget(visual->device_context, &old_target);
+    ID2D1DeviceContext_SetTarget(visual->device_context, (ID2D1Image *)target_bitmap);
+    if (FAILED(hr = ID2D1GdiInteropRenderTarget_GetDC(visual->interop, D2D1_DC_INITIALIZE_MODE_COPY,
+            &src_dc)))
+    {
+        ERR("GetDC failed, hr %#lx.\n", hr);
+        ID2D1DeviceContext_SetTarget(visual->device_context, old_target);
+        if (old_target)
+            ID2D1Image_Release(old_target);
+        goto done;
+    }
+
+    style = DCX_USESTYLE | DCX_CACHE;
+    if (!target->topmost)
+        style |= DCX_CLIPCHILDREN;
+    dst_dc = GetDCEx(target->hwnd, 0, style);
+    GdiAlphaBlend(dst_dc, 0, 0, size.width, size.height, src_dc, 0, 0, size.width, size.height, blend_func);
+    ReleaseDC(target->hwnd, dst_dc);
+
+    ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, NULL);
+    ID2D1DeviceContext_SetTarget(visual->device_context, old_target);
+    if (old_target)
+        ID2D1Image_Release(old_target);
+
+done:
+    if (src_bitmap)
+        ID2D1Bitmap_Release(src_bitmap);
+    if (surface)
+        IDXGISurface1_Release(surface);
+    if (target_bitmap)
+        ID2D1Bitmap1_Release(target_bitmap);
+}
+
+static DWORD WINAPI composite_thread_proc(void *iface)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice(iface);
+    unsigned int count, frequency, refresh_period;
+    IDXGISwapChain1 *swapchain = NULL;
+    struct composition_target *target;
+    struct composition_visual *visual;
+    HDC hdc;
+
+    /* TODO: Implement and use D3DKMTWaitForVerticalBlankEvent() */
+    hdc = GetDC(0);
+    frequency = GetDeviceCaps(hdc, VREFRESH);
+    refresh_period = 1000 / frequency;
+    ReleaseDC(0, hdc);
+
+    while (TRUE)
+    {
+        EnterCriticalSection(&device->cs);
+
+        count = 0;
+        LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
+        {
+            if (!target->root)
+                continue;
+
+            visual = impl_from_IDCompositionVisual(target->root);
+            if (!visual->content)
+                continue;
+
+            if (FAILED(IUnknown_QueryInterface(visual->content, &IID_IDXGISwapChain1, (void **)&swapchain)))
+            {
+                FIXME("Only IDXGISwapChain1 is currently supported.\n");
+                continue;
+            }
+
+            do_composite(target, swapchain);
+            count++;
+            IDXGISwapChain1_Release(swapchain);
+        }
+
+        if (!count)
+        {
+            device->thread_exited = TRUE;
+            LeaveCriticalSection(&device->cs);
+            break;
+        }
+
+        LeaveCriticalSection(&device->cs);
+        Sleep(refresh_period);
+    }
+
+    return 0;
+}
+
 static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    struct composition_device *device = impl_from_IDCompositionDevice(iface);
+    HRESULT hr = S_OK;
+
+    FIXME("iface %p semi-stub!\n", iface);
+
+    EnterCriticalSection(&device->cs);
+
+    if (!device->thread || device->thread_exited)
+    {
+        if (device->thread)
+        {
+            WaitForSingleObject(device->thread, INFINITE);
+            CloseHandle(device->thread);
+        }
+        device->thread_exited = FALSE;
+        device->thread = CreateThread(NULL, 0, composite_thread_proc, iface, 0, NULL);
+    }
+
+    LeaveCriticalSection(&device->cs);
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE device_WaitForCommitCompletion(IDCompositionDevice *iface)
@@ -102,9 +285,11 @@ static HRESULT STDMETHODCALLTYPE device_GetFrameStatistics(IDCompositionDevice *
 static HRESULT STDMETHODCALLTYPE device_CreateTargetForHwnd(IDCompositionDevice *iface,
         HWND hwnd, BOOL topmost, IDCompositionTarget **target)
 {
+    struct composition_device *device = impl_from_IDCompositionDevice(iface);
+
     TRACE("iface %p, hwnd %p, topmost %d, target %p\n", iface, hwnd, topmost, target);
 
-    return create_target(hwnd, topmost, target);
+    return create_target(device, hwnd, topmost, target);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateVisual(IDCompositionDevice *iface,
@@ -319,8 +504,11 @@ static ULONG STDMETHODCALLTYPE desktop_device_Release(IDCompositionDesktopDevice
 
 static HRESULT STDMETHODCALLTYPE desktop_device_Commit(IDCompositionDesktopDevice *iface)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    struct composition_device *device = impl_from_IDCompositionDesktopDevice(iface);
+
+    TRACE("iface %p.\n", iface);
+
+    return IDCompositionDevice_Commit(&device->IDCompositionDevice_iface);
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_WaitForCommitCompletion(IDCompositionDesktopDevice *iface)
@@ -542,6 +730,8 @@ static HRESULT create_device(int version, REFIID iid, void **out)
     if (!device)
         return E_OUTOFMEMORY;
 
+    InitializeCriticalSection(&device->cs);
+    list_init(&device->targets);
     device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
     device->IDCompositionDesktopDevice_iface.lpVtbl = &desktop_device_vtbl;
     device->version = version;

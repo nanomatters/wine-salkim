@@ -66,8 +66,15 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
 
     if (!ref)
     {
+        struct composition_device *device = impl_from_IDCompositionDevice(target->device);
+
         prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
         RemovePropW(target->hwnd, prop);
+
+        EnterCriticalSection(&device->cs);
+        list_remove(&target->entry);
+        LeaveCriticalSection(&device->cs);
+        IDCompositionDevice_Release(target->device);
         if (target->root)
         {
             root_visual = impl_from_IDCompositionVisual(target->root);
@@ -118,7 +125,8 @@ static const struct IDCompositionTargetVtbl target_vtbl =
     target_SetRoot,
 };
 
-HRESULT create_target(HWND hwnd, BOOL topmost, IDCompositionTarget **new_target)
+HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost,
+        IDCompositionTarget **new_target)
 {
     struct composition_target *target;
     const WCHAR *prop;
@@ -139,10 +147,15 @@ HRESULT create_target(HWND hwnd, BOOL topmost, IDCompositionTarget **new_target)
     if (!target)
         return E_OUTOFMEMORY;
 
+    IDCompositionDevice_AddRef(&device->IDCompositionDevice_iface);
+    EnterCriticalSection(&device->cs);
+    list_add_tail(&device->targets, &target->entry);
+    LeaveCriticalSection(&device->cs);
     target->IDCompositionTarget_iface.lpVtbl = &target_vtbl;
     target->ref = 1;
     target->hwnd = hwnd;
     target->topmost = topmost;
+    target->device = &device->IDCompositionDevice_iface;
     *new_target = &target->IDCompositionTarget_iface;
 
     prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
