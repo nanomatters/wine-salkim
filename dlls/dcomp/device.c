@@ -16,6 +16,7 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
+#include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
 
@@ -701,10 +702,39 @@ static HRESULT STDMETHODCALLTYPE desktop_device_OpenSharedResourceHandle(IDCompo
     return E_NOTIMPL;
 }
 
-static HRESULT STDMETHODCALLTYPE desktop_device_Unknown1(IDCompositionDesktopDevicePartner *iface)
+static HRESULT STDMETHODCALLTYPE desktop_device_Unknown1(IDCompositionDesktopDevicePartner *iface,
+     HANDLE visual_handle, REFIID iid, void **out)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    HRESULT hr;
+
+    FIXME("iface %p visual_handle %p, iid %s, out %p stub!\n", iface, visual_handle, debugstr_guid(iid), out);
+
+    /* visual_handle is from DCompositionCreateSharedVisualHandle(). iid is IID_IDCompositionVisual
+    * or IDCompositionTarget */
+    assert(visual_handle == (HANDLE)0xdeadbee1);
+    assert(IsEqualGUID(iid, &IID_IDCompositionVisual) || IsEqualGUID(iid, &IID_IDCompositionTarget));
+    assert(out);
+
+    if (IsEqualGUID(iid, &IID_IDCompositionVisual))
+    {
+        hr = create_visual(2, iid, (void **)out);
+        FIXME("Created a IDCompositionVisual %p from a shared visual handle %p, hr %#lx.\n", *out,
+              visual_handle, hr);
+        return hr;
+    }
+    else if (IsEqualGUID(iid, &IID_IDCompositionTarget))
+    {
+        HWND hwnd = CreateWindowA("static", "dummy_window", WS_VISIBLE, 0, 0, 800, 800, NULL, NULL, NULL, NULL);
+        hr = desktop_device_CreateTargetForHwnd(iface, hwnd, TRUE, (IDCompositionTarget **)out);
+        FIXME("Created a IDCompositionTarget %p from a shared visual handle %p, hr %#lx.\n", *out,
+              visual_handle, hr);
+        return hr;
+    }
+    else
+    {
+        FIXME("Unsupported GUID %s, returning E_NOTIMPL.\n", debugstr_guid(iid));
+        return E_NOTIMPL;
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_Unknown2(IDCompositionDesktopDevicePartner *iface)
