@@ -469,10 +469,11 @@ static HRESULT WINAPI visual_unknown_method13(IDCompositionVisualUnknown *iface)
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI visual_unknown_method14(IDCompositionVisualUnknown *iface)
+/* parameter1 is from the second parameter of NtCreateCompositionInputSink() */
+static HRESULT WINAPI visual_unknown_method14(IDCompositionVisualUnknown *iface, void *parameter1)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    FIXME("iface %p parameter1 %p stub!\n", iface, parameter1);
+    return S_OK;
 }
 
 static HRESULT WINAPI visual_unknown_method15(IDCompositionVisualUnknown *iface)

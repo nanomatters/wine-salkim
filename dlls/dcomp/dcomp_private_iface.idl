@@ -163,7 +163,7 @@ interface IDCompositionVisualUnknown : IDCompositionVisual2
     HRESULT Unknown11();
     HRESULT Unknown12();
     HRESULT Unknown13();
-    HRESULT Unknown14();
+    HRESULT Unknown14(void *parameter1);
     HRESULT Unknown15();
     HRESULT Unknown16();
     HRESULT Unknown17();
