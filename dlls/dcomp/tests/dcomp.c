@@ -821,13 +821,9 @@ static void test_DCompositionCreateDevice3(void)
 
     hr = pDCompositionCreateDevice3((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
             (void **)&dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        refcount = IDCompositionDevice_Release(dcomp_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
     refcount = IDXGIDevice_Release(dxgi_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
 
@@ -840,29 +836,22 @@ static void test_DCompositionCreateDevice3(void)
 
     hr = pDCompositionCreateDevice3((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
             (void **)&dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        /* Interface checks */
-        check_interface(dcomp_device, &IID_IUnknown, TRUE);
-        check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
-        check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
-        check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
 
-        refcount = IDCompositionDevice_Release(dcomp_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+    /* Interface checks */
+    check_interface(dcomp_device, &IID_IUnknown, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
+
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
 
     /* Parameter checks */
     hr = pDCompositionCreateDevice3(NULL, &IID_IDCompositionDevice, (void **)&dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        refcount = IDCompositionDevice_Release(dcomp_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
 
     /* Crash on Windows */
     if (0)

@@ -768,7 +768,11 @@ HRESULT WINAPI DCompositionCreateDevice3(IUnknown *rendering_device, REFIID iid,
 {
     FIXME("%p, %s, %p.\n", rendering_device, debugstr_guid(iid), device);
 
-    return E_NOTIMPL;
+    if (!IsEqualIID(iid, &IID_IDCompositionDevice)
+            && !IsEqualIID(iid, &IID_IDCompositionDesktopDevice))
+        return E_NOINTERFACE;
+
+    return create_device(3, iid, device);
 }
 
 HRESULT WINAPI DCompositionCreateSharedVisualHandle(void **handle)
