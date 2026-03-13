@@ -1169,7 +1169,6 @@ static void test_visual_SetBitmapInterpolationMode(void)
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
         hr = IDCompositionVisual_SetBitmapInterpolationMode(visual, tests[i].mode);
-        todo_wine
         ok(hr == tests[i].hr, "Got unexpected hr %#lx.\n", hr);
     }
 
@@ -1221,7 +1220,6 @@ static void test_visual_SetBorderMode(void)
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
         hr = IDCompositionVisual_SetBorderMode(visual, tests[i].mode);
-        todo_wine
         ok(hr == tests[i].hr, "Got unexpected hr %#lx.\n", hr);
     }
 
@@ -1273,7 +1271,6 @@ static void test_visual_SetBackFaceVisibility(void)
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
         hr = IDCompositionVisual2_SetBackFaceVisibility(visual, tests[i].visibility);
-        todo_wine
         ok(hr == tests[i].hr, "Got unexpected hr %#lx.\n", hr);
     }
 
@@ -1310,7 +1307,6 @@ static void test_visual_SetOffsetX(void)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDCompositionVisual_SetOffsetX(visual, 0);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     IDCompositionVisual_Release(visual);
