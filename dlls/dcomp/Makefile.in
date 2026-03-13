@@ -4,6 +4,7 @@ IMPORTS   = d2d1 dwmapi user32 gdi32
 EXTRADLLFLAGS = -Wb,--prefer-native
 
 SOURCES = \
+	dcomp_private_iface.idl \
 	device.c \
 	target.c \
 	visual.c \
