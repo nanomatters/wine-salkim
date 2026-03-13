@@ -569,7 +569,10 @@ done:
 
 static void test_visual_SetContent(void)
 {
+    IDCompositionSurfaceFactory *surface_factory;
+    IDCompositionDevice2 *dcomp_device2;
     IDCompositionDevice *dcomp_device;
+    IDCompositionSurface *surface;
     IDCompositionVisual *visual;
     IDXGISwapChain *swapchain;
     IDXGIDevice *dxgi_device;
@@ -585,7 +588,11 @@ static void test_visual_SetContent(void)
 
     hwnd = create_window();
     swapchain = create_swapchain(dxgi_device, hwnd);
-    hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, (void **)&dcomp_device);
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
+            (void **)&dcomp_device);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDCompositionDevice_QueryInterface(dcomp_device, &IID_IDCompositionDevice2,
+            (void *)&dcomp_device2);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     hr = IDCompositionDevice_CreateVisual(dcomp_device, &visual);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
@@ -594,6 +601,7 @@ static void test_visual_SetContent(void)
     hr = IDCompositionVisual_SetContent(visual, (IUnknown *)dcomp_device);
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
+    /* IDXGISwapChain1 */
     hr = IDCompositionVisual_SetContent(visual, (IUnknown *)swapchain);
     ok(hr == S_OK || broken(hr == DXGI_ERROR_UNSUPPORTED) /* win8 and win10 v1507 TestBot */,
             "Got unexpected hr %#lx.\n", hr);
@@ -601,13 +609,34 @@ static void test_visual_SetContent(void)
     hr = IDCompositionVisual_SetContent(visual, NULL);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
+    /* IDCompositionSurface */
+    hr = IDCompositionDevice2_CreateSurfaceFactory(dcomp_device2, (IUnknown *)dxgi_device, &surface_factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDCompositionSurfaceFactory_CreateSurface(surface_factory, 640, 480, DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_ALPHA_MODE_PREMULTIPLIED, &surface);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    expect_ref(surface, 1);
+
+    hr = IDCompositionVisual_SetContent(visual, (IUnknown *)surface);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDCompositionVisual_SetContent(visual, NULL);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    expect_ref(surface, 1);
+
+    IDCompositionSurface_Release(surface);
+    IDCompositionSurfaceFactory_Release(surface_factory);
+
     IDCompositionVisual_Release(visual);
+    IDCompositionDevice2_Release(dcomp_device2);
     refcount = IDCompositionDevice_Release(dcomp_device);
-    ok(!refcount, "Device has %lu references left.\n", refcount);
+    ok(!refcount || broken(refcount) /* SetContent() with IDCompositionSurface */,
+            "Device has %lu references left.\n", refcount);
     IDXGISwapChain_Release(swapchain);
     DestroyWindow(hwnd);
     refcount = IDXGIDevice_Release(dxgi_device);
-    ok(!refcount, "Device has %lu references left.\n", refcount);
+    ok(!refcount || broken(refcount) /* SetContent() with IDCompositionSurface */,
+            "Device has %lu references left.\n", refcount);
 }
 
 static void test_target_SetRoot(void)
