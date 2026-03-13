@@ -838,10 +838,15 @@ static HRESULT STDMETHODCALLTYPE desktop_device_Unknown16(IDCompositionDeviceUnk
     return E_NOTIMPL;
 }
 
-static HRESULT STDMETHODCALLTYPE desktop_device_Unknown17(IDCompositionDeviceUnknown *iface)
+static HRESULT STDMETHODCALLTYPE desktop_device_Unknown17(IDCompositionDeviceUnknown *iface, void **parameter1)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    FIXME("iface %p parameter1 %p stub!\n", iface, parameter1);
+
+    if (!parameter1)
+        return E_INVALIDARG;
+
+    *parameter1 = NULL;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_Unknown18(IDCompositionDeviceUnknown *iface)
