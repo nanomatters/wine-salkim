@@ -233,6 +233,8 @@ static void test_DCompositionCreateDevice(void)
     check_interface(dcomp_device, &IID_IDCompositionDevice2, FALSE);
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, FALSE);
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDeviceUnknown, TRUE);
+    check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, &IID_IDCompositionDeviceUnknown);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
@@ -302,6 +304,8 @@ static void test_DCompositionCreateDevice2(void)
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, TRUE);
     check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevice, &IID_IDCompositionDesktopDevicePartner);
+    check_interface(dcomp_device, &IID_IDCompositionDeviceUnknown, TRUE);
+    check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, &IID_IDCompositionDeviceUnknown);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
@@ -880,6 +884,8 @@ static void test_DCompositionCreateDevice3(void)
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, TRUE);
     check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevice, &IID_IDCompositionDesktopDevicePartner);
+    check_interface(dcomp_device, &IID_IDCompositionDeviceUnknown, TRUE);
+    check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, &IID_IDCompositionDeviceUnknown);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
