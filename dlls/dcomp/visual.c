@@ -62,6 +62,7 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
 {
     struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
     ULONG ref = InterlockedDecrement(&visual->ref);
+    struct composition_visual *child;
 
     TRACE("iface %p, ref %lu.\n", iface, ref);
 
@@ -73,6 +74,16 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
             ID2D1DeviceContext_Release(visual->device_context);
         if (visual->content)
             IUnknown_Release(visual->content);
+        dcomp_lock();
+        if (visual->is_child)
+            list_remove(&visual->entry);
+        LIST_FOR_EACH_ENTRY(child, &visual->child_visuals, struct composition_visual, entry)
+        {
+            list_remove(&child->entry);
+            child->is_child = FALSE;
+            child->parent = NULL;
+        }
+        dcomp_unlock();
         free(visual);
     }
 
@@ -136,15 +147,33 @@ static HRESULT STDMETHODCALLTYPE visual_SetEffect(IDCompositionVisualUnknown *if
 static HRESULT STDMETHODCALLTYPE visual_SetBitmapInterpolationMode(IDCompositionVisualUnknown *iface,
         enum DCOMPOSITION_BITMAP_INTERPOLATION_MODE interpolation_mode)
 {
-    FIXME("iface %p, interpolation_mode %d stub!\n", iface, interpolation_mode);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, interpolation_mode %d.\n", iface, interpolation_mode);
+
+    if (interpolation_mode != DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+        && interpolation_mode != DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR
+        && interpolation_mode != DCOMPOSITION_BITMAP_INTERPOLATION_MODE_INHERIT)
+        return E_INVALIDARG;
+
+    visual->interpolation_mode = interpolation_mode;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetBorderMode(IDCompositionVisualUnknown *iface,
         enum DCOMPOSITION_BORDER_MODE border_mode)
 {
-    FIXME("iface %p, border_mode %d stub!\n", iface, border_mode);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, border_mode %d.\n", iface, border_mode);
+
+    if (border_mode != DCOMPOSITION_BORDER_MODE_SOFT
+        && border_mode != DCOMPOSITION_BORDER_MODE_HARD
+        && border_mode != DCOMPOSITION_BORDER_MODE_INHERIT)
+        return E_INVALIDARG;
+
+    visual->border_mode = border_mode;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetClipObject(IDCompositionVisualUnknown *iface,
@@ -246,22 +275,90 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
 static HRESULT STDMETHODCALLTYPE visual_AddVisual(IDCompositionVisualUnknown *iface,
         IDCompositionVisual *visual, BOOL insert_above, IDCompositionVisual *reference_visual)
 {
-    FIXME("iface %p, visual %p, insert_above %d, reference_visual %p, stub!\n", iface, visual,
-            insert_above, reference_visual);
-    return E_NOTIMPL;
+    struct composition_visual *parent_visual_impl = impl_from_IDCompositionVisualUnknown(iface);
+    struct composition_visual *child_visual_impl, *ref_visual_impl = NULL;
+
+    FIXME("iface %p, visual %p, insert_above %d, reference_visual %p.\n", iface, visual,
+          insert_above, reference_visual);
+
+    if (!visual)
+        return E_INVALIDARG;
+
+    child_visual_impl = impl_from_IDCompositionVisual(visual);
+    if (child_visual_impl->is_root || child_visual_impl->is_child)
+        return E_INVALIDARG;
+
+    dcomp_lock();
+    if (reference_visual)
+    {
+        ref_visual_impl = impl_from_IDCompositionVisual(reference_visual);
+        if (!(ref_visual_impl->is_child && ref_visual_impl->parent == parent_visual_impl))
+        {
+            dcomp_unlock();
+            return E_INVALIDARG;
+        }
+
+        if (insert_above)
+            list_add_after(&ref_visual_impl->entry, &child_visual_impl->entry);
+        else
+            list_add_before(&ref_visual_impl->entry, &child_visual_impl->entry);
+    }
+    else
+    {
+        if (insert_above)
+            list_add_tail(&parent_visual_impl->child_visuals, &child_visual_impl->entry);
+        else
+            list_add_head(&parent_visual_impl->child_visuals, &child_visual_impl->entry);
+    }
+
+    child_visual_impl->is_child = TRUE;
+    child_visual_impl->parent = parent_visual_impl;
+    dcomp_unlock();
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_RemoveVisual(IDCompositionVisualUnknown *iface,
         IDCompositionVisual *visual)
 {
-    FIXME("iface %p, visual %p stub!\n", iface, visual);
-    return E_NOTIMPL;
+    struct composition_visual *parent_visual_impl = impl_from_IDCompositionVisualUnknown(iface);
+    struct composition_visual *child_visual_impl;
+
+    FIXME("iface %p, visual %p.\n", iface, visual);
+
+    if (!visual)
+        return E_INVALIDARG;
+
+    child_visual_impl = impl_from_IDCompositionVisual(visual);
+    dcomp_lock();
+    if (!(child_visual_impl->is_child && child_visual_impl->parent == parent_visual_impl))
+    {
+        dcomp_unlock();
+        return E_INVALIDARG;
+    }
+
+    list_remove(&child_visual_impl->entry);
+    child_visual_impl->is_child = FALSE;
+    child_visual_impl->parent = NULL;
+    dcomp_unlock();
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_RemoveAllVisuals(IDCompositionVisualUnknown *iface)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    struct composition_visual *parent_visual_impl = impl_from_IDCompositionVisualUnknown(iface);
+    struct composition_visual *child_visual_impl;
+
+    FIXME("iface %p.\n", iface);
+
+    dcomp_lock();
+    LIST_FOR_EACH_ENTRY(child_visual_impl, &parent_visual_impl->child_visuals, struct composition_visual, entry)
+    {
+        list_remove(&child_visual_impl->entry);
+        child_visual_impl->is_child = FALSE;
+        child_visual_impl->parent = NULL;
+    }
+    dcomp_unlock();
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetCompositeMode(IDCompositionVisualUnknown *iface,
@@ -281,8 +378,17 @@ static HRESULT STDMETHODCALLTYPE visual_SetOpacityMode(IDCompositionVisualUnknow
 static HRESULT STDMETHODCALLTYPE visual_SetBackFaceVisibility(IDCompositionVisualUnknown *iface,
         enum DCOMPOSITION_BACKFACE_VISIBILITY visibility)
 {
-    FIXME("iface %p, visibility %d stub!\n", iface, visibility);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, visibility %d.\n", iface, visibility);
+
+    if (visibility != DCOMPOSITION_BACKFACE_VISIBILITY_VISIBLE
+        && visibility != DCOMPOSITION_BACKFACE_VISIBILITY_HIDDEN
+        && visibility != DCOMPOSITION_BACKFACE_VISIBILITY_INHERIT)
+        return E_INVALIDARG;
+
+    visual->visibility = visibility;
+    return S_OK;
 }
 
 static HRESULT WINAPI visual_unknown_method1(IDCompositionVisualUnknown *iface)
@@ -1025,6 +1131,7 @@ HRESULT create_visual(int version, REFIID iid, void **new_visual)
     visual->IDCompositionVisualUnknown_iface.lpVtbl = &visual_unknown_vtbl;
     visual->version = version;
     visual->ref = 1;
+    list_init(&visual->child_visuals);
     hr = IUnknown_QueryInterface(&visual->IDCompositionVisualUnknown_iface, iid, new_visual);
     IUnknown_Release(&visual->IDCompositionVisualUnknown_iface);
     return hr;

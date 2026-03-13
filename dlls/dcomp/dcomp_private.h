@@ -52,7 +52,14 @@ struct composition_visual
     ID2D1GdiInteropRenderTarget *interop;
     ID2D1DeviceContext *device_context;
     IUnknown *content;
+    enum DCOMPOSITION_BITMAP_INTERPOLATION_MODE interpolation_mode;
+    enum DCOMPOSITION_BORDER_MODE border_mode;
+    enum DCOMPOSITION_BACKFACE_VISIBILITY visibility;
+    struct list child_visuals; /* visuals closer to head are lower in z-order */
+    struct list entry;
+    struct composition_visual *parent;
     BOOL is_root;
+    BOOL is_child;
     int version;
     LONG ref;
 };
@@ -82,6 +89,8 @@ static inline struct composition_visual *impl_from_IDCompositionVisualUnknown(ID
     return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisualUnknown_iface);
 }
 
+void dcomp_lock(void);
+void dcomp_unlock(void);
 HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
 HRESULT create_visual(int version, REFIID iid, void **visual);
 

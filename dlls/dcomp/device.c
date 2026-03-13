@@ -36,6 +36,25 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
+static CRITICAL_SECTION dcomp_cs;
+static CRITICAL_SECTION_DEBUG dcomp_debug =
+{
+    0, 0, &dcomp_cs,
+    { &dcomp_debug.ProcessLocksList, &dcomp_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": dcomp_cs") }
+};
+static CRITICAL_SECTION dcomp_cs = { &dcomp_debug, -1, 0, 0, 0, 0 };
+
+void dcomp_lock(void)
+{
+    EnterCriticalSection(&dcomp_cs);
+}
+
+void dcomp_unlock(void)
+{
+    LeaveCriticalSection(&dcomp_cs);
+}
+
 static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *iface,
         REFIID iid, void **out)
 {
