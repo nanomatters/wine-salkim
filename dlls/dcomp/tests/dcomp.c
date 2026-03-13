@@ -81,13 +81,9 @@ static void test_DCompositionCreateDevice(void)
     }
 
     hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, (void **)&dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        refcount = IDCompositionDevice_Release(dcomp_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
     refcount = IDXGIDevice_Release(dxgi_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
 
@@ -99,26 +95,21 @@ static void test_DCompositionCreateDevice(void)
     }
 
     hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, (void **)&dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
-        /* Device created from DCompositionCreateDevice() doesn't support IDCompositionDevice2 */
-        check_interface(dcomp_device, &IID_IDCompositionDevice2, FALSE);
-        refcount = IDCompositionDevice_Release(dcomp_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+
+    check_interface(dcomp_device, &IID_IUnknown, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
+    /* Device created from DCompositionCreateDevice() doesn't support IDCompositionDevice2 */
+    check_interface(dcomp_device, &IID_IDCompositionDevice2, FALSE);
+
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
 
     /* Parameter checks */
     hr = pDCompositionCreateDevice(NULL, &IID_IDCompositionDevice, (void **)&dcomp_device);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        refcount = IDCompositionDevice_Release(dcomp_device);
-        ok(!refcount, "Device has %lu references left.\n", refcount);
-    }
+    refcount = IDCompositionDevice_Release(dcomp_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
 
     /* Crash on Windows */
     if (0)
@@ -128,11 +119,9 @@ static void test_DCompositionCreateDevice(void)
     }
 
     hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice2, (void **)&dcomp_device);
-    todo_wine
     ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
 
     hr = pDCompositionCreateDevice(dxgi_device, &IID_IDCompositionDevice, NULL);
-    todo_wine
     ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
 
     refcount = IDXGIDevice_Release(dxgi_device);
