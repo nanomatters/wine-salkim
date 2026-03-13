@@ -32,6 +32,7 @@
 
 static HRESULT (WINAPI *pDCompositionCreateDevice)(IDXGIDevice *dxgi_device, REFIID iid, void **device);
 static HRESULT (WINAPI *pDCompositionCreateDevice2)(IUnknown *rendering_device, REFIID iid, void **device);
+static HRESULT (WINAPI *pDCompositionCreateDevice3)(IUnknown *rendering_device, REFIID iid, void **device);
 
 static void *get_stack_pointer(void)
 {
@@ -804,6 +805,76 @@ static void test_device_Commit(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_DCompositionCreateDevice3(void)
+{
+    IDCompositionDevice *dcomp_device;
+    IDXGIDevice *dxgi_device;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* D3D device created without BGRA support */
+    if (!(dxgi_device = create_device(0)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = pDCompositionCreateDevice3((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
+            (void **)&dcomp_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDCompositionDevice_Release(dcomp_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+    /* D3D device created with BGRA support */
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = pDCompositionCreateDevice3((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
+            (void **)&dcomp_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        /* Interface checks */
+        check_interface(dcomp_device, &IID_IUnknown, TRUE);
+        check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
+        check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
+        check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
+
+        refcount = IDCompositionDevice_Release(dcomp_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+
+    /* Parameter checks */
+    hr = pDCompositionCreateDevice3(NULL, &IID_IDCompositionDevice, (void **)&dcomp_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDCompositionDevice_Release(dcomp_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+
+    /* Crash on Windows */
+    if (0)
+    {
+    hr = pDCompositionCreateDevice3((IUnknown *)dxgi_device, NULL, (void **)&dcomp_device);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    }
+
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 START_TEST(dcomp)
 {
     HMODULE module;
@@ -817,6 +888,7 @@ START_TEST(dcomp)
 
     pDCompositionCreateDevice = (void *)GetProcAddress(module, "DCompositionCreateDevice");
     pDCompositionCreateDevice2 = (void *)GetProcAddress(module, "DCompositionCreateDevice2");
+    pDCompositionCreateDevice3 = (void *)GetProcAddress(module, "DCompositionCreateDevice3");
 
     if (!pDCompositionCreateDevice)
     {
@@ -827,6 +899,7 @@ START_TEST(dcomp)
 
     test_DCompositionCreateDevice();
     test_DCompositionCreateDevice2();
+    test_DCompositionCreateDevice3();
     test_DCompositionCreateSharedVisualHandle();
     test_DCompositionWaitForCompositorClock();
     test_device_Commit();
