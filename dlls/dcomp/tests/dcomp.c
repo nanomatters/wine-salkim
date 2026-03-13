@@ -506,10 +506,14 @@ static void test_device_CreateVisual(void)
 
     hr = IDCompositionDevice_CreateVisual(dcomp_device, &visual);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    check_interface(visual, &IID_IUnknown, TRUE);
+    check_interface(visual, &IID_IDCompositionVisual, TRUE);
     /* IDCompositionVisual objects created from a device from DCompositionCreateDevice() doesn't
      * support IDCompositionVisual2 */
-    hr = IDCompositionVisual_QueryInterface(visual, &IID_IDCompositionVisual2, (void *)&visual2);
-    ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
+    check_interface(visual, &IID_IDCompositionVisual2, FALSE);
+    check_interface(visual, &IID_IDCompositionVisualUnknown, TRUE);
+
     IDCompositionVisual_Release(visual);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
@@ -532,6 +536,13 @@ static void test_device_CreateVisual(void)
 
     hr = IDCompositionDesktopDevice_CreateVisual(desktop_device, &visual2);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    check_interface(visual2, &IID_IUnknown, TRUE);
+    check_interface(visual2, &IID_IDCompositionVisual, TRUE);
+    check_interface(visual2, &IID_IDCompositionVisual2, TRUE);
+    check_interface(visual2, &IID_IDCompositionVisualUnknown, TRUE);
+    check_inherited_interface(visual2, &IID_IDCompositionVisual2, &IID_IDCompositionVisualUnknown);
+
     IDCompositionVisual2_Release(visual2);
 
     refcount = IDCompositionDesktopDevice_Release(desktop_device);
