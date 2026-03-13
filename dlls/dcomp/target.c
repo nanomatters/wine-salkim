@@ -1,0 +1,123 @@
+/*
+ * Copyright 2023 Zhiyi Zhang for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#include <stdarg.h>
+
+#define COBJMACROS
+#include "windef.h"
+#include "winbase.h"
+#include "dcomp_private.h"
+#include "wine/debug.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+
+static const WCHAR *wine_window_topmost_composed = L"wine_window_topmost_composed";
+static const WCHAR *wine_window_non_topmost_composed = L"wine_window_non_topmost_composed";
+
+static HRESULT STDMETHODCALLTYPE target_QueryInterface(IDCompositionTarget *iface, REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p!\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown)
+            || IsEqualGUID(iid, &IID_IDCompositionTarget))
+    {
+        IUnknown_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE target_AddRef(IDCompositionTarget *iface)
+{
+    struct composition_target *target = impl_from_IDCompositionTarget(iface);
+    ULONG ref = InterlockedIncrement(&target->ref);
+
+    TRACE("iface %p, ref %lu.\n", iface, ref);
+    return ref;
+}
+
+static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
+{
+    struct composition_target *target = impl_from_IDCompositionTarget(iface);
+    ULONG ref = InterlockedDecrement(&target->ref);
+    const WCHAR *prop;
+
+    TRACE("iface %p, ref %lu.\n", iface, ref);
+
+    if (!ref)
+    {
+        prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
+        RemovePropW(target->hwnd, prop);
+        free(target);
+    }
+
+    return ref;
+}
+
+static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
+        IDCompositionVisual *visual)
+{
+    FIXME("iface %p, visual %p stub!\n", iface, visual);
+    return E_NOTIMPL;
+}
+
+static const struct IDCompositionTargetVtbl target_vtbl =
+{
+    /* IUnknown methods */
+    target_QueryInterface,
+    target_AddRef,
+    target_Release,
+    /* IDCompositionTarget methods */
+    target_SetRoot,
+};
+
+HRESULT create_target(HWND hwnd, BOOL topmost, IDCompositionTarget **new_target)
+{
+    struct composition_target *target;
+    const WCHAR *prop;
+    DWORD pid = 0;
+
+    if (!hwnd || hwnd == GetDesktopWindow() || !new_target)
+        return E_INVALIDARG;
+
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId())
+        return E_ACCESSDENIED;
+
+    if ((topmost && GetPropW(hwnd, wine_window_topmost_composed))
+            || (!topmost && GetPropW(hwnd, wine_window_non_topmost_composed)))
+        return DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED;
+
+    target = calloc(1, sizeof(*target));
+    if (!target)
+        return E_OUTOFMEMORY;
+
+    target->IDCompositionTarget_iface.lpVtbl = &target_vtbl;
+    target->ref = 1;
+    target->hwnd = hwnd;
+    target->topmost = topmost;
+    *new_target = &target->IDCompositionTarget_iface;
+
+    prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
+    SetPropW(target->hwnd, prop, (HANDLE)1);
+    return S_OK;
+}

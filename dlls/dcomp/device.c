@@ -102,8 +102,9 @@ static HRESULT STDMETHODCALLTYPE device_GetFrameStatistics(IDCompositionDevice *
 static HRESULT STDMETHODCALLTYPE device_CreateTargetForHwnd(IDCompositionDevice *iface,
         HWND hwnd, BOOL topmost, IDCompositionTarget **target)
 {
-    FIXME("iface %p, hwnd %p, topmost %d, target %p stub!\n", iface, hwnd, topmost, target);
-    return E_NOTIMPL;
+    TRACE("iface %p, hwnd %p, topmost %d, target %p\n", iface, hwnd, topmost, target);
+
+    return create_target(hwnd, topmost, target);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateVisual(IDCompositionDevice *iface,
@@ -471,8 +472,12 @@ static HRESULT STDMETHODCALLTYPE desktop_device_CreateAnimation(IDCompositionDes
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateTargetForHwnd(IDCompositionDesktopDevice *iface,
         HWND hwnd, BOOL topmost, IDCompositionTarget **target)
 {
-    FIXME("iface %p, hwnd %p, topmost %d, target %p stub!\n", iface, hwnd, topmost, target);
-    return E_NOTIMPL;
+    struct composition_device *device = impl_from_IDCompositionDesktopDevice(iface);
+
+    TRACE("iface %p, hwnd %p, topmost %d, target %p\n", iface, hwnd, topmost, target);
+
+    return IDCompositionDevice_CreateTargetForHwnd(&device->IDCompositionDevice_iface, hwnd,
+            topmost, target);
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurfaceFromHandle(IDCompositionDesktopDevice *iface,
