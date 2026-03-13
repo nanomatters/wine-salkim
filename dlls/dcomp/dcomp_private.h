@@ -32,6 +32,7 @@ struct composition_device
     CRITICAL_SECTION cs;
     struct list targets;
     HANDLE thread;
+    BOOL exit_thread;
     BOOL thread_exited;
     int version;
     LONG ref;
