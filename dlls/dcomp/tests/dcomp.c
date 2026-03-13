@@ -958,6 +958,9 @@ static void test_IDCompositionDesktopDevicePartner(void)
     hr = IDCompositionVisualUnknown_Unknown19(visual_unknown, 0);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
+    hr = IDCompositionVisualUnknown_Unknown20(visual_unknown, 0);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
     IDCompositionVisualUnknown_Release(visual_unknown);
 
     IDCompositionVisual_Release(visual);
@@ -1021,6 +1024,14 @@ static void test_IDCompositionVisualUnknown(void)
     old_stack_pointer = get_stack_pointer();
 
     hr = IDCompositionVisualUnknown_Unknown19(visual_unknown, 0);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    stack_pointer = get_stack_pointer();
+    ok(stack_pointer == old_stack_pointer, "Got unexpected stack pointer.\n");
+
+    old_stack_pointer = get_stack_pointer();
+
+    hr = IDCompositionVisualUnknown_Unknown20(visual_unknown, 0);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     stack_pointer = get_stack_pointer();
