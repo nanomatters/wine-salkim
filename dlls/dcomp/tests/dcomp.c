@@ -25,6 +25,7 @@
 #include "wine/test.h"
 
 static HRESULT (WINAPI *pDCompositionCreateDevice)(IDXGIDevice *dxgi_device, REFIID iid, void **device);
+static HRESULT (WINAPI *pDCompositionCreateDevice2)(IUnknown *rendering_device, REFIID iid, void **device);
 
 #define check_interface(a, b, c) check_interface_(__LINE__, a, b, c)
 static void check_interface_(unsigned int line, void *iface_ptr, REFIID iid, BOOL supported)
@@ -128,6 +129,99 @@ static void test_DCompositionCreateDevice(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_DCompositionCreateDevice2(void)
+{
+    IDCompositionDesktopDevice *desktop_device;
+    IDCompositionDevice2 *dcomp_device2;
+    IDCompositionDevice *dcomp_device;
+    IDXGIDevice *dxgi_device;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* D3D device created without BGRA support */
+    if (!(dxgi_device = create_device(0)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
+            (void **)&dcomp_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDCompositionDevice_Release(dcomp_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+
+    /* D3D device created with BGRA support */
+    if (!(dxgi_device = create_device(D3D10_CREATE_DEVICE_BGRA_SUPPORT)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDevice,
+            (void **)&dcomp_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        check_interface(dcomp_device, &IID_IUnknown, TRUE);
+        check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
+        todo_wine
+        check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
+        todo_wine
+        check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
+
+        refcount = IDCompositionDevice_Release(dcomp_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+
+    /* Parameter checks */
+    hr = pDCompositionCreateDevice2(NULL, &IID_IDCompositionDevice, (void **)&dcomp_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDCompositionDevice_Release(dcomp_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+
+    /* Crash on Windows */
+    if (0)
+    {
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, NULL, (void **)&dcomp_device);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    }
+
+    /* IDCompositionDevice2 needs to be queried from the device instance */
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDevice2,
+            (void **)&dcomp_device2);
+    todo_wine
+    ok(hr == E_NOINTERFACE, "Got unexpected hr %#lx.\n", hr);
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDesktopDevice,
+            (void **)&desktop_device);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDCompositionDesktopDevice_Release(desktop_device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+
+    hr = pDCompositionCreateDevice2((IUnknown *)dxgi_device, &IID_IDCompositionDevice, NULL);
+    todo_wine
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    refcount = IDXGIDevice_Release(dxgi_device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 START_TEST(dcomp)
 {
     HMODULE module;
@@ -140,6 +234,8 @@ START_TEST(dcomp)
     }
 
     pDCompositionCreateDevice = (void *)GetProcAddress(module, "DCompositionCreateDevice");
+    pDCompositionCreateDevice2 = (void *)GetProcAddress(module, "DCompositionCreateDevice2");
+
     if (!pDCompositionCreateDevice)
     {
         win_skip("DCompositionCreateDevice() is unavailable.\n");
@@ -148,6 +244,7 @@ START_TEST(dcomp)
     }
 
     test_DCompositionCreateDevice();
+    test_DCompositionCreateDevice2();
 
     FreeLibrary(module);
 }
