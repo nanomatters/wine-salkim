@@ -94,7 +94,7 @@ static int wayland_disable_ssd(void)
     if (disabled == -1)
         disabled = (env = getenv("WAYLANDDRV_SSD")) && !strcmp(env, "0");
 
-    return disabled;
+    return 1;
 }
 
 /**********************************************************************
