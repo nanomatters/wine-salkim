@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 #include <stdarg.h>
+#include <assert.h>
 
 #define COBJMACROS
 #include "windef.h"
@@ -115,6 +116,14 @@ static const struct IDCompositionSurfaceVtbl surface_vtbl =
     surface_ResumeDraw,
     surface_Scroll,
 };
+
+struct composition_surface *unsafe_impl_from_IDCompositionSurface(IDCompositionSurface *iface)
+{
+    if (!iface)
+        return NULL;
+    assert(iface->lpVtbl == &surface_vtbl);
+    return CONTAINING_RECORD(iface, struct composition_surface, IDCompositionSurface_iface);
+}
 
 HRESULT create_surface(struct composition_surface_factory *factory, UINT width, UINT height,
         DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **dcomp_surface)

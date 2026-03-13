@@ -618,7 +618,6 @@ static void test_visual_SetContent(void)
     expect_ref(surface, 1);
 
     hr = IDCompositionVisual_SetContent(visual, (IUnknown *)surface);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     hr = IDCompositionVisual_SetContent(visual, NULL);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);

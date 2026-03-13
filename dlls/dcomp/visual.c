@@ -200,27 +200,58 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
     ID2D1GdiInteropRenderTarget *interop;
     ID2D1DeviceContext *device_context;
     IDXGISwapChain1 *dxgi_swapchain;
+    IDCompositionSurface *suface;
     IDXGIDevice *dxgi_device;
     ID2D1Device *d2d_device;
+    const GUID *iid = NULL;
     HRESULT hr;
 
     FIXME("iface %p, content %p semi-stub!\n", iface, content);
 
+
     if (content)
     {
-        if (FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1,
+        if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1,
                 (void **)&dxgi_swapchain)))
         {
-            FIXME("Only IDXGISwapChain1 is currently supported.\n");
-            return E_INVALIDARG;
-        }
+            iid = &IID_IDXGISwapChain1;
 
-        hr = IDXGISwapChain1_GetDevice(dxgi_swapchain, &IID_IDXGIDevice, (void **)&dxgi_device);
-        IDXGISwapChain1_Release(dxgi_swapchain);
-        if (FAILED(hr))
+            hr = IDXGISwapChain1_GetDevice(dxgi_swapchain, &IID_IDXGIDevice, (void **)&dxgi_device);
+            IDXGISwapChain1_Release(dxgi_swapchain);
+            if (FAILED(hr))
+            {
+                ERR("Failed to get the swapchain device, hr %#lx.\n", hr);
+                return hr;
+            }
+        }
+        else if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDCompositionSurface, (void **)&suface)))
         {
-            ERR("Failed to get the swapchain device, hr %#lx.\n", hr);
-            return hr;
+            struct composition_surface *dcomp_surface = unsafe_impl_from_IDCompositionSurface(suface);
+
+            if (IsEqualGUID(&dcomp_surface->physical_surface_iid, &IID_IDXGISurface))
+            {
+                iid = &IID_IDCompositionSurface;
+
+                hr = IDXGISurface_GetDevice((IDXGISurface *)dcomp_surface->physical_surface,
+                        &IID_IDXGIDevice, (void **)&dxgi_device);
+                IDCompositionSurface_Release(suface);
+                if (FAILED(hr))
+                {
+                    ERR("Failed to get the dxgi surface device, hr %#lx.\n", hr);
+                    return hr;
+                }
+            }
+            else
+            {
+                FIXME("Only IDCompositionSurface from IDXGISurface is currently supported.\n");
+                IDCompositionSurface_Release(suface);
+                return E_INVALIDARG;
+            }
+        }
+        else
+        {
+            FIXME("Only IDXGISwapChain1 or IDCompositionSurface are currently supported.\n");
+            return E_INVALIDARG;
         }
 
         hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
@@ -269,6 +300,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
     {
         IUnknown_AddRef(content);
         visual->content = content;
+        visual->content_iid = *iid;
         visual->device_context = device_context;
         visual->interop = interop;
     }

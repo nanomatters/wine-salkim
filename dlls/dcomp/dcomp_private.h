@@ -74,6 +74,7 @@ struct composition_visual
     ID2D1GdiInteropRenderTarget *interop;
     ID2D1DeviceContext *device_context;
     IUnknown *content;
+    GUID content_iid;
     enum DCOMPOSITION_BITMAP_INTERPOLATION_MODE interpolation_mode;
     enum DCOMPOSITION_BORDER_MODE border_mode;
     enum DCOMPOSITION_BACKFACE_VISIBILITY visibility;
@@ -106,6 +107,8 @@ static inline struct composition_surface_factory *impl_from_IDCompositionSurface
 {
     return CONTAINING_RECORD(iface, struct composition_surface_factory, IDCompositionSurfaceFactory_iface);
 }
+
+struct composition_surface *unsafe_impl_from_IDCompositionSurface(IDCompositionSurface *iface);
 
 static inline struct composition_target *impl_from_IDCompositionTarget(IDCompositionTarget *iface)
 {
