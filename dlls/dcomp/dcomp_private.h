@@ -28,7 +28,7 @@ struct composition_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
     IDCompositionDeviceUnknown IDCompositionDeviceUnknown_iface;
-    IDCompositionSurface *drawing_surface;
+    IDCompositionSurfaceUnknown *drawing_surface;
     struct list targets;
     HANDLE thread;
     BOOL exit_thread;
@@ -48,7 +48,7 @@ struct composition_surface_factory
 
 struct composition_surface
 {
-    IDCompositionSurface IDCompositionSurface_iface;
+    IDCompositionSurfaceUnknown IDCompositionSurfaceUnknown_iface;
     IDCompositionSurfaceFactory *factory;
     ID3D11Texture2D *draw_surface;
     RECT draw_rect;
@@ -104,9 +104,14 @@ static inline struct composition_device *impl_from_IDCompositionDeviceUnknown(ID
     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDeviceUnknown_iface);
 }
 
+static inline struct composition_surface *impl_from_IDCompositionSurfaceUnknown(IDCompositionSurfaceUnknown *iface)
+{
+    return CONTAINING_RECORD(iface, struct composition_surface, IDCompositionSurfaceUnknown_iface);
+}
+
 static inline struct composition_surface *impl_from_IDCompositionSurface(IDCompositionSurface *iface)
 {
-    return CONTAINING_RECORD(iface, struct composition_surface, IDCompositionSurface_iface);
+    return CONTAINING_RECORD(iface, struct composition_surface, IDCompositionSurfaceUnknown_iface);
 }
 
 static inline struct composition_surface_factory *impl_from_IDCompositionSurfaceFactory(IDCompositionSurfaceFactory *iface)
