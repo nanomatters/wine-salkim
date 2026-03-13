@@ -28,6 +28,7 @@
 #include <d2d1_1.h>
 #include <d3d10_1.h>
 #include "dcomp.h"
+#include "dcomp_private_iface.h"
 #include "wine/test.h"
 
 static HRESULT (WINAPI *pDCompositionCreateDevice)(IDXGIDevice *dxgi_device, REFIID iid, void **device);
@@ -68,6 +69,25 @@ static void check_interface_(unsigned int line, void *iface_ptr, REFIID iid, BOO
     ok_(__FILE__, line)(hr == expected, "got hr %#lx, expected %#lx.\n", hr, expected);
     if (SUCCEEDED(hr))
         IUnknown_Release(unk);
+}
+
+#define check_inherited_interface(a, b, c) _check_inherited_interface(__LINE__, a, b, c)
+static void _check_inherited_interface(unsigned int line, void *iface, REFIID inherited_iid, REFIID iid)
+{
+    IUnknown *unknown, *unknown2;
+    HRESULT hr, hr2;
+
+    hr = IUnknown_QueryInterface((IUnknown *)iface, inherited_iid, (void **)&unknown);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        IUnknown_Release(unknown);
+
+    hr2 = IUnknown_QueryInterface((IUnknown *)iface, iid, (void **)&unknown2);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr2))
+        IUnknown_Release(unknown2);
+
+    ok_(__FILE__, line)(unknown2 == unknown, "Interface is not inherited.\n");
 }
 
 static void set_color(D2D1_COLOR_F *color, float r, float g, float b, float a)
@@ -211,6 +231,8 @@ static void test_DCompositionCreateDevice(void)
     check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
     /* Device created from DCompositionCreateDevice() doesn't support IDCompositionDevice2 */
     check_interface(dcomp_device, &IID_IDCompositionDevice2, FALSE);
+    check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, FALSE);
+    check_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, TRUE);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
@@ -278,6 +300,8 @@ static void test_DCompositionCreateDevice2(void)
     check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, TRUE);
+    check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevice, &IID_IDCompositionDesktopDevicePartner);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
@@ -843,6 +867,8 @@ static void test_DCompositionCreateDevice3(void)
     check_interface(dcomp_device, &IID_IDCompositionDevice, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDevice2, TRUE);
     check_interface(dcomp_device, &IID_IDCompositionDesktopDevice, TRUE);
+    check_interface(dcomp_device, &IID_IDCompositionDesktopDevicePartner, TRUE);
+    check_inherited_interface(dcomp_device, &IID_IDCompositionDesktopDevice, &IID_IDCompositionDesktopDevicePartner);
 
     refcount = IDCompositionDevice_Release(dcomp_device);
     ok(!refcount, "Device has %lu references left.\n", refcount);
