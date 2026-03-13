@@ -26,7 +26,7 @@
 struct composition_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
-    IDCompositionDesktopDevicePartner IDCompositionDesktopDevicePartner_iface;
+    IDCompositionDeviceUnknown IDCompositionDeviceUnknown_iface;
     CRITICAL_SECTION cs;
     struct list targets;
     HANDLE thread;
@@ -62,9 +62,9 @@ static inline struct composition_device *impl_from_IDCompositionDevice(IDComposi
     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice_iface);
 }
 
-static inline struct composition_device *impl_from_IDCompositionDesktopDevicePartner(IDCompositionDesktopDevicePartner *iface)
+static inline struct composition_device *impl_from_IDCompositionDeviceUnknown(IDCompositionDeviceUnknown *iface)
 {
-    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDesktopDevicePartner_iface);
+    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDeviceUnknown_iface);
 }
 
 static inline struct composition_target *impl_from_IDCompositionTarget(IDCompositionTarget *iface)

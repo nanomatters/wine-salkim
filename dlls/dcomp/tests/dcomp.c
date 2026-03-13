@@ -942,7 +942,7 @@ static void test_IDCompositionDesktopDevicePartner(void)
 
     old_stack_pointer = get_stack_pointer();
 
-    hr = IDCompositionDesktopDevicePartner_Unknown1(partner, shared_visual_handle, &IID_IDCompositionVisual, (void **)&visual);
+    hr = IDCompositionDesktopDevicePartner_CreateFromSharedVisualHandle(partner, shared_visual_handle, &IID_IDCompositionVisual, (void **)&visual);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     stack_pointer = get_stack_pointer();
@@ -970,7 +970,7 @@ static void test_IDCompositionDesktopDevicePartner(void)
     hr = pDCompositionCreateSharedVisualHandle(&shared_visual_handle);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
-    hr = IDCompositionDesktopDevicePartner_Unknown1(partner, shared_visual_handle, &IID_IDCompositionTarget, (void **)&target);
+    hr = IDCompositionDesktopDevicePartner_CreateFromSharedVisualHandle(partner, shared_visual_handle, &IID_IDCompositionTarget, (void **)&target);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     check_interface(target, &IID_IDCompositionVisual, FALSE);

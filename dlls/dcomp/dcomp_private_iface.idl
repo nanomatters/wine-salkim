@@ -30,7 +30,18 @@ interface IDCompositionDesktopDevicePartner : IDCompositionDesktopDevice
 {
     HRESULT CreateSharedResource([in] REFIID riid, [out] void **obj);
     HRESULT OpenSharedResourceHandle([in] IUnknown *unknown, [out] HANDLE *handle);
-    HRESULT Unknown1([in] HANDLE handle, [in] REFIID iid, [out] void **out);
+    HRESULT CreateFromSharedVisualHandle([in] HANDLE handle, [in] REFIID iid, [out] void **out);
+}
+
+[
+    object,
+    uuid(28d6ad3d-ee2a-4bcd-9419-7d54800435b1),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDeviceUnknown : IDCompositionDesktopDevicePartner
+{
+    HRESULT Unknown1();
     HRESULT Unknown2();
     HRESULT Unknown3();
     HRESULT Unknown4();
