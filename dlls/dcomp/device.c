@@ -44,6 +44,12 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
         *out = &device->IDCompositionDevice_iface;
         return S_OK;
     }
+    else if (device->version >= 2 && IsEqualGUID(iid, &IID_IDCompositionDevice2))
+    {
+        IUnknown_AddRef(&device->IDCompositionDevice2_iface);
+        *out = &device->IDCompositionDevice2_iface;
+        return S_OK;
+    }
 
     FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
     *out = NULL;
@@ -279,7 +285,219 @@ static const struct IDCompositionDeviceVtbl device_vtbl =
     device_CheckDeviceState,
 };
 
-static HRESULT create_device(REFIID iid, void **out)
+static HRESULT STDMETHODCALLTYPE device2_QueryInterface(IDCompositionDevice2 *iface,
+        REFIID iid, void **out)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice2(iface);
+
+    TRACE("iface %p.\n", iface);
+
+    return IDCompositionDevice_QueryInterface(&device->IDCompositionDevice_iface, iid, out);
+}
+
+static ULONG STDMETHODCALLTYPE device2_AddRef(IDCompositionDevice2 *iface)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice2(iface);
+
+    TRACE("iface %p.\n", iface);
+
+    return IDCompositionDevice_AddRef(&device->IDCompositionDevice_iface);
+}
+
+static ULONG STDMETHODCALLTYPE device2_Release(IDCompositionDevice2 *iface)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice2(iface);
+
+    TRACE("iface %p.\n", iface);
+
+    return IDCompositionDevice_Release(&device->IDCompositionDevice_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE device2_Commit(IDCompositionDevice2 *iface)
+{
+    FIXME("iface %p stub!\n", iface);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_WaitForCommitCompletion(IDCompositionDevice2 *iface)
+{
+    FIXME("iface %p stub!\n", iface);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_GetFrameStatistics(IDCompositionDevice2 *iface,
+        DCOMPOSITION_FRAME_STATISTICS *statistics)
+{
+    FIXME("iface %p, statistics %p stub!\n", iface, statistics);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateVisual(IDCompositionDevice2 *iface,
+        IDCompositionVisual2 **visual)
+{
+    FIXME("iface %p, visual %p stub!\n", iface, visual);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateSurfaceFactory(IDCompositionDevice2 *iface,
+        IUnknown *rendering_device, IDCompositionSurfaceFactory **surface_factory)
+{
+    FIXME("iface %p, rendering_device %p, surface_factory %p stub!\n", iface, rendering_device,
+            surface_factory);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateSurface(IDCompositionDevice2 *iface,
+        UINT width, UINT height, DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode,
+        IDCompositionSurface **surface)
+{
+    FIXME("iface %p, width %u, height %u, format %#x, alpha_mode %#x, surface %p stub!\n", iface,
+            width, height, pixel_format, alpha_mode, surface);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateVirtualSurface(IDCompositionDevice2 *iface,
+        UINT width, UINT height, DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode,
+        IDCompositionVirtualSurface **surface)
+{
+    FIXME("iface %p, width %u, height %u, format %#x, alpha_mode %#x, surface %p stub!\n", iface,
+            width, height, pixel_format, alpha_mode, surface);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateTranslateTransform(IDCompositionDevice2 *iface,
+        IDCompositionTranslateTransform **transform)
+{
+    FIXME("iface %p, transform %p stub!\n", iface, transform);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateScaleTransform(IDCompositionDevice2 *iface,
+        IDCompositionScaleTransform **transform)
+{
+    FIXME("iface %p, transform %p stub!\n", iface, transform);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateRotateTransform(IDCompositionDevice2 *iface,
+        IDCompositionRotateTransform **transform)
+{
+    FIXME("iface %p, transform %p stub!\n", iface, transform);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateSkewTransform(IDCompositionDevice2 *iface,
+        IDCompositionSkewTransform **transform)
+{
+    FIXME("iface %p, transform %p stub!\n", iface, transform);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateMatrixTransform(IDCompositionDevice2 *iface,
+        IDCompositionMatrixTransform **transform)
+{
+    FIXME("iface %p, transform %p stub!\n", iface, transform);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateTransformGroup(IDCompositionDevice2 *iface,
+        IDCompositionTransform **transforms, UINT elements,
+        IDCompositionTransform **transform_group)
+{
+    FIXME("iface %p, transforms %p, elements %u, transform_group %p stub!\n", iface, transforms,
+            elements, transform_group);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateTranslateTransform3D(IDCompositionDevice2 *iface,
+        IDCompositionTranslateTransform3D **transform_3d)
+{
+    FIXME("iface %p, translate_transform_3d %p stub!\n", iface, transform_3d);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateScaleTransform3D(IDCompositionDevice2 *iface,
+        IDCompositionScaleTransform3D **transform_3d)
+{
+    FIXME("iface %p, transform_3d %p stub!\n", iface, transform_3d);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateRotateTransform3D(IDCompositionDevice2 *iface,
+        IDCompositionRotateTransform3D **transform_3d)
+{
+    FIXME("iface %p, transform_3d %p stub!\n", iface, transform_3d);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateMatrixTransform3D(IDCompositionDevice2 *iface,
+        IDCompositionMatrixTransform3D **transform_3d)
+{
+    FIXME("iface %p, transform_3d %p stub!\n", iface, transform_3d);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateTransform3DGroup(IDCompositionDevice2 *iface,
+        IDCompositionTransform3D **transforms_3d, UINT elements,
+        IDCompositionTransform3D **transform_3d_group)
+{
+    FIXME("iface %p, transforms_3d %p, elements %u, transform_3d_group %p stub!\n", iface,
+            transforms_3d, elements, transform_3d_group);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateEffectGroup(IDCompositionDevice2 *iface,
+        IDCompositionEffectGroup **effect_group)
+{
+    FIXME("iface %p, effect_group %p stub!\n", iface, effect_group);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateRectangleClip(IDCompositionDevice2 *iface,
+        IDCompositionRectangleClip **clip)
+{
+    FIXME("iface %p, clip %p stub!\n", iface, clip);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE device2_CreateAnimation(IDCompositionDevice2 *iface,
+        IDCompositionAnimation **animation)
+{
+    FIXME("iface %p, animation %p stub!\n", iface, animation);
+    return E_NOTIMPL;
+}
+
+static const struct IDCompositionDevice2Vtbl device2_vtbl =
+{
+    /* IUnknown methods */
+    device2_QueryInterface,
+    device2_AddRef,
+    device2_Release,
+    /* IDCompositionDevice2 methods */
+    device2_Commit,
+    device2_WaitForCommitCompletion,
+    device2_GetFrameStatistics,
+    device2_CreateVisual,
+    device2_CreateSurfaceFactory,
+    device2_CreateSurface,
+    device2_CreateVirtualSurface,
+    device2_CreateTranslateTransform,
+    device2_CreateScaleTransform,
+    device2_CreateRotateTransform,
+    device2_CreateSkewTransform,
+    device2_CreateMatrixTransform,
+    device2_CreateTransformGroup,
+    device2_CreateTranslateTransform3D,
+    device2_CreateScaleTransform3D,
+    device2_CreateRotateTransform3D,
+    device2_CreateMatrixTransform3D,
+    device2_CreateTransform3DGroup,
+    device2_CreateEffectGroup,
+    device2_CreateRectangleClip,
+    device2_CreateAnimation,
+};
+
+static HRESULT create_device(int version, REFIID iid, void **out)
 {
     struct composition_device *device;
     HRESULT hr;
@@ -292,6 +510,8 @@ static HRESULT create_device(REFIID iid, void **out)
         return E_OUTOFMEMORY;
 
     device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
+    device->IDCompositionDevice2_iface.lpVtbl = &device2_vtbl;
+    device->version = version;
     device->ref = 1;
     hr = IDCompositionDevice_QueryInterface(&device->IDCompositionDevice_iface, iid, out);
     IDCompositionDevice_Release(&device->IDCompositionDevice_iface);
@@ -305,14 +525,17 @@ HRESULT WINAPI DCompositionCreateDevice(IDXGIDevice *dxgi_device, REFIID iid, vo
     if (!IsEqualIID(iid, &IID_IDCompositionDevice))
         return E_NOINTERFACE;
 
-    return create_device(iid, device);
+    return create_device(1, iid, device);
 }
 
 HRESULT WINAPI DCompositionCreateDevice2(IUnknown *rendering_device, REFIID iid, void **device)
 {
-    FIXME("%p, %s, %p.\n", rendering_device, debugstr_guid(iid), device);
+    FIXME("%p, %s, %p semi-stub!\n", rendering_device, debugstr_guid(iid), device);
 
-    return E_NOTIMPL;
+    if (!IsEqualIID(iid, &IID_IDCompositionDevice))
+        return E_NOINTERFACE;
+
+    return create_device(2, iid, device);
 }
 
 HRESULT WINAPI DCompositionCreateDevice3(IUnknown *rendering_device, REFIID iid, void **device)

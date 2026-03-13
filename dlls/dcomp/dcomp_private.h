@@ -23,12 +23,19 @@
 struct composition_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
+    IDCompositionDevice2 IDCompositionDevice2_iface;
+    int version;
     LONG ref;
 };
 
 static inline struct composition_device *impl_from_IDCompositionDevice(IDCompositionDevice *iface)
 {
     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice_iface);
+}
+
+static inline struct composition_device *impl_from_IDCompositionDevice2(IDCompositionDevice2 *iface)
+{
+    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice2_iface);
 }
 
 #endif /* __WINE_DCOMP_PRIVATE_H */
