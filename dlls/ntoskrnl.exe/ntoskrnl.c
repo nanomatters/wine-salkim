@@ -2442,6 +2442,31 @@ NTSTATUS WINAPI ExInitializeZone(PZONE_HEADER Zone,
 }
 
 /***********************************************************************
+ *           FsRtlGetFileSize   (NTOSKRNL.EXE.@)
+ */
+NTSTATUS WINAPI FsRtlGetFileSize( PFILE_OBJECT file_obj, PLARGE_INTEGER file_size )
+{
+    FILE_STANDARD_INFORMATION info;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS status;
+    HANDLE handle;
+
+    TRACE( "file_obj %p, file_size %p\n", file_obj, file_size );
+
+    status = ObOpenObjectByPointer( file_obj, 0, NULL, 0, IoFileObjectType, KernelMode, &handle );
+    if (status) return status;
+
+    status = NtQueryInformationFile( handle, &iosb, &info, sizeof(info), FileStandardInformation );
+    NtClose( handle );
+    if (!status)
+    {
+        if (info.Directory) return STATUS_FILE_IS_A_DIRECTORY;
+        file_size->QuadPart = info.EndOfFile.QuadPart;
+    }
+    return status;
+}
+
+/***********************************************************************
 *           FsRtlIsNameInExpression   (NTOSKRNL.EXE.@)
 */
 BOOLEAN WINAPI FsRtlIsNameInExpression(PUNICODE_STRING expression, PUNICODE_STRING name,
@@ -4633,6 +4658,13 @@ void WINAPI KeStackAttachProcess(KPROCESS *process, KAPC_STATE *apc_state)
 void WINAPI KeUnstackDetachProcess(KAPC_STATE *apc_state)
 {
     FIXME("apc_state %p stub.\n", apc_state);
+}
+
+NTSTATUS WINAPI KdChangeOption(ULONG option, ULONG in_size, PVOID in_buffer,
+                               ULONG out_size, PVOID out_buffer, PULONG ret_size)
+{
+    FIXME( "stub: %lu %lu %p %lu %p %p\n", option, in_size, in_buffer, out_size, out_buffer, ret_size );
+    return STATUS_DEBUGGER_INACTIVE;
 }
 
 NTSTATUS WINAPI KdDisableDebugger(void)
