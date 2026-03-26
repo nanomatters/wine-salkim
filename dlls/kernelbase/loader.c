@@ -561,6 +561,7 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
 {
     UNICODE_STRING str;
     HMODULE module;
+    WCHAR overrideW[MAX_PATH] = {0}, envW[40] = {0};
 
     if (!name)
     {
@@ -575,11 +576,43 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
         flags = 0;
     }
 
-    RtlInitUnicodeString( &str, name );
+    if ( GetEnvironmentVariableW( L"WINE_LOADDLL_REPLACE", envW, sizeof(envW)) )
+    {
+        if ( wcsstr( envW, L"fsr3" ) )
+        {
+            /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR3 upgrade */
+            if (wcsstr( name, L"amd_fidelityfx_vk.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amd_fidelityfx_vk.dll" );
+            if (wcsstr( name, L"amd_fidelityfx_dx12.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amd_fidelityfx_dx12.dll" );
+        }
+        if ( wcsstr( envW, L"fsr4" ) )
+        {
+            /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 upgrade */
+            if (wcsstr( name, L"amdxcffx64.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\amdxcffx64.dll" );
+        }
+        if ( wcsstr( envW, L"dlss" ) )
+        {
+            /* HACK: override nvngx_dlss*.dll paths to a non-standard location for DLSS upgrade */
+            if (wcsstr( name, L"nvngx_dlss.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlss.dll" );
+            if (wcsstr( name, L"nvngx_dlssd.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssd.dll" );
+            if (wcsstr( name, L"nvngx_dlssg.dll" ) && !wcsstr( name, L"nvidia/wine/nvngx_dlssg.dll" ))
+                wcscpy( overrideW, L"c:\\windows\\system32\\nvngx_dlssg.dll" );
+        }
+        if ( wcsstr( envW, L"xess" ) )
+        {
+            /* HACK: override libxe*.dll paths to a non-standard location for XeSS upgrade */
+            if (wcsstr( name, L"libxess.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess.dll" );
+            if (wcsstr( name, L"libxess_dx11.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess_dx11.dll" );
+            if (wcsstr( name, L"libxell.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxell.dll" );
+            if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( overrideW, L"c:\\windows\\system32\\libxess_fg.dll" );
+        }
+        if ( overrideW[0] ) FIXME( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
+    }
+
+    RtlInitUnicodeString( &str, overrideW[0] ? overrideW : name );
     if (str.Length && str.Buffer[str.Length/sizeof(WCHAR) - 1] != ' ') return load_library( &str, flags );
 
     /* library name has trailing spaces */
-    RtlCreateUnicodeString( &str, name );
+    RtlCreateUnicodeString( &str, overrideW[0] ? overrideW : name );
     while (str.Length > sizeof(WCHAR) && str.Buffer[str.Length/sizeof(WCHAR) - 1] == ' ')
         str.Length -= sizeof(WCHAR);
 
