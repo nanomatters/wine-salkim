@@ -59,7 +59,7 @@ int do_fsync(void)
     if (do_fsync_cached == -1)
     {
         syscall( __NR_futex_waitv, 0, 0, 0, 0, 0);
-        do_fsync_cached = getenv("WINEFSYNC") && atoi(getenv("WINEFSYNC")) && errno != ENOSYS && errno != EPERM;
+        do_fsync_cached = !(getenv("WINEFSYNC") && !atoi(getenv("WINEFSYNC"))) && errno != ENOSYS && errno != EPERM && !do_ntsync();
     }
 
     return do_fsync_cached;
@@ -117,8 +117,6 @@ void fsync_init(void)
 
     is_fsync_initialized = 1;
 
-    fprintf( stderr, "fsync: up and running.\n" );
-
     shm_idx_free_map_size = 256;
     shm_idx_free_map = malloc( shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
     memset( shm_idx_free_map, 0xff, shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
@@ -164,6 +162,7 @@ const struct object_ops fsync_ops =
     default_unlink_name,       /* unlink_name */
     no_open_file,              /* open_file */
     no_kernel_obj_list,        /* get_kernel_obj_list */
+    no_get_inproc_sync,        /* get_inproc_sync */
     no_close_handle,           /* close_handle */
     fsync_destroy              /* destroy */
 };
