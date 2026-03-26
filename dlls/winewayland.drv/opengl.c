@@ -34,7 +34,7 @@
 
 #if defined(SONAME_LIBEGL) && defined(HAVE_LIBWAYLAND_EGL)
 
-WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
 #include <wayland-egl.h>
 #include <EGL/egl.h>
@@ -199,6 +199,7 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
 {
     struct wayland_gl_drawable *gl;
     int client_width, client_height;
+    DWORD tid, pid;
     RECT client_rect = {0};
     const EGLint attribs[] = {EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE};
 
@@ -221,6 +222,13 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
      * target render surface. */
     if (!(gl->client = wayland_client_surface_create(hwnd))) goto err;
     set_client_surface(hwnd, gl->client);
+
+    tid = NtUserGetWindowThread(hwnd, &pid);
+    if (tid && pid != GetCurrentProcessId())
+    {
+        ERR("Cross process rendering is not supported!\n");
+        return NULL;
+    }
 
     gl->wl_egl_window = wl_egl_window_create(gl->client->wl_surface,
                                              client_width, client_height);
@@ -717,7 +725,10 @@ static BOOL wayland_wglSwapBuffers(HDC hdc)
 {
     struct wgl_context *ctx = NtCurrentTeb()->glContext;
     HWND hwnd = NtUserWindowFromDC(hdc), toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+    DWORD style = NtUserGetWindowLongW(toplevel, GWL_STYLE);
     struct wayland_gl_drawable *gl;
+
+    TRACE("hdc=%p\n", hdc);
 
     if (!(gl = wayland_gl_drawable_get(NtUserWindowFromDC(hdc), hdc))) return FALSE;
 
@@ -727,7 +738,15 @@ static BOOL wayland_wglSwapBuffers(HDC hdc)
 
     /* Although all the EGL surfaces we create are double-buffered, we want to
      * use some as single-buffered, so avoid swapping those. */
-    if (gl->double_buffered) p_eglSwapBuffers(egl_display, gl->surface);
+    if (gl->double_buffered)
+    {
+        /* Don't swap when there is no mapped toplevel,
+         * otherwise these swaps can cause hangs */
+        if (gl->swap_interval && !(style & WS_VISIBLE))
+            ERR("Cannot swap when toplevel is not visible!\n");
+        else
+            p_eglSwapBuffers(egl_display, gl->surface);
+    }
     wayland_gl_drawable_sync_size(gl);
 
     wayland_gl_drawable_release(gl);
@@ -1247,6 +1266,7 @@ static BOOL init_opengl_funcs(void)
     opengl_funcs.ext.p_wglCreateContextAttribsARB = wayland_wglCreateContextAttribsARB;
 
     register_extension("WGL_EXT_swap_control");
+    register_extension("WGL_EXT_swap_control_tear");
     opengl_funcs.ext.p_wglGetSwapIntervalEXT = wayland_wglGetSwapIntervalEXT;
     opengl_funcs.ext.p_wglSwapIntervalEXT = wayland_wglSwapIntervalEXT;
 
@@ -1303,7 +1323,7 @@ static BOOL init_egl_configs(void)
         return FALSE;
     }
 
-    if (TRACE_ON(waylanddrv))
+    if (TRACE_ON(wgl))
     {
         for (i = 0; i < num_egl_configs; i++)
         {
@@ -1386,7 +1406,7 @@ static void init_opengl(void)
     egl_display = p_eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,
                                           process_wayland.wl_display,
                                           NULL);
-    if (egl_display == EGL_NO_DISPLAY)
+    if (egl_display == EGL_NO_DISPLAY || egl_display == (void *)EGL_BAD_PARAMETER)
     {
         ERR("Failed to get EGLDisplay\n");
         goto err;

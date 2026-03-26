@@ -2468,7 +2468,7 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     case VK_SHIFT:
     case VK_LSHIFT:
     case VK_RSHIFT:
-        vkey = (input->kbd.flags & KEYEVENTF_EXTENDEDKEY) ? VK_RSHIFT : VK_LSHIFT;
+        vkey = (input->kbd.scan == 0x36) ? VK_RSHIFT : VK_LSHIFT;
         if ((input->kbd.vkey & 0xff) == VK_SHIFT) hook_vkey = vkey;
         break;
     }
@@ -2515,8 +2515,8 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     }
 
     /* send numpad vkeys if NumLock is active */
-    if ((input->kbd.vkey & KBDNUMPAD) && (desktop->keystate[VK_NUMLOCK] & 0x01) &&
-        !(desktop->keystate[VK_SHIFT] & 0x80))
+    if ((input->kbd.vkey & KBDNUMPAD) && (desktop_shm->keystate[VK_NUMLOCK] & 0x01) &&
+        !(desktop_shm->keystate[VK_SHIFT] & 0x80))
     {
        switch (vkey)
        {
