@@ -4905,13 +4905,13 @@ DWORD WINAPI WinHttpWebSocketQueryCloseStatus( HINTERNET hsocket, USHORT *status
     return ret;
 }
 
-enum request_state
+enum winhttp_request_state
 {
-    REQUEST_STATE_INITIALIZED,
-    REQUEST_STATE_CANCELLED,
-    REQUEST_STATE_OPEN,
-    REQUEST_STATE_SENT,
-    REQUEST_STATE_RESPONSE_RECEIVED
+    WINHTTP_REQUEST_STATE_INITIALIZED,
+    WINHTTP_REQUEST_STATE_CANCELLED,
+    WINHTTP_REQUEST_STATE_OPEN,
+    WINHTTP_REQUEST_STATE_SENT,
+    WINHTTP_REQUEST_STATE_RESPONSE_RECEIVED
 };
 
 struct winhttp_request
@@ -4919,7 +4919,7 @@ struct winhttp_request
     IWinHttpRequest IWinHttpRequest_iface;
     LONG refs;
     CRITICAL_SECTION cs;
-    enum request_state state;
+    enum winhttp_request_state state;
     HINTERNET hsession;
     HINTERNET hconnect;
     HINTERNET hrequest;
@@ -4961,7 +4961,7 @@ static ULONG WINAPI winhttp_request_AddRef(
 /* critical section must be held */
 static void cancel_request( struct winhttp_request *request )
 {
-    if (request->state <= REQUEST_STATE_CANCELLED) return;
+    if (request->state <= WINHTTP_REQUEST_STATE_CANCELLED) return;
 
     if (request->proc_running)
     {
@@ -4972,13 +4972,13 @@ static void cancel_request( struct winhttp_request *request )
 
         EnterCriticalSection( &request->cs );
     }
-    request->state = REQUEST_STATE_CANCELLED;
+    request->state = WINHTTP_REQUEST_STATE_CANCELLED;
 }
 
 /* critical section must be held */
 static void free_request( struct winhttp_request *request )
 {
-    if (request->state < REQUEST_STATE_INITIALIZED) return;
+    if (request->state < WINHTTP_REQUEST_STATE_INITIALIZED) return;
     WinHttpCloseHandle( request->hrequest );
     WinHttpCloseHandle( request->hconnect );
     WinHttpCloseHandle( request->hsession );
@@ -5281,7 +5281,7 @@ static HRESULT WINAPI winhttp_request_SetCredentials(
     TRACE( "%p, %s, %p, %#lx\n", request, debugstr_w(username), password, flags );
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_OPEN)
+    if (request->state < WINHTTP_REQUEST_STATE_OPEN)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_OPEN;
         goto done;
@@ -5317,7 +5317,7 @@ static void initialize_request( struct winhttp_request *request )
     request->receive_timeout = 30000;
     request->url_codepage = CP_UTF8;
     VariantInit( &request->data );
-    request->state = REQUEST_STATE_INITIALIZED;
+    request->state = WINHTTP_REQUEST_STATE_INITIALIZED;
 }
 
 static void reset_request( struct winhttp_request *request )
@@ -5347,7 +5347,7 @@ static void reset_request( struct winhttp_request *request )
     free( request->proxy.lpszProxyBypass );
     request->proxy.lpszProxyBypass = NULL;
     VariantClear( &request->data );
-    request->state = REQUEST_STATE_INITIALIZED;
+    request->state = WINHTTP_REQUEST_STATE_INITIALIZED;
 }
 
 static HRESULT WINAPI winhttp_request_Open(
@@ -5426,7 +5426,7 @@ static HRESULT WINAPI winhttp_request_Open(
     }
     WinHttpSetOption( request->hrequest, WINHTTP_OPTION_CONTEXT_VALUE, &request, sizeof(request) );
 
-    request->state = REQUEST_STATE_OPEN;
+    request->state = WINHTTP_REQUEST_STATE_OPEN;
     request->verb = verb;
     free( hostname );
     free( path );
@@ -5457,12 +5457,12 @@ static HRESULT WINAPI winhttp_request_SetRequestHeader(
     if (!header) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_OPEN)
+    if (request->state < WINHTTP_REQUEST_STATE_OPEN)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_OPEN;
         goto done;
     }
-    if (request->state >= REQUEST_STATE_SENT)
+    if (request->state >= WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_AFTER_SEND;
         goto done;
@@ -5498,7 +5498,7 @@ static HRESULT WINAPI winhttp_request_GetResponseHeader(
     TRACE("%p, %p\n", request, header);
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -5542,7 +5542,7 @@ static HRESULT WINAPI winhttp_request_GetAllResponseHeaders(
     if (!headers) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -5635,7 +5635,7 @@ static HRESULT request_receive( struct winhttp_request *request )
     if ((err = wait_for_completion( request ))) return HRESULT_FROM_WIN32( err );
     if (!wcscmp( request->verb, L"HEAD" ))
     {
-        request->state = REQUEST_STATE_RESPONSE_RECEIVED;
+        request->state = WINHTTP_REQUEST_STATE_RESPONSE_RECEIVED;
         return S_OK;
     }
     if (!(request->buffer = malloc( buflen ))) return E_OUTOFMEMORY;
@@ -5674,7 +5674,7 @@ static HRESULT request_receive( struct winhttp_request *request )
         request->offset += request->bytes_read;
     } while (request->bytes_read);
 
-    request->state = REQUEST_STATE_RESPONSE_RECEIVED;
+    request->state = WINHTTP_REQUEST_STATE_RESPONSE_RECEIVED;
     return S_OK;
 
 error:
@@ -5770,7 +5770,7 @@ static HRESULT request_send( struct winhttp_request *request )
     if ((err = wait_for_completion( request ))) goto error;
     if (sa) SafeArrayUnaccessData( sa );
     else free( ptr );
-    request->state = REQUEST_STATE_SENT;
+    request->state = WINHTTP_REQUEST_STATE_SENT;
     return S_OK;
 
 error:
@@ -5829,12 +5829,12 @@ static HRESULT WINAPI winhttp_request_Send(
     TRACE("%p, %s\n", request, debugstr_variant(&body));
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_OPEN)
+    if (request->state < WINHTTP_REQUEST_STATE_OPEN)
     {
         LeaveCriticalSection( &request->cs );
         return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CALL_BEFORE_OPEN );
     }
-    if (request->state >= REQUEST_STATE_SENT)
+    if (request->state >= WINHTTP_REQUEST_STATE_SENT)
     {
         LeaveCriticalSection( &request->cs );
         return S_OK;
@@ -5871,7 +5871,7 @@ static HRESULT WINAPI winhttp_request_get_Status(
     if (!status) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -5901,7 +5901,7 @@ static HRESULT WINAPI winhttp_request_get_StatusText(
     if (!status) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -5972,7 +5972,7 @@ static HRESULT WINAPI winhttp_request_get_ResponseText(
     if (!body) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -6007,7 +6007,7 @@ static HRESULT WINAPI winhttp_request_get_ResponseBody(
     if (!body) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -6208,7 +6208,7 @@ static HRESULT WINAPI winhttp_request_get_ResponseStream(
     if (!body) return E_INVALIDARG;
 
     EnterCriticalSection( &request->cs );
-    if (request->state < REQUEST_STATE_SENT)
+    if (request->state < WINHTTP_REQUEST_STATE_SENT)
     {
         err = ERROR_WINHTTP_CANNOT_CALL_BEFORE_SEND;
         goto done;
@@ -6344,7 +6344,7 @@ static HRESULT WINAPI winhttp_request_WaitForResponse(
     TRACE("%p, %s, %p\n", request, debugstr_variant(&timeout), succeeded);
 
     EnterCriticalSection( &request->cs );
-    if (request->state >= REQUEST_STATE_RESPONSE_RECEIVED)
+    if (request->state >= WINHTTP_REQUEST_STATE_RESPONSE_RECEIVED)
     {
         LeaveCriticalSection( &request->cs );
         return S_OK;
