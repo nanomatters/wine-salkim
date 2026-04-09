@@ -573,7 +573,7 @@ BOOL loaddll_redirect(LPCWSTR name, LPWSTR override, DWORD size)
     if ( !ret ) return FALSE;
     if ( ret > ARRAY_SIZE(envW) )
     {
-        ERR("WINE_LOADDLL_REDIRECT value larger than %zu (%u)\n", ARRAY_SIZE(envW), ret);
+        ERR("WINE_LOADDLL_REDIRECT larger than %zu (%u)\n", ARRAY_SIZE(envW), ret);
         return FALSE;
     }
 
@@ -616,16 +616,25 @@ BOOL loaddll_redirect(LPCWSTR name, LPWSTR override, DWORD size)
     return FALSE;
 }
 
-BOOL loaddll_replace(LPCWSTR name, LPWSTR override)
+BOOL loaddll_replace(LPCWSTR name, LPWSTR override, DWORD size)
 {
+    WCHAR dllW[64] = {0};
     WCHAR envW[64] = {0};
     UINT ret;
+
+    ret = GetEnvironmentVariableW( L"WINE_OPTISCALER_NAME", dllW, sizeof(dllW));
+    if ( !ret || ret > ARRAY_SIZE(dllW) ) return FALSE;
+    if ( !wcscmp( name, dllW ) )
+    {
+        swprintf( override, size, L"c:\\windows\\system32\\umu\\%s", dllW );
+        return TRUE;
+    }
 
     ret = GetEnvironmentVariableW( L"WINE_LOADDLL_REPLACE", envW, sizeof(envW));
     if ( !ret ) return FALSE;
     if ( ret > ARRAY_SIZE(envW) )
     {
-        ERR("WINE_LOADDLL_REPLACE value larger than %zu (%u)\n", ARRAY_SIZE(envW), ret);
+        ERR("WINE_LOADDLL_REPLACE larger than %zu (%u)\n", ARRAY_SIZE(envW), ret);
         return FALSE;
     }
 
@@ -683,7 +692,7 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
         flags = 0;
     }
 
-    if ( loaddll_replace(name, overrideW) || loaddll_redirect(name, overrideW, ARRAY_SIZE(overrideW)) )
+    if ( loaddll_replace(name, overrideW, ARRAY_SIZE(overrideW)) || loaddll_redirect(name, overrideW, ARRAY_SIZE(overrideW)) )
         FIXME( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
 
     RtlInitUnicodeString( &str, overrideW[0] ? overrideW : name );
