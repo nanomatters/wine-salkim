@@ -553,18 +553,30 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExA( LPCSTR name, HANDLE file, DWORD
 /***********************************************************************
  * LoadLibary replace hack
  */
-BOOL loaddll_replace(LPCWSTR name, LPWSTR override)
+BOOL loaddll_optiscaler_hack(LPCWSTR name, LPWSTR override, DWORD size)
+{
+    WCHAR dllW[64] = {0};
+    UINT ret;
+
+    ret = GetEnvironmentVariableW( L"WINE_OPTISCALER_NAME", dllW, sizeof(dllW));
+    if ( !ret || ret >= ARRAY_SIZE(dllW) ) return FALSE;
+
+    if ( !wcscmp( name, dllW ) )
+    {
+        swprintf( override, size, L"c:\\windows\\system32\\umu\\%s", dllW );
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override, DWORD size)
 {
     WCHAR envW[64] = {0};
     UINT ret;
 
-    ret = GetEnvironmentVariableW( L"WINE_LOADDLL_REPLACE", envW, sizeof(envW));
-    if ( !ret ) return FALSE;
-    if ( ret > ARRAY_SIZE(envW) )
-    {
-        ERR("WINE_LOADDLL_REPLACE value larger than %zu (%u)\n", ARRAY_SIZE(envW), ret);
-        return FALSE;
-    }
+    ret = GetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", envW, sizeof(envW));
+    if ( !ret || ret >= ARRAY_SIZE(envW) ) return FALSE;
 
     if ( wcsstr( envW, L"fsr3" ) )
     {
@@ -620,8 +632,11 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
         flags = 0;
     }
 
-    if ( loaddll_replace(name, overrideW) )
-        FIXME( "HACK: replaced %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
+    if ( loaddll_optiscaler_hack(name, overrideW, ARRAY_SIZE(overrideW))
+        || loaddll_upscaler_hack(name, overrideW, ARRAY_SIZE(overrideW)) )
+    {
+        FIXME( "HACK: replacing %s with %s\n", debugstr_w(name), debugstr_w(overrideW));
+    }
 
     RtlInitUnicodeString( &str, overrideW[0] ? overrideW : name );
     if (str.Length && str.Buffer[str.Length/sizeof(WCHAR) - 1] != ' ') return load_library( &str, flags );
