@@ -414,7 +414,7 @@ struct wl_output *wayland_get_best_output_for_rect(const RECT *window_rect);
 
 struct wayland_surface *wayland_surface_create(HWND hwnd);
 void wayland_surface_destroy(struct wayland_surface *surface);
-void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor);
+void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor, BOOL force);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_clear_role(struct wayland_surface *surface);
