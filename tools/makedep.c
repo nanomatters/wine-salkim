@@ -4382,7 +4382,7 @@ static void output_top_makefile( struct makefile *make )
             silent_rules ? " -S" : "" );
     strarray_add( &make->phony_targets, "depend" );
 
-    if (!strarray_exists( &disabled_dirs[0], "tools/wine" ))
+    if (!strarray_exists( disabled_dirs[0], "tools/wine" ))
     {
         output( "wine: %s\n", tools_path( make, "wine" ));
         output( "\t%srm -f $@ && %s %s $@\n", cmd_prefix( "LN" ), ln_s, tools_path( make, "wine" ));
@@ -4456,9 +4456,9 @@ static void load_sources( struct makefile *make )
 
     if (make->obj_dir)
     {
-        make->disabled[0] = strarray_exists( &disabled_dirs[0], make->obj_dir );
+        make->disabled[0] = strarray_exists( disabled_dirs[0], make->obj_dir );
         for (arch = 1; arch < archs.count; arch++)
-            make->disabled[arch] = make->disabled[0] || strarray_exists( &disabled_dirs[arch], make->obj_dir );
+            make->disabled[arch] = make->disabled[0] || strarray_exists( disabled_dirs[arch], make->obj_dir );
     }
     make->is_win16   = strarray_exists( &make->extradllflags, "-m16" );
     make->data_only  = strarray_exists( &make->extradllflags, "-Wb,--data-only" );
