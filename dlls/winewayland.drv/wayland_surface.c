@@ -312,14 +312,14 @@ void wayland_surface_destroy(struct wayland_surface *surface)
  *
  * Gives the toplevel role to a plain wayland surface.
  */
-void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor)
+void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor, BOOL force)
 {
     WCHAR text[1024];
 
     TRACE("surface=%p\n", surface);
 
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL);
-    if (surface->xdg_surface && surface->xdg_toplevel) return;
+    if (surface->xdg_surface && surface->xdg_toplevel && !force) return;
 
     wayland_surface_clear_role(surface);
     surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
