@@ -2709,8 +2709,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI(".cfi_adjust_cfa_offset 4\n\t")
                    "popl 0x04(%ecx)\n\t"           /* frame->eflags */
                    __ASM_CFI(".cfi_adjust_cfa_offset -4\n\t")
-                   ".globl " __ASM_NAME("__wine_syscall_dispatcher_prolog_end") "\n"
-                   __ASM_NAME("__wine_syscall_dispatcher_prolog_end") ":\n\t"
+                   __ASM_GLOBL(__ASM_NAME("__wine_syscall_dispatcher_prolog_end")) "\n\t"
                    "movl %esp,0x0c(%ecx)\n\t"      /* frame->esp */
                    __ASM_CFI_CFA_IS_AT1(ecx, 0x0c)
                    "movw %cs,0x10(%ecx)\n\t"
@@ -2880,7 +2879,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    /* pop ebp-based kernel stack cfi */
                    __ASM_CFI("\t.cfi_restore_state\n")
 
-                   "6:\tmovl $0xc000000d,%eax\n\t" /* STATUS_INVALID_PARAMETER */
+                   "6:\tmovl $0xc000001c,%eax\n\t" /* STATUS_INVALID_SYSTEM_SERVICE */
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
@@ -2898,8 +2897,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "popl 0x08(%ecx)\n\t"       /* frame->eip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -4\n\t")
                    __ASM_CFI_REG_IS_AT1(eip, ecx, 0x08)
-                   ".globl " __ASM_NAME("__wine_unix_call_dispatcher_prolog_end") "\n"
-                   __ASM_NAME("__wine_unix_call_dispatcher_prolog_end") ":\n\t"
+                   __ASM_GLOBL(__ASM_NAME("__wine_unix_call_dispatcher_prolog_end")) "\n\t"
                    "leal 0x10(%esp),%edx\n\t"
                    "movl %edx,0x0c(%ecx)\n\t"  /* frame->esp */
                    __ASM_CFI_CFA_IS_AT1(ecx, 0x0c)

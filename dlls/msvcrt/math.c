@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <fenv.h>
 #include <fpieee.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <locale.h>
 #include <math.h>
@@ -1634,23 +1635,6 @@ int CDECL _isnan(double num)
 #if _MSVCR_VER>=120
 
 /*********************************************************************
- *      rint (MSVCR120.@)
- */
-double CDECL MSVCRT_rint(double x)
-{
-    unsigned cw;
-    double y;
-
-    cw = _controlfp(0, 0);
-    if ((cw & _MCW_PC) != _PC_53)
-        _controlfp(_PC_53, _MCW_PC);
-    y = rint(x);
-    if ((cw & _MCW_PC) != _PC_53)
-        _controlfp(cw, _MCW_PC);
-    return y;
-}
-
-/*********************************************************************
  *		_nearbyint (MSVCR120.@)
  *
  * Based on musl: src/math/nearbyteint.c
@@ -1668,7 +1652,7 @@ double CDECL nearbyint(double x)
         cw |= _EM_INEXACT;
         _setfp(&cw, _EM_INEXACT, NULL, 0);
     }
-    x = MSVCRT_rint(x);
+    x = rint(x);
     if (update_cw || update_sw)
     {
         sw = 0;
@@ -2100,6 +2084,20 @@ lldiv_t CDECL lldiv(__int64 num, __int64 denom)
   ret.quot = num / denom;
   ret.rem = num % denom;
 
+  return ret;
+}
+#endif
+
+#if _MSVCR_VER>=120
+/*********************************************************************
+ *              imaxdiv (MSVCR100.@)
+ */
+imaxdiv_t CDECL imaxdiv(intmax_t num, intmax_t denom)
+{
+  imaxdiv_t ret;
+
+  ret.quot = num / denom;
+  ret.rem = num % denom;
   return ret;
 }
 #endif
@@ -2601,7 +2599,7 @@ __msvcrt_long CDECL lrint(double x)
 {
     double d;
 
-    d = MSVCRT_rint(x);
+    d = rint(x);
     if ((d < 0 && d != (double)(__msvcrt_long)d)
             || (d >= 0 && d != (double)(__msvcrt_ulong)d)) {
         *_errno() = EDOM;
@@ -2633,7 +2631,7 @@ __int64 CDECL llrint(double x)
 {
     double d;
 
-    d = MSVCRT_rint(x);
+    d = rint(x);
     if ((d < 0 && d != (double)(__int64)d)
             || (d >= 0 && d != (double)(unsigned __int64)d)) {
         *_errno() = EDOM;

@@ -124,22 +124,14 @@ SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
 static void * const syscalls[] =
 {
 #define SYSCALL_ENTRY(id,name,args) name,
-#ifdef _WIN64
-    ALL_SYSCALLS64
-#else
-    ALL_SYSCALLS32
-#endif
+    ALL_SYSCALLS
 #undef SYSCALL_ENTRY
 };
 
 static BYTE syscall_args[ARRAY_SIZE(syscalls)] =
 {
 #define SYSCALL_ENTRY(id,name,args) args,
-#ifdef _WIN64
-    ALL_SYSCALLS64
-#else
-    ALL_SYSCALLS32
-#endif
+    ALL_SYSCALLS
 #undef SYSCALL_ENTRY
 };
 
@@ -611,6 +603,10 @@ static void preloader_exec( char **argv )
 /* exec the appropriate wine loader for the specified machine */
 static NTSTATUS loader_exec( char **argv, WORD machine )
 {
+    static char noexec[] = "WINELOADERNOEXEC=1";
+
+    putenv( noexec );
+
     if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
 
     argv[1] = strdup( wineloader );
@@ -2722,6 +2718,7 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
             fatal_error( "could not exec the wine loader\n" );
         }
     }
+    unsetenv( "WINELOADERNOEXEC" );
 
 #ifdef RLIMIT_NOFILE
     set_max_limit( RLIMIT_NOFILE );

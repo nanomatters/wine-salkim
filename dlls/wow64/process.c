@@ -270,6 +270,26 @@ void put_vm_counters( VM_COUNTERS_EX32 *info32, const VM_COUNTERS_EX *info, ULON
 
 
 /**********************************************************************
+ *           wow64_NtAlertMultipleThreadByThreadId
+ */
+NTSTATUS WINAPI wow64_NtAlertMultipleThreadByThreadId( UINT *args )
+{
+    LONG *handles_ptr = get_ptr( &args );
+    ULONG count = get_ulong( &args );
+    void *unk1 = get_ptr( &args );
+    void *unk2 = get_ptr( &args );
+    HANDLE handles_buf[256], *handles;
+    unsigned int i;
+
+    if (count <= ARRAY_SIZE(handles_buf)) handles = handles_buf;
+    else                                  handles = Wow64AllocateTemp( count * sizeof(*handles) );
+    for (i = 0; i < count; ++i) handles[i] = (HANDLE)(ULONG_PTR)handles_ptr[i];
+
+    return NtAlertMultipleThreadByThreadId( handles, count, unk1, unk2 );
+}
+
+
+/**********************************************************************
  *           wow64_NtAlertResumeThread
  */
 NTSTATUS WINAPI wow64_NtAlertResumeThread( UINT *args )
@@ -432,6 +452,27 @@ NTSTATUS WINAPI wow64_NtDebugActiveProcess( UINT *args )
 NTSTATUS WINAPI wow64_NtFlushProcessWriteBuffers( UINT *args )
 {
     return NtFlushProcessWriteBuffers();
+}
+
+
+/**********************************************************************
+ *           wow64_NtGetNextProcess
+ */
+NTSTATUS WINAPI wow64_NtGetNextProcess( UINT *args )
+{
+    HANDLE process = get_handle( &args );
+    ACCESS_MASK access = get_ulong( &args );
+    ULONG attributes = get_ulong( &args );
+    ULONG flags = get_ulong( &args );
+    ULONG *handle_ptr = get_ptr( &args );
+
+    HANDLE handle = 0;
+    NTSTATUS status;
+
+    *handle_ptr = 0;
+    status = NtGetNextProcess( process, access, attributes, flags, &handle );
+    put_handle( handle_ptr, handle );
+    return status;
 }
 
 

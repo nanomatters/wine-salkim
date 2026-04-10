@@ -43,6 +43,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 #include "wine/wgl.h"
 #include "wine/wgl_driver.h"
 
+/* Support building on systems with older EGL headers, which may not include
+ * the EGL_EXT_present_opaque extension. */
+#ifndef EGL_PRESENT_OPAQUE_EXT
+#define EGL_PRESENT_OPAQUE_EXT 0x31DF
+#endif
+
 static void *egl_handle;
 static struct opengl_funcs opengl_funcs;
 static EGLDisplay egl_display;
@@ -194,6 +200,7 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
     struct wayland_gl_drawable *gl;
     int client_width, client_height;
     RECT client_rect = {0};
+    const EGLint attribs[] = {EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE};
 
     TRACE("hwnd=%p format=%d\n", hwnd, format);
 
@@ -212,7 +219,8 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
     /* Get the client surface for the HWND. If don't have a wayland surface
      * (e.g., HWND_MESSAGE windows) just create a dummy surface to act as the
      * target render surface. */
-    if (!(gl->client = get_client_surface(hwnd))) goto err;
+    if (!(gl->client = wayland_client_surface_create(hwnd))) goto err;
+    set_client_surface(hwnd, gl->client);
 
     gl->wl_egl_window = wl_egl_window_create(gl->client->wl_surface,
                                              client_width, client_height);
@@ -223,7 +231,7 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
     }
 
     gl->surface = p_eglCreateWindowSurface(egl_display, egl_config_for_format(format),
-                                           gl->wl_egl_window, NULL);
+                                           gl->wl_egl_window, attribs);
     if (!gl->surface)
     {
         ERR("Failed to create EGL surface\n");
@@ -715,6 +723,8 @@ static BOOL wayland_wglSwapBuffers(HDC hdc)
 
     if (ctx) wgl_context_refresh(ctx);
     ensure_window_surface_contents(toplevel);
+    set_client_surface(hwnd, gl->client);
+
     /* Although all the EGL surfaces we create are double-buffered, we want to
      * use some as single-buffered, so avoid swapping those. */
     if (gl->double_buffered) p_eglSwapBuffers(egl_display, gl->surface);
@@ -1397,6 +1407,7 @@ static void init_opengl(void)
     REQUIRE_EXT(EGL_KHR_create_context);
     REQUIRE_EXT(EGL_KHR_create_context_no_error);
     REQUIRE_EXT(EGL_KHR_no_config_context);
+    REQUIRE_EXT(EGL_EXT_present_opaque);
 #undef REQUIRE_EXT
 
     has_egl_ext_pixel_format_float = has_extension(egl_exts, "EGL_EXT_pixel_format_float");

@@ -586,7 +586,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
 {
     pid_t pid;
     int fd[2], stdin_fd = -1, stdout_fd = -1;
-    char **argv, **envp;
+    char **argv;
     NTSTATUS status;
 
 #ifdef HAVE_PIPE2
@@ -629,13 +629,12 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
             signal( SIGPIPE, SIG_DFL );
 
             argv = build_argv( &params->CommandLine, 0 );
-            envp = build_envp( params->Environment );
             if (unixdir != -1)
             {
                 fchdir( unixdir );
                 close( unixdir );
             }
-            execve( unix_name, argv, envp );
+            execv( unix_name, argv );
         }
 
         if (pid <= 0)  /* grandchild if exec failed or child if fork failed */
@@ -1259,7 +1258,7 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                             pbi.InheritedFromUniqueProcessId = reply->ppid;
                             if (is_old_wow64())
                             {
-                                if (reply->machine != native_machine)
+                                if (!is_machine_64bit( reply->machine ))
                                     pbi.PebBaseAddress = (PEB *)((char *)pbi.PebBaseAddress + 0x1000);
                                 else
                                     pbi.PebBaseAddress = NULL;
@@ -2059,6 +2058,33 @@ NTSTATUS WINAPI NtResumeProcess( HANDLE handle )
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+    return ret;
+}
+
+
+/**********************************************************************
+ *           NtGetNextProcess  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtGetNextProcess( HANDLE process, ACCESS_MASK access, ULONG attributes,
+                                  ULONG flags, HANDLE *handle )
+{
+    HANDLE ret_handle = 0;
+    unsigned int ret;
+
+    TRACE( "process %p, access %#x, attributes %#x, flags %#x, handle %p.\n",
+           process, (int)access, (int)attributes, (int)flags, handle );
+
+    SERVER_START_REQ( get_next_process )
+    {
+        req->last = wine_server_obj_handle( process );
+        req->access = access;
+        req->attributes = attributes;
+        req->flags = flags;
+        if (!(ret = wine_server_call( req ))) ret_handle = wine_server_ptr_handle( reply->handle );
+    }
+    SERVER_END_REQ;
+
+    *handle = ret_handle;
     return ret;
 }
 
