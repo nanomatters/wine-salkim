@@ -2521,7 +2521,7 @@ static void output_symlink_rule( const char *src_name, const char *link_name, in
         dir[name - link_name] = 0;
     }
 
-    output( "\t%s", cmd_prefix( "LN" ));
+    output( "\t%s", create_dir ? "" : cmd_prefix( "LN" ));
     if (create_dir && dir && *dir) output( "%s -d %s && ", root_src_dir_path( "tools/install-sh" ), dir );
     output( "rm -f %s && ", link_name );
 
@@ -2603,10 +2603,6 @@ static void output_install_commands( struct makefile *make, struct strarray file
             output( "\t%s $(INSTALL_SCRIPT_FLAGS) %s %s\n",
                     install_sh, src_dir_path( make, file ), dest );
             break;
-        case 't':  /* script in tools dir */
-            output( "\t%s $(INSTALL_SCRIPT_FLAGS) %s %s\n",
-                    install_sh, tools_dir_path( make, files.str[i] ), dest );
-            break;
         case 'y':  /* symlink */
             output_symlink_rule( files.str[i], dest, 1 );
             break;
@@ -2643,9 +2639,6 @@ static void output_install_rules( struct makefile *make, enum install_rules rule
         case 'p':  /* program file */
         case 's':  /* script */
             strarray_add_uniq( &targets, obj_dir_path( make, file ));
-            break;
-        case 't':  /* script in tools dir */
-            strarray_add_uniq( &targets, tools_dir_path( make, file ));
             break;
         }
     }
@@ -3798,7 +3791,7 @@ static void output_programs( struct makefile *make )
 
     for (i = 0; i < make->programs.count; i++)
     {
-        char *program_installed = NULL;
+        const char *install_dir;
         char *program = strmake( "%s%s", make->programs.str[i], exe_ext );
         struct strarray deps = get_local_dependencies( make, make->programs.str[i], make->in_files );
         struct strarray all_libs = get_expanded_file_local_var( make, make->programs.str[i], "LDFLAGS" );
@@ -3834,8 +3827,8 @@ static void output_programs( struct makefile *make )
         }
         strarray_addall( &make->all_targets[arch], symlinks );
 
-        add_install_rule( make, program, arch, program_installed ? program_installed : program,
-                          strmake( "p$(bindir)/%s", program ));
+        install_dir = !strcmp( make->obj_dir, "loader" ) ? arch_install_dirs[arch] : "$(bindir)/";
+        add_install_rule( make, program, arch, program, strmake( "p%s%s", install_dir, program ));
         for (j = 0; j < symlinks.count; j++)
             add_install_rule( make, symlinks.str[j], arch, program,
                               strmake( "y$(bindir)/%s%s", symlinks.str[j], exe_ext ));
@@ -4058,7 +4051,7 @@ static void output_sources( struct makefile *make )
         if (make->is_exe && !make->is_win16 && unix_lib_supported && strendswith( make->module, ".exe" ))
         {
             char *binary = replace_extension( make->module, ".exe", "" );
-            add_install_rule( make, binary, 0, "wineapploader", strmake( "t$(bindir)/%s", binary ));
+            add_install_rule( make, binary, 0, "wine", strmake( "y$(bindir)/%s", binary ));
         }
     }
     else if (make->testdll)
@@ -4448,6 +4441,13 @@ static void output_top_makefile( struct makefile *make )
             compile_commands_mode ? " -C" : "",
             silent_rules ? " -S" : "" );
     strarray_add( &make->phony_targets, "depend" );
+
+    if (!strarray_exists( disabled_dirs[0], "tools/wine" ))
+    {
+        output( "wine: %s\n", tools_path( make, "wine" ));
+        output( "\t%srm -f $@ && %s %s $@\n", cmd_prefix( "LN" ), ln_s, tools_path( make, "wine" ));
+        strarray_add( &make->all_targets[0], "wine" );
+    }
 
     for (i = 0; i < subdirs.count; i++) output_sources( submakes[i] );
     output_sources( make );
