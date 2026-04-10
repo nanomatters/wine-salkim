@@ -354,6 +354,8 @@ static BOOL is_ignored_env_var( const char *var )
             STARTS_WITH( var, "SDL_AUDIO_DRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEODRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEO_DRIVER=" ) ||
+            STARTS_WITH( var, "DOTNET_ROOT=" ) || /* fedora still hasn't fixed its dotnet packages */
+            STARTS_WITH( var, "DOTNET_BUNDLE_EXTRACT_BASE_DIR=" ) ||
             STARTS_WITH( var, "VK_" ) ||
             STARTS_WITH( var, "XR_" ));
 }
