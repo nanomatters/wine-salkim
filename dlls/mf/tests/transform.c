@@ -9705,7 +9705,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb32_default_stride, .output_bitmap = L"rgb32frame-flip.bmp",
             .output_buffer_desc = use_2d_buffer ? rgb32_negative_stride : NULL,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
-            .delta = 2, /* Windows returns 0, Wine needs 2 */
         },
         { /* Test 1 */
             .input_type_desc = nv12_default_stride, .input_bitmap = L"nv12frame.bmp",
@@ -9713,7 +9712,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb32_negative_stride, .output_bitmap = L"rgb32frame-flip.bmp",
             .output_buffer_desc = use_2d_buffer ? rgb32_negative_stride : NULL,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
-            .delta = 2, /* Windows returns 0, Wine needs 2 */
         },
         { /* Test 2 */
             .input_type_desc = nv12_default_stride, .input_bitmap = L"nv12frame.bmp",
@@ -9729,7 +9727,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = nv12_default_stride, .output_bitmap = L"nv12frame-flip.bmp", .output_bitmap_2d = L"nv12frame-flip-2d.bmp",
             .output_buffer_desc = use_2d_buffer ? nv12_default_stride : NULL,
             .output_sample_desc = &nv12_sample_desc, .output_sample_2d_desc = &nv12_sample_2d_desc,
-            .delta = 2, /* Windows returns 0, Wine needs 2 */
         },
         { /* Test 4 */
             .input_type_desc = rgb32_negative_stride, .input_bitmap = L"rgb32frame.bmp",
@@ -9737,7 +9734,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = nv12_default_stride, .output_bitmap = L"nv12frame-flip.bmp", .output_bitmap_2d = L"nv12frame-flip-2d.bmp",
             .output_buffer_desc = use_2d_buffer ? nv12_default_stride : NULL,
             .output_sample_desc = &nv12_sample_desc, .output_sample_2d_desc = &nv12_sample_2d_desc,
-            .delta = 2, /* Windows returns 0, Wine needs 2 */
         },
         { /* Test 5 */
             .input_type_desc = rgb32_positive_stride, .input_bitmap = L"rgb32frame.bmp",
@@ -9784,6 +9780,7 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_buffer_desc = use_2d_buffer ? rgb32_with_aperture : NULL,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
             .broken = TRUE, /* old Windows version incorrectly rescale */
+            .delta = 3, /* Windows returns 0, Wine needs 3 */
         },
         { /* Test 11 */
             .input_type_desc = rgb32_default_stride, .input_bitmap = L"rgb32frame.bmp",
@@ -9791,7 +9788,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb555_default_stride, .output_bitmap = L"rgb555frame.bmp",
             .output_buffer_desc = use_2d_buffer ? rgb555_negative_stride : NULL,
             .output_sample_desc = &rgb555_sample_desc, .output_sample_2d_desc = &rgb555_sample_desc,
-            .delta = 5, /* Windows returns 0, Wine needs 5 */
         },
         { /* Test 12 */
             .input_type_desc = rgb32_default_stride, .input_bitmap = L"rgb32frame.bmp",
@@ -9799,7 +9795,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb555_negative_stride, .output_bitmap = L"rgb555frame.bmp",
             .output_buffer_desc = use_2d_buffer ? rgb555_negative_stride : NULL,
             .output_sample_desc = &rgb555_sample_desc, .output_sample_2d_desc = &rgb555_sample_desc,
-            .delta = 5, /* Windows returns 0, Wine needs 5 */
         },
         { /* Test 13 */
             .input_type_desc = rgb32_default_stride, .input_bitmap = L"rgb32frame.bmp",
@@ -9807,7 +9802,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb555_positive_stride, .output_bitmap = L"rgb555frame-flip.bmp",
             .output_buffer_desc = use_2d_buffer ? rgb555_positive_stride : NULL,
             .output_sample_desc = &rgb555_sample_desc, .output_sample_2d_desc = &rgb555_sample_desc,
-            .delta = 3, /* Windows returns 0, Wine needs 3 */
         },
         { /* Test 14 */
             .input_type_desc = rgb555_default_stride, .input_bitmap = L"rgb555frame.bmp",
@@ -9815,7 +9809,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb555_positive_stride, .output_bitmap = L"rgb555frame-flip.bmp",
             .output_buffer_desc = use_2d_buffer ? rgb555_positive_stride : NULL,
             .output_sample_desc = &rgb555_sample_desc, .output_sample_2d_desc = &rgb555_sample_desc,
-            .delta = 4, /* Windows returns 0, Wine needs 4 */
         },
         { /* Test 15 */
             .input_type_desc = nv12_with_aperture, .input_bitmap = L"nv12frame.bmp",
@@ -9832,7 +9825,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_buffer_desc = use_2d_buffer ? rgb32_with_aperture : NULL,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
             .broken = TRUE, /* old Windows version incorrectly rescale */
-            .todo = use_2d_buffer,
         },
         { /* Test 17 */
             .input_type_desc = rgb32_with_aperture, .input_bitmap = L"rgb32frame-flip.bmp",
@@ -9857,7 +9849,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_buffer_desc = use_2d_buffer ? rgb32_default_stride : NULL,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
             .delta = 3, /* Windows returns 3 with 2D buffer */
-            .todo = use_2d_buffer,
         },
         { /* Test 20 */
             .input_type_desc = nv12_default_stride, .input_bitmap = L"nv12frame.bmp",
@@ -9866,7 +9857,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_buffer_desc = use_2d_buffer ? rgb32_positive_stride : NULL,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
             .delta = 3, /* Windows returns 3 with 2D buffer */
-            .todo = use_2d_buffer,
         },
 
         { /* Test 21, 2D only */
@@ -9875,7 +9865,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb32_default_stride, .output_bitmap = L"rgb32frame-extra-width.bmp",
             .output_buffer_desc = rgb32_extra_width,
             .output_sample_desc = &rgb32_extra_width_sample_desc, .output_sample_2d_desc = &rgb32_extra_width_sample_desc,
-            .todo = TRUE,
         },
         { /* Test 22, 2D only */
             .input_type_desc = rgb32_default_stride, .input_bitmap = L"rgb32frame-extra-width.bmp",
@@ -9883,7 +9872,7 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = nv12_default_stride, .output_bitmap_1d = L"nv12frame.bmp", .output_bitmap_2d = L"nv12frame-2d.bmp",
             .output_buffer_desc = nv12_default_stride,
             .output_sample_desc = &nv12_sample_desc, .output_sample_2d_desc = &nv12_sample_2d_desc,
-            .delta = 2, /* Windows returns 2 with 1D buffer */ .todo = TRUE,
+            .delta = 2, /* Windows returns 2 with 1D buffer */
         },
         { /* Test 23, 2D only */
             .input_type_desc = rgb32_default_stride, .input_bitmap = L"rgb32frame-extra-width.bmp",
@@ -9891,7 +9880,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = nv12_default_stride, .output_bitmap_1d = L"nv12frame-extra-width.bmp", .output_bitmap_2d = L"nv12frame-extra-width-2d.bmp",
             .output_buffer_desc = nv12_extra_width,
             .output_sample_desc = &nv12_extra_width_sample_desc, .output_sample_2d_desc = &nv12_extra_width_sample_2d_desc,
-            .todo = TRUE,
         },
         { /* Test 24, 2D only */
             .input_type_desc = nv12_default_stride, .input_bitmap = L"nv12frame-extra-width.bmp",
@@ -9899,7 +9887,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = rgb32_default_stride, .output_bitmap_1d = L"rgb32frame.bmp", .output_bitmap_2d = L"rgb32frame.bmp",
             .output_buffer_desc = rgb32_default_stride,
             .output_sample_desc = &rgb32_sample_desc, .output_sample_2d_desc = &rgb32_sample_desc,
-            .todo = TRUE,
         },
         { /* Test 25 */
             .input_type_desc = rgb32_crop, .input_bitmap = L"rgb32frame-crop.bmp",
@@ -9907,8 +9894,7 @@ static void test_video_processor(BOOL use_2d_buffer)
             .output_type_desc = nv12_crop, .output_bitmap = L"nv12frame-crop.bmp", .output_bitmap_1d = L"nv12frame-crop-1d.bmp", .output_bitmap_2d = L"nv12frame-crop-2d.bmp",
             .output_buffer_desc = use_2d_buffer ? nv12_crop : NULL,
             .output_sample_desc = &nv12_crop_sample_desc, .output_sample_2d_desc = &nv12_crop_sample_2d_desc,
-            .delta = 2, /* Windows returns 1, Wine needs 2 */
-            .todo = use_2d_buffer,
+            .delta = 1, /* Windows returns 1, Wine needs 2 */
         },
     };
 
@@ -9949,7 +9935,6 @@ static void test_video_processor(BOOL use_2d_buffer)
             &IID_IMFTransform, (void **)&transform)))
         goto failed;
 
-    todo_wine
     check_interface(transform, &IID_IMFVideoProcessorControl, TRUE);
     todo_wine
     check_interface(transform, &IID_IMFRealTimeClientEx, TRUE);
@@ -10098,7 +10083,6 @@ static void test_video_processor(BOOL use_2d_buffer)
     ok(hr == S_OK, "Failed to create a sample, hr %#lx.\n", hr);
 
     hr = check_mft_process_output(transform, output_sample, &output_status);
-    todo_wine
     ok(hr == MF_E_TRANSFORM_NEED_MORE_INPUT, "Unexpected hr %#lx.\n", hr);
 
     hr = IMFTransform_ProcessInput(transform, 0, input_sample, 0);
