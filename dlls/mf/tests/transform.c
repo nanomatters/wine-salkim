@@ -8921,10 +8921,10 @@ static void test_color_convert(BOOL use_2d_buffer)
         ATTR_BLOB(MF_MT_MINIMUM_DISPLAY_APERTURE, &actual_aperture, 16),
         ATTR_RATIO(MF_MT_FRAME_SIZE, actual_width, actual_height),
         ATTR_UINT32(MF_MT_DEFAULT_STRIDE, actual_width),
-        ATTR_UINT32(MF_MT_SAMPLE_SIZE, actual_width * actual_height * 3 / 2, .todo = TRUE),
-        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1, .todo = TRUE),
-        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1, .todo = TRUE),
-        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1, .todo = TRUE),
+        ATTR_UINT32(MF_MT_SAMPLE_SIZE, actual_width * actual_height * 3 / 2),
+        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1),
+        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1),
+        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1),
         {0},
     };
     const struct attribute_desc expect_output_type_desc[] =
@@ -8933,10 +8933,10 @@ static void test_color_convert(BOOL use_2d_buffer)
         ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32),
         ATTR_RATIO(MF_MT_FRAME_SIZE, actual_width, actual_height),
         ATTR_UINT32(MF_MT_DEFAULT_STRIDE, actual_width * 4),
-        ATTR_UINT32(MF_MT_SAMPLE_SIZE, actual_width * actual_height * 4, .todo = TRUE),
-        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1, .todo = TRUE),
-        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1, .todo = TRUE),
-        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1, .todo = TRUE),
+        ATTR_UINT32(MF_MT_SAMPLE_SIZE, actual_width * actual_height * 4),
+        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1),
+        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1),
+        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1),
         {0},
     };
     const struct attribute_desc expect_output_type_desc_negative_stride[] =
@@ -8945,10 +8945,10 @@ static void test_color_convert(BOOL use_2d_buffer)
         ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32),
         ATTR_RATIO(MF_MT_FRAME_SIZE, actual_width, actual_height),
         ATTR_UINT32(MF_MT_DEFAULT_STRIDE, -actual_width * 4),
-        ATTR_UINT32(MF_MT_SAMPLE_SIZE, actual_width * actual_height * 4, .todo = TRUE),
-        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1, .todo = TRUE),
-        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1, .todo = TRUE),
-        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1, .todo = TRUE),
+        ATTR_UINT32(MF_MT_SAMPLE_SIZE, actual_width * actual_height * 4),
+        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1),
+        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1),
+        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1),
         {0},
     };
     const MFT_OUTPUT_STREAM_INFO output_info =
@@ -9115,7 +9115,7 @@ static void test_color_convert(BOOL use_2d_buffer)
 
     check_mft_set_input_type_required(transform, input_type_desc);
     check_mft_set_input_type(transform, input_type_desc, S_OK);
-    check_mft_get_input_current_type_(__LINE__, transform, expect_input_type_desc, FALSE, TRUE);
+    check_mft_get_input_current_type(transform, expect_input_type_desc);
 
 
     hr = IMFTransform_QueryInterface(transform, &IID_IMediaObject, (void **)&dmo);
@@ -9123,13 +9123,13 @@ static void test_color_convert(BOOL use_2d_buffer)
 
     memset(&dmo_mt, 0, sizeof(dmo_mt));
     hr = IMediaObject_GetInputCurrentType(dmo, 0, &dmo_mt);
-    todo_wine ok(hr == S_OK, "GetInputCurrentType returned %#lx\n", hr);
-    todo_wine ok(IsEqualGUID(&dmo_mt.formattype, &FORMAT_MFVideoFormat), "got format %s\n", debugstr_guid(&dmo_mt.formattype));
-    todo_wine ok(dmo_mt.cbFormat == sizeof(MFVIDEOFORMAT), "got cbFormat %#lx\n", dmo_mt.cbFormat);
+    ok(hr == S_OK, "GetInputCurrentType returned %#lx\n", hr);
+    ok(IsEqualGUID(&dmo_mt.formattype, &FORMAT_MFVideoFormat), "got format %s\n", debugstr_guid(&dmo_mt.formattype));
+    ok(dmo_mt.cbFormat == sizeof(MFVIDEOFORMAT), "got cbFormat %#lx\n", dmo_mt.cbFormat);
     ok(is_dmo_subtype(&dmo_mt.subtype), "got subtype %s\n", debugstr_guid(&dmo_mt.subtype));
 
     hr = MFCreateMediaTypeFromRepresentation(AM_MEDIA_TYPE_REPRESENTATION, &dmo_mt, &media_type);
-    todo_wine ok(hr == S_OK, "MFCreateMediaTypeFromRepresentation returned %#lx\n", hr);
+    ok(hr == S_OK, "MFCreateMediaTypeFromRepresentation returned %#lx\n", hr);
     if (hr == S_OK)
     {
     /* MFCreateMediaTypeFromRepresentation automatically converts MF to DMO media types */
@@ -9140,7 +9140,7 @@ static void test_color_convert(BOOL use_2d_buffer)
 
     hr = IMediaObject_SetInputType(dmo, 0, &dmo_mt, 0);
     ok(hr == S_OK, "SetInputType returned %#lx\n", hr);
-    check_mft_get_input_current_type_(__LINE__, transform, expect_input_type_desc, FALSE, TRUE);
+    check_mft_get_input_current_type(transform, expect_input_type_desc);
     }
 
     MoFreeMediaType(&dmo_mt);
@@ -9156,7 +9156,7 @@ static void test_color_convert(BOOL use_2d_buffer)
         winetest_push_context("color conversion #%lu", i);
         check_mft_set_output_type_required(transform, color_conversion_tests[i].output_type_desc);
         check_mft_set_output_type(transform, color_conversion_tests[i].output_type_desc, S_OK);
-        check_mft_get_output_current_type_(__LINE__, transform, color_conversion_tests[i].expect_output_type_desc, FALSE, TRUE);
+        check_mft_get_output_current_type(transform, color_conversion_tests[i].expect_output_type_desc);
 
 
         hr = IMFTransform_QueryInterface(transform, &IID_IMediaObject, (void **)&dmo);
@@ -9164,13 +9164,13 @@ static void test_color_convert(BOOL use_2d_buffer)
 
         memset(&dmo_mt, 0, sizeof(dmo_mt));
         hr = IMediaObject_GetOutputCurrentType(dmo, 0, &dmo_mt);
-        todo_wine ok(hr == S_OK, "GetOutputCurrentType returned %#lx\n", hr);
-        todo_wine ok(IsEqualGUID(&dmo_mt.formattype, &FORMAT_MFVideoFormat), "got format %s\n", debugstr_guid(&dmo_mt.formattype));
-        todo_wine ok(dmo_mt.cbFormat == sizeof(MFVIDEOFORMAT), "got cbFormat %#lx\n", dmo_mt.cbFormat);
+        ok(hr == S_OK, "GetOutputCurrentType returned %#lx\n", hr);
+        ok(IsEqualGUID(&dmo_mt.formattype, &FORMAT_MFVideoFormat), "got format %s\n", debugstr_guid(&dmo_mt.formattype));
+        ok(dmo_mt.cbFormat == sizeof(MFVIDEOFORMAT), "got cbFormat %#lx\n", dmo_mt.cbFormat);
         ok(is_dmo_subtype(&dmo_mt.subtype), "got subtype %s\n", debugstr_guid(&dmo_mt.subtype));
 
         hr = MFCreateMediaTypeFromRepresentation(AM_MEDIA_TYPE_REPRESENTATION, &dmo_mt, &media_type);
-        todo_wine ok(hr == S_OK, "MFCreateMediaTypeFromRepresentation returned %#lx\n", hr);
+        ok(hr == S_OK, "MFCreateMediaTypeFromRepresentation returned %#lx\n", hr);
         if (hr == S_OK)
         {
         /* MFCreateMediaTypeFromRepresentation automatically converts MF to DMO media types */
@@ -9181,7 +9181,7 @@ static void test_color_convert(BOOL use_2d_buffer)
 
         hr = IMediaObject_SetOutputType(dmo, 0, &dmo_mt, 0);
         ok(hr == S_OK, "SetOutputType returned %#lx\n", hr);
-        check_mft_get_output_current_type_(__LINE__, transform, color_conversion_tests[i].expect_output_type_desc, FALSE, TRUE);
+        check_mft_get_output_current_type(transform, color_conversion_tests[i].expect_output_type_desc);
         }
 
         MoFreeMediaType(&dmo_mt);
