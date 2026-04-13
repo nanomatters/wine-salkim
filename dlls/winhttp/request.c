@@ -2238,11 +2238,16 @@ static void finished_reading( struct request *request )
     request->netconn = NULL;
 }
 
-static DWORD read_data( struct request *request, void *buffer, DWORD size, DWORD *read, BOOL async )
+static DWORD read_data( struct request *request, char *buffer, DWORD size, DWORD *read, BOOL async )
 {
-    DWORD bytes_read = 0, ret;
+    DWORD bytes_read = 0, count, ret = ERROR_SUCCESS;
 
-    ret = read_data_stream( request, buffer, size, &bytes_read );
+    while (size)
+    {
+        if ((ret = read_data_stream( request, buffer + bytes_read, size, &count )) || !count) break;
+        bytes_read += count;
+        size -= count;
+    }
 
     TRACE( "retrieved %lu bytes (%I64u/%I64u)\n", bytes_read, request->content_read, request->content_length );
     if (end_of_data_stream( request )) finished_reading( request );
