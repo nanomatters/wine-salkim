@@ -239,6 +239,7 @@ struct wayland_window_config
     double scale;
     BOOL visible;
     BOOL managed;
+    BOOL resizeable;
 };
 
 struct wayland_client_surface
@@ -376,6 +377,7 @@ struct wayland_win_data
     /* window rects, relative to parent client area */
     struct window_rects rects;
     BOOL is_fullscreen;
+    BOOL resizeable;
     BOOL managed;
     BOOL layered_attribs_set;
 };
