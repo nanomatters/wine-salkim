@@ -354,7 +354,8 @@ void client_surface_release( struct client_surface *surface )
         pthread_mutex_unlock( &surfaces_lock );
 
         surface->funcs->destroy( surface );
-        free( surface );
+        /* the driver may cache the surface */
+        if (!surface->ref) free( surface );
     }
 }
 
