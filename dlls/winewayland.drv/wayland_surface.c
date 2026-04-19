@@ -1249,17 +1249,33 @@ static struct wayland_client_surface *impl_from_client_surface(struct client_sur
 static void wayland_client_surface_destroy(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_win_data *data;
+    BOOL keep_alive = FALSE;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (surface->wp_content_type_v1)
-        wp_content_type_v1_destroy(surface->wp_content_type_v1);
-    if (surface->wp_viewport)
-        wp_viewport_destroy(surface->wp_viewport);
-    if (surface->wl_subsurface)
-        wl_subsurface_destroy(surface->wl_subsurface);
-    if (surface->wl_surface)
-        wl_surface_destroy(surface->wl_surface);
+    if ((data = wayland_win_data_get(client->hwnd)))
+    {
+        if (list_count(&data->client_surface_cache) > 1)
+            list_remove(&surface->entry);
+        else if (!list_empty(&surface->entry)) keep_alive = TRUE;
+        wayland_win_data_release(data);
+    }
+
+    if (!keep_alive)
+    {
+        if (surface->wl_subsurface)
+            wl_subsurface_destroy(surface->wl_subsurface);
+        if (surface->wp_content_type_v1)
+            wp_content_type_v1_destroy(surface->wp_content_type_v1);
+        if (surface->wp_viewport)
+            wp_viewport_destroy(surface->wp_viewport);
+        if (surface->wl_surface)
+            wl_surface_destroy(surface->wl_surface);
+        return;
+    }
+
+    client_surface_add_ref(&surface->client);
 }
 
 static void wayland_client_surface_detach(struct client_surface *client)
@@ -1356,6 +1372,8 @@ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
             TRACE("set game content on client surface!\n");
         }
     }
+
+    list_init( &client->entry );
 
     return client;
 
