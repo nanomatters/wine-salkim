@@ -39,19 +39,61 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
+static void insert_client_surface(HWND hwnd, struct wayland_client_surface *surface)
+{
+    struct wayland_win_data *data;
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+
+    list_add_tail(&data->client_surface_cache, &surface->entry);
+
+    wayland_win_data_release(data);
+}
+
+static struct wayland_client_surface *find_client_surface(HWND hwnd)
+{
+    struct wayland_client_surface *surface = NULL;
+    struct wayland_win_data *data;
+
+    if (!(data = wayland_win_data_get(hwnd))) return NULL;
+
+    LIST_FOR_EACH_ENTRY(surface, &data->client_surface_cache,
+                        struct wayland_client_surface, entry)
+    {
+        /* this is held by a swapchain */
+        if (surface->client.ref > 1) continue;
+
+        list_remove(&surface->client.entry);
+
+        TRACE("Found surface %p\n", surface);
+        goto done;
+    }
+
+    surface = NULL;
+
+    done:
+    wayland_win_data_release(data);
+    return surface;
+}
+
 static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
                                               VkSurfaceKHR *handle, struct client_surface **client)
 {
+    BOOL needs_insert = FALSE;
     VkResult res;
     VkWaylandSurfaceCreateInfoKHR create_info_host;
     struct wayland_client_surface *surface;
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
 
-    if (!(surface = wayland_client_surface_create(hwnd)))
+    if (!(surface = find_client_surface(hwnd)))
     {
-        ERR("Failed to create vulkan client surface\n");
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (!(surface = wayland_client_surface_create(hwnd)))
+        {
+            ERR("Failed to create vulkan client surface\n");
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        needs_insert = TRUE;
     }
 
     create_info_host.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
@@ -69,6 +111,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
     }
 
     set_client_surface(hwnd, surface);
+    if (needs_insert) insert_client_surface(hwnd, surface);
     *client = &surface->client;
 
     TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);

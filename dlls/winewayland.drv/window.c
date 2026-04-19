@@ -74,6 +74,7 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     data->rects = *rects;
     data->ime_enabled = FALSE;
     data->num_ime_children = 0;
+    list_init( &data->client_surface_cache );
 
     pthread_mutex_lock(&win_data_mutex);
 
@@ -96,11 +97,20 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
  */
 static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
+    struct wayland_client_surface *surface, *next;
     TRACE("hwnd=%p\n", data->hwnd);
 
     rb_remove(&win_data_rb, &data->entry);
 
     pthread_mutex_unlock(&win_data_mutex);
+
+    LIST_FOR_EACH_ENTRY_SAFE(surface, next, &data->client_surface_cache,
+                             struct wayland_client_surface, entry)
+    {
+        list_remove(&surface->entry);
+        /* data is no longer in win_data_rb */
+        client_surface_release(&surface->client);
+    }
 
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
     if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);

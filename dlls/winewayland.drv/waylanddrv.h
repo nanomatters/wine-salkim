@@ -263,6 +263,7 @@ struct wayland_window_config
 struct wayland_client_surface
 {
     struct client_surface client;
+    struct list entry;
     HWND toplevel;
     struct wl_surface *wl_surface;
     struct wl_subsurface *wl_subsurface;
@@ -397,6 +398,8 @@ struct wayland_win_data
     struct wayland_client_surface *client_surface;
     /* window rects, relative to parent client area */
     struct window_rects rects;
+    /* intended for vulkan surfaces */
+    struct list client_surface_cache;
     BOOL is_fullscreen;
     BOOL managed;
     BOOL layered_attribs_set;
