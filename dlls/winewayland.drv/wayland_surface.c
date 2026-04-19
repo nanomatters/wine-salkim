@@ -1296,7 +1296,7 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     ensure_window_surface_contents(toplevel);
-    set_client_surface(hwnd, surface);
+    set_client_surface(hwnd, surface, FALSE);
 }
 
 static const struct client_surface_funcs wayland_client_surface_funcs =

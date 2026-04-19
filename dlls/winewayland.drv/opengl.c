@@ -118,7 +118,7 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struc
 
     if (!(gl->wl_egl_window = wl_egl_window_create(client->wl_surface, rect.right, rect.bottom))) goto err;
     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
-    set_client_surface(hwnd, client);
+    set_client_surface(hwnd, client, FALSE);
 
     TRACE("Created drawable %s with egl_surface %p\n", debugstr_opengl_drawable(&gl->base), gl->base.surface);
 

@@ -395,6 +395,8 @@ struct wayland_win_data
     struct wayland_surface *wayland_surface;
     /* wayland client surface (if any) for this window */
     struct wayland_client_surface *client_surface;
+    /* track a stale client surface to ensure DMABUF modifiers stay valid */
+    struct wayland_client_surface *stashed_client;
     /* window rects, relative to parent client area */
     struct window_rects rects;
     BOOL is_fullscreen;
@@ -409,7 +411,7 @@ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
-void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+void set_client_surface(HWND hwnd, struct wayland_client_surface *client, BOOL stash);
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);

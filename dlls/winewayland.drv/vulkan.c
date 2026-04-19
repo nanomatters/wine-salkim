@@ -39,6 +39,31 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
+static struct wayland_client_surface *find_stashed_surface(HWND hwnd)
+{
+    struct wayland_client_surface *ret = NULL;
+    struct wayland_win_data *data;
+
+    if (!(data = wayland_win_data_get(hwnd))) return NULL;
+
+    if (data->stashed_client &&
+        !data->stashed_client->client.busy_ref)
+    {
+        ret = data->stashed_client;
+        /* cannot decrease the ref count here as there is a
+         * new VkSurface referencing this client surface */
+        data->stashed_client = NULL;
+        if (data->client_surface == ret)
+        {
+            wayland_client_surface_attach(ret, NULL);
+            data->client_surface = NULL;
+        }
+    }
+
+    wayland_win_data_release(data);
+    return ret;
+}
+
 static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
                                               VkSurfaceKHR *handle, struct client_surface **client)
 {
@@ -48,7 +73,8 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
 
-    if (!(surface = wayland_client_surface_create(hwnd)))
+    if (!(surface = find_stashed_surface(hwnd)) &&
+        !(surface = wayland_client_surface_create(hwnd)))
     {
         ERR("Failed to create vulkan client surface\n");
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -68,7 +94,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
         return res;
     }
 
-    set_client_surface(hwnd, surface);
+    set_client_surface(hwnd, surface, TRUE);
     *client = &surface->client;
 
     TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);

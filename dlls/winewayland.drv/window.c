@@ -102,6 +102,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
 
     pthread_mutex_unlock(&win_data_mutex);
 
+    if (data->stashed_client) client_surface_release(&data->stashed_client->client);
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
     if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
     free(data);
@@ -889,7 +890,7 @@ BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *sty
     return ret;
 }
 
-void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client, BOOL stash)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_client_surface *old_client;
@@ -908,7 +909,15 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
         if ((data->client_surface = new_client))
         {
             if (toplevel && NtUserIsWindowVisible(hwnd))
+            {
                 wayland_client_surface_attach(new_client, toplevel);
+                if (stash && data->stashed_client != new_client)
+                {
+                    client_surface_add_ref(&new_client->client);
+                    if (data->stashed_client) client_surface_release(&data->stashed_client->client);
+                    data->stashed_client = new_client;
+                }
+            }
             else
                 wayland_client_surface_attach(new_client, NULL);
         }
