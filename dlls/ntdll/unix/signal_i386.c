@@ -2528,32 +2528,35 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
 }
 
 
-/**********************************************************************
- *             signal_init_threading
- */
-void signal_init_threading(void)
+static void init_thread_selectors(void)
 {
 #ifdef __linux__
-    /* the preloader may have allocated it already */
-    gdt_fs_sel = get_fs();
+    gdt_fs_sel = get_fs(); /* the preloader may have allocated it already */
     if (!gdt_fs_sel || !is_gdt_sel( gdt_fs_sel ))
     {
-        struct modify_ldt_s ldt_info = { -1 };
-
-        ldt_info.seg_32bit = 1;
-        ldt_info.usable = 1;
+        struct modify_ldt_s ldt_info = { .entry_number = -1, .seg_32bit = 1, .usable = 1 };
         if (set_thread_area( &ldt_info ) >= 0) gdt_fs_sel = (ldt_info.entry_number << 3) | 3;
         else gdt_fs_sel = 0;
     }
 #elif defined(__FreeBSD__) || defined (__FreeBSD_kernel__)
     gdt_fs_sel = GSEL( GUFS_SEL, SEL_UPL );
 #endif
+
+    /* leave some space if libc is using the LDT for %gs */
+    if (!gdt_fs_sel && !is_gdt_sel( get_gs() )) memset( ldt_bitmap, 0xff, 512 / 8 );
 }
+
 
 void set_thread_teb( TEB *teb )
 {
     struct x86_thread_data *thread_data = (struct x86_thread_data *)&teb->GdiTebBatch;
 
+    init_thread_selectors();
+    if (signal_alloc_thread( teb ))
+    {
+        ERR_(seh)( "failed to allocate the initial TEB selector\n" );
+        exit(1);
+    }
     ldt_set_fs( thread_data->fs, teb );
 }
 
@@ -2564,12 +2567,13 @@ NTSTATUS signal_alloc_thread( TEB *teb )
 {
     struct x86_thread_data *thread_data = (struct x86_thread_data *)&teb->GdiTebBatch;
 
-    if (!gdt_fs_sel)
+    /* The main thread may already have a selector from early TEB setup. */
+    if (!thread_data->fs && !gdt_fs_sel)
     {
         thread_data->fs = ldt_alloc_entry( ldt_make_fs32_entry( teb ));
         if (!thread_data->fs) return STATUS_TOO_MANY_THREADS;
     }
-    else thread_data->fs = gdt_fs_sel;
+    else if (!thread_data->fs) thread_data->fs = gdt_fs_sel;
 
     /* libc TLS selector, same GDT slot in every thread.  signal_init_thread
      * refreshes it for normal threads; system threads never run it, and
@@ -2589,7 +2593,7 @@ void signal_free_thread( TEB *teb )
 {
     struct x86_thread_data *thread_data = (struct x86_thread_data *)&teb->GdiTebBatch;
 
-    if (!gdt_fs_sel) ldt_free_entry( thread_data->fs );
+    if (!is_gdt_sel( thread_data->fs )) ldt_free_entry( thread_data->fs );
 }
 
 
@@ -2609,8 +2613,7 @@ void signal_init_process(void)
 
     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
 
-    /* leave some space if libc is using the LDT for %gs */
-    if (!gdt_fs_sel && !is_gdt_sel( get_gs() )) memset( ldt_bitmap, 0xff, 512 / 8 );
+    init_thread_selectors();
 
     signal_alloc_thread( NtCurrentTeb() );
 

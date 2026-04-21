@@ -3183,16 +3183,6 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
 
 
 /**********************************************************************
- *             signal_init_threading
- */
-void signal_init_threading(void)
-{
-    __asm__( "movw %%cs,%0" : "=m" (cs64_sel) );
-    __asm__( "movw %%ss,%0" : "=m" (ds64_sel) );
-}
-
-
-/**********************************************************************
  *		signal_alloc_thread
  */
 NTSTATUS signal_alloc_thread( TEB *teb )
@@ -3296,6 +3286,9 @@ void signal_init_process(void)
     *(void **)ptr = __wine_syscall_dispatcher;
 
     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
+
+    __asm__( "movw %%cs,%0" : "=m" (cs64_sel) );
+    __asm__( "movw %%ss,%0" : "=m" (ds64_sel) );
 
     if (wow_teb)
     {
