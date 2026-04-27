@@ -72,6 +72,9 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
 
     data->hwnd = hwnd;
     data->rects = *rects;
+    data->ime_enabled = FALSE;
+    data->num_ime_children = 0;
+    list_init( &data->client_surface_cache );
 
     pthread_mutex_lock(&win_data_mutex);
 
@@ -94,11 +97,20 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
  */
 static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
+    struct wayland_client_surface *surface, *next;
     TRACE("hwnd=%p\n", data->hwnd);
 
     rb_remove(&win_data_rb, &data->entry);
 
     pthread_mutex_unlock(&win_data_mutex);
+
+    LIST_FOR_EACH_ENTRY_SAFE(surface, next, &data->client_surface_cache,
+                             struct wayland_client_surface, entry)
+    {
+        list_remove(&surface->entry);
+        /* data is no longer in win_data_rb */
+        client_surface_release(&surface->client);
+    }
 
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
     if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
@@ -154,14 +166,21 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     enum wayland_surface_config_state window_state = 0;
     DWORD style;
 
-    conf->rect = data->rects.window;
+    conf->rect = data->rects.visible;
+    conf->window_rect = data->rects.window;
     conf->client_rect = data->rects.client;
     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
 
     TRACE("window=%s style=%#x\n", wine_dbgstr_rect(&conf->rect), style);
 
+    conf->minimized = FALSE;
+
+    if (style & WS_MINIMIZE)
+    {
+        conf->minimized = TRUE;
+    }
     /* The fullscreen state is implied by the window position and style. */
-    if (data->is_fullscreen)
+    else if (data->is_fullscreen)
     {
         if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
             window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
@@ -173,8 +192,12 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
     }
 
+    conf->resizeable = !!(style & WS_THICKFRAME);
     conf->state = window_state;
-    conf->scale = NtUserGetSystemDpiForProcess(0) / 96.0;
+    if (process_wayland.wp_fractional_scale_manager_v1)
+        conf->scale = conf->fractional_scale;
+    else
+        conf->scale = NtUserGetSystemDpiForProcess(0) / 96.0;
     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
     conf->managed = data->managed;
 }
@@ -192,13 +215,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *surface;
     enum wayland_surface_role role;
-    BOOL visible;
+    HWND focused;
+    BOOL visible, server_decor = FALSE;
     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
     struct wl_region *input_region;
 
     TRACE("hwnd=%p\n", data->hwnd);
 
-    visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
+    visible = ((style & WS_VISIBLE) == WS_VISIBLE) &&
                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
@@ -223,6 +248,30 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     wl_surface_set_input_region(surface->wl_surface, input_region);
     if (input_region) wl_region_destroy(input_region);
 
+    if (!EqualRect(&data->rects.visible, &data->rects.window)
+        && is_decoration_enabled(style, exstyle))
+    {
+        server_decor = TRUE;
+    }
+
+    pthread_mutex_lock(&process_wayland.keyboard.mutex);
+    focused = process_wayland.keyboard.focused_hwnd;
+    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+
+    /* Force recreate the toplevel if it is now unminimized.
+     * This resets the toplevel state, effectively making it unminimized.
+     * Ensure that this restoration is not user driven,
+     * as this case is already handled by the compositor.
+     * If we don't have caps yet, assume that minimize is supported. */
+    if (surface->window.minimized && focused != data->hwnd
+        && (!surface->current.caps
+            || surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE)
+        && !(style & WS_MINIMIZE))
+    {
+        TRACE("restoring hwnd %p\n", data->hwnd);
+        wayland_surface_clear_role(surface);
+    }
+
     /* If the window is a visible toplevel make it a wayland
      * xdg_toplevel. Otherwise keep it role-less to avoid polluting the
      * compositor with empty xdg_toplevels. */
@@ -232,7 +281,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         wayland_surface_clear_role(surface);
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
-        wayland_surface_make_toplevel(surface);
+        wayland_surface_make_toplevel(surface, server_decor);
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, toplevel_surface);
@@ -253,11 +302,12 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
 static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
 {
+    const RECT *rect = &surface->window.rect;
     BOOL processing_config = surface->processing.serial &&
                              !surface->processing.processed;
 
-    TRACE("hwnd=%p window_state=%#x %s->state=%#x\n",
-          surface->hwnd, surface->window.state,
+    TRACE("hwnd=%p window_state=%#x minimized=%u %s->state=%#x\n",
+          surface->hwnd, surface->window.state, surface->window.minimized,
           processing_config ? "processing" : "current",
           processing_config ? surface->processing.state : surface->current.state);
 
@@ -276,6 +326,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         {
             xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
+            surface->requested_output = NULL;
         }
 
         if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
@@ -283,10 +334,35 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         {
             xdg_toplevel_set_maximized(surface->xdg_toplevel);
         }
-        if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-           !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+        if (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
         {
-            xdg_toplevel_set_fullscreen(surface->xdg_toplevel, NULL);
+            struct wayland_output *wayland_output;
+            struct wl_output *output = NULL;
+            pthread_mutex_lock(&process_wayland.output_mutex);
+
+            if ((wayland_output = wayland_output_for_rect(rect)))
+                output = wayland_output->wl_output;
+
+            if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+            {
+                if (surface->requested_output != output)
+                {
+                    xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
+                    wl_display_flush(process_wayland.wl_display);
+                }
+                else
+                    goto skip_fullscreen;
+            }
+
+            xdg_toplevel_set_fullscreen(surface->xdg_toplevel, output);
+            surface->requested_output = output;
+
+            skip_fullscreen:
+            pthread_mutex_unlock(&process_wayland.output_mutex);
+        }
+        if (surface->window.minimized)
+        {
+            xdg_toplevel_set_minimized(surface->xdg_toplevel);
         }
     }
     else
@@ -488,7 +564,7 @@ static void wayland_configure_window(HWND hwnd)
 {
     struct wayland_surface *surface;
     INT width, height, window_width, window_height;
-    INT window_surf_width, window_surf_height;
+    INT window_surf_width, window_surf_height, offset_x, offset_y;
     UINT flags = 0;
     uint32_t state;
     DWORD style;
@@ -523,8 +599,14 @@ static void wayland_configure_window(HWND hwnd)
 
     state = surface->processing.state;
     /* Ignore size hints if we don't have a state that requires strict
-     * size adherence, in order to avoid spurious resizes. */
-    if (state)
+     * size adherence, in order to avoid spurious resizes.
+     * The tiled and maximized states have a strict size adherance, so
+     * their sizes cannot change while we are still processing the new config.
+     * This allows us to respect the size hint on transitions of maximized/tiled
+     * to a stateless regular window. */
+    if (state || surface->current.state &
+        (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+               WAYLAND_SURFACE_CONFIG_STATE_TILED))
     {
         width = surface->processing.width;
         height = surface->processing.height;
@@ -553,6 +635,11 @@ static void wayland_configure_window(HWND hwnd)
     {
         flags |= SWP_FRAMECHANGED;
     }
+    /* Transitions between decoration modes may entail a frame change. */
+    else if (surface->processing.decor != surface->current.decor)
+    {
+        flags |= SWP_FRAMECHANGED;
+    }
 
     wayland_surface_coords_from_window(surface,
                                        surface->window.rect.right -
@@ -575,6 +662,22 @@ static void wayland_configure_window(HWND hwnd)
 
     wayland_surface_coords_to_window(surface, width, height,
                                      &window_width, &window_height);
+    offset_x = ((surface->window.rect.left - surface->window.window_rect.left) +
+                (surface->window.window_rect.right - surface->window.rect.right));
+    offset_y = ((surface->window.rect.top - surface->window.window_rect.top) +
+                (surface->window.window_rect.bottom - surface->window.rect.bottom));
+
+    flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
+    if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
+    /* avoid any behavior differences when server side decorations is disabled */
+    else if (surface->processing.decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
+    {
+        window_height += offset_y;
+        window_width += offset_x;
+    }
+
+    SetRect(&rect, 0, 0, window_width, window_height);
+    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
 
     wayland_win_data_release(data);
 
@@ -583,11 +686,9 @@ static void wayland_configure_window(HWND hwnd)
     if (needs_enter_size_move) send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
     if (needs_exit_size_move) send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
 
-    flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
-    if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
-
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE))
+    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE)
+        && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         NtUserSetWindowLong(hwnd, GWL_STYLE, style ^ WS_MAXIMIZE, FALSE);
 
     /* The Wayland maximized and fullscreen states are very strict about
@@ -601,8 +702,6 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_NOSENDCHANGING;
     }
 
-    SetRect(&rect, 0, 0, window_width, window_height);
-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
 }
 
@@ -620,8 +719,21 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         wayland_configure_window(hwnd);
         return 0;
     case WM_WAYLAND_SET_FOREGROUND:
-        NtUserSetForegroundWindowInternal(hwnd);
+    {
+        HWND focused;
+        pthread_mutex_lock(&process_wayland.keyboard.mutex);
+        focused = process_wayland.keyboard.focused_hwnd;
+        pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+        /* if the focused hwnd is already == hwnd, this was a spurious leave event. */
+        if (wp && NtUserGetForegroundWindow() == hwnd && focused != hwnd)
+            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        /* the same applies here */
+        else if (!wp && focused == hwnd)
+            NtUserSetForegroundWindowInternal(hwnd);
+        else
+            WARN("Ignoring stale %s message\n", wp ? "focus loss" : "focus gain");
         return 0;
+    }
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;
@@ -774,6 +886,76 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
     }
 
     wl_display_flush(process_wayland.wl_display);
+    return ret;
+}
+
+/***********************************************************************
+ *          WAYLAND_HasWindowManager
+ */
+BOOL WAYLAND_HasWindowManager(const char *name)
+{
+    static int once;
+    const char *env = getenv("XDG_CURRENT_DESKTOP");
+
+    if (!once++) TRACE("DE: %s\n", debugstr_a(env));
+
+    if (!strcmp("waylanddrv", name)) return TRUE;
+    if (env && !strcmp(env, name)) return TRUE;
+
+    return FALSE;
+}
+
+/**********************************************************************
+ *          WAYLAND_FlashWindowEx
+ */
+void WAYLAND_FlashWindowEx(FLASHWINFO *info)
+{
+    struct wayland_win_data *data;
+
+    TRACE("hwnd %p flags %u\n", info->hwnd, info->dwFlags);
+
+    if ((data = wayland_win_data_get(info->hwnd)))
+    {
+        if (data->wayland_surface && info->dwFlags)
+            wayland_surface_activate(data->wayland_surface);
+        wayland_win_data_release(data);
+    }
+}
+
+/***********************************************************************
+ *           WAYLAND_GetWindowStyleMasks
+ */
+BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask)
+{
+    BOOL ret = TRUE;
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+
+    TRACE("%p %x %x %p %p\n", hwnd, style, ex_style, style_mask, ex_style_mask);
+
+    *style_mask = *ex_style_mask = 0;
+
+    if (!process_wayland.zxdg_decoration_manager_v1) return FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+
+    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
+    {
+        if (!data->managed) ret = FALSE;
+        else if (surface->current.decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE)
+            ret = FALSE;
+    }
+
+    wayland_win_data_release(data);
+
+    if (ret) ret = is_decoration_enabled(style, ex_style);
+
+    if (ret)
+    {
+        *style_mask |= WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME;
+        *ex_style_mask |= WS_EX_DLGMODALFRAME;
+    }
+
     return ret;
 }
 
