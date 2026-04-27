@@ -568,7 +568,6 @@ static void session_set_topo_status(struct media_session *session, HRESULT statu
 
 static HRESULT session_bind_output_nodes(IMFTopology *topology)
 {
-    MF_TOPOLOGY_TYPE node_type;
     IMFStreamSink *stream_sink;
     IMFMediaSink *media_sink;
     WORD node_count = 0, i;
@@ -585,7 +584,7 @@ static HRESULT session_bind_output_nodes(IMFTopology *topology)
         if (FAILED(hr = IMFTopology_GetNode(topology, i, &node)))
             break;
 
-        if (FAILED(hr = IMFTopologyNode_GetNodeType(node, &node_type)) || node_type != MF_TOPOLOGY_OUTPUT_NODE)
+        if (topology_node_get_type(node) != MF_TOPOLOGY_OUTPUT_NODE)
         {
             IMFTopologyNode_Release(node);
             continue;
@@ -633,7 +632,6 @@ static HRESULT session_bind_output_nodes(IMFTopology *topology)
 
 static HRESULT session_init_media_types(IMFTopology *topology)
 {
-    MF_TOPOLOGY_TYPE node_type;
     WORD node_count, i, j;
     IMFTopologyNode *node;
     IMFMediaType *type;
@@ -649,8 +647,7 @@ static HRESULT session_init_media_types(IMFTopology *topology)
             break;
 
         if (FAILED(hr = IMFTopologyNode_GetInputCount(node, &input_count))
-                || FAILED(hr = IMFTopologyNode_GetNodeType(node, &node_type))
-                || node_type != MF_TOPOLOGY_OUTPUT_NODE)
+                || topology_node_get_type(node) != MF_TOPOLOGY_OUTPUT_NODE)
         {
             IMFTopologyNode_Release(node);
             continue;
@@ -834,7 +831,6 @@ static void release_topo_node(struct topo_node *node)
 static void session_shutdown_current_topology(struct media_session *session)
 {
     unsigned int shutdown, force_shutdown;
-    MF_TOPOLOGY_TYPE node_type;
     IMFStreamSink *stream_sink;
     IMFTopology *topology;
     IMFTopologyNode *node;
@@ -850,8 +846,7 @@ static void session_shutdown_current_topology(struct media_session *session)
 
     while (SUCCEEDED(IMFTopology_GetNode(topology, idx++, &node)))
     {
-        if (SUCCEEDED(IMFTopologyNode_GetNodeType(node, &node_type)) &&
-                node_type == MF_TOPOLOGY_OUTPUT_NODE)
+        if (topology_node_get_type(node) == MF_TOPOLOGY_OUTPUT_NODE)
         {
             shutdown = 1;
             IMFTopologyNode_GetUINT32(node, &MF_TOPONODE_NOSHUTDOWN_ON_REMOVE, &shutdown);
@@ -1895,7 +1890,6 @@ static HRESULT session_append_node(struct media_session *session, IMFTopologyNod
     if (!(topo_node = calloc(1, sizeof(*topo_node))))
         return E_OUTOFMEMORY;
 
-    IMFTopologyNode_GetNodeType(node, &topo_node->type);
     IMFTopologyNode_GetTopoNodeID(node, &topo_node->node_id);
     topo_node->node = node;
     IMFTopologyNode_AddRef(topo_node->node);
@@ -1903,7 +1897,7 @@ static HRESULT session_append_node(struct media_session *session, IMFTopologyNod
     if (SUCCEEDED(IMFTopologyNode_GetUINT32(node, &MF_TOPONODE_MARKIN_HERE, &value)) && value)
         topo_node->flags |= TOPO_NODE_MARKIN_HERE;
 
-    switch (topo_node->type)
+    switch ((topo_node->type = topology_node_get_type(node)))
     {
         case MF_TOPOLOGY_OUTPUT_NODE:
             topo_node->u.sink.notify_cb.lpVtbl = &node_sample_allocator_cb_vtbl;
@@ -2348,7 +2342,6 @@ static HRESULT session_check_stream_descriptor(IMFPresentationDescriptor *pd, IM
 
 static HRESULT session_check_topology(IMFTopology *topology)
 {
-    MF_TOPOLOGY_TYPE node_type;
     IMFTopologyNode *node;
     WORD node_count, i;
     HRESULT hr;
@@ -2365,13 +2358,7 @@ static HRESULT session_check_topology(IMFTopology *topology)
         if (FAILED(hr = IMFTopology_GetNode(topology, i, &node)))
             break;
 
-        if (FAILED(hr = IMFTopologyNode_GetNodeType(node, &node_type)))
-        {
-            IMFTopologyNode_Release(node);
-            break;
-        }
-
-        switch (node_type)
+        switch (topology_node_get_type(node))
         {
             case MF_TOPOLOGY_SOURCESTREAM_NODE:
             {
@@ -3676,7 +3663,7 @@ static void release_output_samples(struct topo_node *node, MFT_OUTPUT_DATA_BUFFE
 
 static BOOL transform_node_markin_need_more_input(const struct media_session *session, struct topo_node *node, MFT_OUTPUT_DATA_BUFFER *buffers)
 {
-    BOOL need_more_input, drop_sample;
+    BOOL need_more_input, drop_sample, have_duration, have_time;
     LONGLONG time, duration;
     HRESULT hr;
     UINT i;
@@ -3690,7 +3677,7 @@ static BOOL transform_node_markin_need_more_input(const struct media_session *se
     {
         struct transform_stream *stream = &node->u.transform.outputs[i];
 
-        drop_sample = FALSE;
+        drop_sample = have_duration = have_time = FALSE;
 
         if (buffers[i].pEvents)
             need_more_input = FALSE;
@@ -3704,19 +3691,32 @@ static BOOL transform_node_markin_need_more_input(const struct media_session *se
             continue;
         }
 
-        if (FAILED(hr = IMFSample_GetSampleTime(buffers[i].pSample, &time)))
-            WARN("Failed to get sample time, hr %#lx\n", hr);
-        else if (FAILED(hr = IMFSample_GetSampleDuration(buffers[i].pSample, &duration)))
-            WARN("Failed to get sample time, hr %#lx\n", hr);
-        else if (time + duration <= session->presentation.start_position.hVal.QuadPart)
-            drop_sample = TRUE;
+        if (SUCCEEDED(hr = IMFSample_GetSampleTime(buffers[i].pSample, &time)))
+        {
+            have_time = TRUE;
+            if (SUCCEEDED(hr = IMFSample_GetSampleDuration(buffers[i].pSample, &duration)))
+                have_duration = TRUE;
+            else
+                WARN("Failed to get sample duration, hr %#lx\n", hr);
 
-        if (!drop_sample && time < session->presentation.start_position.hVal.QuadPart)
+            if (have_duration && time + duration <= session->presentation.start_position.hVal.QuadPart)
+                drop_sample = TRUE;
+        }
+        else
+        {
+            WARN("Failed to get sample time, hr %#lx\n", hr);
+        }
+
+        if (have_time && !drop_sample && time < session->presentation.start_position.hVal.QuadPart)
         {
             LONGLONG delta = session->presentation.start_position.hVal.QuadPart - time;
-            duration -= delta;
             IMFSample_SetSampleTime(buffers[i].pSample, session->presentation.start_position.hVal.QuadPart);
-            IMFSample_SetSampleDuration(buffers[i].pSample, duration);
+
+            if (have_duration)
+            {
+                duration -= delta;
+                IMFSample_SetSampleDuration(buffers[i].pSample, duration);
+            }
 
             if (stream->raw_audio && stream->bytes_per_second && stream->block_alignment)
             {

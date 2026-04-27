@@ -728,6 +728,7 @@ AC_CHECK_HEADERS(\
 	sys/modem.h \
 	sys/mtio.h \
 	sys/param.h \
+	sys/personality.h \
 	sys/prctl.h \
 	sys/ptrace.h \
 	sys/queue.h \
@@ -2163,7 +2164,6 @@ AC_CHECK_FUNCS(\
         dladdr1 \
 	dlinfo \
 	epoll_create \
-	epoll_pwait2 \
 	fstatfs \
 	futimens \
 	futimes \
@@ -2526,6 +2526,7 @@ WINE_CONFIG_MAKEFILE(dlls/advpack)
 WINE_CONFIG_MAKEFILE(dlls/advpack/tests)
 WINE_CONFIG_MAKEFILE(dlls/amsi)
 WINE_CONFIG_MAKEFILE(dlls/amd_ags_x64)
+WINE_CONFIG_MAKEFILE(dlls/amdxc64)
 WINE_CONFIG_MAKEFILE(dlls/amstream)
 WINE_CONFIG_MAKEFILE(dlls/amstream/tests)
 WINE_CONFIG_MAKEFILE(dlls/apisetschema)
