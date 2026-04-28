@@ -104,6 +104,7 @@ struct thread_data
 {
     TEB         *teb;               /* TEB */
     pthread_t    pthread_id;        /* pthread thread id */
+    void        *jmp_buf;           /* setjmp buffer for exception handling */
     char         signal_stack[];    /* signal stack */
     /* char kernel_stack[] */
 };
@@ -131,7 +132,6 @@ struct ntdll_thread_data
     struct list               entry;         /* entry in TEB list */
     PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
     void                     *param;         /* thread entry point parameter */
-    void                     *jmp_buf;       /* setjmp buffer for exception handling */
     BOOL                      system_thread; /* thread runs only on the Unix side */
     int                      *fsync_apc_futex;
 };

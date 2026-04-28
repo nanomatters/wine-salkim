@@ -1973,6 +1973,7 @@ static BOOL handle_interrupt( unsigned int interrupt, ucontext_t *sigcontext, vo
 static BOOL handle_syscall_fault( ucontext_t *sigcontext, void *stack_ptr,
                                   EXCEPTION_RECORD *rec, CONTEXT *context )
 {
+    struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame();
     UINT i, *stack;
 
@@ -1993,17 +1994,17 @@ static BOOL handle_syscall_fault( ucontext_t *sigcontext, void *stack_ptr,
             && is_inside_syscall_stack_guard( (char *)rec->ExceptionInformation[1] ))
         ERR_(seh)( "Syscall stack overrun.\n ");
 
-    if (ntdll_get_thread_data()->jmp_buf)
+    if (data->jmp_buf)
     {
         TRACE( "returning to handler\n" );
         /* push stack frame for calling longjmp */
         stack = stack_ptr;
         *(--stack) = 1;
-        *(--stack) = (DWORD)ntdll_get_thread_data()->jmp_buf;
+        *(--stack) = (DWORD)data->jmp_buf;
         *(--stack) = 0xdeadbabe;  /* return address */
         ESP_sig(sigcontext) = (DWORD)stack;
         EIP_sig(sigcontext) = (DWORD)longjmp;
-        ntdll_get_thread_data()->jmp_buf = NULL;
+        data->jmp_buf = NULL;
     }
     else
     {

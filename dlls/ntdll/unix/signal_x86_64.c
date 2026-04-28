@@ -2479,6 +2479,7 @@ static BOOL check_atl_thunk( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONT
  */
 static BOOL handle_syscall_fault( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
 {
+    struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame();
     DWORD i;
 
@@ -2508,13 +2509,13 @@ static BOOL handle_syscall_fault( ucontext_t *sigcontext, EXCEPTION_RECORD *rec,
             && is_inside_syscall_stack_guard( (char *)rec->ExceptionInformation[1] ))
         ERR_(seh)( "Syscall stack overrun.\n ");
 
-    if (ntdll_get_thread_data()->jmp_buf)
+    if (data->jmp_buf)
     {
         TRACE_(seh)( "returning to handler\n" );
-        RDI_sig(sigcontext) = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+        RDI_sig(sigcontext) = (ULONG_PTR)data->jmp_buf;
         RSI_sig(sigcontext) = 1;
         RIP_sig(sigcontext) = (ULONG_PTR)longjmp;
-        ntdll_get_thread_data()->jmp_buf = NULL;
+        data->jmp_buf = NULL;
     }
     else
     {
@@ -2539,7 +2540,7 @@ static BOOL handle_syscall_fault( ucontext_t *sigcontext, EXCEPTION_RECORD *rec,
 
         TRACE_(seh)( "returning to user mode ip=%016lx ret=%08x\n", frame->rip, rec->ExceptionCode );
         RAX_sig(sigcontext) = rec->ExceptionCode;
-        R13_sig(sigcontext) = (ULONG_PTR)NtCurrentTeb();
+        R13_sig(sigcontext) = (ULONG_PTR)data->teb;
         RSP_sig(sigcontext) = (ULONG_PTR)frame;
         RIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return;
     }
