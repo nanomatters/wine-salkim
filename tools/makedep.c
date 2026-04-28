@@ -475,6 +475,19 @@ static const char *get_base_name( const char *name )
     return base;
 }
 
+/*******************************************************************
+ *         replace_char
+ */
+char* replace_char(char* str, char find, char replace)
+{
+    char *current_pos;
+    current_pos = strchr(str, find);
+    while (current_pos) {
+        *current_pos = replace;
+        current_pos = strchr(current_pos + 1, find);
+    };
+    return str;
+}
 
 /*******************************************************************
  *         replace_filename
@@ -3240,6 +3253,7 @@ static void output_source_one_arch( struct makefile *make, struct incl_file *sou
 {
     const int is_cxx = strendswith( source->name, ".cpp" );
     const char *obj_name, *var_cc, *var_cxx, *var_cflags, *var_cxxflags;
+    char obj2[256] = {0};
     struct compile_command *cmd;
     struct strarray cflags = empty_strarray;
 
@@ -3320,6 +3334,11 @@ static void output_source_one_arch( struct makefile *make, struct incl_file *sou
     output_filenames( defines );
     output_filenames( cflags );
     output_filename( is_cxx ? var_cxxflags : var_cflags );
+    strncpy( obj2, obj, sizeof( obj2 ) );
+    obj2[ sizeof( obj2 ) - 1] = '\0';
+    replace_char( obj2, '-', '_' );
+    replace_char( obj2, '.', '_' );
+    output_filename( arch_make_variable( strmake( "%s_CFLAGS", basename( obj2 ) ), arch ));
     output( "\n" );
 
     if (make->testdll && strendswith( source->name, ".c" ) &&
@@ -3775,6 +3794,7 @@ static void output_programs( struct makefile *make )
 {
     unsigned int i, j;
     unsigned int arch = 0;  /* programs are always native */
+    char program2[256] = {0};
 
     for (i = 0; i < make->programs.count; i++)
     {
@@ -3800,6 +3820,10 @@ static void output_programs( struct makefile *make )
         output_filenames_obj_dir( make, objs );
         output_filenames( all_libs );
         output_filename( "$(LDFLAGS)" );
+        strncpy( program2, program, sizeof( program2 ) );
+        program2[ sizeof( program2 ) - 1] = '\0';
+        replace_char( program2, '-', '_' );
+        output_filename( arch_make_variable( strmake( "%s_LDFLAGS", basename( program2 ) ), arch ));
         output( "\n" );
         strarray_add( &make->all_targets[arch], program );
 
@@ -3866,6 +3890,8 @@ static void output_subdirs( struct makefile *make )
 
         strarray_addall_path( &all_targets, submakes[i]->obj_dir, submakes[i]->font_files );
         if (!strcmp( submakes[i]->obj_dir, "tools" ) || !strncmp( submakes[i]->obj_dir, "tools/", 6 ))
+            strarray_add( &tooldeps_deps, obj_dir_path( submakes[i], "all" ));
+        if (!strcmp( submakes[i]->obj_dir, "nls" ) || !strncmp( submakes[i]->obj_dir, "nls/", 4 ))
             strarray_add( &tooldeps_deps, obj_dir_path( submakes[i], "all" ));
         if (submakes[i]->testdll)
             strarray_add( &buildtest_deps, obj_dir_path( submakes[i], "all" ));

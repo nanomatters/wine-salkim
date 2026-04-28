@@ -4664,6 +4664,7 @@ HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerat
     BOOL current = FALSE;
     HRESULT hr = S_OK;
     size_t i;
+    const char *sgi = getenv("SteamGameId");
 
     *ret = NULL;
 
@@ -4790,7 +4791,9 @@ HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerat
             }
         }
 
-        IDWriteFontFileStream_Release(stream);
+        if ((!sgi) | (sgi && strcmp(sgi, "244210"))) {
+            IDWriteFontFileStream_Release(stream);
+        }
     }
 
     LIST_FOR_EACH_ENTRY_SAFE(fileenum, fileenum2, &scannedfiles, struct fontfile_enum, entry)

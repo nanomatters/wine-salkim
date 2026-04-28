@@ -2018,14 +2018,22 @@ static void install_bpf(struct sigaction *sig_act)
 
     static struct sock_filter filter[] =
     {
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
-        /* Native libs are loaded at high addresses. */
-        BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, NATIVE_SYSCALL_ADDRESS_START >> 32, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         /* Allow i386. */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
         BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* Native libs are loaded at high addresses. */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, NATIVE_SYSCALL_ADDRESS_START >> 32, 0, 8),
+        /* High addresses may be top-down allocations, trap those */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x7fff, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0xfe000000, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0xffff0000, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
         /* Allow wine64-preloader */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d400000, 1, 0),
@@ -2040,8 +2048,9 @@ static void install_bpf(struct sigaction *sig_act)
     unsigned int i, j;
     NTSTATUS status;
 
-    if ((ULONG_PTR)sc_seccomp < NATIVE_SYSCALL_ADDRESS_START
-            || (ULONG_PTR)syscall < NATIVE_SYSCALL_ADDRESS_START)
+    /* don't fail on systems with limited VA space (e.g. android)*/
+    int limited_va = (ULONG_PTR)syscall < NATIVE_SYSCALL_ADDRESS_START;
+    if (!limited_va && (ULONG_PTR)sc_seccomp < NATIVE_SYSCALL_ADDRESS_START)
     {
         ERR_(seh)("Native libs are being loaded in low addresses, sc_seccomp %p, syscall %p, not installing seccomp.\n",
                 sc_seccomp, syscall);
@@ -2079,9 +2088,10 @@ static void install_bpf(struct sigaction *sig_act)
 
     frame->syscall_flags = syscall_flags;
 
-    test_syscall = mmap((void *)0x600000000000, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
+    void *mmap_hint = limited_va ? NULL : (void *)0x600000000000;
+    test_syscall = mmap(mmap_hint, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (test_syscall != (void *)0x600000000000)
+    if (!limited_va ? test_syscall != (void *)0x600000000000 : test_syscall == MAP_FAILED)
     {
         int ret;
 
@@ -3065,7 +3075,7 @@ void set_thread_teb( TEB *teb )
 /***********************************************************************
  *           call_init_thunk
  */
-void call_init_thunk( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb,
+__attribute__((used)) void call_init_thunk( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb,
                       struct syscall_frame *frame, void *syscall_cfa )
 {
     struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;

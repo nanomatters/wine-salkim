@@ -20,6 +20,9 @@
 #define WIN32_NO_STATUS
 #include "mfsrcsnk_private.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "wine/list.h"
 #include "wine/debug.h"
 #include "wine/winedmo.h"
@@ -68,6 +71,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
         object->refcount = 1;                                                                      \
         return object;                                                                             \
     }
+
+#include "imfbytestream_read_hack.h"
 
 #define DEFINE_MF_ASYNC_CALLBACK_(type, name, impl_from, pfx, mem, expr)                           \
     static struct type *impl_from(IMFAsyncCallback *iface)                                         \
@@ -1793,7 +1798,7 @@ static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *
             && FAILED(IMFByteStream_SetCurrentPosition(source->stream, source->position)))
         WARN("Failed to set current position\n");
 
-    if (FAILED(IMFByteStream_Read(source->stream, buffer, *size, size)))
+    if (FAILED(IMFByteStream_Read_Hack(source->stream, buffer, *size, size)))
         return STATUS_UNSUCCESSFUL;
 
     source->position += *size;
@@ -2084,6 +2089,14 @@ static BOOL use_gst_byte_stream_handler(void)
 {
     BOOL result;
     DWORD size = sizeof(result);
+    const char *orientation = getenv("PROTON_GST_VIDEO_ORIENTATION");
+    const char *media_use_gst = getenv("PROTON_MEDIA_USE_GST");
+
+    /* Proton override: if PROTON_VIDEO_ORIENTATION is set then manually set orientation based on value */
+    if (orientation || (media_use_gst && !strcmp(media_use_gst, "1")))
+    {
+        return TRUE;
+    }
 
     /* @@ Wine registry key: HKCU\Software\Wine\MediaFoundation */
     if (!RegGetValueW( HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstByteStreamHandler",
