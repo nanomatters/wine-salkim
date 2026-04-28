@@ -602,6 +602,7 @@ SOURCES = \
 	ntsecapi.h \
 	ntsecpkg.h \
 	ntstatus.h \
+	ntsync.h \
 	ntuser.h \
 	oaidl.idl \
 	objbase.h \
