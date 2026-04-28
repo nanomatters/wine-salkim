@@ -2379,6 +2379,18 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
 
 /***********************************************************************
+ *             NtCreateSectionEx (NTDLL.@)
+ */
+NTSTATUS WINAPI NtCreateSectionEx( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                   const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags,
+                                   HANDLE file, MEM_EXTENDED_PARAMETER *parameters, ULONG count )
+{
+    if (count) FIXME( "extended params not supported\n" );
+    return NtCreateSection( handle, access, attr, size, protect, sec_flags, file );
+}
+
+
+/***********************************************************************
  *             NtOpenSection (NTDLL.@)
  */
 NTSTATUS WINAPI NtOpenSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
@@ -2473,6 +2485,27 @@ NTSTATUS WINAPI NtCompleteConnectPort( HANDLE handle )
 
 
 /***********************************************************************
+ *             NtImpersonateClientOfPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtImpersonateClientOfPort( HANDLE handle, LPC_MESSAGE *request )
+{
+    FIXME( "(%p,%p),stub!\n", handle, request );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtReadRequestData (NTDLL.@)
+ */
+NTSTATUS WINAPI NtReadRequestData( HANDLE handle, LPC_MESSAGE *request, ULONG id,
+                                   void *buffer, ULONG len, ULONG *retlen )
+{
+    FIXME( "(%p,%p,%u,%p,%u,%p),stub!\n", handle, request, id, buffer, len, retlen );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
  *             NtRegisterThreadTerminatePort (NTDLL.@)
  */
 NTSTATUS WINAPI NtRegisterThreadTerminatePort( HANDLE handle )
@@ -2498,6 +2531,16 @@ NTSTATUS WINAPI NtRequestWaitReplyPort( HANDLE handle, LPC_MESSAGE *msg_in, LPC_
 
 
 /***********************************************************************
+ *             NtReplyPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtReplyPort( HANDLE handle, LPC_MESSAGE *reply )
+{
+    FIXME("(%p,%p),stub!\n", handle, reply );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
  *             NtReplyWaitReceivePort (NTDLL.@)
  */
 NTSTATUS WINAPI NtReplyWaitReceivePort( HANDLE handle, ULONG *id, LPC_MESSAGE *reply, LPC_MESSAGE *msg )
@@ -2506,6 +2549,27 @@ NTSTATUS WINAPI NtReplyWaitReceivePort( HANDLE handle, ULONG *id, LPC_MESSAGE *r
     return STATUS_NOT_IMPLEMENTED;
 }
 
+
+/***********************************************************************
+ *             NtReplyWaitReceivePortEx (NTDLL.@)
+ */
+NTSTATUS WINAPI NtReplyWaitReceivePortEx( HANDLE handle, ULONG *id, LPC_MESSAGE *reply, LPC_MESSAGE *msg,
+                                          LARGE_INTEGER *timeout )
+{
+    FIXME("(%p,%p,%p,%p,%p),stub!\n", handle, id, reply, msg, timeout );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtWriteRequestData (NTDLL.@)
+ */
+NTSTATUS WINAPI NtWriteRequestData( HANDLE handle, LPC_MESSAGE *request, ULONG id,
+                                    void *buffer, ULONG len, ULONG *retlen )
+{
+    FIXME( "(%p,%p,%u,%p,%u,%p),stub!\n", handle, request, id, buffer, len, retlen );
+    return STATUS_NOT_IMPLEMENTED;
+}
 
 #define MAX_ATOM_LEN  255
 #define IS_INTATOM(x) (((ULONG_PTR)(x) >> 16) == 0)
@@ -2707,6 +2771,14 @@ static unsigned int handle_to_index( HANDLE handle, unsigned int *block_idx )
     return idx % TID_ALERT_BLOCK_SIZE;
 }
 
+static BOOL is_alert_tid_valid( HANDLE tid )
+{
+    unsigned int block_idx;
+
+    handle_to_index( tid, &block_idx );
+    return block_idx <= ARRAY_SIZE(tid_alert_blocks);
+}
+
 static union tid_alert_entry *get_tid_alert_entry( HANDLE tid )
 {
     unsigned int block_idx, idx = handle_to_index( tid, &block_idx );
@@ -2774,6 +2846,25 @@ static union tid_alert_entry *get_tid_alert_entry( HANDLE tid )
 #endif
 
     return entry;
+}
+
+
+/***********************************************************************
+ *             NtAlertMultipleThreadByThreadId (NTDLL.@)
+ */
+NTSTATUS WINAPI NtAlertMultipleThreadByThreadId( HANDLE *tids, ULONG count, void *unk1, void *unk2 )
+{
+    unsigned int i;
+
+    TRACE( "%p %d %p %p\n", tids, (int)count, unk1, unk2 );
+
+    if (unk1 || unk2) FIXME( "unk1 %p, unk2 %p.\n", unk1, unk2 );
+    for (i = 0; i < count; ++i)
+    {
+        if (!is_alert_tid_valid( tids[i] )) return STATUS_INVALID_CID;
+    }
+    for (i = 0; i < count; ++i) NtAlertThreadByThreadId( tids[i] );
+    return STATUS_SUCCESS;
 }
 
 

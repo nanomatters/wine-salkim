@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <float.h>
+#include <inttypes.h>
 #include <io.h>
 #include <sys/stat.h>
 #include <share.h>
@@ -492,7 +493,7 @@ static void test__sopen_dispatch(void)
 
 static void test__sopen_s(void)
 {
-    int ret, fd;
+    int ret, fd, fd2;
     char *tempf;
 
     tempf = _tempnam(".", "wne");
@@ -518,11 +519,38 @@ static void test__sopen_s(void)
     ok(fd == -1, "got fd %d\n", fd);
     CHECK_CALLED(global_invalid_parameter_handler);
 
+    fd = 0;
+    ret = _sopen_s(&fd, tempf, _O_CREAT | _O_WRONLY, _SH_SECURE, _S_IWRITE);
+    ok(!ret, "got %d\n", ret);
+    ok(fd > 0, "got fd %d\n", fd);
+    fd2 = 0;
+    ret = _sopen_s(&fd2, tempf, _O_RDONLY, _SH_SECURE, 0);
+    ok(ret == EACCES, "got %d\n", ret);
+    ok(fd2 == -1, "got fd %d\n", fd2);
+    ret = _close(fd);
+    ok(!ret, "close() returned %d\n", ret);
+
+    fd = 0;
+    ret = _sopen_s(&fd, tempf, _O_RDONLY, _SH_SECURE, 0);
+    ok(!ret, "got %d\n", ret);
+    ok(fd > 0, "got fd %d\n", fd);
+    fd2 = 0;
+    ret = _sopen_s(&fd2, tempf, _O_RDONLY, _SH_SECURE, 0);
+    ok(!ret, "got %d\n", ret);
+    ok(fd2 > 0, "got fd %d\n", fd2);
+    ret = close(fd);
+    ok(!ret, "_close() returned %d\n", ret);
+    ret = close(fd2);
+    ok(!ret, "_close() returned %d\n", ret);
+    ret = unlink(tempf);
+    ok(!ret, "unlink() returned %d\n", ret);
+
     free(tempf);
 }
 
 static void test_lldiv(void)
 {
+    imaxdiv_t div_res;
     lldiv_t r;
 
     r = lldiv(((LONGLONG)0x111 << 32) + 0x222, (LONGLONG)1 << 32);
@@ -536,6 +564,18 @@ static void test_lldiv(void)
     r = lldiv(((LONGLONG)0x243A5678 << 32) + 0x9ABCDEF0, (LONGLONG)0x12 << 48);
     ok(r.quot == 0x0203, "quot = %s\n", wine_dbgstr_longlong(r.quot));
     ok(r.rem == ((LONGLONG)0x00045678 << 32) + 0x9ABCDEF0, "rem = %s\n", wine_dbgstr_longlong(r.rem));
+
+    div_res = imaxdiv(((intmax_t)0x111 << 32) + 0x222, (intmax_t)1 << 32);
+    ok(div_res.quot == 0x111, "quot = %s\n", wine_dbgstr_longlong(div_res.quot));
+    ok(div_res.rem == 0x222, "rem = %s\n", wine_dbgstr_longlong(div_res.rem));
+
+    div_res = imaxdiv(((intmax_t)0x69CF0012 << 32) + 0x0033E78A, 0x30);
+    ok(div_res.quot == ((intmax_t)0x02345000 << 32) + 0x600114D2, "quot = %s\n", wine_dbgstr_longlong(div_res.quot));
+    ok(div_res.rem == 0x2A, "rem = %s\n", wine_dbgstr_longlong(div_res.rem));
+
+    div_res = imaxdiv(((intmax_t)0x243A5678 << 32) + 0x9ABCDEF0, (intmax_t)0x12 << 48);
+    ok(div_res.quot == 0x0203, "quot = %s\n", wine_dbgstr_longlong(div_res.quot));
+    ok(div_res.rem == ((intmax_t)0x00045678 << 32) + 0x9ABCDEF0, "rem = %s\n", wine_dbgstr_longlong(div_res.rem));
 }
 
 static void test_isblank(void)

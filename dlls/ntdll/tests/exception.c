@@ -2814,24 +2814,21 @@ static const struct exception
         /* It is observed that fs/gs base is reset
            on some CPUs when setting the segment value
            even to 0 (regardless of CPU spec
-           saying otherwise) and it is not currently
-           handled in Wine.
+           saying otherwise) and the fs base case
+           is not currently handled in Wine.
            Disable this part to avoid crashing the test. */
         0x8e, 0xe0, /* mov %eax,%fs */
-        0x8e, 0xe8, /* mov %eax,%gs */
 #else
-        0x90, 0x90, /* nop */
         0x90, 0x90, /* nop */
 #endif
+        0x8e, 0xe8, /* mov %eax,%gs */
         0xfa,       /* cli */
         0x58,       /* pop %rax */
-#if 0
         0x8e, 0xe8, /* mov %eax,%gs */
         0x58,       /* pop %rax */
+#if 0
         0x8e, 0xe0, /* mov %eax,%fs */
 #else
-        0x58,       /* pop %rax */
-        0x90, 0x90, /* nop */
         0x90, 0x90, /* nop */
 #endif
         0x58,       /* pop %rax */
@@ -2851,6 +2848,12 @@ static const struct exception
 /* 40 */
     { { 0xb8, 0x01, 0x00, 0x00, 0x00,          /* mov $0x01, %eax */
         0xcd, 0x2d, 0xfa, 0xc3 },              /* int $0x2d; cli; ret */
+      8, 0, STATUS_SUCCESS, 0 },
+    { { 0x66, 0x0f, 0xa8,                      /* push %gs */
+        0x66, 0x0f, 0xa9,                      /* pop  %gs */
+        0x65, 0x48, 0x8b, 0x04, 0x25,          /* movq %gs:0x30,%rax (NtCurrentTeb) */
+        0x30, 0x00, 0x00, 0x00,
+        0xc3 },                                /* ret */
       8, 0, STATUS_SUCCESS, 0 },
 };
 
