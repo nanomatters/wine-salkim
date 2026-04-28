@@ -55,28 +55,73 @@ static VkBool32 (*pvkGetPhysicalDeviceWaylandPresentationSupportKHR)(VkPhysicalD
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
-static void wine_vk_surface_destroy(struct wayland_client_surface *client)
+static void wine_vk_surface_destroy(struct wayland_client_surface *client, UINT ref)
 {
     HWND hwnd = wl_surface_get_user_data(client->wl_surface);
-    struct wayland_win_data *data = wayland_win_data_get(hwnd);
+    struct wayland_win_data *data;
 
-    if (wayland_client_surface_release(client) && data)
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        /* if the swapchain using this surface was destroyed, it is safe to reuse */
+        if (!ref)
+        {
+            if (data->saved_client_surface)
+                wayland_client_surface_release(data->saved_client_surface);
+            data->saved_client_surface = client;
+        }
+        wayland_client_surface_detach(client);
         data->client_surface = NULL;
+        wayland_win_data_release(data);
+    }
+}
 
-    if (data) wayland_win_data_release(data);
+static BOOL vulkan_opwr_disabled(void)
+{
+    static int disabled = -1;
+
+    if (disabled == -1)
+    {
+        const char *env = getenv("WINE_DISABLE_VULKAN_OPWR");
+        if (env && !strcmp(env, "1"))
+            disabled = 1;
+        else
+            disabled = 0;
+    }
+
+    return disabled;
 }
 
 static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *surface, void **private)
 {
     VkResult res;
+    DWORD pid, tid;
     VkWaylandSurfaceCreateInfoKHR create_info_host;
-    struct wayland_client_surface *client;
+    struct wayland_win_data *data;
+    struct wayland_client_surface *client = NULL;
 
     TRACE("%p %p %p %p\n", hwnd, instance, surface, private);
 
-    if (!(client = wayland_client_surface_create(hwnd)))
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        client = data->saved_client_surface;
+        data->saved_client_surface = NULL;
+        WARN("Reusing client surface %p\n", client);
+        wayland_win_data_release(data);
+    }
+
+    if (!client && !(client = wayland_client_surface_create(hwnd)))
     {
         ERR("Failed to create client surface for hwnd=%p\n", hwnd);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    tid = NtUserGetWindowThread(hwnd, &pid);
+    if (tid && pid != GetCurrentProcessId())
+    {
+        if (vulkan_opwr_disabled() && hwnd != NtUserGetDesktopWindow())
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+        ERR("Cross process rendering is not supported!\n");
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
@@ -92,7 +137,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_ins
     if (res != VK_SUCCESS)
     {
         ERR("Failed to create vulkan wayland surface, res=%d\n", res);
-        wine_vk_surface_destroy(client);
+        wine_vk_surface_destroy(client, 1);
         return res;
     }
 
@@ -103,13 +148,13 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_ins
     return VK_SUCCESS;
 }
 
-static void wayland_vulkan_surface_destroy(HWND hwnd, void *private)
+static void wayland_vulkan_surface_destroy(HWND hwnd, void *private, UINT ref)
 {
     struct wayland_client_surface *client = private;
 
     TRACE("%p %p\n", hwnd, private);
 
-    wine_vk_surface_destroy(client);
+    wine_vk_surface_destroy(client, ref);
 }
 
 static void wayland_vulkan_surface_detach(HWND hwnd, void *private)

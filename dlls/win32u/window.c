@@ -2043,7 +2043,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (create_layered || is_layered) needs_surface = TRUE;
 
     if (is_opengl && !is_layered && !create_layered
-        && !(!create_opaque && NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY))
+        && !(!create_opaque && NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY)
+        && !user_driver->pHasWindowManager("waylanddrv"))
     {
         if (new_surface) window_surface_release( new_surface );
         new_surface = NULL;
@@ -2056,7 +2057,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
         window_surface_add_ref( (new_surface = &dummy_surface) );
     }
 
-    if (new_surface && !is_layered)
+    if (new_surface && new_surface != &dummy_surface && !is_layered)
     {
         DWORD lwa_flags = 0, alpha_bits = -1;
         COLORREF key;
@@ -2087,6 +2088,23 @@ static void update_children_window_state( HWND hwnd )
     free( children );
 }
 
+static int move_hack_disabled(void)
+{
+    static volatile int disabled = -1;
+
+    if (disabled == -1)
+    {
+        const char *env = getenv("WINE_MOVE_HACK");
+
+        if (env && !strcmp(env, "0"))
+            disabled = 1;
+        else
+            disabled = 0;
+    }
+
+    return disabled;
+}
+
 /***********************************************************************
  *           apply_window_pos
  *
@@ -2099,10 +2117,59 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     WND *win;
     HWND owner_hint, surface_win = 0, parent = NtUserGetAncestor( hwnd, GA_PARENT );
     BOOL ret, is_fullscreen, is_layered, is_child;
-    struct window_rects old_rects;
+    struct window_rects old_rects, adjusted;
     RECT extra_rects[3];
     struct window_surface *old_surface;
     UINT raw_dpi_num, raw_dpi_den, monitor_dpi;
+
+    /* HACK: move windows within the virtual screen on winewayland */
+    if (user_driver->pHasWindowManager("waylanddrv") && !move_hack_disabled())
+    {
+        RECT temp, *adj;
+        RECT virtual_screen = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+
+        adjusted = *new_rects;
+        adj = &adjusted.client;
+
+        intersect_rect(&temp, &virtual_screen, adj);
+
+        /* we aren't off screen */
+        if (!IsRectEmpty(&temp))
+        {
+            LONG offset_x = 0, offset_y = 0;
+
+            if (adj->bottom - adj->top <=
+                virtual_screen.bottom - virtual_screen.top)
+            {
+                if (adj->bottom > virtual_screen.bottom)
+                    offset_y = virtual_screen.bottom - adj->bottom;
+                else if (virtual_screen.top > adj->top)
+                    offset_y = virtual_screen.top - adj->top;
+            }
+
+            if (adj->right - adj->left <=
+                virtual_screen.right - virtual_screen.left)
+            {
+                if (adj->right > virtual_screen.right)
+                    offset_x = virtual_screen.right - adj->right;
+                else if (virtual_screen.left > adj->left)
+                    offset_x = virtual_screen.left - adj->left;
+            }
+
+            OffsetRect(&adjusted.client, offset_x, offset_y);
+            OffsetRect(&adjusted.visible, offset_x, offset_y);
+            OffsetRect(&adjusted.window, offset_x, offset_y);
+
+            if (offset_x != 0 || offset_y != 0)
+            {
+                TRACE("virtual_screen %s\n", wine_dbgstr_rect(&virtual_screen));
+                TRACE("Original window rects: %s\n", debugstr_window_rects(new_rects));
+                TRACE("Adjusted window rects: %s\n", debugstr_window_rects(&adjusted));
+
+                new_rects = &adjusted;
+            }
+        }
+    }
 
     is_layered = new_surface && new_surface->alpha_mask;
     is_fullscreen = is_window_rect_full_screen( &new_rects->visible, get_thread_dpi() );
@@ -6195,6 +6262,7 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
     case NtUserCallHwndParam_GetWinMonitorDpi:
     {
         UINT raw_dpi_num, raw_dpi_den, dpi = get_win_monitor_dpi( hwnd, &raw_dpi_num, &raw_dpi_den );
+        if (!raw_dpi_den) raw_dpi_den = 1;
         return param == MDT_EFFECTIVE_DPI ? dpi : (raw_dpi_num + raw_dpi_den / 2) / raw_dpi_den;
     }
 
