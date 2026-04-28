@@ -464,6 +464,8 @@ extern BOOL use_take_focus;
 extern BOOL use_primary_selection;
 extern BOOL use_system_cursors;
 extern BOOL grab_fullscreen;
+extern int keyboard_layout;
+extern BOOL keyboard_scancode_detect;
 extern BOOL usexcomposite;
 extern BOOL use_xfixes;
 extern BOOL managed_mode;
@@ -767,6 +769,11 @@ extern RECT get_work_area( const RECT *monitor_rect );
 extern BOOL xinerama_get_fullscreen_monitors( const RECT *rect, long *indices );
 extern void xinerama_init( unsigned int width, unsigned int height );
 extern void init_recursive_mutex( pthread_mutex_t *mutex );
+
+/* keyboard.c */
+
+extern int x11drv_find_keyboard_layout( const WCHAR *layout );
+extern WCHAR *x11drv_get_keyboard_layout_list( DWORD *size );
 
 #define DEPTH_COUNT 3
 extern const unsigned int *depths;
