@@ -563,11 +563,11 @@ static UINT64 xstate_extended_features;
 static LONG syscall_dispatch_enabled = TRUE;
 
 #if defined(__linux__) || defined(__APPLE__)
-static inline TEB *get_current_teb(void)
+static inline struct thread_data *get_current_thread_data(void)
 {
     unsigned long rsp;
     __asm__( "movq %%rsp,%0" : "=r" (rsp) );
-    return (TEB *)(rsp & ~signal_stack_mask);
+    return (struct thread_data *)(rsp & ~signal_stack_mask);
 }
 #endif
 
@@ -948,13 +948,13 @@ static inline ucontext_t *init_handler( void *sigcontext )
     clear_alignment_flag();
 #ifdef __linux__
     {
-        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_teb()->GdiTebBatch;
+        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_thread_data()->teb->GdiTebBatch;
         thread_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
         if (fs32_sel) arch_prctl( ARCH_SET_FS, thread_data->pthread_teb );
     }
 #elif defined __APPLE__
     {
-        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_teb()->GdiTebBatch;
+        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_thread_data()->teb->GdiTebBatch;
         _thread_set_tsd_base( (uint64_t)thread_data->pthread_teb );
 
         /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
@@ -2121,12 +2121,12 @@ __ASM_GLOBAL_FUNC( user_mode_abort_thread,
  */
 NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
 {
+    struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame();
     ULONG64 rsp = (frame->rsp - offsetof( struct callback_stack_layout, args_data[len] )) & ~15;
     struct callback_stack_layout *stack = (struct callback_stack_layout *)rsp;
 
-    if ((char *)ntdll_get_thread_data()->kernel_stack + min_kernel_stack > (char *)&frame)
-        return STATUS_STACK_OVERFLOW;
+    if ((char *)get_kernel_stack( data ) + min_kernel_stack > (char *)&frame) return STATUS_STACK_OVERFLOW;
 
     stack->args              = stack->args_data;
     stack->len               = len;
@@ -2518,7 +2518,7 @@ static BOOL handle_syscall_fault( ucontext_t *sigcontext, EXCEPTION_RECORD *rec,
     }
     else
     {
-        const char *kernel_stack = ntdll_get_thread_data()->kernel_stack;
+        const char *kernel_stack = get_kernel_stack( get_thread_data() );
         char *stack = (char *)RSP_sig(sigcontext);
 
         WINE_BACKTRACE_LOG( "--- Exception %#x at %s.\n", rec->ExceptionCode,
@@ -3020,6 +3020,7 @@ void deferred_sigusr1(void)
 static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+    struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame();
     struct xcontext *context;
 
@@ -3072,7 +3073,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     }
 
     context = (struct xcontext *)(((ULONG_PTR)RSP_sig(ucontext) - 128 - sizeof(*context)) & ~15);
-    if ((char *)context < (char *)ntdll_get_thread_data()->kernel_stack)
+    if ((char *)context < (char *)get_kernel_stack( data ))
     {
         ERR_(seh)( "kernel stack overflow.\n" );
         return;

@@ -1119,17 +1119,19 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
  *
  * Startup routine for a newly created thread.
  */
-static void start_thread( TEB *teb )
+static void start_thread( struct thread_data *data )
 {
-    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&data->teb->GdiTebBatch;
     BOOL suspend;
+
+    data->pthread_id = pthread_self();
+    pthread_setspecific( thread_data_key, data );
 
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
-    thread_data->pthread_id = pthread_self();
-    pthread_setspecific( teb_key, teb );
+    pthread_setspecific( teb_key, data->teb );
     server_init_thread( thread_data->start, &suspend );
-    signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
+    signal_start_thread( thread_data->start, thread_data->param, suspend, data->teb );
 }
 
 
@@ -1202,15 +1204,9 @@ void set_thread_id( TEB *teb, DWORD tid )
  */
 NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
 {
-    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     WOW_TEB *wow_teb = get_wow_teb( teb );
     INITIAL_TEB stack;
     NTSTATUS status;
-
-    /* kernel stack */
-    if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
-        return status;
-    thread_data->kernel_stack = stack.DeallocationStack;
 
     if (wow_teb)
     {
@@ -1340,6 +1336,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     data_size_t len;
     struct object_attributes *objattr;
     struct ntdll_thread_data *thread_data;
+    struct thread_data *data;
     DWORD tid = 0;
     int request_pipe[2];
     TEB *teb;
@@ -1417,13 +1414,25 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         return status;
     }
 
+    if (!(data = virtual_alloc_thread_data()))
+    {
+        NtClose( *handle );
+        close( request_pipe[1] );
+        return STATUS_NO_MEMORY;
+    }
+
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
-    if ((status = virtual_alloc_teb( &teb ))) goto done;
+    if ((status = virtual_alloc_teb( &teb )))
+    {
+        virtual_free_thread_data( data );
+        goto done;
+    }
+    data->teb = teb;
 
     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
     {
-        virtual_free_teb( teb );
+        virtual_free_thread_data( data );
         goto done;
     }
 
@@ -1444,14 +1453,14 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     thread_data->param = param;
 
     pthread_attr_init( &pthread_attr );
-    pthread_attr_setstack( &pthread_attr, thread_data->kernel_stack, kernel_stack_size );
+    pthread_attr_setstack( &pthread_attr, get_kernel_stack( data ), kernel_stack_size );
     pthread_attr_setguardsize( &pthread_attr, 0 );
     pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
     InterlockedIncrement( &nb_threads );
-    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb ))
+    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, data ))
     {
         InterlockedDecrement( &nb_threads );
-        virtual_free_teb( teb );
+        virtual_free_thread_data( data );
         status = STATUS_NO_MEMORY;
     }
     pthread_attr_destroy( &pthread_attr );
@@ -1474,16 +1483,17 @@ done:
  *
  * Startup routine for a thread that runs entirely on the Unix side.
  */
-static void start_system_thread( TEB *teb )
+static void start_system_thread( struct thread_data *data )
 {
-    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&data->teb->GdiTebBatch;
     BOOL suspend;
 
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
-    thread_data->pthread_id = pthread_self();
+    data->pthread_id = pthread_self();
     thread_data->system_thread = TRUE;
-    pthread_setspecific( teb_key, teb );
+    pthread_setspecific( thread_data_key, data );
+    pthread_setspecific( teb_key, data->teb );
     server_init_thread( NULL, &suspend );
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
     thread_data->start( thread_data->param );
@@ -1503,7 +1513,7 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     data_size_t len;
     struct object_attributes *objattr;
     struct ntdll_thread_data *thread_data;
-    INITIAL_TEB stack;
+    struct thread_data *data;
     DWORD tid = 0;
     int request_pipe[2];
     TEB *teb;
@@ -1546,32 +1556,34 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
-    if ((status = virtual_alloc_teb( &teb ))) goto done;
-
-    /* kernel stack only, system threads never run PE code */
-    if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
+    if (!(data = virtual_alloc_thread_data()))
     {
-        virtual_free_teb( teb );
+        status = STATUS_NO_MEMORY;
         goto done;
     }
+    if ((status = virtual_alloc_teb( &teb )))
+    {
+        virtual_free_thread_data( data );
+        goto done;
+    }
+    data->teb = teb;
 
     set_thread_id( teb, tid );
 
     thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     thread_data->request_fd   = request_pipe[1];
-    thread_data->kernel_stack = stack.DeallocationStack;
     thread_data->start = start;
     thread_data->param = param;
 
     pthread_attr_init( &pthread_attr );
-    pthread_attr_setstack( &pthread_attr, thread_data->kernel_stack, kernel_stack_size );
+    pthread_attr_setstack( &pthread_attr, get_kernel_stack( data ), kernel_stack_size );
     pthread_attr_setguardsize( &pthread_attr, 0 );
     pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
     InterlockedIncrement( &nb_threads );
-    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_system_thread, teb ))
+    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_system_thread, data ))
     {
         InterlockedDecrement( &nb_threads );
-        virtual_free_teb( teb );
+        virtual_free_thread_data( data );
         status = STATUS_NO_MEMORY;
     }
     pthread_attr_destroy( &pthread_attr );
@@ -1618,21 +1630,19 @@ void abort_process( int status )
  */
 static DECLSPEC_NORETURN void exit_thread( int status )
 {
-    static void *prev_teb;
-    TEB *teb;
+    static void *prev_data;
+    struct thread_data *data;
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
     if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
 
-    if ((teb = InterlockedExchangePointer( &prev_teb, NtCurrentTeb() )))
+    if ((data = InterlockedExchangePointer( &prev_data, get_thread_data() )))
     {
-        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
-
-        if (thread_data->pthread_id)
+        if (data->pthread_id)
         {
-            pthread_join( thread_data->pthread_id, NULL );
-            virtual_free_teb( teb );
+            pthread_join( data->pthread_id, NULL );
+            virtual_free_thread_data( data );
         }
     }
     pthread_exit_wrapper( status );
