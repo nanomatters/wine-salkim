@@ -1127,8 +1127,8 @@ static void start_thread( struct thread_data *data )
 
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
-    server_init_thread( thread_data->start, &suspend );
-    signal_start_thread( thread_data->start, thread_data->param, suspend, data->teb );
+    server_init_thread( data->start, &suspend );
+    signal_start_thread( data->start, data->param, suspend, data->teb );
 }
 
 
@@ -1446,8 +1446,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
     thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     thread_data->request_fd  = request_pipe[1];
-    thread_data->start = start;
-    thread_data->param = param;
+    data->start = start;
+    data->param = param;
 
     pthread_attr_init( &pthread_attr );
     pthread_attr_setstack( &pthread_attr, get_kernel_stack( data ), kernel_stack_size );
@@ -1492,7 +1492,7 @@ static void start_system_thread( struct thread_data *data )
     pthread_setspecific( thread_data_key, data );
     server_init_thread( NULL, &suspend );
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
-    thread_data->start( thread_data->param );
+    ((PRTL_THREAD_START_ROUTINE)data->start)( data->param );
     PsTerminateSystemThread( 0 );
 }
 
@@ -1568,8 +1568,8 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
 
     thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     thread_data->request_fd   = request_pipe[1];
-    thread_data->start = start;
-    thread_data->param = param;
+    data->start = start;
+    data->param = param;
 
     pthread_attr_init( &pthread_attr );
     pthread_attr_setstack( &pthread_attr, get_kernel_stack( data ), kernel_stack_size );

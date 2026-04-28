@@ -105,6 +105,8 @@ struct thread_data
     TEB         *teb;               /* TEB */
     pthread_t    pthread_id;        /* pthread thread id */
     void        *jmp_buf;           /* setjmp buffer for exception handling */
+    void        *start;             /* thread entry point */
+    void        *param;             /* thread entry point parameter */
     char         signal_stack[];    /* signal stack */
     /* char kernel_stack[] */
 };
@@ -130,8 +132,6 @@ struct ntdll_thread_data
     UINT64                    completion_cookie; /* associated kernel completion port */
     BOOL                      allow_writes;  /* ThreadAllowWrites flags */
     struct list               entry;         /* entry in TEB list */
-    PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
-    void                     *param;         /* thread entry point parameter */
     BOOL                      system_thread; /* thread runs only on the Unix side */
     int                      *fsync_apc_futex;
 };
