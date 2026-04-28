@@ -2134,7 +2134,7 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     stack->machine_frame.rip = frame->rip;
     stack->machine_frame.rsp = frame->rsp;
     memcpy( stack->args_data, args, len );
-    return call_user_mode_callback( rsp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
+    return call_user_mode_callback( rsp, ret_ptr, ret_len, pKiUserCallbackDispatcher, data->teb );
 }
 
 
