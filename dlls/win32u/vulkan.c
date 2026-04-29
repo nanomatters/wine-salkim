@@ -144,6 +144,7 @@ struct surface
 {
     struct vulkan_surface obj;
     struct client_surface *client;
+    struct swapchain *swapchain;
     HWND hwnd;
 };
 
@@ -2606,6 +2607,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
+    client_surface_add_ref(surface->client);
+    surface->swapchain = swapchain;
     swapchain->extents = create_info->imageExtent;
     instance->p_insert_object( instance, &swapchain->obj.obj );
 
@@ -2668,6 +2671,11 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     }
 
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+    if (swapchain->surface)
+    {
+        swapchain->surface->swapchain = NULL;
+        client_surface_release( swapchain->surface->client );
+    }
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
     free( swapchain );
