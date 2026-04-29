@@ -1421,12 +1421,12 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
-    if ((status = virtual_alloc_teb( &teb )))
+    if ((status = virtual_alloc_teb( data )))
     {
         virtual_free_thread_data( data );
         goto done;
     }
-    data->teb = teb;
+    teb = data->teb;
 
     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
     {
@@ -1512,7 +1512,6 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     struct thread_data *data;
     DWORD tid = 0;
     int request_pipe[2];
-    TEB *teb;
     unsigned int status;
 
     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
@@ -1557,12 +1556,11 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
         status = STATUS_NO_MEMORY;
         goto done;
     }
-    if ((status = virtual_alloc_teb( &teb )))
+    if ((status = virtual_alloc_teb( data )))
     {
         virtual_free_thread_data( data );
         goto done;
     }
-    data->teb = teb;
 
     data->tid = tid;
     set_thread_id( data );
