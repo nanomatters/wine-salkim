@@ -117,6 +117,7 @@ struct thread_data
     UINT64       completion_cookie; /* associated kernel completion port */
     BOOL         system_thread;     /* thread runs only on the Unix side */
     int         *fsync_apc_futex;
+    char         debug_info[0x800]; /* debug_info structure */
     char         signal_stack[];    /* signal stack */
     /* char kernel_stack[] */
 };
