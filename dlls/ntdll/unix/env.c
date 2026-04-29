@@ -1883,7 +1883,7 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
         NtCurrentTeb()->WowTebOffset = teb_offset;
         NtCurrentTeb()->Tib.ExceptionList = (void *)((char *)NtCurrentTeb() + teb_offset);
         wow_peb = (PEB32 *)((char *)peb + page_size);
-        set_thread_id( NtCurrentTeb(), GetCurrentThreadId() );
+        set_thread_id( get_thread_data() );
     }
 #endif
 
@@ -2503,5 +2503,5 @@ HANDLE WINAPI PsGetCurrentProcessId(void)
  */
 HANDLE WINAPI PsGetCurrentThreadId(void)
 {
-    return NtCurrentTeb()->ClientId.UniqueThread;
+    return ULongToHandle( get_thread_data()->tid );
 }
