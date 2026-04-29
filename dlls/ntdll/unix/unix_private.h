@@ -103,10 +103,17 @@ static inline BOOL is_arm64ec(void)
 struct thread_data
 {
     TEB         *teb;               /* TEB */
+    int          request_fd;        /* fd for sending server requests */
+    int          reply_fd;          /* fd for receiving server replies */
+    int          wait_fd[2];        /* fd for sleeping server requests */
+    int          alert_fd;          /* inproc sync fd for user apc alerts */
     pthread_t    pthread_id;        /* pthread thread id */
     void        *jmp_buf;           /* setjmp buffer for exception handling */
     void        *start;             /* thread entry point */
     void        *param;             /* thread entry point parameter */
+    UINT64       completion_cookie; /* associated kernel completion port */
+    BOOL         system_thread;     /* thread runs only on the Unix side */
+    int         *fsync_apc_futex;
     char         signal_stack[];    /* signal stack */
     /* char kernel_stack[] */
 };
@@ -125,15 +132,8 @@ struct ntdll_thread_data
     SYSTEM_SERVICE_TABLE     *syscall_table; /* 214/0370 syscall table */
     struct syscall_frame     *syscall_frame; /* 218/0378 current syscall frame */
     int                       syscall_trace; /* 21c/0380 syscall trace flag */
-    int                       request_fd;    /* fd for sending server requests */
-    int                       reply_fd;      /* fd for receiving server replies */
-    int                       wait_fd[2];    /* fd for sleeping server requests */
-    int                       alert_fd;      /* inproc sync fd for user apc alerts */
-    UINT64                    completion_cookie; /* associated kernel completion port */
     BOOL                      allow_writes;  /* ThreadAllowWrites flags */
     struct list               entry;         /* entry in TEB list */
-    BOOL                      system_thread; /* thread runs only on the Unix side */
-    int                      *fsync_apc_futex;
 };
 
 C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );

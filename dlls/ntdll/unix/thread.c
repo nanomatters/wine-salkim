@@ -1103,11 +1103,12 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  */
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
-    close( ntdll_get_thread_data()->alert_fd );
-    close( ntdll_get_thread_data()->wait_fd[0] );
-    close( ntdll_get_thread_data()->wait_fd[1] );
-    close( ntdll_get_thread_data()->reply_fd );
-    close( ntdll_get_thread_data()->request_fd );
+    struct thread_data *data = get_thread_data();
+    close( data->alert_fd );
+    close( data->wait_fd[0] );
+    close( data->wait_fd[1] );
+    close( data->reply_fd );
+    close( data->request_fd );
     pthread_exit( UIntToPtr(status) );
 }
 
@@ -1332,7 +1333,6 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     pthread_attr_t pthread_attr;
     data_size_t len;
     struct object_attributes *objattr;
-    struct ntdll_thread_data *thread_data;
     struct thread_data *data;
     DWORD tid = 0;
     int request_pipe[2];
@@ -1444,8 +1444,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         wow_teb->SkipLoaderInit = teb->SkipLoaderInit;
     }
 
-    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
-    thread_data->request_fd  = request_pipe[1];
+    data->request_fd = request_pipe[1];
     data->start = start;
     data->param = param;
 
@@ -1488,7 +1487,7 @@ static void start_system_thread( struct thread_data *data )
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
     data->pthread_id = pthread_self();
-    thread_data->system_thread = TRUE;
+    data->system_thread = TRUE;
     pthread_setspecific( thread_data_key, data );
     server_init_thread( NULL, &suspend );
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
@@ -1566,8 +1565,7 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
 
     set_thread_id( teb, tid );
 
-    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
-    thread_data->request_fd   = request_pipe[1];
+    data->request_fd = request_pipe[1];
     data->start = start;
     data->param = param;
 

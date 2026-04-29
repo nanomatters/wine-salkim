@@ -2945,7 +2945,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
 
-    if (!ntdll_get_thread_data()->system_thread && !is_inside_syscall( RSP_sig(ucontext) ))
+    if (!get_thread_data()->system_thread && !is_inside_syscall( RSP_sig(ucontext) ))
         user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread( 0 );
 }
@@ -3029,7 +3029,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     extern const void *__wine_syscall_dispatcher_return_ptr;
     extern const void *__wine_syscall_dispatcher_return_end_ptr;
 
-    if (ntdll_get_thread_data()->system_thread)
+    if (get_thread_data()->system_thread)
     {
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
         return;

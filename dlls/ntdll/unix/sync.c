@@ -908,7 +908,7 @@ static NTSTATUS inproc_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *inf
 
 int get_inproc_alert_fd(void)
 {
-    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    struct thread_data *data = get_thread_data();
     obj_handle_t token;
     sigset_t sigset;
     int fd;
@@ -952,7 +952,7 @@ static NTSTATUS get_iocp_sync( HANDLE handle, ACCESS_MASK access, struct inproc_
 
 static NTSTATUS associate_iocp( HANDLE handle, struct inproc_sync *sync, BOOLEAN alertable )
 {
-    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    struct thread_data *data = get_thread_data();
     NTSTATUS status;
 
     if (data->completion_cookie == sync->cookie) return STATUS_SUCCESS;
@@ -3045,7 +3045,7 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
         }
         return status;
     }
-    ntdll_get_thread_data()->completion_cookie = 0;
+    get_thread_data()->completion_cookie = 0;
 
     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {
@@ -3110,7 +3110,7 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
 
     status = inproc_remove_iocp( handle, info, count, written, timeout, alertable );
     if (status != STATUS_NOT_IMPLEMENTED) return status;
-    ntdll_get_thread_data()->completion_cookie = 0;
+    get_thread_data()->completion_cookie = 0;
 
     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {

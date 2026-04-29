@@ -2301,7 +2301,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *ucontext = sigcontext;
 
     init_handler( sigcontext );
-    if (!ntdll_get_thread_data()->system_thread && !is_inside_syscall( ESP_sig(ucontext) ))
+    if (!get_thread_data()->system_thread && !is_inside_syscall( ESP_sig(ucontext) ))
         user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread( 0 );
 }
@@ -2377,7 +2377,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     data = get_thread_data();
     frame = get_syscall_frame();
 
-    if (ntdll_get_thread_data()->system_thread)
+    if (get_thread_data()->system_thread)
     {
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
         return;
