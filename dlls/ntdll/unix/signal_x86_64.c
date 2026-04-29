@@ -169,6 +169,12 @@ __ASM_GLOBAL_FUNC( modify_ldt,
                    "popq %rbx\n\t"
                    "ret" );
 
+#ifndef PR_SET_SYSCALL_USER_DISPATCH
+#define PR_SET_SYSCALL_USER_DISPATCH 59
+#define PR_SYS_DISPATCH_OFF          0
+#define PR_SYS_DISPATCH_ON           1
+#endif
+
 #ifndef FP_XSTATE_MAGIC1
 #define FP_XSTATE_MAGIC1 0x46505853
 #endif
@@ -3097,7 +3103,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 }
 
 
-#if defined(__APPLE__) || defined(PR_SET_SYSCALL_USER_DISPATCH)
+#if defined(__APPLE__) || defined(__linux__)
 /**********************************************************************
  *		sigsys_handler
  *
@@ -3113,7 +3119,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     TRACE_(seh)("SIGSYS, rax %#lx, rip %#lx.\n", (long)RAX_sig(sigcontext), (long)RIP_sig(sigcontext));
 
-#ifdef PR_SET_SYSCALL_USER_DISPATCH
+#ifdef __linux__
     if (!syscall_dispatch_enabled)
     {
         prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0 );
@@ -3249,7 +3255,7 @@ static void *mac_thread_gsbase(void)
 }
 #endif
 
-#ifdef PR_SET_SYSCALL_USER_DISPATCH
+#ifdef __linux__
 static uintptr_t libc_addr, libc_size;
 
 static int libc_addr_cb( struct dl_phdr_info *info, size_t size, void *arg )
@@ -3304,7 +3310,7 @@ void signal_init_process(void)
 #endif
     }
 
-#ifdef PR_SET_SYSCALL_USER_DISPATCH
+#ifdef __linux__
     if (syscall_dispatch_enabled && !dl_iterate_phdr( libc_addr_cb, NULL ))
     {
         WARN_(seh)( "could not find libc\n" );
@@ -3334,7 +3340,7 @@ void signal_init_process(void)
     if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
-#if defined(__APPLE__) || defined(PR_SET_SYSCALL_USER_DISPATCH)
+#if defined(__APPLE__) || defined(__linux__)
     sig_act.sa_sigaction = sigsys_handler;
     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
 #endif
@@ -3374,11 +3380,9 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
         arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
         alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
     }
-#ifdef PR_SET_SYSCALL_USER_DISPATCH
     if (syscall_dispatch_enabled && prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
                                            libc_addr, libc_size, &thread_data->syscall_dispatch ) < 0)
         WARN_(seh)( "could not enable syscall user dispatch\n" );
-#endif
 #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
     amd64_set_gsbase( teb );
 #elif defined(__NetBSD__)
