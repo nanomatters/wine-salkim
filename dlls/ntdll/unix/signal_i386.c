@@ -578,6 +578,22 @@ static inline struct thread_data *get_current_thread_data(void)
 }
 
 
+static inline BOOL is_16bit( const ucontext_t *sigcontext )
+{
+    /* Note that during switch from 16-bit mode to linear mode, CS may
+     * be set to system segment before FS is restored. Fortunately, in
+     * this case SS is still non-system segment. This is why both CS
+     * and SS are checked.
+     */
+    return !ldt_is_system(CS_sig(sigcontext)) || !ldt_is_system(SS_sig(sigcontext));
+}
+
+static inline void *get_exception_stack( struct thread_data *data, const ucontext_t *sigcontext )
+{
+    return is_16bit(sigcontext) ? data->teb->SystemReserved1[0] : (void *)(ESP_sig(sigcontext) & ~3);
+}
+
+
 void set_process_instrumentation_callback( void *callback )
 {
     if (callback) FIXME( "Not supported.\n" );
@@ -686,11 +702,8 @@ __ASM_GLOBAL_FUNC( clear_alignment_flag,
 
 /***********************************************************************
  *           init_handler
- *
- * Handler initialization when the full context is not needed.
- * Return the stack pointer to use for pushing the exception data.
  */
-static inline void *init_handler( const ucontext_t *sigcontext )
+static inline struct thread_data *init_handler( const ucontext_t *sigcontext )
 {
     struct thread_data *data = get_current_thread_data();
 
@@ -703,19 +716,7 @@ static inline void *init_handler( const ucontext_t *sigcontext )
         set_gs( thread_data->gs );
     }
 #endif
-
-    if (!ldt_is_system(CS_sig(sigcontext)) || !ldt_is_system(SS_sig(sigcontext)))  /* 16-bit mode */
-    {
-        /*
-         * Win16 or DOS protected mode. Note that during switch
-         * from 16-bit mode to linear mode, CS may be set to system
-         * segment before FS is restored. Fortunately, in this case
-         * SS is still non-system segment. This is why both CS and SS
-         * are checked.
-         */
-        return data->teb->SystemReserved1[0];
-    }
-    return (void *)(ESP_sig(sigcontext) & ~3);
+    return data;
 }
 
 
@@ -1584,12 +1585,13 @@ static BOOL check_atl_thunk( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONT
  *
  * Change context to setup a call to a raise exception function.
  */
-static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcontext, void *stack_ptr,
+static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcontext,
                                    EXCEPTION_RECORD *rec, struct xcontext *xcontext )
 {
     CONTEXT *context = &xcontext->c;
     XSAVE_AREA_HEADER *src_xs;
     struct exc_stack_layout *stack;
+    void *stack_ptr;
     size_t stack_size;
     NTSTATUS status = send_debug_event( rec, context, TRUE, TRUE );
 
@@ -1602,6 +1604,7 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Eip--;
 
+    stack_ptr = get_exception_stack( data, sigcontext );
     stack_size = (ULONG_PTR)stack_ptr - (((ULONG_PTR)stack_ptr - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
     stack = virtual_setup_exception( data, stack_ptr, stack_size, rec );
     stack->rec_ptr      = &stack->rec;
@@ -1900,7 +1903,7 @@ static inline DWORD get_fpu_code( const CONTEXT *context )
  * Handle an interrupt.
  */
 static BOOL handle_interrupt( struct thread_data *data, unsigned int interrupt, ucontext_t *sigcontext,
-                              void *stack, EXCEPTION_RECORD *rec, struct xcontext *xcontext )
+                              EXCEPTION_RECORD *rec, struct xcontext *xcontext )
 {
     CONTEXT *context = &xcontext->c;
 
@@ -1936,7 +1939,7 @@ static BOOL handle_interrupt( struct thread_data *data, unsigned int interrupt, 
         rec->ExceptionInformation[0] = context->Eax;
         rec->ExceptionInformation[1] = context->Ecx;
         rec->ExceptionInformation[2] = context->Edx;
-        setup_raise_exception( data, sigcontext, stack, rec, xcontext );
+        setup_raise_exception( data, sigcontext, rec, xcontext );
         return TRUE;
     default:
         return FALSE;
@@ -2050,8 +2053,8 @@ static BOOL handle_syscall_trap( struct thread_data *data, ucontext_t *sigcontex
 static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    void *stack = init_handler( sigcontext );
-    struct thread_data *data = get_thread_data();
+    struct thread_data *data = init_handler( sigcontext );
+    void *stack = get_exception_stack( data, sigcontext );
     struct xcontext xcontext;
     void *steamclient_addr = NULL;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
@@ -2077,7 +2080,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         {
             WORD err = ERROR_sig(sigcontext);
             if (!err && (rec.ExceptionCode = is_privileged_instr( &xcontext.c ))) break;
-            if ((err & 7) == 2 && handle_interrupt( data, err >> 3, sigcontext, stack, &rec, &xcontext )) return;
+            if ((err & 7) == 2 && handle_interrupt( data, err >> 3, sigcontext, &rec, &xcontext )) return;
             rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
             rec.NumberParameters = 2;
             rec.ExceptionInformation[0] = 0;
@@ -2138,7 +2141,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     }
     abort_sigusr1_context_block();
     if (handle_syscall_fault( data, sigcontext, stack, &rec, &xcontext.c )) return;
-    setup_raise_exception( data, sigcontext, stack, &rec, &xcontext );
+    setup_raise_exception( data, sigcontext, &rec, &xcontext );
 }
 
 
@@ -2150,8 +2153,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    void *stack = init_handler( sigcontext );
-    struct thread_data *data = get_thread_data();
+    struct thread_data *data = init_handler( sigcontext );
     struct xcontext xcontext;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
@@ -2188,7 +2190,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         break;
     }
     abort_sigusr1_context_block();
-    setup_raise_exception( data, sigcontext, stack, &rec, &xcontext );
+    setup_raise_exception( data, sigcontext, &rec, &xcontext );
 }
 
 
@@ -2200,8 +2202,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    void *stack = init_handler( sigcontext );
-    struct thread_data *data = get_thread_data();
+    struct thread_data *data = init_handler( sigcontext );
     struct xcontext xcontext;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
@@ -2244,7 +2245,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
         break;
     }
-    setup_raise_exception( data, sigcontext, stack, &rec, &xcontext );
+    setup_raise_exception( data, sigcontext, &rec, &xcontext );
 }
 
 
@@ -2274,15 +2275,14 @@ static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    void *stack = init_handler( sigcontext );
-    struct thread_data *data = get_thread_data();
+    struct thread_data *data = init_handler( sigcontext );
     struct xcontext xcontext;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_WINE_ASSERTION,
                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
                              .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
     save_context( &xcontext, sigcontext );
-    setup_raise_exception( data, sigcontext, stack, &rec, &xcontext );
+    setup_raise_exception( data, sigcontext, &rec, &xcontext );
 }
 
 
@@ -2294,10 +2294,8 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    struct thread_data *data;
+    struct thread_data *data = init_handler( sigcontext );
 
-    init_handler( sigcontext );
-    data = get_thread_data();
     if (!get_thread_data()->system_thread && !is_inside_syscall( data, ESP_sig(sigcontext) ))
         user_mode_abort_thread( 0, get_syscall_frame( data ) );
     abort_thread( 0 );
@@ -2363,7 +2361,7 @@ void deferred_sigusr1(void)
 static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    struct thread_data *data;
+    struct thread_data *data = init_handler( sigcontext );
     struct syscall_frame *frame;
     struct xcontext *context;
 
@@ -2371,8 +2369,6 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     extern const void *__wine_syscall_dispatcher_return_ptr;
     extern const void *__wine_syscall_dispatcher_return_end_ptr;
 
-    init_handler( sigcontext );
-    data = get_thread_data();
     frame = get_syscall_frame( data );
 
     if (get_thread_data()->system_thread)
