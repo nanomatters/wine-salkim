@@ -917,7 +917,7 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
 
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
-        get_syscall_frame()->restore_flags |= LOWORD(CONTEXT_INTEGER);
+        get_syscall_frame(get_thread_data())->restore_flags |= LOWORD(CONTEXT_INTEGER);
     return status;
 }
 
@@ -979,7 +979,8 @@ static NTSTATUS set_current_thread_context( const CONTEXT *context, DWORD flags,
                                             BOOL check_debug_regs, BOOL update_debug_regs,
                                             BOOL *server_needed )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
 
     *server_needed = FALSE;
     if (check_debug_regs && (flags & CONTEXT_DEBUG_REGISTERS) &&
@@ -1116,7 +1117,8 @@ static NTSTATUS get_current_thread_context( CONTEXT *context, DWORD needed_flags
                                             BOOL check_debug_regs, BOOL update_debug_regs,
                                             BOOL *server_needed )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     BOOL use_cached_debug_regs = FALSE;
 
     *server_needed = FALSE;
@@ -1641,7 +1643,8 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
 NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
                                    PNTAPCFUNC func, NTSTATUS status )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     ULONG esp = context ? context->Esp : frame->esp;
     struct apc_stack_layout *stack = (struct apc_stack_layout *)esp - 1;
 
@@ -1673,7 +1676,7 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
  */
 void call_raise_user_exception_dispatcher(void)
 {
-    get_syscall_frame()->eip = (DWORD)pKiRaiseUserExceptionDispatcher;
+    get_syscall_frame(get_thread_data())->eip = (DWORD)pKiRaiseUserExceptionDispatcher;
 }
 
 
@@ -1682,7 +1685,8 @@ void call_raise_user_exception_dispatcher(void)
  */
 NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     ULONG esp = (frame->esp - sizeof(struct exc_stack_layout)) & ~3;
     struct exc_stack_layout *stack;
     XSAVE_AREA_HEADER *src_xs;
@@ -1836,7 +1840,7 @@ __ASM_GLOBAL_FUNC( user_mode_abort_thread,
 NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
 {
     struct thread_data *data = get_thread_data();
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( data );
     ULONG esp = (frame->esp - offsetof(struct callback_stack_layout, args_data[len])) & ~3;
     struct callback_stack_layout *stack = (struct callback_stack_layout *)esp;
 
@@ -1857,8 +1861,11 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
  */
 NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
 {
-    if (!get_syscall_frame()->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
-    user_mode_callback_return( ret_ptr, ret_len, status, NtCurrentTeb() );
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
+
+    if (!frame->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
+    user_mode_callback_return( ret_ptr, ret_len, status, data->teb );
 }
 
 
@@ -1945,10 +1952,10 @@ static BOOL handle_interrupt( struct thread_data *data, unsigned int interrupt, 
 static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigcontext, void *stack_ptr,
                                   EXCEPTION_RECORD *rec, CONTEXT *context )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( data );
     UINT i, *stack;
 
-    if (!is_inside_syscall( ESP_sig(sigcontext) )) return FALSE;
+    if (!is_inside_syscall( data, ESP_sig(sigcontext) )) return FALSE;
 
     TRACE( "code=%x flags=%x addr=%p ip=%08x\n",
            rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress, context->Eip );
@@ -1962,7 +1969,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
           context->SegEs, context->SegFs, context->SegGs, context->EFlags );
 
     if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION
-            && is_inside_syscall_stack_guard( (char *)rec->ExceptionInformation[1] ))
+            && is_inside_syscall_stack_guard( data, (char *)rec->ExceptionInformation[1] ))
         ERR_(seh)( "Syscall stack overrun.\n ");
 
     if (data->jmp_buf)
@@ -1998,7 +2005,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
  */
 static BOOL handle_syscall_trap( struct thread_data *data, ucontext_t *sigcontext, siginfo_t *siginfo )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( data );
 
     /* disallow single-stepping through a syscall */
 
@@ -2015,7 +2022,7 @@ static BOOL handle_syscall_trap( struct thread_data *data, ucontext_t *sigcontex
         EIP_sig( sigcontext ) = (ULONG)__wine_unix_call_dispatcher_prolog_end;
         fixup_frame_fpu_state( frame, sigcontext );
     }
-    else if (siginfo->si_code == 4 /* TRAP_HWBKPT */ && is_inside_syscall( ESP_sig(sigcontext) ))
+    else if (siginfo->si_code == 4 /* TRAP_HWBKPT */ && is_inside_syscall( data, ESP_sig(sigcontext) ))
     {
         TRACE_(seh)( "ignoring HWBKPT in syscall eip=%p\n", (void *)EIP_sig(sigcontext) );
         return TRUE;
@@ -2287,10 +2294,12 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data;
 
     init_handler( sigcontext );
-    if (!get_thread_data()->system_thread && !is_inside_syscall( ESP_sig(sigcontext) ))
-        user_mode_abort_thread( 0, get_syscall_frame() );
+    data = get_thread_data();
+    if (!get_thread_data()->system_thread && !is_inside_syscall( data, ESP_sig(sigcontext) ))
+        user_mode_abort_thread( 0, get_syscall_frame( data ) );
     abort_thread( 0 );
 }
 
@@ -2302,7 +2311,8 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
  */
 static void usr1_inside_syscall( struct xcontext *context )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     ULONG64 saved_compaction = 0;
 
     context->c.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
@@ -2363,7 +2373,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     init_handler( sigcontext );
     data = get_thread_data();
-    frame = get_syscall_frame();
+    frame = get_syscall_frame( data );
 
     if (get_thread_data()->system_thread)
     {
@@ -2383,7 +2393,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         EIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return_ptr;
         ESP_sig(sigcontext) = (ULONG_PTR)frame;
     }
-    else if (!is_inside_syscall( ESP_sig(sigcontext) ))
+    else if (!is_inside_syscall( data, ESP_sig(sigcontext) ))
     {
         struct xcontext outside_context;
 
