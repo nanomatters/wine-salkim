@@ -1578,20 +1578,6 @@ static BOOL check_atl_thunk( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONT
 
 
 /***********************************************************************
- *           setup_exception_record
- *
- * Setup the exception record and context on the thread stack.
- */
-static void *setup_exception_record( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, struct xcontext *xcontext )
-{
-    void *stack = init_handler( sigcontext );
-
-    rec->ExceptionAddress = (void *)EIP_sig( sigcontext );
-    save_context( xcontext, sigcontext );
-    return stack;
-}
-
-/***********************************************************************
  *           setup_raise_exception
  *
  * Change context to setup a call to a raise exception function.
@@ -1646,20 +1632,6 @@ static void setup_raise_exception( ucontext_t *sigcontext, void *stack_ptr,
     FS_sig(sigcontext)  = get_fs();
     GS_sig(sigcontext)  = get_gs();
     SS_sig(sigcontext)  = get_ds();
-}
-
-
-/***********************************************************************
- *           setup_exception
- *
- * Do the full setup to raise an exception from an exception record.
- */
-static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
-{
-    struct xcontext xcontext;
-    void *stack = setup_exception_record( sigcontext, rec, &xcontext );
-
-    setup_raise_exception( sigcontext, stack, rec, &xcontext );
 }
 
 
@@ -2069,15 +2041,17 @@ static BOOL handle_syscall_trap( ucontext_t *sigcontext, siginfo_t *siginfo )
  *
  * Handler for SIGSEGV and related errors.
  */
-static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
-    EXCEPTION_RECORD rec = { 0 };
+    ucontext_t *sigcontext = _sigcontext;
+    void *stack = init_handler( sigcontext );
     struct xcontext xcontext;
-    ucontext_t *ucontext = sigcontext;
-    void *stack = setup_exception_record( sigcontext, &rec, &xcontext );
     void *steamclient_addr = NULL;
+    EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    switch (TRAP_sig(ucontext))
+    save_context( &xcontext, sigcontext );
+
+    switch (TRAP_sig(sigcontext))
     {
     case TRAP_x86_OFLOW:   /* Overflow exception */
         rec.ExceptionCode = EXCEPTION_INT_OVERFLOW;
@@ -2094,9 +2068,9 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     case TRAP_x86_SEGNPFLT:  /* Segment not present exception */
     case TRAP_x86_PROTFLT:   /* General protection fault */
         {
-            WORD err = ERROR_sig(ucontext);
+            WORD err = ERROR_sig(sigcontext);
             if (!err && (rec.ExceptionCode = is_privileged_instr( &xcontext.c ))) break;
-            if ((err & 7) == 2 && handle_interrupt( err >> 3, ucontext, stack, &rec, &xcontext )) return;
+            if ((err & 7) == 2 && handle_interrupt( err >> 3, sigcontext, stack, &rec, &xcontext )) return;
             rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
             rec.NumberParameters = 2;
             rec.ExceptionInformation[0] = 0;
@@ -2105,19 +2079,19 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             else
             {
                 rec.ExceptionInformation[1] = 0xffffffff;
-                if (check_invalid_gs( ucontext, &xcontext.c )) return;
+                if (check_invalid_gs( sigcontext, &xcontext.c )) return;
             }
         }
         break;
     case TRAP_x86_PAGEFLT:  /* Page fault */
-        if ((steamclient_addr = steamclient_handle_fault( siginfo->si_addr, (ERROR_sig(ucontext) >> 1) & 0x09 )))
+        if ((steamclient_addr = steamclient_handle_fault( siginfo->si_addr, (ERROR_sig(sigcontext) >> 1) & 0x09 )))
         {
-            EIP_sig(ucontext) = (intptr_t)steamclient_addr;
+            EIP_sig(sigcontext) = (intptr_t)steamclient_addr;
             return;
         }
 
         rec.NumberParameters = 2;
-        rec.ExceptionInformation[0] = (ERROR_sig(ucontext) >> 1) & 0x09;
+        rec.ExceptionInformation[0] = (ERROR_sig(sigcontext) >> 1) & 0x09;
         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
         if (!virtual_handle_fault( &rec, stack )) return;
         if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
@@ -2127,7 +2101,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             NtQueryInformationProcess( GetCurrentProcess(), ProcessExecuteFlags,
                                        &flags, sizeof(flags), NULL );
             if (!(flags & MEM_EXECUTE_OPTION_DISABLE_THUNK_EMULATION) &&
-                check_atl_thunk( ucontext, &rec, &xcontext.c ))
+                check_atl_thunk( sigcontext, &rec, &xcontext.c ))
                 return;
 
             /* send EXCEPTION_EXECUTE_FAULT only if data execution prevention is enabled */
@@ -2138,13 +2112,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         /* FIXME: pass through exception handler first? */
         if (xcontext.c.EFlags & 0x00040000)
         {
-            EFL_sig(ucontext) &= ~0x00040000;  /* disable AC flag */
+            EFL_sig(sigcontext) &= ~0x00040000;  /* disable AC flag */
             return;
         }
         rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
         break;
     default:
-        WINE_ERR( "Got unexpected trap %d\n", TRAP_sig(ucontext) );
+        WINE_ERR( "Got unexpected trap %d\n", TRAP_sig(sigcontext) );
         /* fall through */
     case TRAP_x86_NMI:       /* NMI interrupt */
     case TRAP_x86_DNA:       /* Device not available exception */
@@ -2156,8 +2130,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         break;
     }
     abort_sigusr1_context_block();
-    if (handle_syscall_fault( ucontext, stack, &rec, &xcontext.c )) return;
-    setup_raise_exception( ucontext, stack, &rec, &xcontext );
+    if (handle_syscall_fault( sigcontext, stack, &rec, &xcontext.c )) return;
+    setup_raise_exception( sigcontext, stack, &rec, &xcontext );
 }
 
 
@@ -2166,16 +2140,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGTRAP.
  */
-static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
-    EXCEPTION_RECORD rec = { 0 };
+    ucontext_t *sigcontext = _sigcontext;
+    void *stack = init_handler( sigcontext );
     struct xcontext xcontext;
-    ucontext_t *ucontext = sigcontext;
-    void *stack = setup_exception_record( sigcontext, &rec, &xcontext );
+    EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    if (handle_syscall_trap( ucontext, siginfo )) return;
+    if (handle_syscall_trap( sigcontext, siginfo )) return;
 
-    switch (TRAP_sig(ucontext))
+    save_context( &xcontext, sigcontext );
+
+    switch (TRAP_sig(sigcontext))
     {
     case TRAP_x86_TRCTRAP:  /* Single-step exception */
         rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
@@ -2213,14 +2189,16 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGFPE.
  */
-static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
-    EXCEPTION_RECORD rec = { 0 };
+    ucontext_t *sigcontext = _sigcontext;
+    void *stack = init_handler( sigcontext );
     struct xcontext xcontext;
-    ucontext_t *ucontext = sigcontext;
-    void *stack = setup_exception_record( sigcontext, &rec, &xcontext );
+    EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    switch (TRAP_sig(ucontext))
+    save_context( &xcontext, sigcontext );
+
+    switch (TRAP_sig(sigcontext))
     {
     case TRAP_x86_DIVIDE:   /* Division by zero exception */
         rec.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO;
@@ -2253,7 +2231,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         }
         break;
     default:
-        WINE_ERR( "Got unexpected trap %d\n", TRAP_sig(ucontext) );
+        WINE_ERR( "Got unexpected trap %d\n", TRAP_sig(sigcontext) );
         rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
         break;
     }
@@ -2266,8 +2244,9 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGINT.
  */
-static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
+    ucontext_t *sigcontext = _sigcontext;
     HANDLE handle;
 
     init_handler( sigcontext );
@@ -2283,11 +2262,17 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGABRT.
  */
-static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
-    EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
+    ucontext_t *sigcontext = _sigcontext;
+    void *stack = init_handler( sigcontext );
+    struct xcontext xcontext;
+    EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_WINE_ASSERTION,
+                             .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
+                             .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    setup_exception( sigcontext, &rec );
+    save_context( &xcontext, sigcontext );
+    setup_raise_exception( sigcontext, stack, &rec, &xcontext );
 }
 
 
@@ -2296,12 +2281,12 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGQUIT.
  */
-static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
-    ucontext_t *ucontext = sigcontext;
+    ucontext_t *sigcontext = _sigcontext;
 
     init_handler( sigcontext );
-    if (!get_thread_data()->system_thread && !is_inside_syscall( ESP_sig(ucontext) ))
+    if (!get_thread_data()->system_thread && !is_inside_syscall( ESP_sig(sigcontext) ))
         user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread( 0 );
 }
@@ -2362,9 +2347,9 @@ void deferred_sigusr1(void)
  *
  * Handler for SIGUSR1, used to signal a thread that it got suspended.
  */
-static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
-    ucontext_t *ucontext = sigcontext;
+    ucontext_t *sigcontext = _sigcontext;
     struct thread_data *data;
     struct syscall_frame *frame;
     struct xcontext *context;
@@ -2382,27 +2367,27 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
         return;
     }
-    if (EIP_sig(ucontext) >= (ULONG_PTR)__wine_syscall_dispatcher &&
-        EIP_sig(ucontext) < (ULONG_PTR)__wine_syscall_dispatcher_save_end_ptr)
+    if (EIP_sig(sigcontext) >= (ULONG_PTR)__wine_syscall_dispatcher &&
+        EIP_sig(sigcontext) < (ULONG_PTR)__wine_syscall_dispatcher_save_end_ptr)
     {
         x86_thread_data()->sigusr1_pending = 1;
         return;
     }
-    if (EIP_sig(ucontext) >= (ULONG_PTR)__wine_syscall_dispatcher_return_ptr &&
-        EIP_sig(ucontext) < (ULONG_PTR)__wine_syscall_dispatcher_return_end_ptr)
+    if (EIP_sig(sigcontext) >= (ULONG_PTR)__wine_syscall_dispatcher_return_ptr &&
+        EIP_sig(sigcontext) < (ULONG_PTR)__wine_syscall_dispatcher_return_end_ptr)
     {
-        EAX_sig(ucontext) = x86_thread_data()->syscall_retval;
-        EIP_sig(ucontext) = (ULONG_PTR)__wine_syscall_dispatcher_return_ptr;
-        ESP_sig(ucontext) = (ULONG_PTR)frame;
+        EAX_sig(sigcontext) = x86_thread_data()->syscall_retval;
+        EIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return_ptr;
+        ESP_sig(sigcontext) = (ULONG_PTR)frame;
     }
-    else if (!is_inside_syscall( ESP_sig(ucontext) ))
+    else if (!is_inside_syscall( ESP_sig(sigcontext) ))
     {
         struct xcontext outside_context;
 
-        save_context( &outside_context, ucontext );
+        save_context( &outside_context, sigcontext );
         outside_context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         wait_suspend( &outside_context.c );
-        restore_context( &outside_context, ucontext );
+        restore_context( &outside_context, sigcontext );
         return;
     }
     else if (x86_thread_data()->sigusr1_blocked)
@@ -2411,7 +2396,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
 
-    context = (struct xcontext *)(((ULONG_PTR)ESP_sig(ucontext) - sizeof(*context)) & ~15);
+    context = (struct xcontext *)(((ULONG_PTR)ESP_sig(sigcontext) - sizeof(*context)) & ~15);
     if ((char *)context < (char *)get_kernel_stack( data ))
     {
         ERR_(seh)( "kernel stack overflow.\n" );
@@ -2421,7 +2406,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     {
         frame->restore_flags &= ~RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT;
         frame->eflags = 0x202;
-        fixup_frame_fpu_state( frame, ucontext );
+        fixup_frame_fpu_state( frame, sigcontext );
     }
     usr1_inside_syscall( context );
 }
