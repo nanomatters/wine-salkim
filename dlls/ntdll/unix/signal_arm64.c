@@ -746,7 +746,8 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 /***********************************************************************
  *           setup_raise_exception
  */
-static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
+static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcontext,
+                                   EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
@@ -762,7 +763,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Pc -= 4;
 
-    stack = virtual_setup_exception( stack_ptr, sizeof(*stack), rec );
+    stack = virtual_setup_exception( data, stack_ptr, sizeof(*stack), rec );
     stack->rec = *rec;
     stack->context = *context;
     context_init_empty_xstate( &stack->context, stack->redzone );
@@ -771,7 +772,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
 
     SP_sig(sigcontext) = (ULONG_PTR)stack;
     PC_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
-    REGn_sig(18, sigcontext) = (ULONG_PTR)NtCurrentTeb();
+    REGn_sig(18, sigcontext) = (ULONG_PTR)data->teb;
 }
 
 
@@ -1035,9 +1036,8 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
  *
  * Handle a page fault happening during a system call.
  */
-static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
+static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context, EXCEPTION_RECORD *rec )
 {
-    struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame();
     DWORD i;
 
@@ -1105,6 +1105,7 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
 static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
     DWORD64 esr = get_fault_esr( sigcontext );
@@ -1115,11 +1116,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
 
-    if (!virtual_handle_fault( &rec, (void *)SP_sig(sigcontext) )) return;
-    if (handle_syscall_fault( sigcontext, &rec )) return;
+    if (!virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) )) return;
+    if (handle_syscall_fault( data, sigcontext, &rec )) return;
 
     save_context( &context, sigcontext );
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -1131,6 +1132,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION,
                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
@@ -1150,7 +1152,7 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     }
 
     save_context( &context, sigcontext );
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -1162,12 +1164,13 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void bus_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT,
                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
 
     save_context( &context, sigcontext );
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -1179,6 +1182,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION,
                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
@@ -1232,7 +1236,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         break;
     }
 
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 /**********************************************************************
@@ -1243,6 +1247,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
 
@@ -1291,7 +1296,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         break;
     }
     save_context( &context, sigcontext );
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -1319,13 +1324,14 @@ static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_WINE_ASSERTION,
                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
 
     save_context( &context, sigcontext );
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 

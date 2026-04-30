@@ -516,7 +516,8 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 /***********************************************************************
  *           setup_raise_exception
  */
-static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
+static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcontext,
+                                   EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~7);
@@ -532,7 +533,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Pc -= 2;
 
-    stack = virtual_setup_exception( stack_ptr, sizeof(*stack), rec );
+    stack = virtual_setup_exception( data, stack_ptr, sizeof(*stack), rec );
     stack->rec = *rec;
     stack->context = *context;
 
@@ -753,9 +754,8 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
  *
  * Handle a page fault happening during a system call.
  */
-static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
+static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context, EXCEPTION_RECORD *rec )
 {
-    struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame();
     UINT i;
 
@@ -810,6 +810,7 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
 static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION,
                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
@@ -843,7 +844,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         else if (get_error_code(sigcontext) & 0x800) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
         else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
-        if (!virtual_handle_fault( &rec, (void *)SP_sig(sigcontext) )) return;
+        if (!virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) )) return;
         break;
     case TRAP_ARM_ALIGNFLT:  /* Alignment check exception */
         rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
@@ -858,8 +859,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         ERR("Got unexpected trap %d\n", get_trap_code(signal, sigcontext));
         break;
     }
-    if (handle_syscall_fault( sigcontext, &rec )) return;
-    setup_raise_exception( sigcontext, &rec, &context );
+    if (handle_syscall_fault( data, sigcontext, &rec )) return;
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -871,6 +872,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
 
@@ -888,7 +890,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.NumberParameters = 1;
         break;
     }
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -900,6 +902,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
 
@@ -949,7 +952,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
         break;
     }
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
@@ -977,13 +980,14 @@ static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
+    struct thread_data *data = get_thread_data();
     CONTEXT context;
     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_WINE_ASSERTION,
                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
 
     save_context( &context, sigcontext );
-    setup_raise_exception( sigcontext, &rec, &context );
+    setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
 
