@@ -533,9 +533,9 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs 
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
 
-static inline struct amd64_thread_data *amd64_thread_data(void)
+static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
 {
-    return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+    return (struct amd64_thread_data *)get_teb_data(data)->cpu_data;
 }
 
 /* Keep local signal state in the last CPU data slot, away from upstream fields. */
@@ -957,13 +957,13 @@ static inline struct thread_data *init_handler( void *sigcontext )
 
 #ifdef __linux__
     {
-        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&data->teb->GdiTebBatch;
+        struct amd64_thread_data *thread_data = amd64_thread_data( data );
         thread_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
         if (fs32_sel) arch_prctl( ARCH_SET_FS, thread_data->pthread_teb );
     }
 #elif defined __APPLE__
     {
-        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&data->teb->GdiTebBatch;
+        struct amd64_thread_data *thread_data = amd64_thread_data( data );
         _thread_set_tsd_base( (uint64_t)thread_data->pthread_teb );
 
         /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
@@ -986,7 +986,7 @@ static inline struct thread_data *init_handler( void *sigcontext )
 static inline void leave_handler( struct thread_data *data, ucontext_t *sigcontext )
 {
 #ifdef __linux__
-    struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&data->teb->GdiTebBatch;
+    struct amd64_thread_data *thread_data = amd64_thread_data( data );
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext) ))
     {
@@ -1017,9 +1017,11 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
  *
  * Set the register values from a sigcontext.
  */
-static void save_context( struct xcontext *xcontext, const ucontext_t *sigcontext )
+static void save_context( struct thread_data *data, struct xcontext *xcontext,
+                          const ucontext_t *sigcontext )
 {
     CONTEXT *context = &xcontext->c;
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
 
     context->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
     context->Rax    = RAX_sig(sigcontext);
@@ -1046,12 +1048,12 @@ static void save_context( struct xcontext *xcontext, const ucontext_t *sigcontex
     context->SegEs  = ds64_sel;
     context->SegGs  = ds64_sel;
     context->SegSs  = ds64_sel;
-    context->Dr0    = amd64_thread_data()->dr0;
-    context->Dr1    = amd64_thread_data()->dr1;
-    context->Dr2    = amd64_thread_data()->dr2;
-    context->Dr3    = amd64_thread_data()->dr3;
-    context->Dr6    = amd64_thread_data()->dr6;
-    context->Dr7    = amd64_thread_data()->dr7;
+    context->Dr0    = amd64_data->dr0;
+    context->Dr1    = amd64_data->dr1;
+    context->Dr2    = amd64_data->dr2;
+    context->Dr3    = amd64_data->dr3;
+    context->Dr6    = amd64_data->dr6;
+    context->Dr7    = amd64_data->dr7;
     if (FPU_sig(sigcontext))
     {
         XSAVE_AREA_HEADER *xs;
@@ -1115,13 +1117,14 @@ static void restore_context( struct thread_data *data, const struct xcontext *xc
                              ucontext_t *sigcontext )
 {
     const CONTEXT *context = &xcontext->c;
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
 
-    amd64_thread_data()->dr0 = context->Dr0;
-    amd64_thread_data()->dr1 = context->Dr1;
-    amd64_thread_data()->dr2 = context->Dr2;
-    amd64_thread_data()->dr3 = context->Dr3;
-    amd64_thread_data()->dr6 = context->Dr6;
-    amd64_thread_data()->dr7 = context->Dr7;
+    amd64_data->dr0 = context->Dr0;
+    amd64_data->dr1 = context->Dr1;
+    amd64_data->dr2 = context->Dr2;
+    amd64_data->dr3 = context->Dr3;
+    amd64_data->dr6 = context->Dr6;
+    amd64_data->dr7 = context->Dr7;
     set_sigcontext( context, sigcontext );
     if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
     leave_handler( data, sigcontext );
@@ -1200,15 +1203,16 @@ static NTSTATUS set_current_thread_context( const CONTEXT *context, DWORD flags,
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
 
     *server_needed = FALSE;
     if (check_debug_regs && (flags & CONTEXT_DEBUG_REGISTERS) &&
-        (amd64_thread_data()->dr0 != context->Dr0 ||
-         amd64_thread_data()->dr1 != context->Dr1 ||
-         amd64_thread_data()->dr2 != context->Dr2 ||
-         amd64_thread_data()->dr3 != context->Dr3 ||
-         amd64_thread_data()->dr6 != context->Dr6 ||
-         amd64_thread_data()->dr7 != context->Dr7))
+        (amd64_data->dr0 != context->Dr0 ||
+         amd64_data->dr1 != context->Dr1 ||
+         amd64_data->dr2 != context->Dr2 ||
+         amd64_data->dr3 != context->Dr3 ||
+         amd64_data->dr6 != context->Dr6 ||
+         amd64_data->dr7 != context->Dr7))
     {
         *server_needed = TRUE;
         return STATUS_SUCCESS;
@@ -1216,12 +1220,12 @@ static NTSTATUS set_current_thread_context( const CONTEXT *context, DWORD flags,
 
     if (update_debug_regs)
     {
-        amd64_thread_data()->dr0 = context->Dr0;
-        amd64_thread_data()->dr1 = context->Dr1;
-        amd64_thread_data()->dr2 = context->Dr2;
-        amd64_thread_data()->dr3 = context->Dr3;
-        amd64_thread_data()->dr6 = context->Dr6;
-        amd64_thread_data()->dr7 = context->Dr7;
+        amd64_data->dr0 = context->Dr0;
+        amd64_data->dr1 = context->Dr1;
+        amd64_data->dr2 = context->Dr2;
+        amd64_data->dr3 = context->Dr3;
+        amd64_data->dr6 = context->Dr6;
+        amd64_data->dr7 = context->Dr7;
     }
 
     if (flags & CONTEXT_INTEGER)
@@ -1326,13 +1330,14 @@ static NTSTATUS get_current_thread_context( CONTEXT *context, DWORD needed_flags
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
     BOOL use_cached_debug_regs = FALSE;
 
     *server_needed = FALSE;
     if (check_debug_regs && (needed_flags & CONTEXT_DEBUG_REGISTERS))
     {
         /* debug registers require a server call if hw breakpoints are enabled */
-        if (amd64_thread_data()->dr7 & 0xff)
+        if (amd64_data->dr7 & 0xff)
         {
             *server_needed = TRUE;
             return STATUS_SUCCESS;
@@ -1372,7 +1377,7 @@ static NTSTATUS get_current_thread_context( CONTEXT *context, DWORD needed_flags
     {
         context->SegDs  = ds64_sel;
         context->SegEs  = ds64_sel;
-        context->SegFs  = amd64_thread_data()->fs;
+        context->SegFs  = amd64_data->fs;
         context->SegGs  = ds64_sel;
         context->ContextFlags |= CONTEXT_SEGMENTS;
     }
@@ -1452,22 +1457,22 @@ static NTSTATUS get_current_thread_context( CONTEXT *context, DWORD needed_flags
     {
         if (use_cached_debug_regs)
         {
-            context->Dr0 = amd64_thread_data()->dr0;
-            context->Dr1 = amd64_thread_data()->dr1;
-            context->Dr2 = amd64_thread_data()->dr2;
-            context->Dr3 = amd64_thread_data()->dr3;
-            context->Dr6 = amd64_thread_data()->dr6;
-            context->Dr7 = amd64_thread_data()->dr7;
+            context->Dr0 = amd64_data->dr0;
+            context->Dr1 = amd64_data->dr1;
+            context->Dr2 = amd64_data->dr2;
+            context->Dr3 = amd64_data->dr3;
+            context->Dr6 = amd64_data->dr6;
+            context->Dr7 = amd64_data->dr7;
         }
         else if (update_debug_regs)
         {
             /* update the cached version of the debug registers */
-            amd64_thread_data()->dr0 = context->Dr0;
-            amd64_thread_data()->dr1 = context->Dr1;
-            amd64_thread_data()->dr2 = context->Dr2;
-            amd64_thread_data()->dr3 = context->Dr3;
-            amd64_thread_data()->dr6 = context->Dr6;
-            amd64_thread_data()->dr7 = context->Dr7;
+            amd64_data->dr0 = context->Dr0;
+            amd64_data->dr1 = context->Dr1;
+            amd64_data->dr2 = context->Dr2;
+            amd64_data->dr3 = context->Dr3;
+            amd64_data->dr6 = context->Dr6;
+            amd64_data->dr7 = context->Dr7;
         }
     }
     return STATUS_SUCCESS;
@@ -1515,16 +1520,17 @@ static NTSTATUS set_current_wow64_thread_context( const I386_CONTEXT *context, D
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
     I386_CONTEXT *wow_frame;
 
     *server_needed = FALSE;
     if (check_debug_regs && (flags & CONTEXT_I386_DEBUG_REGISTERS) &&
-        (amd64_thread_data()->dr0 != context->Dr0 ||
-         amd64_thread_data()->dr1 != context->Dr1 ||
-         amd64_thread_data()->dr2 != context->Dr2 ||
-         amd64_thread_data()->dr3 != context->Dr3 ||
-         amd64_thread_data()->dr6 != context->Dr6 ||
-         amd64_thread_data()->dr7 != context->Dr7))
+        (amd64_data->dr0 != context->Dr0 ||
+         amd64_data->dr1 != context->Dr1 ||
+         amd64_data->dr2 != context->Dr2 ||
+         amd64_data->dr3 != context->Dr3 ||
+         amd64_data->dr6 != context->Dr6 ||
+         amd64_data->dr7 != context->Dr7))
     {
         *server_needed = TRUE;
         return STATUS_SUCCESS;
@@ -1532,12 +1538,12 @@ static NTSTATUS set_current_wow64_thread_context( const I386_CONTEXT *context, D
 
     if (update_debug_regs)
     {
-        amd64_thread_data()->dr0 = context->Dr0;
-        amd64_thread_data()->dr1 = context->Dr1;
-        amd64_thread_data()->dr2 = context->Dr2;
-        amd64_thread_data()->dr3 = context->Dr3;
-        amd64_thread_data()->dr6 = context->Dr6;
-        amd64_thread_data()->dr7 = context->Dr7;
+        amd64_data->dr0 = context->Dr0;
+        amd64_data->dr1 = context->Dr1;
+        amd64_data->dr2 = context->Dr2;
+        amd64_data->dr3 = context->Dr3;
+        amd64_data->dr6 = context->Dr6;
+        amd64_data->dr7 = context->Dr7;
     }
     if (server_context && !(flags & ~CONTEXT_I386_DEBUG_REGISTERS))
         return STATUS_SUCCESS;
@@ -1570,7 +1576,7 @@ static NTSTATUS set_current_wow64_thread_context( const I386_CONTEXT *context, D
     {
         wow_frame->SegDs = ds64_sel;
         wow_frame->SegEs = ds64_sel;
-        wow_frame->SegFs = amd64_thread_data()->fs;
+        wow_frame->SegFs = amd64_data->fs;
         wow_frame->SegGs = ds64_sel;
     }
     if (flags & CONTEXT_I386_DEBUG_REGISTERS)
@@ -1648,6 +1654,7 @@ static NTSTATUS get_current_wow64_thread_context( I386_CONTEXT *context, DWORD n
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
     I386_CONTEXT *wow_frame;
 
     *server_needed = FALSE;
@@ -1659,12 +1666,12 @@ static NTSTATUS get_current_wow64_thread_context( I386_CONTEXT *context, DWORD n
 
     if (update_debug_regs)
     {
-        amd64_thread_data()->dr0 = context->Dr0;
-        amd64_thread_data()->dr1 = context->Dr1;
-        amd64_thread_data()->dr2 = context->Dr2;
-        amd64_thread_data()->dr3 = context->Dr3;
-        amd64_thread_data()->dr6 = context->Dr6;
-        amd64_thread_data()->dr7 = context->Dr7;
+        amd64_data->dr0 = context->Dr0;
+        amd64_data->dr1 = context->Dr1;
+        amd64_data->dr2 = context->Dr2;
+        amd64_data->dr3 = context->Dr3;
+        amd64_data->dr6 = context->Dr6;
+        amd64_data->dr7 = context->Dr7;
     }
     if (server_context && !(needed_flags & ~CONTEXT_I386_DEBUG_REGISTERS))
         return STATUS_SUCCESS;
@@ -1696,7 +1703,7 @@ static NTSTATUS get_current_wow64_thread_context( I386_CONTEXT *context, DWORD n
     {
         context->SegDs = ds64_sel;
         context->SegEs = ds64_sel;
-        context->SegFs = amd64_thread_data()->fs;
+        context->SegFs = amd64_data->fs;
         context->SegGs = ds64_sel;
         context->ContextFlags |= CONTEXT_I386_SEGMENTS;
     }
@@ -2712,7 +2719,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     void *steamclient_addr = NULL;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
-    save_context( &context, sigcontext );
+    save_context( data, &context, sigcontext );
 
     switch(TRAP_sig(sigcontext))
     {
@@ -2812,7 +2819,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     if (handle_syscall_trap( data, sigcontext, siginfo )) return;
 
-    save_context( &context, sigcontext );
+    save_context( data, &context, sigcontext );
 
     switch (TRAP_sig(sigcontext))
     {
@@ -2845,7 +2852,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     struct xcontext context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
-    save_context( &context, sigcontext );
+    save_context( data, &context, sigcontext );
 
     switch (siginfo->si_code)
     {
@@ -2943,7 +2950,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
                              .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
-    save_context( &context, sigcontext );
+    save_context( data, &context, sigcontext );
     setup_raise_exception( data, sigcontext, &rec, &context );
 }
 
@@ -3071,7 +3078,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     {
         struct xcontext outside_context;
 
-        save_context( &outside_context, sigcontext );
+        save_context( data, &outside_context, sigcontext );
         outside_context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         if (is_wow64() && outside_context.c.SegCs == cs64_sel)
             outside_context.c.ContextFlags |= CONTEXT_EXCEPTION_ACTIVE;
@@ -3431,12 +3438,12 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
         wait_suspend( &context );
         if (context.ContextFlags & CONTEXT_DEBUG_REGISTERS & ~CONTEXT_AMD64)
         {
-            amd64_thread_data()->dr0 = context.Dr0;
-            amd64_thread_data()->dr1 = context.Dr1;
-            amd64_thread_data()->dr2 = context.Dr2;
-            amd64_thread_data()->dr3 = context.Dr3;
-            amd64_thread_data()->dr6 = context.Dr6;
-            amd64_thread_data()->dr7 = context.Dr7;
+            amd64_thread_data( get_thread_data() )->dr0 = context.Dr0;
+            amd64_thread_data( get_thread_data() )->dr1 = context.Dr1;
+            amd64_thread_data( get_thread_data() )->dr2 = context.Dr2;
+            amd64_thread_data( get_thread_data() )->dr3 = context.Dr3;
+            amd64_thread_data( get_thread_data() )->dr6 = context.Dr6;
+            amd64_thread_data( get_thread_data() )->dr7 = context.Dr7;
         }
     }
 
