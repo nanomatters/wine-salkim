@@ -536,9 +536,9 @@ static unsigned int frame_size;
 static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
 static UINT64 xstate_extended_features;
 
-static inline struct x86_thread_data *x86_thread_data(void)
+static inline struct x86_thread_data *x86_thread_data( struct thread_data *data )
 {
-    return (struct x86_thread_data *)ntdll_get_thread_data()->cpu_data;
+    return (struct x86_thread_data *)get_teb_data(data)->cpu_data;
 }
 
 static inline WORD get_cs(void) { WORD res; __asm__( "movw %%cs,%0" : "=r" (res) ); return res; }
@@ -666,7 +666,7 @@ static void wine_sigacthandler( int signal, siginfo_t *siginfo, void *sigcontext
 
     __asm__ __volatile__("mov %ss,%ax; mov %ax,%ds; mov %ax,%es");
 
-    thread_data = (struct x86_thread_data *)&get_current_thread_data()->teb->GdiTebBatch;
+    thread_data = x86_thread_data( get_current_thread_data() );
     set_fs( thread_data->fs );
     set_gs( thread_data->gs );
 
@@ -711,7 +711,7 @@ static inline struct thread_data *init_handler( const ucontext_t *sigcontext )
 
 #ifndef __sun  /* see above for Solaris handling */
     {
-        struct x86_thread_data *thread_data = (struct x86_thread_data *)&data->teb->GdiTebBatch;
+        struct x86_thread_data *thread_data = x86_thread_data( data );
         set_fs( thread_data->fs );
         set_gs( thread_data->gs );
     }
@@ -768,11 +768,11 @@ static inline void restore_fpu( const CONTEXT *context )
  *
  * Build a context structure from the signal info.
  */
-static inline void save_context( struct xcontext *xcontext, const ucontext_t *sigcontext )
+static void save_context( struct thread_data *data, CONTEXT *context, const ucontext_t *sigcontext )
 {
     FLOATING_SAVE_AREA *fpu = FPU_sig(sigcontext);
     void *fpux = FPUX_sig(sigcontext);
-    CONTEXT *context = &xcontext->c;
+    struct x86_thread_data *x86_data = x86_thread_data( data );
 
     memset(context, 0, sizeof(*context));
     context->ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
@@ -792,12 +792,12 @@ static inline void save_context( struct xcontext *xcontext, const ucontext_t *si
     context->SegFs        = LOWORD(FS_sig(sigcontext));
     context->SegGs        = LOWORD(GS_sig(sigcontext));
     context->SegSs        = LOWORD(SS_sig(sigcontext));
-    context->Dr0          = x86_thread_data()->dr0;
-    context->Dr1          = x86_thread_data()->dr1;
-    context->Dr2          = x86_thread_data()->dr2;
-    context->Dr3          = x86_thread_data()->dr3;
-    context->Dr6          = x86_thread_data()->dr6;
-    context->Dr7          = x86_thread_data()->dr7;
+    context->Dr0          = x86_data->dr0;
+    context->Dr1          = x86_data->dr1;
+    context->Dr2          = x86_data->dr2;
+    context->Dr3          = x86_data->dr3;
+    context->Dr6          = x86_data->dr6;
+    context->Dr7          = x86_data->dr7;
 
     if (fpu)
     {
@@ -875,18 +875,18 @@ static void fixup_frame_fpu_state( struct syscall_frame *frame, const ucontext_t
  *
  * Restore the signal info from the context.
  */
-static inline void restore_context( const struct xcontext *xcontext, ucontext_t *sigcontext )
+static void restore_context( struct thread_data *data, const CONTEXT *context, ucontext_t *sigcontext )
 {
     FLOATING_SAVE_AREA *fpu = FPU_sig(sigcontext);
     void *fpux = FPUX_sig(sigcontext);
-    const CONTEXT *context = &xcontext->c;
+    struct x86_thread_data *x86_data = x86_thread_data( data );
 
-    x86_thread_data()->dr0 = context->Dr0;
-    x86_thread_data()->dr1 = context->Dr1;
-    x86_thread_data()->dr2 = context->Dr2;
-    x86_thread_data()->dr3 = context->Dr3;
-    x86_thread_data()->dr6 = context->Dr6;
-    x86_thread_data()->dr7 = context->Dr7;
+    x86_data->dr0 = context->Dr0;
+    x86_data->dr1 = context->Dr1;
+    x86_data->dr2 = context->Dr2;
+    x86_data->dr3 = context->Dr3;
+    x86_data->dr6 = context->Dr6;
+    x86_data->dr7 = context->Dr7;
     EAX_sig(sigcontext) = context->Eax;
     EBX_sig(sigcontext) = context->Ebx;
     ECX_sig(sigcontext) = context->Ecx;
@@ -944,31 +944,31 @@ void deferred_sigusr1(void);
 
 static inline void block_sigusr1(void)
 {
-    x86_thread_data()->sigusr1_blocked++;
+    x86_thread_data( get_thread_data() )->sigusr1_blocked++;
 }
 
 static inline void unblock_sigusr1(void)
 {
-    if (!--x86_thread_data()->sigusr1_blocked && x86_thread_data()->sigusr1_pending)
+    if (!--x86_thread_data( get_thread_data() )->sigusr1_blocked && x86_thread_data( get_thread_data() )->sigusr1_pending)
         deferred_sigusr1();
 }
 
 static inline void abort_sigusr1_context_block(void)
 {
-    unsigned char depth = x86_thread_data()->sigusr1_context_depth;
+    unsigned char depth = x86_thread_data( get_thread_data() )->sigusr1_context_depth;
 
     if (!depth) return;
-    x86_thread_data()->sigusr1_context_depth = 0;
-    x86_thread_data()->sigusr1_blocked -= depth;
+    x86_thread_data( get_thread_data() )->sigusr1_context_depth = 0;
+    x86_thread_data( get_thread_data() )->sigusr1_blocked -= depth;
 }
 
 #define CALL_SIGUSR1_PROTECTED(status, expression) \
     do \
     { \
         block_sigusr1(); \
-        x86_thread_data()->sigusr1_context_depth++; \
+        x86_thread_data( get_thread_data() )->sigusr1_context_depth++; \
         status = (expression); \
-        x86_thread_data()->sigusr1_context_depth--; \
+        x86_thread_data( get_thread_data() )->sigusr1_context_depth--; \
         unblock_sigusr1(); \
     } while (0)
 
@@ -985,12 +985,12 @@ static NTSTATUS set_current_thread_context( const CONTEXT *context, DWORD flags,
 
     *server_needed = FALSE;
     if (check_debug_regs && (flags & CONTEXT_DEBUG_REGISTERS) &&
-        (x86_thread_data()->dr0 != context->Dr0 ||
-         x86_thread_data()->dr1 != context->Dr1 ||
-         x86_thread_data()->dr2 != context->Dr2 ||
-         x86_thread_data()->dr3 != context->Dr3 ||
-         x86_thread_data()->dr6 != context->Dr6 ||
-         x86_thread_data()->dr7 != context->Dr7))
+        (x86_thread_data( data )->dr0 != context->Dr0 ||
+         x86_thread_data( data )->dr1 != context->Dr1 ||
+         x86_thread_data( data )->dr2 != context->Dr2 ||
+         x86_thread_data( data )->dr3 != context->Dr3 ||
+         x86_thread_data( data )->dr6 != context->Dr6 ||
+         x86_thread_data( data )->dr7 != context->Dr7))
     {
         *server_needed = TRUE;
         return STATUS_SUCCESS;
@@ -998,12 +998,12 @@ static NTSTATUS set_current_thread_context( const CONTEXT *context, DWORD flags,
 
     if (update_debug_regs)
     {
-        x86_thread_data()->dr0 = context->Dr0;
-        x86_thread_data()->dr1 = context->Dr1;
-        x86_thread_data()->dr2 = context->Dr2;
-        x86_thread_data()->dr3 = context->Dr3;
-        x86_thread_data()->dr6 = context->Dr6;
-        x86_thread_data()->dr7 = context->Dr7;
+        x86_thread_data( data )->dr0 = context->Dr0;
+        x86_thread_data( data )->dr1 = context->Dr1;
+        x86_thread_data( data )->dr2 = context->Dr2;
+        x86_thread_data( data )->dr3 = context->Dr3;
+        x86_thread_data( data )->dr6 = context->Dr6;
+        x86_thread_data( data )->dr7 = context->Dr7;
     }
 
     if (flags & CONTEXT_INTEGER)
@@ -1126,7 +1126,7 @@ static NTSTATUS get_current_thread_context( CONTEXT *context, DWORD needed_flags
     if (check_debug_regs && (needed_flags & CONTEXT_DEBUG_REGISTERS))
     {
         /* debug registers require a server call if hw breakpoints are enabled */
-        if (x86_thread_data()->dr7 & 0xff)
+        if (x86_thread_data( data )->dr7 & 0xff)
         {
             *server_needed = TRUE;
             return STATUS_SUCCESS;
@@ -1252,22 +1252,22 @@ static NTSTATUS get_current_thread_context( CONTEXT *context, DWORD needed_flags
     {
         if (use_cached_debug_regs)
         {
-            context->Dr0 = x86_thread_data()->dr0;
-            context->Dr1 = x86_thread_data()->dr1;
-            context->Dr2 = x86_thread_data()->dr2;
-            context->Dr3 = x86_thread_data()->dr3;
-            context->Dr6 = x86_thread_data()->dr6;
-            context->Dr7 = x86_thread_data()->dr7;
+            context->Dr0 = x86_thread_data( data )->dr0;
+            context->Dr1 = x86_thread_data( data )->dr1;
+            context->Dr2 = x86_thread_data( data )->dr2;
+            context->Dr3 = x86_thread_data( data )->dr3;
+            context->Dr6 = x86_thread_data( data )->dr6;
+            context->Dr7 = x86_thread_data( data )->dr7;
         }
         else if (update_debug_regs)
         {
             /* update the cached version of the debug registers */
-            x86_thread_data()->dr0 = context->Dr0;
-            x86_thread_data()->dr1 = context->Dr1;
-            x86_thread_data()->dr2 = context->Dr2;
-            x86_thread_data()->dr3 = context->Dr3;
-            x86_thread_data()->dr6 = context->Dr6;
-            x86_thread_data()->dr7 = context->Dr7;
+            x86_thread_data( data )->dr0 = context->Dr0;
+            x86_thread_data( data )->dr1 = context->Dr1;
+            x86_thread_data( data )->dr2 = context->Dr2;
+            x86_thread_data( data )->dr3 = context->Dr3;
+            x86_thread_data( data )->dr6 = context->Dr6;
+            x86_thread_data( data )->dr7 = context->Dr7;
         }
     }
     return STATUS_SUCCESS;
@@ -1423,7 +1423,7 @@ static BOOL check_invalid_gs( struct thread_data *data, ucontext_t *sigcontext, 
 {
     unsigned int prefix_count = 0;
     const BYTE *instr = (BYTE *)context->Eip;
-    WORD system_gs = x86_thread_data()->gs;
+    WORD system_gs = x86_thread_data(data)->gs;
 
     if (context->SegGs == system_gs) return FALSE;
     if (!ldt_is_system( context->SegCs )) return FALSE;
@@ -1597,7 +1597,7 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
 
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
     {
-        restore_context( xcontext, sigcontext );
+        restore_context( data, context, sigcontext );
         return;
     }
 
@@ -2059,7 +2059,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     void *steamclient_addr = NULL;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    save_context( &xcontext, sigcontext );
+    save_context( data, &xcontext.c, sigcontext );
 
     switch (TRAP_sig(sigcontext))
     {
@@ -2159,7 +2159,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     if (handle_syscall_trap( data, sigcontext, siginfo )) return;
 
-    save_context( &xcontext, sigcontext );
+    save_context( data, &xcontext.c, sigcontext );
 
     switch (TRAP_sig(sigcontext))
     {
@@ -2206,7 +2206,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     struct xcontext xcontext;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    save_context( &xcontext, sigcontext );
+    save_context( data, &xcontext.c, sigcontext );
 
     switch (TRAP_sig(sigcontext))
     {
@@ -2281,7 +2281,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
                              .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
-    save_context( &xcontext, sigcontext );
+    save_context( data, &xcontext.c, sigcontext );
     setup_raise_exception( data, sigcontext, &rec, &xcontext );
 }
 
@@ -2344,12 +2344,12 @@ void deferred_sigusr1(void)
 
     do
     {
-        x86_thread_data()->sigusr1_pending = 0;
+        x86_thread_data( get_thread_data() )->sigusr1_pending = 0;
         /* This block must not enclose faultable user-buffer access because it is not depth-tracked. */
-        x86_thread_data()->sigusr1_blocked++;
+        x86_thread_data( get_thread_data() )->sigusr1_blocked++;
         usr1_inside_syscall( &context );
-        x86_thread_data()->sigusr1_blocked--;
-    } while (x86_thread_data()->sigusr1_pending);
+        x86_thread_data( get_thread_data() )->sigusr1_blocked--;
+    } while (x86_thread_data( get_thread_data() )->sigusr1_pending);
 }
 
 
@@ -2379,13 +2379,13 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     if (EIP_sig(sigcontext) >= (ULONG_PTR)__wine_syscall_dispatcher &&
         EIP_sig(sigcontext) < (ULONG_PTR)__wine_syscall_dispatcher_save_end_ptr)
     {
-        x86_thread_data()->sigusr1_pending = 1;
+        x86_thread_data( data )->sigusr1_pending = 1;
         return;
     }
     if (EIP_sig(sigcontext) >= (ULONG_PTR)__wine_syscall_dispatcher_return_ptr &&
         EIP_sig(sigcontext) < (ULONG_PTR)__wine_syscall_dispatcher_return_end_ptr)
     {
-        EAX_sig(sigcontext) = x86_thread_data()->syscall_retval;
+        EAX_sig(sigcontext) = x86_thread_data( data )->syscall_retval;
         EIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return_ptr;
         ESP_sig(sigcontext) = (ULONG_PTR)frame;
     }
@@ -2393,15 +2393,15 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     {
         struct xcontext outside_context;
 
-        save_context( &outside_context, sigcontext );
+        save_context( data, &outside_context.c, sigcontext );
         outside_context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         wait_suspend( &outside_context.c );
-        restore_context( &outside_context, sigcontext );
+        restore_context( data, &outside_context.c, sigcontext );
         return;
     }
-    else if (x86_thread_data()->sigusr1_blocked)
+    else if (x86_thread_data( data )->sigusr1_blocked)
     {
-        x86_thread_data()->sigusr1_pending = 1;
+        x86_thread_data( data )->sigusr1_pending = 1;
         return;
     }
 
@@ -2677,12 +2677,12 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
         wait_suspend( &context );
         if (context.ContextFlags & CONTEXT_DEBUG_REGISTERS & ~CONTEXT_i386)
         {
-            x86_thread_data()->dr0 = context.Dr0;
-            x86_thread_data()->dr1 = context.Dr1;
-            x86_thread_data()->dr2 = context.Dr2;
-            x86_thread_data()->dr3 = context.Dr3;
-            x86_thread_data()->dr6 = context.Dr6;
-            x86_thread_data()->dr7 = context.Dr7;
+            x86_thread_data( get_thread_data() )->dr0 = context.Dr0;
+            x86_thread_data( get_thread_data() )->dr1 = context.Dr1;
+            x86_thread_data( get_thread_data() )->dr2 = context.Dr2;
+            x86_thread_data( get_thread_data() )->dr3 = context.Dr3;
+            x86_thread_data( get_thread_data() )->dr6 = context.Dr6;
+            x86_thread_data( get_thread_data() )->dr7 = context.Dr7;
         }
     }
 
