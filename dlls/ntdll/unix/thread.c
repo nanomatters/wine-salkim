@@ -1120,14 +1120,14 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
  */
 static void start_thread( struct thread_data *data )
 {
-    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&data->teb->GdiTebBatch;
+    struct teb_data *teb_data = get_teb_data( data );
     BOOL suspend;
 
     data->pthread_id = pthread_self();
     pthread_setspecific( thread_data_key, data );
 
-    thread_data->syscall_table = KeServiceDescriptorTable;
-    thread_data->syscall_trace = TRACE_ON(syscall);
+    teb_data->syscall_table = KeServiceDescriptorTable;
+    teb_data->syscall_trace = TRACE_ON(syscall);
     server_init_thread( data->start, &suspend );
     signal_start_thread( data->start, data->param, suspend, data->teb );
 }
@@ -1482,7 +1482,7 @@ done:
  */
 static void start_system_thread( struct thread_data *data )
 {
-    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&data->teb->GdiTebBatch;
+    struct teb_data *thread_data = (struct teb_data *)&data->teb->GdiTebBatch;
     BOOL suspend;
 
     thread_data->syscall_table = KeServiceDescriptorTable;
@@ -1508,7 +1508,6 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     pthread_attr_t pthread_attr;
     data_size_t len;
     struct object_attributes *objattr;
-    struct ntdll_thread_data *thread_data;
     struct thread_data *data;
     DWORD tid = 0;
     int request_pipe[2];

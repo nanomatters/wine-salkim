@@ -525,7 +525,7 @@ struct amd64_thread_data
     char                  syscall_dispatch; /* 0340 */
 };
 
-C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_teb ) == 0x320 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, frame_size ) == 0x328 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
@@ -546,14 +546,14 @@ struct sigusr1_thread_data
     volatile char context_depth; /* 036a */
 };
 
-C_ASSERT( sizeof(struct amd64_thread_data) <= offsetof( struct ntdll_thread_data, cpu_data[15] ));
-C_ASSERT( sizeof(struct sigusr1_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data[15]) );
-C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, cpu_data[15] ) +
+C_ASSERT( sizeof(struct amd64_thread_data) <= offsetof( struct teb_data, cpu_data[15] ));
+C_ASSERT( sizeof(struct sigusr1_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data[15]) );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, cpu_data[15] ) +
           offsetof( struct sigusr1_thread_data, pending ) == 0x369 );
 
 static inline struct sigusr1_thread_data *sigusr1_thread_data( TEB *teb )
 {
-    return (struct sigusr1_thread_data *)&((struct ntdll_thread_data *)&teb->GdiTebBatch)->cpu_data[15];
+    return (struct sigusr1_thread_data *)&((struct teb_data *)&teb->GdiTebBatch)->cpu_data[15];
 }
 
 static inline void update_instrumentation_rip( struct syscall_frame *frame )
@@ -3368,8 +3368,9 @@ void set_thread_teb( TEB *teb )
  */
 __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
-    struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
     CONTEXT *ctx, context = { 0 };
     I386_CONTEXT *wow_context;
     void *callback;

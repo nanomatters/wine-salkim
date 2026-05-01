@@ -524,7 +524,7 @@ struct x86_thread_data
     volatile char      sigusr1_context_depth; /* 1fe */
 };
 
-C_ASSERT( sizeof(struct x86_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( sizeof(struct x86_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct x86_thread_data, gs ) == 0x1d8 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct x86_thread_data, frame_size ) == 0x1f4 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct x86_thread_data, syscall_retval ) == 0x1f8 );
@@ -2643,8 +2643,9 @@ void signal_init_process(void)
  */
 __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     struct x86_thread_data *thread_data = (struct x86_thread_data *)&teb->GdiTebBatch;
-    struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
     CONTEXT *ctx, context = { CONTEXT_ALL };
     DWORD *stack;
 

@@ -70,11 +70,11 @@ struct arm64_thread_data
     BOOL suspend_pending;
 };
 
-C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
 
 static inline struct arm64_thread_data *arm64_thread_data(void)
 {
-    return (struct arm64_thread_data *)ntdll_get_thread_data()->cpu_data;
+    return (struct arm64_thread_data *)get_teb_data( get_thread_data() )->cpu_data;
 }
 
 /***********************************************************************
@@ -1526,7 +1526,8 @@ void syscall_dispatcher_return_slowpath(void)
  */
 __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
-    struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
     CONTEXT *ctx, context = { CONTEXT_ALL };
     I386_CONTEXT *i386_context;
     ARM_CONTEXT *arm_context;
