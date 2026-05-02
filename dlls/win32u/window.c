@@ -382,10 +382,25 @@ void client_surface_update( struct client_surface *surface )
 
 void add_window_client_surface( HWND hwnd, struct client_surface *surface )
 {
+    BOOL found = FALSE;
+    struct client_surface *temp;
     pthread_mutex_lock( &surfaces_lock );
 
-    surface->hwnd = hwnd;
-    list_add_tail( &client_surfaces, &surface->entry );
+    /* due to client surface reuse, this element may already be in the list */
+    LIST_FOR_EACH_ENTRY( temp, &client_surfaces, struct client_surface, entry )
+    {
+        if (temp == surface)
+        {
+            found = TRUE;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        surface->hwnd = hwnd;
+        list_add_tail( &client_surfaces, &surface->entry );
+    }
     surface->funcs->update( surface );
 
     pthread_mutex_unlock( &surfaces_lock );
