@@ -201,7 +201,7 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
-static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *toplevel_surface)
+BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *toplevel_surface)
 {
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *surface;
@@ -365,7 +365,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
     }
 }
 
-static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
 {
     struct wayland_surface *surface = data->wayland_surface;
 
@@ -742,16 +742,49 @@ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return NtUserMessageCall(hwnd, msg, wp, lp, 0, NtUserDefWindowProc, FALSE);
 }
 
+/* Mark a layered window's attribs as having been set (UpdateLayeredWindow or
+ * SetLayeredWindowAttributes has run with valid content) and, on the FALSE->TRUE
+ * transition, refresh the wayland_surface role.
+ *
+ * wayland_win_data_create_wayland_surface() gates a layered window's
+ * visibility on this flag - before it transitions, the wl_surface is left
+ * with WAYLAND_SURFACE_ROLE_NONE, which the compositor cannot display.
+ * Without this refresh nothing else triggers a re-evaluation (the app may
+ * not call SetWindowPos after UpdateLayeredWindow), so the surface stays
+ * roleless forever and renders as a white box.  CEF-based apps such as
+ * Ubisoft Connect and Steam hit this on every UI window. */
+void wayland_win_data_set_layered_attribs(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    BOOL was_set;
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    was_set = data->layered_attribs_set;
+    data->layered_attribs_set = TRUE;
+
+    if (!was_set)
+    {
+        HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+        struct wayland_win_data *toplevel_data;
+        struct wayland_surface *toplevel_surface = NULL;
+
+        if (toplevel && toplevel != hwnd &&
+            (toplevel_data = wayland_win_data_get_nolock(toplevel)))
+            toplevel_surface = toplevel_data->wayland_surface;
+
+        if (wayland_win_data_create_wayland_surface(data, toplevel_surface))
+            wayland_win_data_update_wayland_state(data);
+    }
+
+    wayland_win_data_release(data);
+}
+
 /*****************************************************************
  *		WAYLAND_SetLayeredWindowAttributes
  */
 void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags)
 {
-    struct wayland_win_data *data;
-
-    if (!(data = wayland_win_data_get(hwnd))) return;
-    data->layered_attribs_set = TRUE;
-    wayland_win_data_release(data);
+    wayland_win_data_set_layered_attribs(hwnd);
 }
 
 static enum xdg_toplevel_resize_edge hittest_to_resize_edge(WPARAM hittest)

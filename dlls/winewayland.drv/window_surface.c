@@ -523,9 +523,13 @@ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_re
     if (!(data = wayland_win_data_get(hwnd))) return TRUE; /* use default surface */
     if (previous) window_surface_release(previous);
 
-    if (layered) data->layered_attribs_set = TRUE;
     *surface = wayland_window_surface_create(data->hwnd, surface_rect, layered);
 
     wayland_win_data_release(data);
+
+    /* For layered windows, mark the attribs as set and refresh the surface
+     * role.  Held outside the lock because the helper reacquires it. */
+    if (layered) wayland_win_data_set_layered_attribs(hwnd);
+
     return TRUE;
 }

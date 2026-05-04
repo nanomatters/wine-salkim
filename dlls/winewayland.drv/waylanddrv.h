@@ -492,6 +492,10 @@ struct wayland_win_data
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
 struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
+BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                              struct wayland_surface *toplevel_surface);
+void wayland_win_data_update_wayland_state(struct wayland_win_data *data);
+void wayland_win_data_set_layered_attribs(HWND hwnd);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client, BOOL stash);
