@@ -1248,7 +1248,10 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
         pointer->pending_warp = FALSE;
     }
 
-    if (wl_surface && hwnd == pointer->constraint_hwnd && pointer->zwp_locked_pointer_v1)
+    /* according to protocol spec, the position hints only do something
+     * when transitioning from locked to unlocked states */
+    if (wl_surface && hwnd == pointer->constraint_hwnd &&
+        pointer->zwp_locked_pointer_v1 && !clip && !covers_vscreen)
     {
         zwp_locked_pointer_v1_set_cursor_position_hint(
                 pointer->zwp_locked_pointer_v1,
