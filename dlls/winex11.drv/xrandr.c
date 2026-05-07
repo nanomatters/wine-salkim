@@ -27,6 +27,9 @@
 #include "config.h"
 
 #include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <X11/Xlib.h>
 #ifdef HAVE_X11_EXTENSIONS_XRANDR_H
 #include <X11/extensions/Xrandr.h>
@@ -659,9 +662,187 @@ static void set_screen_size( int width, int height )
     pXRRSetScreenSize( gdi_display, root_window, width, height, mm_width, mm_height );
 }
 
+/* When XWayland is the X server (i.e. we run inside a Wayland session that
+ * presents an X11 socket via XWayland), XRandR can return a synthesized
+ * modeline whose dotClock + h/v totals don't reflect the real display
+ * timing - high-refresh / DSC-encoded modes often degenerate to ~2 Hz when
+ * the modeline math is applied.  When that happens, query Wayland's
+ * wl_output protocol directly for the real refresh rate of an output whose
+ * active mode matches `width x height`.  Returns 0 on any failure (no
+ * Wayland session, libwayland-client missing, no matching output, etc.) so
+ * the caller can fall back.
+ *
+ * Implementation note: we dlopen libwayland-client.so.0 lazily rather than
+ * linking against it.  This keeps winex11.drv free of a build-time Wayland
+ * dependency on systems that don't have it, and the helper just returns 0
+ * when the library is absent at runtime. */
+struct wlapi_wl_proxy;
+struct wlapi_wl_interface;
+
+#define WLAPI_WL_OUTPUT_MODE_CURRENT  0x1
+#define WLAPI_WL_DISPLAY_GET_REGISTRY 1
+#define WLAPI_WL_REGISTRY_BIND        0
+#define WLAPI_WL_OUTPUT_DESTROY       1  /* unused; we let disconnect clean up */
+
+struct wlapi
+{
+    void *handle;
+    void *(*display_connect)( const char *name );
+    void  (*display_disconnect)( void *display );
+    int   (*display_roundtrip)( void *display );
+    struct wlapi_wl_proxy *(*proxy_marshal_constructor)( struct wlapi_wl_proxy *proxy,
+                                                         uint32_t opcode,
+                                                         const struct wlapi_wl_interface *iface,
+                                                         ... );
+    struct wlapi_wl_proxy *(*proxy_marshal_constructor_versioned)( struct wlapi_wl_proxy *proxy,
+                                                                   uint32_t opcode,
+                                                                   const struct wlapi_wl_interface *iface,
+                                                                   uint32_t version, ... );
+    int   (*proxy_add_listener)( struct wlapi_wl_proxy *proxy,
+                                 void (**implementation)( void ), void *data );
+    void  (*proxy_destroy)( struct wlapi_wl_proxy *proxy );
+    const struct wlapi_wl_interface *registry_interface;
+    const struct wlapi_wl_interface *output_interface;
+};
+
+static struct wlapi wlapi;
+static int wlapi_init_done;
+
+static int wlapi_init(void)
+{
+    if (wlapi_init_done) return wlapi.handle != NULL;
+    wlapi_init_done = 1;
+
+    wlapi.handle = dlopen( "libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL );
+    if (!wlapi.handle) return 0;
+
+#define DLSYM(target, name) wlapi.target = dlsym( wlapi.handle, name )
+    DLSYM( display_connect,                    "wl_display_connect" );
+    DLSYM( display_disconnect,                 "wl_display_disconnect" );
+    DLSYM( display_roundtrip,                  "wl_display_roundtrip" );
+    DLSYM( proxy_marshal_constructor,          "wl_proxy_marshal_constructor" );
+    DLSYM( proxy_marshal_constructor_versioned, "wl_proxy_marshal_constructor_versioned" );
+    DLSYM( proxy_add_listener,                 "wl_proxy_add_listener" );
+    DLSYM( proxy_destroy,                      "wl_proxy_destroy" );
+    wlapi.registry_interface = dlsym( wlapi.handle, "wl_registry_interface" );
+    wlapi.output_interface   = dlsym( wlapi.handle, "wl_output_interface" );
+#undef DLSYM
+
+    if (!wlapi.display_connect || !wlapi.display_disconnect
+        || !wlapi.display_roundtrip
+        || !wlapi.proxy_marshal_constructor
+        || !wlapi.proxy_marshal_constructor_versioned
+        || !wlapi.proxy_add_listener || !wlapi.proxy_destroy
+        || !wlapi.registry_interface || !wlapi.output_interface)
+    {
+        dlclose( wlapi.handle );
+        wlapi.handle = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+struct wlapi_query
+{
+    int target_width, target_height;
+    int found_refresh_mhz;
+};
+
+/* wl_output listener - only the .mode callback carries information we need;
+ * the others are stub no-ops we still have to provide because wl_output's
+ * listener vtable has fixed slot layout (geometry, mode, done, scale, name,
+ * description). */
+static void wlapi_out_geometry( void *data, struct wlapi_wl_proxy *proxy,
+                                int x, int y, int pw, int ph, int sub,
+                                const char *make, const char *model, int transform ) {}
+static void wlapi_out_mode( void *data, struct wlapi_wl_proxy *proxy,
+                            uint32_t flags, int width, int height, int refresh )
+{
+    struct wlapi_query *q = data;
+    if (!(flags & WLAPI_WL_OUTPUT_MODE_CURRENT)) return;
+    if (width != q->target_width || height != q->target_height) return;
+    q->found_refresh_mhz = refresh;
+}
+static void wlapi_out_done( void *data, struct wlapi_wl_proxy *proxy ) {}
+static void wlapi_out_scale( void *data, struct wlapi_wl_proxy *proxy, int factor ) {}
+static void wlapi_out_name( void *data, struct wlapi_wl_proxy *proxy, const char *name ) {}
+static void wlapi_out_description( void *data, struct wlapi_wl_proxy *proxy, const char *desc ) {}
+static const struct
+{
+    void (*geometry)( void *, struct wlapi_wl_proxy *, int, int, int, int, int,
+                      const char *, const char *, int );
+    void (*mode)( void *, struct wlapi_wl_proxy *, uint32_t, int, int, int );
+    void (*done)( void *, struct wlapi_wl_proxy * );
+    void (*scale)( void *, struct wlapi_wl_proxy *, int );
+    void (*name)( void *, struct wlapi_wl_proxy *, const char * );
+    void (*description)( void *, struct wlapi_wl_proxy *, const char * );
+}
+wlapi_output_listener =
+{
+    wlapi_out_geometry, wlapi_out_mode, wlapi_out_done, wlapi_out_scale,
+    wlapi_out_name, wlapi_out_description,
+};
+
+/* Registry listener - bind every wl_output advertised so we receive its
+ * mode events on the next roundtrip. */
+static void wlapi_reg_global( void *data, struct wlapi_wl_proxy *registry, uint32_t name,
+                              const char *iface_name, uint32_t version )
+{
+    struct wlapi_wl_proxy *output;
+    if (strcmp( iface_name, "wl_output" ) != 0) return;
+    if (version > 4) version = 4;
+
+    output = wlapi.proxy_marshal_constructor_versioned(
+        registry, WLAPI_WL_REGISTRY_BIND, wlapi.output_interface, version,
+        name, "wl_output", version, NULL );
+    if (output)
+        wlapi.proxy_add_listener( output, (void (**)(void))&wlapi_output_listener, data );
+}
+static void wlapi_reg_global_remove( void *data, struct wlapi_wl_proxy *registry, uint32_t global_name ) {}
+static const struct
+{
+    void (*global)( void *, struct wlapi_wl_proxy *, uint32_t, const char *, uint32_t );
+    void (*global_remove)( void *, struct wlapi_wl_proxy *, uint32_t );
+}
+wlapi_registry_listener = { wlapi_reg_global, wlapi_reg_global_remove };
+
+static unsigned int wayland_query_refresh_hz( int width, int height )
+{
+    struct wlapi_query q = { width, height, 0 };
+    void *display;
+    struct wlapi_wl_proxy *registry;
+
+    if (!wlapi_init()) return 0;
+
+    display = wlapi.display_connect( NULL );
+    if (!display) return 0;
+
+    registry = wlapi.proxy_marshal_constructor(
+        (struct wlapi_wl_proxy *)display, WLAPI_WL_DISPLAY_GET_REGISTRY,
+        wlapi.registry_interface, NULL );
+    if (!registry)
+    {
+        wlapi.display_disconnect( display );
+        return 0;
+    }
+
+    wlapi.proxy_add_listener( registry, (void (**)(void))&wlapi_registry_listener, &q );
+    /* First roundtrip drains the global advertisements; second receives the
+     * mode events from each bound wl_output. */
+    wlapi.display_roundtrip( display );
+    wlapi.display_roundtrip( display );
+
+    wlapi.proxy_destroy( registry );
+    wlapi.display_disconnect( display );
+
+    /* wl_output reports refresh rate in mHz (millihertz). */
+    return q.found_refresh_mhz > 0 ? (unsigned)((q.found_refresh_mhz + 500) / 1000) : 0;
+}
+
 static unsigned int get_frequency( const XRRModeInfo *mode )
 {
     unsigned int dots = mode->hTotal * mode->vTotal;
+    unsigned int rate;
 
     if (!dots)
         return 0;
@@ -671,7 +852,28 @@ static unsigned int get_frequency( const XRRModeInfo *mode )
     if (mode->modeFlags & RR_Interlace)
         dots /= 2;
 
-    return (mode->dotClock + dots / 2) / dots;
+    rate = (mode->dotClock + dots / 2) / dots;
+
+    /* Some XRandR modelines (forced / virtual / pre-EDID modes) advertise
+     * absurdly low or high refresh rates - e.g. a 5120x2160 mode with a
+     * 41.5 MHz pixel clock yielding ~2.3 Hz under XWayland.  Feeding that
+     * to IDXGIOutput::GetDescription / GetDeviceCaps(VREFRESH) makes
+     * Chromium/CEF pace its BeginFrame at ~500 ms intervals and animations
+     * crawl at 1-2 fps.
+     *
+     * On Wayland sessions (XWayland), ask wl_output for the real refresh
+     * rate of an output whose active mode matches this width x height -
+     * KWin / mutter / weston all expose the actual configured rate that
+     * way.  Outside Wayland (real X11), we have no reliable secondary
+     * source so just clamp to a sane default. */
+    if (rate < 24 || rate > 1000)
+    {
+        unsigned int wl_rate = 0;
+        if (getenv( "WAYLAND_DISPLAY" ))
+            wl_rate = wayland_query_refresh_hz( mode->width, mode->height );
+        rate = wl_rate ? wl_rate : 60;
+    }
+    return rate;
 }
 
 static DWORD get_orientation( Rotation rotation )
