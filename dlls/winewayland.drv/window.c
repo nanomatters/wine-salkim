@@ -170,12 +170,26 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     {
         conf->minimized = TRUE;
     }
-    /* The fullscreen state is implied by the window position and style. */
+    /* The fullscreen state is implied by the window position and style.
+     *
+     * data->is_fullscreen is set by win32u when the window happens to
+     * cover the monitor (dlls/win32u/window.c is_fullscreen()).  That
+     * is a weak signal - borderless-windowed launchers like Steam
+     * launch at display size but declare WS_THICKFRAME (resizable
+     * border), meaning the user is supposed to be able to drag the
+     * edges to make the window smaller.  Propagating FULLSCREEN to
+     * the compositor in that case locks Mutter into the fullscreen
+     * role and refuses every interactive resize, so the user
+     * literally cannot escape the initial display-sized window.
+     *
+     * Only request FULLSCREEN when the app has not declared the
+     * window resizable.  Apps that genuinely want fullscreen do not
+     * also set WS_THICKFRAME. */
     else if (data->is_fullscreen)
     {
         if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
             window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
-        else if (!(style & WS_MINIMIZE))
+        else if (!(style & WS_MINIMIZE) && !(style & WS_THICKFRAME))
             window_state |= WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
     }
     else if (style & WS_MAXIMIZE)
