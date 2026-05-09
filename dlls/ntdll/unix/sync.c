@@ -48,6 +48,9 @@
 #ifdef HAVE_SYS_RESOURCE_H
 # include <sys/resource.h>
 #endif
+#ifdef __linux__
+# include <sys/prctl.h>
+#endif
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -2556,40 +2559,111 @@ NTSTATUS WINAPI NtSetSystemTime( const LARGE_INTEGER *new, LARGE_INTEGER *old )
 
 /***********************************************************************
  *              NtQueryTimerResolution (NTDLL.@)
+ *              NtSetTimerResolution   (NTDLL.@)
+ *
+ * On Windows these functions advertise / adjust the global scheduler
+ * timer-tick quantum (typically 15.625 ms by default; programs lower it
+ * to ~1 ms to get finer Sleep accuracy).  Linux has no equivalent
+ * global tick - every timed wait already runs against the hrtimer
+ * subsystem with sub-microsecond precision - but it does expose a
+ * per-thread "timer slack" (PR_SET_TIMERSLACK / PR_GET_TIMERSLACK), the
+ * maximum amount the kernel may delay an hrtimer expiration past its
+ * requested instant.  Default 50 us, configurable down to 1 ns.
+ *
+ * Map the NT API onto timer-slack so callers get real behaviour
+ * instead of synthetic constants:
+ *
+ *   - NtSetTimerResolution(res, TRUE, ...)  ->  PR_SET_TIMERSLACK(res*100ns),
+ *     clamped to [100ns, 15.625ms].  Subsequent NtDelayExecution / waits
+ *     on this thread wake within `res` of their target.
+ *   - NtSetTimerResolution(_, FALSE, ...)   ->  PR_SET_TIMERSLACK(0),
+ *     restoring the kernel default (50 us).
+ *   - NtQueryTimerResolution                ->  reports min as the
+ *     coarsest meaningful Windows-side value (15.625 ms), max as Linux
+ *     hrtimer floor (100 ns), cur read live from PR_GET_TIMERSLACK.
+ *
+ * Caveat (per-thread vs. per-process):  Windows registrations are
+ * process-scoped; the kernel publishes the system-wide minimum across
+ * all callers.  Linux PR_SET_TIMERSLACK is per-thread.  Most NT
+ * callers register from a single thread early in process startup,
+ * which makes the difference invisible - but a thread that didn't
+ * call NtSetTimerResolution itself will see the default slack rather
+ * than the process-wide request.  Acceptable until a real workload
+ * complains.
  */
 NTSTATUS WINAPI NtQueryTimerResolution( ULONG *min_res, ULONG *max_res, ULONG *current_res )
 {
     TRACE( "(%p,%p,%p)\n", min_res, max_res, current_res );
-    *max_res = *current_res = 10000; /* See NtSetTimerResolution() */
-    *min_res = 156250;
+
+    if (!min_res || !max_res || !current_res) return STATUS_ACCESS_VIOLATION;
+
+    *min_res = 156250;  /* 15.625 ms - coarsest meaningful tick */
+    *max_res = 1;       /* 100 ns    - Linux hrtimer floor */
+
+#ifdef __linux__
+    {
+        int slack = prctl( PR_GET_TIMERSLACK );
+        if (slack <= 0) slack = 50000;             /* Linux default if query fails */
+        *current_res = (ULONG)((slack + 99) / 100); /* round-up ns -> 100 ns units */
+        if (*current_res < 1)      *current_res = 1;
+        if (*current_res > 156250) *current_res = 156250;
+    }
+#else
+    *current_res = 156250;
+#endif
     return STATUS_SUCCESS;
 }
 
 
-/***********************************************************************
- *              NtSetTimerResolution (NTDLL.@)
- */
 NTSTATUS WINAPI NtSetTimerResolution( ULONG res, BOOLEAN set, ULONG *current_res )
 {
-    static BOOL has_request = FALSE;
+    /* Process-wide tracking of whether *anyone* in this process has an
+     * outstanding registration, matching the Windows convention: if
+     * `set=FALSE` arrives without a prior `set=TRUE`, return
+     * STATUS_TIMER_RESOLUTION_NOT_SET.  The actual prctl effect is
+     * still per-thread (see header comment). */
+    static BOOL has_request;
 
-    TRACE( "(%u,%u,%p), semi-stub!\n", res, set, current_res );
+    TRACE( "(%u,%u,%p)\n", res, set, current_res );
 
-    /* Wine has no support for anything other that 1 ms and does not keep of
-     * track resolution requests anyway.
-     * Fortunately NtSetTimerResolution() should ignore requests to lower the
-     * timer resolution. So by claiming that 'some other process' requested the
-     * max resolution already, there no need to actually change it.
-     */
-    *current_res = 10000;
+    if (!current_res) return STATUS_ACCESS_VIOLATION;
 
-    /* Just keep track of whether this process requested a specific timer
-     * resolution.
-     */
-    if (!has_request && !set)
+#ifdef __linux__
+    if (set)
+    {
+        unsigned long target_ns = (unsigned long)res * 100; /* 100 ns -> ns */
+        if (target_ns < 100)       target_ns = 100;
+        if (target_ns > 15625000)  target_ns = 15625000;
+        prctl( PR_SET_TIMERSLACK, target_ns );
+        has_request = TRUE;
+    }
+    else
+    {
+        if (!has_request)
+        {
+            *current_res = 156250;
+            return STATUS_TIMER_RESOLUTION_NOT_SET;
+        }
+        prctl( PR_SET_TIMERSLACK, 0 ); /* restore kernel default (50 us) */
+        has_request = FALSE;
+    }
+
+    {
+        int slack = prctl( PR_GET_TIMERSLACK );
+        if (slack <= 0) slack = 50000;
+        *current_res = (ULONG)((slack + 99) / 100);
+        if (*current_res < 1)      *current_res = 1;
+        if (*current_res > 156250) *current_res = 156250;
+    }
+#else
+    if (!set && !has_request)
+    {
+        *current_res = 156250;
         return STATUS_TIMER_RESOLUTION_NOT_SET;
-    has_request = set;
-
+    }
+    has_request = !!set;
+    *current_res = res < 1 ? 1 : (res > 156250 ? 156250 : res);
+#endif
     return STATUS_SUCCESS;
 }
 
