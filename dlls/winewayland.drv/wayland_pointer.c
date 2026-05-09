@@ -125,7 +125,7 @@ static void wayland_pointer_reset_frame(void)
 {
     struct wayland_pointer_frame *frame = &process_wayland.pointer.frame;
 
-    frame->dx = frame->dy = 0.0;;
+    frame->dx = frame->dy = 0.0;
     frame->dx_raw = frame->dy_raw = 0.0;
     frame->horz_scroll = frame->scroll = 0.0;
     frame->horz_axis = frame->axis = 0.0;
@@ -223,8 +223,11 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     /* Handle the enter as a motion, to account for cases where the
      * window first appears beneath the pointer and won't get a separate
      * motion event. */
-    pointer_handle_motion_internal(sx, sy);
-    pointer_handle_frame(NULL, pointer->wl_pointer);
+    if (!pointer->relative_mode)
+    {
+        pointer_handle_motion_internal(sx, sy);
+        pointer_handle_frame(NULL, pointer->wl_pointer);
+    }
 }
 
 static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
