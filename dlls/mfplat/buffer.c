@@ -68,6 +68,7 @@ struct buffer
     {
         ID3D11Texture2D *texture;
         unsigned int sub_resource_idx;
+        DXGI_FORMAT format;
         ID3D11Texture2D *rb_texture;
         D3D11_MAPPED_SUBRESOURCE map_desc;
         struct attributes attributes;
@@ -1098,6 +1099,7 @@ static HRESULT dxgi_surface_buffer_lock(struct buffer *buffer, MF2DBuffer_LockFl
         BYTE **scanline0, LONG *pitch, BYTE **buffer_start, DWORD *buffer_length)
 {
     HRESULT hr = S_OK;
+    DWORD length;
 
     if (buffer->_2d.linear_buffer)
         hr = MF_E_UNEXPECTED;
@@ -1118,7 +1120,24 @@ static HRESULT dxgi_surface_buffer_lock(struct buffer *buffer, MF2DBuffer_LockFl
         if (buffer_start)
             *buffer_start = *scanline0;
         if (buffer_length)
-            *buffer_length = buffer->dxgi_surface.map_desc.DepthPitch;
+        {
+            length = buffer->dxgi_surface.map_desc.DepthPitch;
+
+            switch (buffer->dxgi_surface.format)
+            {
+                case DXGI_FORMAT_NV12:
+                case DXGI_FORMAT_P010:
+                    length = buffer->dxgi_surface.map_desc.RowPitch * buffer->_2d.height * 3 / 2;
+                    break;
+                case DXGI_FORMAT_NV11:
+                    length = buffer->dxgi_surface.map_desc.RowPitch * buffer->_2d.height * 2;
+                    break;
+                default:
+                    break;
+            }
+
+            *buffer_length = length;
+        }
     }
 
     return hr;
@@ -1605,6 +1624,7 @@ static HRESULT create_dxgi_surface_buffer(IUnknown *surface, unsigned int sub_re
     InitializeCriticalSection(&object->cs);
     object->dxgi_surface.texture = texture;
     object->dxgi_surface.sub_resource_idx = sub_resource_idx;
+    object->dxgi_surface.format = desc.Format;
 
     MFGetPlaneSize(format, desc.Width, desc.Height, &object->_2d.plane_size);
     object->_2d.width = stride;
