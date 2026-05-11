@@ -318,9 +318,18 @@ static HRESULT STDMETHODCALLTYPE dxgi_device_ReclaimResources(IWineDXGIDevice *i
 
 static HRESULT STDMETHODCALLTYPE dxgi_device_EnqueueSetEvent(IWineDXGIDevice *iface, HANDLE event)
 {
-    FIXME("iface %p, event %p stub!\n", iface, event);
+    TRACE("iface %p, event %p semi-stub: signalling immediately.\n", iface, event);
 
-    return E_NOTIMPL;
+    /* The documented semantics are to signal `event` once the GPU has
+     * completed all queued work submitted up to now. Wine does not
+     * track GPU completion here; signalling synchronously is
+     * functionally adequate for callers (e.g. CEF/Chromium's GPU
+     * process) that only care that the event eventually fires.
+     * E_NOTIMPL makes Chromium's GPU process treat the device as
+     * unusable and shut itself down. */
+    if (event && !SetEvent(event))
+        return HRESULT_FROM_WIN32(GetLastError());
+    return S_OK;
 }
 
 static void STDMETHODCALLTYPE dxgi_device_Trim(IWineDXGIDevice *iface)
