@@ -24,10 +24,20 @@
 #include <d3d11.h>
 #include "wine/list.h"
 
+/* IDCompositionDevice3 - real interface stub. We declare the vtable
+ * inline rather than aliasing the Wine-internal IDCompositionDeviceUnknown
+ * (whose vtable extends past Device3 with private methods at slots that
+ * don't match Device3's effect methods, causing type confusion when CEF
+ * called Device3 methods that landed on unrelated DesktopDevice slots). */
+typedef struct IDCompositionDevice3Inner IDCompositionDevice3Inner;
+typedef struct IDCompositionDevice3InnerVtbl IDCompositionDevice3InnerVtbl;
+struct IDCompositionDevice3Inner { CONST_VTBL IDCompositionDevice3InnerVtbl *lpVtbl; };
+
 struct composition_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
     IDCompositionDeviceUnknown IDCompositionDeviceUnknown_iface;
+    IDCompositionDevice3Inner IDCompositionDevice3_iface;
     IDCompositionSurfaceUnknown *drawing_surface;
     struct list targets;
     HANDLE thread;
@@ -102,6 +112,11 @@ static inline struct composition_device *impl_from_IDCompositionDevice(IDComposi
 static inline struct composition_device *impl_from_IDCompositionDeviceUnknown(IDCompositionDeviceUnknown *iface)
 {
     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDeviceUnknown_iface);
+}
+
+static inline struct composition_device *impl_from_IDCompositionDevice3Inner(IDCompositionDevice3Inner *iface)
+{
+    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice3_iface);
 }
 
 static inline struct composition_surface *impl_from_IDCompositionSurfaceUnknown(IDCompositionSurfaceUnknown *iface)

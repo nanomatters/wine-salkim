@@ -40,6 +40,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
+/* IDCompositionDevice4 is intentionally not recognised. Some
+ * applications (e.g. Ubisoft Connect) skip their IDCompositionDevice2
+ * fallback path when Device4 is advertised and end up in an
+ * icon-only rendering state; returning E_NOINTERFACE for Device4
+ * keeps them on the working pre-Device4 path.
+ *
+ * IID_IDCompositionDevice3 is now declared in Wine's dcomp.h; the
+ * dedicated vtable below is what QueryInterface returns for it. */
+
 static CRITICAL_SECTION dcomp_cs;
 static CRITICAL_SECTION_DEBUG dcomp_debug =
 {
@@ -71,6 +80,21 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
     {
         IUnknown_AddRef(&device->IDCompositionDevice_iface);
         *out = &device->IDCompositionDevice_iface;
+        return S_OK;
+    }
+    else if (device->version >= 2
+             && IsEqualGUID(iid, &IID_IDCompositionDevice3))
+    {
+        /* IUnknown and IDCompositionDevice2 methods forward to the
+         * desktop_device implementations on the same backing object;
+         * the 13 Device3-only filter-effect creators stub to
+         * E_NOTIMPL. A dedicated vtable is required (rather than
+         * aliasing an existing internal Device2 vtable) because
+         * Device3's added effect-method slots overlap with the
+         * IDCompositionDesktopDevice methods that follow Device2 in
+         * the internal vtable layout. */
+        IUnknown_AddRef(&device->IDCompositionDevice_iface);
+        *out = &device->IDCompositionDevice3_iface;
         return S_OK;
     }
     else if ((device->version >= 2
@@ -1851,6 +1875,207 @@ static HRESULT STDMETHODCALLTYPE desktop_device_Unknown99(IDCompositionDeviceUnk
     return E_NOTIMPL;
 }
 
+/*
+ * IDCompositionDevice3 vtable.
+ *
+ * Microsoft's IDCompositionDevice3 inherits from IDCompositionDevice2
+ * and adds 13 filter-effect-creator methods. The IUnknown and Device2
+ * methods forward to the desktop_device implementations on the same
+ * backing object; the 13 effect creators return E_NOTIMPL with a
+ * FIXME, matching Microsoft's documented behaviour for an
+ * implementation that lacks filter-effect support. None of the
+ * effect creators affect the rendering pipeline - they only produce
+ * IDCompositionFilterEffect-derived objects that an application may
+ * later attach to a visual.
+ */
+struct IDCompositionDevice3InnerVtbl
+{
+    /* IUnknown */
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IDCompositionDevice3Inner*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(IDCompositionDevice3Inner*);
+    ULONG   (STDMETHODCALLTYPE *Release)(IDCompositionDevice3Inner*);
+    /* IDCompositionDevice2 */
+    HRESULT (STDMETHODCALLTYPE *Commit)(IDCompositionDevice3Inner*);
+    HRESULT (STDMETHODCALLTYPE *WaitForCommitCompletion)(IDCompositionDevice3Inner*);
+    HRESULT (STDMETHODCALLTYPE *GetFrameStatistics)(IDCompositionDevice3Inner*, DCOMPOSITION_FRAME_STATISTICS*);
+    HRESULT (STDMETHODCALLTYPE *CreateVisual)(IDCompositionDevice3Inner*, IDCompositionVisual2**);
+    HRESULT (STDMETHODCALLTYPE *CreateSurfaceFactory)(IDCompositionDevice3Inner*, IUnknown*, IDCompositionSurfaceFactory**);
+    HRESULT (STDMETHODCALLTYPE *CreateSurface)(IDCompositionDevice3Inner*, UINT, UINT, DXGI_FORMAT, DXGI_ALPHA_MODE, IDCompositionSurface**);
+    HRESULT (STDMETHODCALLTYPE *CreateVirtualSurface)(IDCompositionDevice3Inner*, UINT, UINT, DXGI_FORMAT, DXGI_ALPHA_MODE, IDCompositionVirtualSurface**);
+    HRESULT (STDMETHODCALLTYPE *CreateTranslateTransform)(IDCompositionDevice3Inner*, IDCompositionTranslateTransform**);
+    HRESULT (STDMETHODCALLTYPE *CreateScaleTransform)(IDCompositionDevice3Inner*, IDCompositionScaleTransform**);
+    HRESULT (STDMETHODCALLTYPE *CreateRotateTransform)(IDCompositionDevice3Inner*, IDCompositionRotateTransform**);
+    HRESULT (STDMETHODCALLTYPE *CreateSkewTransform)(IDCompositionDevice3Inner*, IDCompositionSkewTransform**);
+    HRESULT (STDMETHODCALLTYPE *CreateMatrixTransform)(IDCompositionDevice3Inner*, IDCompositionMatrixTransform**);
+    HRESULT (STDMETHODCALLTYPE *CreateTransformGroup)(IDCompositionDevice3Inner*, IDCompositionTransform**, UINT, IDCompositionTransform**);
+    HRESULT (STDMETHODCALLTYPE *CreateTranslateTransform3D)(IDCompositionDevice3Inner*, IDCompositionTranslateTransform3D**);
+    HRESULT (STDMETHODCALLTYPE *CreateScaleTransform3D)(IDCompositionDevice3Inner*, IDCompositionScaleTransform3D**);
+    HRESULT (STDMETHODCALLTYPE *CreateRotateTransform3D)(IDCompositionDevice3Inner*, IDCompositionRotateTransform3D**);
+    HRESULT (STDMETHODCALLTYPE *CreateMatrixTransform3D)(IDCompositionDevice3Inner*, IDCompositionMatrixTransform3D**);
+    HRESULT (STDMETHODCALLTYPE *CreateTransform3DGroup)(IDCompositionDevice3Inner*, IDCompositionTransform3D**, UINT, IDCompositionTransform3D**);
+    HRESULT (STDMETHODCALLTYPE *CreateEffectGroup)(IDCompositionDevice3Inner*, IDCompositionEffectGroup**);
+    HRESULT (STDMETHODCALLTYPE *CreateRectangleClip)(IDCompositionDevice3Inner*, IDCompositionRectangleClip**);
+    HRESULT (STDMETHODCALLTYPE *CreateAnimation)(IDCompositionDevice3Inner*, IDCompositionAnimation**);
+    /* IDCompositionDevice3 effect creators (13). All take
+     * IDCompositionFilterEffect** out; we use IUnknown** since Wine
+     * doesn't declare the filter-effect types. Stubs return E_NOTIMPL. */
+    HRESULT (STDMETHODCALLTYPE *CreateGaussianBlurEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateBrightnessEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateColorMatrixEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateShadowEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateHueRotationEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateSaturationEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateTurbulenceEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateLinearTransferEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateTableTransferEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateCompositeEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateBlendEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateArithmeticCompositeEffect)(IDCompositionDevice3Inner*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE *CreateAffineTransform2DEffect)(IDCompositionDevice3Inner*, IUnknown**);
+};
+
+/* Forward to the Wine-internal IDCompositionDeviceUnknown for the IUnknown +
+ * Device2 methods (same backing object). */
+
+static HRESULT STDMETHODCALLTYPE device3_QueryInterface(IDCompositionDevice3Inner *iface, REFIID iid, void **out)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice3Inner(iface);
+    return IDCompositionDevice_QueryInterface(&device->IDCompositionDevice_iface, iid, out);
+}
+
+static ULONG STDMETHODCALLTYPE device3_AddRef(IDCompositionDevice3Inner *iface)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice3Inner(iface);
+    return IDCompositionDevice_AddRef(&device->IDCompositionDevice_iface);
+}
+
+static ULONG STDMETHODCALLTYPE device3_Release(IDCompositionDevice3Inner *iface)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice3Inner(iface);
+    return IDCompositionDevice_Release(&device->IDCompositionDevice_iface);
+}
+
+#define DEV3_FWD(name) impl_from_IDCompositionDevice3Inner(iface)->IDCompositionDeviceUnknown_iface
+
+static HRESULT STDMETHODCALLTYPE device3_Commit(IDCompositionDevice3Inner *iface)
+{ return desktop_device_Commit(&DEV3_FWD(Commit)); }
+static HRESULT STDMETHODCALLTYPE device3_WaitForCommitCompletion(IDCompositionDevice3Inner *iface)
+{ return desktop_device_WaitForCommitCompletion(&DEV3_FWD(WaitForCommitCompletion)); }
+static HRESULT STDMETHODCALLTYPE device3_GetFrameStatistics(IDCompositionDevice3Inner *iface, DCOMPOSITION_FRAME_STATISTICS *s)
+{ return desktop_device_GetFrameStatistics(&DEV3_FWD(GetFrameStatistics), s); }
+static HRESULT STDMETHODCALLTYPE device3_CreateVisual(IDCompositionDevice3Inner *iface, IDCompositionVisual2 **v)
+{ return desktop_device_CreateVisual(&DEV3_FWD(CreateVisual), v); }
+static HRESULT STDMETHODCALLTYPE device3_CreateSurfaceFactory(IDCompositionDevice3Inner *iface, IUnknown *r, IDCompositionSurfaceFactory **f)
+{ return desktop_device_CreateSurfaceFactory(&DEV3_FWD(CreateSurfaceFactory), r, f); }
+static HRESULT STDMETHODCALLTYPE device3_CreateSurface(IDCompositionDevice3Inner *iface, UINT w, UINT h, DXGI_FORMAT fmt, DXGI_ALPHA_MODE am, IDCompositionSurface **s)
+{ return desktop_device_CreateSurface(&DEV3_FWD(CreateSurface), w, h, fmt, am, s); }
+static HRESULT STDMETHODCALLTYPE device3_CreateVirtualSurface(IDCompositionDevice3Inner *iface, UINT w, UINT h, DXGI_FORMAT fmt, DXGI_ALPHA_MODE am, IDCompositionVirtualSurface **s)
+{ return desktop_device_CreateVirtualSurface(&DEV3_FWD(CreateVirtualSurface), w, h, fmt, am, s); }
+static HRESULT STDMETHODCALLTYPE device3_CreateTranslateTransform(IDCompositionDevice3Inner *iface, IDCompositionTranslateTransform **t)
+{ return desktop_device_CreateTranslateTransform(&DEV3_FWD(CreateTranslateTransform), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateScaleTransform(IDCompositionDevice3Inner *iface, IDCompositionScaleTransform **t)
+{ return desktop_device_CreateScaleTransform(&DEV3_FWD(CreateScaleTransform), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateRotateTransform(IDCompositionDevice3Inner *iface, IDCompositionRotateTransform **t)
+{ return desktop_device_CreateRotateTransform(&DEV3_FWD(CreateRotateTransform), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateSkewTransform(IDCompositionDevice3Inner *iface, IDCompositionSkewTransform **t)
+{ return desktop_device_CreateSkewTransform(&DEV3_FWD(CreateSkewTransform), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateMatrixTransform(IDCompositionDevice3Inner *iface, IDCompositionMatrixTransform **t)
+{ return desktop_device_CreateMatrixTransform(&DEV3_FWD(CreateMatrixTransform), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateTransformGroup(IDCompositionDevice3Inner *iface, IDCompositionTransform **a, UINT n, IDCompositionTransform **g)
+{ return desktop_device_CreateTransformGroup(&DEV3_FWD(CreateTransformGroup), a, n, g); }
+static HRESULT STDMETHODCALLTYPE device3_CreateTranslateTransform3D(IDCompositionDevice3Inner *iface, IDCompositionTranslateTransform3D **t)
+{ return desktop_device_CreateTranslateTransform3D(&DEV3_FWD(CreateTranslateTransform3D), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateScaleTransform3D(IDCompositionDevice3Inner *iface, IDCompositionScaleTransform3D **t)
+{ return desktop_device_CreateScaleTransform3D(&DEV3_FWD(CreateScaleTransform3D), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateRotateTransform3D(IDCompositionDevice3Inner *iface, IDCompositionRotateTransform3D **t)
+{ return desktop_device_CreateRotateTransform3D(&DEV3_FWD(CreateRotateTransform3D), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateMatrixTransform3D(IDCompositionDevice3Inner *iface, IDCompositionMatrixTransform3D **t)
+{ return desktop_device_CreateMatrixTransform3D(&DEV3_FWD(CreateMatrixTransform3D), t); }
+static HRESULT STDMETHODCALLTYPE device3_CreateTransform3DGroup(IDCompositionDevice3Inner *iface, IDCompositionTransform3D **a, UINT n, IDCompositionTransform3D **g)
+{ return desktop_device_CreateTransform3DGroup(&DEV3_FWD(CreateTransform3DGroup), a, n, g); }
+static HRESULT STDMETHODCALLTYPE device3_CreateEffectGroup(IDCompositionDevice3Inner *iface, IDCompositionEffectGroup **g)
+{ return desktop_device_CreateEffectGroup(&DEV3_FWD(CreateEffectGroup), g); }
+static HRESULT STDMETHODCALLTYPE device3_CreateRectangleClip(IDCompositionDevice3Inner *iface, IDCompositionRectangleClip **c)
+{ return desktop_device_CreateRectangleClip(&DEV3_FWD(CreateRectangleClip), c); }
+static HRESULT STDMETHODCALLTYPE device3_CreateAnimation(IDCompositionDevice3Inner *iface, IDCompositionAnimation **a)
+{ return desktop_device_CreateAnimation(&DEV3_FWD(CreateAnimation), a); }
+
+#undef DEV3_FWD
+
+/* Device3 effect creators - all stubs returning E_NOTIMPL.
+ * CEF/Chromium uses IID_IDCompositionDevice3 only as a "Win 8.1+ DComp
+ * present?" probe; it does not call these in normal CEF rendering
+ * paths. E_NOTIMPL is the documented Microsoft behaviour for
+ * "feature absent". */
+
+#define DEV3_EFFECT_STUB(method) \
+    static HRESULT STDMETHODCALLTYPE device3_##method(IDCompositionDevice3Inner *iface, IUnknown **out) \
+    { \
+        FIXME("iface %p, out %p stub! IDCompositionDevice3::" #method "\n", iface, out); \
+        if (out) *out = NULL; \
+        return E_NOTIMPL; \
+    }
+
+DEV3_EFFECT_STUB(CreateGaussianBlurEffect)
+DEV3_EFFECT_STUB(CreateBrightnessEffect)
+DEV3_EFFECT_STUB(CreateColorMatrixEffect)
+DEV3_EFFECT_STUB(CreateShadowEffect)
+DEV3_EFFECT_STUB(CreateHueRotationEffect)
+DEV3_EFFECT_STUB(CreateSaturationEffect)
+DEV3_EFFECT_STUB(CreateTurbulenceEffect)
+DEV3_EFFECT_STUB(CreateLinearTransferEffect)
+DEV3_EFFECT_STUB(CreateTableTransferEffect)
+DEV3_EFFECT_STUB(CreateCompositeEffect)
+DEV3_EFFECT_STUB(CreateBlendEffect)
+DEV3_EFFECT_STUB(CreateArithmeticCompositeEffect)
+DEV3_EFFECT_STUB(CreateAffineTransform2DEffect)
+
+#undef DEV3_EFFECT_STUB
+
+static const struct IDCompositionDevice3InnerVtbl device3_vtbl =
+{
+    /* IUnknown */
+    device3_QueryInterface,
+    device3_AddRef,
+    device3_Release,
+    /* Device2 (21) */
+    device3_Commit,
+    device3_WaitForCommitCompletion,
+    device3_GetFrameStatistics,
+    device3_CreateVisual,
+    device3_CreateSurfaceFactory,
+    device3_CreateSurface,
+    device3_CreateVirtualSurface,
+    device3_CreateTranslateTransform,
+    device3_CreateScaleTransform,
+    device3_CreateRotateTransform,
+    device3_CreateSkewTransform,
+    device3_CreateMatrixTransform,
+    device3_CreateTransformGroup,
+    device3_CreateTranslateTransform3D,
+    device3_CreateScaleTransform3D,
+    device3_CreateRotateTransform3D,
+    device3_CreateMatrixTransform3D,
+    device3_CreateTransform3DGroup,
+    device3_CreateEffectGroup,
+    device3_CreateRectangleClip,
+    device3_CreateAnimation,
+    /* Device3 effect creators (13) */
+    device3_CreateGaussianBlurEffect,
+    device3_CreateBrightnessEffect,
+    device3_CreateColorMatrixEffect,
+    device3_CreateShadowEffect,
+    device3_CreateHueRotationEffect,
+    device3_CreateSaturationEffect,
+    device3_CreateTurbulenceEffect,
+    device3_CreateLinearTransferEffect,
+    device3_CreateTableTransferEffect,
+    device3_CreateCompositeEffect,
+    device3_CreateBlendEffect,
+    device3_CreateArithmeticCompositeEffect,
+    device3_CreateAffineTransform2DEffect,
+};
+
 static const struct IDCompositionDeviceUnknownVtbl desktop_device_vtbl =
 {
     /* IUnknown methods */
@@ -2004,6 +2229,7 @@ static HRESULT create_device(int version, REFIID iid, void **out)
     list_init(&device->targets);
     device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
     device->IDCompositionDeviceUnknown_iface.lpVtbl = &desktop_device_vtbl;
+    device->IDCompositionDevice3_iface.lpVtbl = &device3_vtbl;
     device->version = version;
     device->ref = 1;
     hr = IDCompositionDevice_QueryInterface(&device->IDCompositionDevice_iface, iid, out);
