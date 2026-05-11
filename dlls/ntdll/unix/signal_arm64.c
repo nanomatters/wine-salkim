@@ -412,6 +412,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     BOOL self = (handle == GetCurrentThread());
     DWORD flags = context->ContextFlags & ~CONTEXT_ARM64;
 
+    if (self && !frame) return STATUS_ACCESS_DENIED;
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
 
     if (!self)
@@ -466,6 +467,7 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_ARM64 );
         if (ret || !self) return ret;
     }
+    else if (!frame) return STATUS_ACCESS_DENIED;
 
     if (needed_flags & CONTEXT_INTEGER)
     {
@@ -1411,6 +1413,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     DWORD i;
 
     if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
+    if (!frame) return;
 
     FP_sig(sigcontext)     = frame->fp;
     LR_sig(sigcontext)     = frame->lr;

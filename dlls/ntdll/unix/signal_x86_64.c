@@ -1287,6 +1287,8 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     BOOL server_needed;
     NTSTATUS ret;
 
+    if (self && !get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
+
     if ((flags & CONTEXT_XSTATE) && xstate_extended_features)
     {
         CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
@@ -1314,6 +1316,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         WARN_(seh)( "Setting debug registers is not supported under Rosetta\n" );
 #endif
     if (ret || !self) return ret;
+    if (!get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
     CALL_SIGUSR1_PROTECTED( ret, (set_current_thread_context( context, flags, FALSE,
                                                              flags & CONTEXT_DEBUG_REGISTERS,
                                                              &server_needed )) );
@@ -1490,6 +1493,8 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
     BOOL server_needed;
     NTSTATUS ret;
 
+    if (self && !get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
+
     if (self)
     {
         CALL_SIGUSR1_PROTECTED( ret, (get_current_thread_context( context, needed_flags, TRUE,
@@ -1503,6 +1508,7 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 
     ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_AMD64 );
     if (ret || !self) return ret;
+    if (!get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
     CALL_SIGUSR1_PROTECTED( ret, (get_current_thread_context( context, needed_flags, FALSE,
                                                              needed_flags & CONTEXT_DEBUG_REGISTERS,
                                                              &server_needed )) );
@@ -1626,6 +1632,7 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
     NTSTATUS ret;
 
     if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+    if (self && !get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
     flags = context->ContextFlags & ~CONTEXT_i386;
 
     if (self)
@@ -1638,6 +1645,7 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
 
     ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 );
     if (ret || !self) return ret;
+    if (!get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
     CALL_SIGUSR1_PROTECTED( ret, (set_current_wow64_thread_context( context, flags, FALSE,
                                                                    flags & CONTEXT_I386_DEBUG_REGISTERS,
                                                                    TRUE, &server_needed )) );
@@ -1766,6 +1774,7 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
     NTSTATUS ret;
 
     if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+    if (self && !get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
     needed_flags = context->ContextFlags & ~CONTEXT_i386;
 
     if (self)
@@ -1782,6 +1791,7 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 
     ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 );
     if (ret || !self) return ret;
+    if (!get_syscall_frame( get_thread_data() )) return STATUS_ACCESS_DENIED;
     CALL_SIGUSR1_PROTECTED( ret, (get_current_wow64_thread_context( context, needed_flags, FALSE,
                                                                    needed_flags & CONTEXT_I386_DEBUG_REGISTERS,
                                                                    TRUE, &server_needed )) );
@@ -3182,7 +3192,6 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
 {
     THREAD_BASIC_INFORMATION tbi;
     NTSTATUS status;
-    TEB *teb = NtCurrentTeb();
 
     if (len != sizeof(*info)) return STATUS_INFO_LENGTH_MISMATCH;
     if (info->Selector >> 16) return STATUS_UNSUCCESSFUL;
@@ -3193,8 +3202,12 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
         status = NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL );
         if (status) return status;
     }
-    else tbi.ClientId = teb->ClientId;
-
+    else
+    {
+        TEB *teb = NtCurrentTeb();
+        if (!teb) return STATUS_ACCESS_DENIED;
+        tbi.ClientId = teb->ClientId;
+    }
     return ldt_get_entry( info->Selector, tbi.ClientId, &info->Entry );
 }
 
