@@ -1960,7 +1960,7 @@ static BOOL handle_interrupt( struct thread_data *data, unsigned int interrupt, 
 static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigcontext, void *stack_ptr,
                                   EXCEPTION_RECORD *rec, CONTEXT *context )
 {
-    struct syscall_frame *frame = get_syscall_frame( data );
+    struct syscall_frame *frame;
     UINT i, *stack;
 
     if (!is_inside_syscall( data, ESP_sig(sigcontext) )) return FALSE;
@@ -1991,8 +1991,9 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
         ESP_sig(sigcontext) = (DWORD)stack;
         EIP_sig(sigcontext) = (DWORD)longjmp;
         data->jmp_buf = NULL;
+        return TRUE;
     }
-    else
+    if ((frame = get_syscall_frame( data )))
     {
         WINE_BACKTRACE_LOG( "--- Exception %#x at %s.\n", rec->ExceptionCode,
                             wine_debuginfostr_pc( rec->ExceptionAddress ));
@@ -2001,8 +2002,9 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
         EAX_sig(sigcontext) = rec->ExceptionCode;
         EBP_sig(sigcontext) = (DWORD)&frame->ebp;
         EIP_sig(sigcontext) = (DWORD)__wine_syscall_dispatcher_return;
+        return TRUE;
     }
-    return TRUE;
+    return FALSE;
 }
 
 

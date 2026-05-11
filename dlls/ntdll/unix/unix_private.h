@@ -495,6 +495,7 @@ static inline BOOL is_inside_syscall_stack_guard( struct thread_data *data, cons
 
 static inline BOOL is_inside_syscall( struct thread_data *data, ULONG_PTR sp )
 {
+    if (!data->teb) return TRUE;
     return ((char *)sp >= (char *)get_kernel_stack( data ) &&
             (char *)sp <= (char *)get_syscall_frame( data ));
 }
