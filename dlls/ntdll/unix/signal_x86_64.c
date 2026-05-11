@@ -535,7 +535,8 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, sys
 
 static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
 {
-    return (struct amd64_thread_data *)get_teb_data(data)->cpu_data;
+    if (!data->teb) return NULL;
+    return (struct amd64_thread_data *)get_teb_data( data )->cpu_data;
 }
 
 /* Keep local signal state in the last CPU data slot, away from upstream fields. */
@@ -952,29 +953,25 @@ __ASM_GLOBAL_FUNC( clear_alignment_flag,
 static inline struct thread_data *init_handler( void *sigcontext )
 {
     struct thread_data *data = get_current_thread_data();
+    struct amd64_thread_data *amd64_data;
 
     clear_alignment_flag();
+    if (!(amd64_data = amd64_thread_data( data ))) return data;
 
 #ifdef __linux__
-    {
-        struct amd64_thread_data *thread_data = amd64_thread_data( data );
-        thread_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
-        if (fs32_sel) arch_prctl( ARCH_SET_FS, thread_data->pthread_teb );
-    }
+    amd64_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
+    if (fs32_sel) arch_prctl( ARCH_SET_FS, amd64_data->pthread_teb );
 #elif defined __APPLE__
-    {
-        struct amd64_thread_data *thread_data = amd64_thread_data( data );
-        _thread_set_tsd_base( (uint64_t)thread_data->pthread_teb );
+    _thread_set_tsd_base( (uint64_t)amd64_data->pthread_teb );
 
-        /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
-         * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
-         * Fix up sigcontext so later code can compare it to cs64_sel.
-         *
-         * Only applies on Intel, not under Rosetta.
-         */
-        if (CS_sig((ucontext_t *)sigcontext) == 0x07 /* SYSCALL_CS */)
-            CS_sig((ucontext_t *)sigcontext) = cs64_sel;
-    }
+    /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
+     * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
+     * Fix up sigcontext so later code can compare it to cs64_sel.
+     *
+     * Only applies on Intel, not under Rosetta.
+     */
+    if (CS_sig((ucontext_t *)sigcontext) == 0x07 /* SYSCALL_CS */)
+        CS_sig((ucontext_t *)sigcontext) = cs64_sel;
 #endif
     return data;
 }
@@ -985,12 +982,14 @@ static inline struct thread_data *init_handler( void *sigcontext )
  */
 static inline void leave_handler( struct thread_data *data, ucontext_t *sigcontext )
 {
+    struct amd64_thread_data *amd64_data = amd64_thread_data( data );
+
+    if (!amd64_data) return;
 #ifdef __linux__
-    struct amd64_thread_data *thread_data = amd64_thread_data( data );
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext) ))
     {
-        thread_data->syscall_dispatch = 1;  /* SYSCALL_DISPATCH_FILTER_BLOCK */
+        amd64_data->syscall_dispatch = 1;  /* SYSCALL_DISPATCH_FILTER_BLOCK */
         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
     }
 #elif defined __APPLE__
@@ -1048,12 +1047,17 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
     context->SegEs  = ds64_sel;
     context->SegGs  = ds64_sel;
     context->SegSs  = ds64_sel;
-    context->Dr0    = amd64_data->dr0;
-    context->Dr1    = amd64_data->dr1;
-    context->Dr2    = amd64_data->dr2;
-    context->Dr3    = amd64_data->dr3;
-    context->Dr6    = amd64_data->dr6;
-    context->Dr7    = amd64_data->dr7;
+    if (amd64_data)
+    {
+        context->Dr0 = amd64_data->dr0;
+        context->Dr1 = amd64_data->dr1;
+        context->Dr2 = amd64_data->dr2;
+        context->Dr3 = amd64_data->dr3;
+        context->Dr6 = amd64_data->dr6;
+        context->Dr7 = amd64_data->dr7;
+    }
+    else context->Dr7 = 0;
+
     if (FPU_sig(sigcontext))
     {
         XSAVE_AREA_HEADER *xs;
@@ -1119,12 +1123,15 @@ static void restore_context( struct thread_data *data, const struct xcontext *xc
     const CONTEXT *context = &xcontext->c;
     struct amd64_thread_data *amd64_data = amd64_thread_data( data );
 
-    amd64_data->dr0 = context->Dr0;
-    amd64_data->dr1 = context->Dr1;
-    amd64_data->dr2 = context->Dr2;
-    amd64_data->dr3 = context->Dr3;
-    amd64_data->dr6 = context->Dr6;
-    amd64_data->dr7 = context->Dr7;
+    if (amd64_data)
+    {
+        amd64_data->dr0 = context->Dr0;
+        amd64_data->dr1 = context->Dr1;
+        amd64_data->dr2 = context->Dr2;
+        amd64_data->dr3 = context->Dr3;
+        amd64_data->dr6 = context->Dr6;
+        amd64_data->dr7 = context->Dr7;
+    }
     set_sigcontext( context, sigcontext );
     if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
     leave_handler( data, sigcontext );
@@ -1177,11 +1184,17 @@ static inline void unblock_sigusr1(void)
 
 static inline void abort_sigusr1_context_block(void)
 {
-    unsigned char depth = sigusr1_thread_data( NtCurrentTeb() )->context_depth;
+    TEB *teb = NtCurrentTeb();
+    struct sigusr1_thread_data *data;
+    unsigned char depth;
+
+    if (!teb) return;
+    data = sigusr1_thread_data( teb );
+    depth = data->context_depth;
 
     if (!depth) return;
-    sigusr1_thread_data( NtCurrentTeb() )->context_depth = 0;
-    sigusr1_thread_data( NtCurrentTeb() )->blocked -= depth;
+    data->context_depth = 0;
+    data->blocked -= depth;
 }
 
 #define CALL_SIGUSR1_PROTECTED(status, expression) \
@@ -2622,6 +2635,7 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
     unsigned int i, len, prefix_count = 0;
     ULONG_PTR cur_gsbase = 0;
 
+    if (!data->teb) return FALSE;
     if (CS_sig(ucontext) != cs64_sel) return FALSE;
 
 #ifdef __linux__
@@ -3058,7 +3072,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     extern const void *__wine_syscall_dispatcher_return_ptr;
     extern const void *__wine_syscall_dispatcher_return_end_ptr;
 
-    if (get_thread_data()->system_thread)
+    if (!data->teb || data->system_thread)
     {
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
         return;
@@ -3381,7 +3395,7 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
-    struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
+    struct amd64_thread_data *thread_data = amd64_thread_data( data );
     CONTEXT *ctx, context = { 0 };
     I386_CONTEXT *wow_context;
     void *callback;

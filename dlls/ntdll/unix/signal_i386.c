@@ -538,6 +538,7 @@ static UINT64 xstate_extended_features;
 
 static inline struct x86_thread_data *x86_thread_data( struct thread_data *data )
 {
+    if (!data->teb) return NULL;
     return (struct x86_thread_data *)get_teb_data(data)->cpu_data;
 }
 
@@ -666,10 +667,11 @@ static void wine_sigacthandler( int signal, siginfo_t *siginfo, void *sigcontext
 
     __asm__ __volatile__("mov %ss,%ax; mov %ax,%ds; mov %ax,%es");
 
-    thread_data = x86_thread_data( get_current_thread_data() );
-    set_fs( thread_data->fs );
-    set_gs( thread_data->gs );
-
+    if ((thread_data = x86_thread_data( get_current_thread_data() )))
+    {
+        set_fs( thread_data->fs );
+        set_gs( thread_data->gs );
+    }
     libc_sigacthandler( signal, siginfo, sigcontext );
 }
 
@@ -706,16 +708,17 @@ __ASM_GLOBAL_FUNC( clear_alignment_flag,
 static inline struct thread_data *init_handler( const ucontext_t *sigcontext )
 {
     struct thread_data *data = get_current_thread_data();
+    struct x86_thread_data *x86_data;
 
     clear_alignment_flag();
 
-#ifndef __sun  /* see above for Solaris handling */
+    if ((x86_data = x86_thread_data( data )))
     {
-        struct x86_thread_data *thread_data = x86_thread_data( data );
-        set_fs( thread_data->fs );
-        set_gs( thread_data->gs );
-    }
+#ifndef __sun  /* see above for Solaris handling */
+        set_fs( x86_data->fs );
+        set_gs( x86_data->gs );
 #endif
+    }
     return data;
 }
 
@@ -792,12 +795,15 @@ static void save_context( struct thread_data *data, CONTEXT *context, const ucon
     context->SegFs        = LOWORD(FS_sig(sigcontext));
     context->SegGs        = LOWORD(GS_sig(sigcontext));
     context->SegSs        = LOWORD(SS_sig(sigcontext));
-    context->Dr0          = x86_data->dr0;
-    context->Dr1          = x86_data->dr1;
-    context->Dr2          = x86_data->dr2;
-    context->Dr3          = x86_data->dr3;
-    context->Dr6          = x86_data->dr6;
-    context->Dr7          = x86_data->dr7;
+    if (x86_data)
+    {
+        context->Dr0 = x86_data->dr0;
+        context->Dr1 = x86_data->dr1;
+        context->Dr2 = x86_data->dr2;
+        context->Dr3 = x86_data->dr3;
+        context->Dr6 = x86_data->dr6;
+        context->Dr7 = x86_data->dr7;
+    }
 
     if (fpu)
     {
@@ -881,12 +887,15 @@ static void restore_context( struct thread_data *data, const CONTEXT *context, u
     void *fpux = FPUX_sig(sigcontext);
     struct x86_thread_data *x86_data = x86_thread_data( data );
 
-    x86_data->dr0 = context->Dr0;
-    x86_data->dr1 = context->Dr1;
-    x86_data->dr2 = context->Dr2;
-    x86_data->dr3 = context->Dr3;
-    x86_data->dr6 = context->Dr6;
-    x86_data->dr7 = context->Dr7;
+    if (x86_data)
+    {
+        x86_data->dr0 = context->Dr0;
+        x86_data->dr1 = context->Dr1;
+        x86_data->dr2 = context->Dr2;
+        x86_data->dr3 = context->Dr3;
+        x86_data->dr6 = context->Dr6;
+        x86_data->dr7 = context->Dr7;
+    }
     EAX_sig(sigcontext) = context->Eax;
     EBX_sig(sigcontext) = context->Ebx;
     ECX_sig(sigcontext) = context->Ecx;
@@ -955,11 +964,15 @@ static inline void unblock_sigusr1(void)
 
 static inline void abort_sigusr1_context_block(void)
 {
-    unsigned char depth = x86_thread_data( get_thread_data() )->sigusr1_context_depth;
+    struct x86_thread_data *data = x86_thread_data( get_thread_data() );
+    unsigned char depth;
+
+    if (!data) return;
+    depth = data->sigusr1_context_depth;
 
     if (!depth) return;
-    x86_thread_data( get_thread_data() )->sigusr1_context_depth = 0;
-    x86_thread_data( get_thread_data() )->sigusr1_blocked -= depth;
+    data->sigusr1_context_depth = 0;
+    data->sigusr1_blocked -= depth;
 }
 
 #define CALL_SIGUSR1_PROTECTED(status, expression) \
@@ -1428,9 +1441,10 @@ static BOOL check_invalid_gs( struct thread_data *data, ucontext_t *sigcontext, 
 {
     unsigned int prefix_count = 0;
     const BYTE *instr = (BYTE *)context->Eip;
-    WORD system_gs = x86_thread_data(data)->gs;
+    struct x86_thread_data *x86_data = x86_thread_data( data );
 
-    if (context->SegGs == system_gs) return FALSE;
+    if (!x86_data) return FALSE;
+    if (context->SegGs == x86_data->gs) return FALSE;
     if (!ldt_is_system( context->SegCs )) return FALSE;
     /* only handle faults in system libraries */
     if (virtual_is_valid_code_address( instr, 1 )) return FALSE;
@@ -1452,8 +1466,8 @@ static BOOL check_invalid_gs( struct thread_data *data, ucontext_t *sigcontext, 
         instr++;
         continue;
     case 0x65:  /* %gs: */
-        TRACE( "%04x/%04x at %p, fixing up\n", context->SegGs, system_gs, instr );
-        GS_sig(sigcontext) = system_gs;
+        TRACE( "%04x/%04x at %p, fixing up\n", context->SegGs, x86_data->gs, instr );
+        GS_sig(sigcontext) = x86_data->gs;
         return TRUE;
     default:
         return FALSE;
@@ -2378,7 +2392,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 
     frame = get_syscall_frame( data );
 
-    if (get_thread_data()->system_thread)
+    if (!data->teb || data->system_thread)
     {
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
         return;
@@ -2653,7 +2667,7 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
-    struct x86_thread_data *thread_data = (struct x86_thread_data *)&teb->GdiTebBatch;
+    struct x86_thread_data *thread_data = x86_thread_data( data );
     CONTEXT *ctx, context = { CONTEXT_ALL };
     DWORD *stack;
 
