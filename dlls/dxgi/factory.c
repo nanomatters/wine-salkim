@@ -381,10 +381,69 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
 static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
 {
-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
+    IWineDXGISwapChainFactory *swapchain_factory;
+    ID3D12CommandQueue *command_queue;
+    HWND hwnd;
+    HRESULT hr;
+
+    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
             iface, device, desc, output, swapchain);
 
-    return E_NOTIMPL;
+    if (!device || !desc || !swapchain)
+    {
+        WARN("Invalid pointer.\n");
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+            && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
+    {
+        WARN("Invalid swap effect %u for composition swapchain.\n", desc->SwapEffect);
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (!dxgi_validate_swapchain_desc(desc))
+        return DXGI_ERROR_INVALID_CALL;
+
+    if (output)
+        FIXME("Ignoring output %p.\n", output);
+
+    /* A composition swapchain has no on-screen target window of its own:
+     * the DComp compositor reads its front buffer via GetBuffer() and
+     * blits the result to the visual's target HWND. wined3d still
+     * requires a non-NULL HWND for IsWindow() and GetClientRect() checks
+     * during Present(), so a hidden HWND_MESSAGE-parented window suffices
+     * and has no visual side effects.
+     *
+     * The HWND must outlive the swapchain - wined3d retains it on the
+     * swapchain object for Present-time checks. Destroying it triggers
+     * progressive Present failures in the GDI blit path. The HWND is
+     * therefore intentionally not destroyed; one is created per
+     * composition swapchain (a handful in typical CEF process trees). */
+    hwnd = CreateWindowA("message", NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, NULL);
+    if (!hwnd)
+    {
+        ERR("Failed to create dummy window for composition swapchain.\n");
+        return E_OUTOFMEMORY;
+    }
+
+    if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_IWineDXGISwapChainFactory, (void **)&swapchain_factory)))
+    {
+        hr = IWineDXGISwapChainFactory_create_swapchain(swapchain_factory,
+                (IDXGIFactory *)iface, hwnd, desc, NULL, output, swapchain);
+        IWineDXGISwapChainFactory_Release(swapchain_factory);
+        return hr;
+    }
+
+    if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&command_queue)))
+    {
+        hr = d3d12_swapchain_create(iface, command_queue, hwnd, desc, NULL, swapchain);
+        ID3D12CommandQueue_Release(command_queue);
+        return hr;
+    }
+
+    ERR("This is not the device we're looking for.\n");
+    return DXGI_ERROR_UNSUPPORTED;
 }
 
 static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
