@@ -26,6 +26,7 @@ SOURCES = \
 	mutex.c \
 	named_pipe.c \
 	object.c \
+	presentation.c \
 	process.c \
 	procfs.c \
 	ptrace.c \

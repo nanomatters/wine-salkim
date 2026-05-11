@@ -1060,8 +1060,9 @@ typedef volatile struct
 
 typedef volatile struct
 {
-    struct obj_locator   class;            /* object locator for the window class shared object */
-    unsigned int         dpi_context;      /* DPI awareness context */
+    struct obj_locator   class;                  /* object locator for the window class shared object */
+    unsigned int         dpi_context;            /* DPI awareness context */
+    unsigned int         presentation_generation; /* monotonic counter; bumped when this window's resolved presentation parent or its export changes */
 } window_shm_t;
 
 typedef volatile union
@@ -4385,4 +4386,60 @@ enum fsync_type
     obj_handle_t  handle;                     /* shared visual handle */
 @REPLY
     client_ptr_t  target_root;                /* root IDCompositionVisual pointer for the target created from this shared visual */
+@END
+
+
+/* Presentation export protocol identifiers. Names which Wayland-side
+ * protocol the opaque token belongs to. */
+enum presentation_protocol
+{
+    PRESENTATION_PROTOCOL_NONE,           /* no export set on this window */
+    PRESENTATION_PROTOCOL_XDG_FOREIGN_V2  /* zwp_xdg_foreign_v2 token */
+};
+
+
+/* Bitmask flags returned in get_window_presentation_parent.reason
+ * describing how the resolver reached its answer. NO_ANCHOR is the
+ * absence of any flag. Multiple flags may be set simultaneously. */
+enum presentation_reason
+{
+    PRESENTATION_REASON_NO_ANCHOR    = 0x0000,  /* no anchor found */
+    PRESENTATION_REASON_OWNER_CHAIN  = 0x0001,  /* anchor reached via GW_OWNER walk */
+    PRESENTATION_REASON_EXPORT_FOUND = 0x0002,  /* anchor has a non-NONE export */
+    PRESENTATION_REASON_SAME_PROCESS = 0x0004,  /* anchor is in the querying process */
+    PRESENTATION_REASON_CYCLE_BROKEN = 0x0008   /* depth limit hit; tree had a cycle */
+};
+
+
+/* Set a window's presentation export.
+ * The opaque token in VARARG identifies the window in the named
+ * compositor protocol. Calling this on a window that already has
+ * an export replaces the prior token. */
+@REQ(set_window_presentation)
+    user_handle_t  handle;       /* handle to the window */
+    unsigned int   protocol;     /* enum presentation_protocol */
+    VARARG(token,bytes);         /* opaque protocol-specific token */
+@END
+
+
+/* Clear a window's presentation export. No-op if none was set. */
+@REQ(clear_window_presentation)
+    user_handle_t  handle;       /* handle to the window */
+@END
+
+
+/* Resolve a window's presentation parent.
+ * Walks the GW_OWNER chain starting from `handle` and returns the
+ * first ancestor whose presentation_protocol is not NONE. The
+ * reply carries the resolved parent's token so the caller can
+ * import it without a second round-trip. Generation is the
+ * invalidation cookie callers should re-query when it changes. */
+@REQ(get_window_presentation_parent)
+    user_handle_t  handle;       /* handle to the window */
+@REPLY
+    user_handle_t  parent;       /* resolved parent, 0 if no anchor */
+    unsigned int   protocol;     /* enum presentation_protocol of parent */
+    unsigned int   reason;       /* bitmask of enum presentation_reason */
+    unsigned int   generation;   /* parent's presentation generation */
+    VARARG(token,bytes);         /* parent's opaque token (empty if none) */
 @END

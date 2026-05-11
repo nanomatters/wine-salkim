@@ -36,6 +36,7 @@
 #include "process.h"
 #include "user.h"
 #include "unicode.h"
+#include "presentation.h"
 
 /* a window property */
 struct property
@@ -53,11 +54,28 @@ enum property_type
 };
 
 
+/* Per-window presentation export metadata for the wineserver-mediated
+ * cross-process parent-linking machinery used by winewayland.drv.
+ *
+ * Allocated lazily in set_window_presentation; NULL means "no token
+ * published". Freed in window_destroy (object destructor). */
+struct presentation_export
+{
+    unsigned int   protocol;       /* PRESENTATION_PROTOCOL_* */
+    unsigned int   token_len;      /* byte length of token */
+    unsigned int   generation;     /* monotonic, bumped on any state change */
+    unsigned int   owner_pid;      /* pid that published */
+    char          *token;          /* opaque bytes (mem_alloc'd); may contain NULs */
+};
+
 struct window
 {
     struct object    obj;             /* object header */
     struct window   *parent;          /* parent window */
     user_handle_t    owner;           /* owner of this window */
+    struct list      owned_windows;   /* windows that have us as their owner */
+    struct list      owner_entry;     /* entry in our owner's owned_windows list */
+    struct presentation_export *presentation; /* token published by our process for this window */
     struct list      children;        /* list of children in Z-order */
     struct list      unlinked;        /* list of children not linked in the Z-order list */
     struct list      entry;           /* entry in parent's children list */
@@ -163,11 +181,47 @@ static void window_dump( struct object *obj, int verbose )
     fprintf( stderr, "window %p handle %x\n", win, win->handle );
 }
 
+/* Forward declarations for the presentation helpers; definitions follow
+ * after is_orphan_window because they need ntuser/process helpers that
+ * the prelude has already declared, but window_destroy is called above
+ * those definitions. */
+static void bump_presentation_generation( struct window *win );
+static void bump_owned_generations( struct window *win );
+
 static void window_destroy( struct object *obj )
 {
     struct window *win = (struct window *)obj;
 
     assert( !win->handle );
+
+    /* Cross-process presentation cleanup. Must run from the object
+     * destructor, not just DECL_HANDLER(destroy_window), to cover
+     * refcount-driven and process-crash teardown paths.
+     *
+     * 1. Bump generations of windows we directly or transitively owned;
+     *    their imports must re-resolve since their anchor is going away.
+     * 2. Detach owned windows from our owned_windows list. Their
+     *    owner_entry would otherwise still link into our freed list
+     *    head, so when they later destruct their list_remove writes
+     *    into freed memory.
+     * 3. Remove ourselves from our owner's owned_windows list.
+     * 4. Free our own presentation_export (if any). */
+    bump_owned_generations( win );
+    while (!list_empty( &win->owned_windows ))
+    {
+        struct window *owned = LIST_ENTRY( list_head( &win->owned_windows ),
+                                           struct window, owner_entry );
+        list_remove( &owned->owner_entry );
+        list_init( &owned->owner_entry );
+    }
+    if (!list_empty( &win->owner_entry ))
+        list_remove( &win->owner_entry );
+    if (win->presentation)
+    {
+        free( win->presentation->token );
+        free( win->presentation );
+        win->presentation = NULL;
+    }
 
     if (win->parent)
     {
@@ -201,6 +255,139 @@ static inline struct window *get_window( user_handle_t handle )
 static inline int is_desktop_window( const struct window *win )
 {
     return !win->parent;  /* only desktop windows have no parent */
+}
+
+/* Bump the presentation generation of a window. Called when state
+ * changes that imported peers should detect: the window's owner
+ * changed, an ancestor was destroyed, the export was replaced, etc.
+ *
+ * The new value is mirrored into win->shared->presentation_generation
+ * so importers polling shared memory see the change without a
+ * server round-trip.
+ *
+ * Bumps the windows that have a published export AND windows that
+ * don't - even a non-exporting window's owned-windows callers benefit
+ * from a generation bump on the resolved-anchor side. We therefore
+ * bump unconditionally as long as the window has shared memory. */
+static void bump_presentation_generation( struct window *win )
+{
+    if (!win || !win->shared) return;
+    if (win->presentation) win->presentation->generation++;
+    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+    {
+        shared->presentation_generation++;
+    }
+    SHARED_WRITE_END;
+}
+
+/* On owner-tree mutation that affects a window's resolve_presentation_parent
+ * answer, bump generations of the windows that were directly or
+ * transitively owned by it. Two levels suffices: typical CEF owner
+ * chain depth is <=2 (main -> popup -> sub-popup). */
+static void bump_owned_generations( struct window *win )
+{
+    struct window *direct, *transitive;
+
+    if (!win) return;
+
+    LIST_FOR_EACH_ENTRY( direct, &win->owned_windows, struct window, owner_entry )
+    {
+        bump_presentation_generation( direct );
+        LIST_FOR_EACH_ENTRY( transitive, &direct->owned_windows, struct window, owner_entry )
+            bump_presentation_generation( transitive );
+    }
+}
+
+/* Production callbacks for resolve_presentation_parent. The resolver
+ * is callback-abstracted so it can be unit-tested with fixture data
+ * (see server/tests/presentation_test.c). */
+static void *presentation_lookup( unsigned int handle, void *ctx )
+{
+    (void)ctx;
+    return get_user_object( handle, NTUSER_OBJ_WINDOW );
+}
+
+static unsigned int presentation_get_owner( void *node, void *ctx )
+{
+    (void)ctx;
+    return ((struct window *)node)->owner;
+}
+
+static unsigned int presentation_get_protocol( void *node, void *ctx )
+{
+    struct window *win = (struct window *)node;
+    (void)ctx;
+    if (!win->presentation) return PRESENTATION_PROTOCOL_NONE;
+    return win->presentation->protocol;
+}
+
+static unsigned int presentation_get_pid( void *node, void *ctx )
+{
+    struct window *win = (struct window *)node;
+    (void)ctx;
+    if (!win->thread || !win->thread->process) return 0;
+    return get_process_id( win->thread->process );
+}
+
+/* GW_CHILD parent fallback. Returns the parent handle only if the
+ * window is actually WS_CHILD with a non-desktop parent. Without the
+ * style filter we'd walk a top-level popup's parent pointer (its
+ * GW_OWNER root) into the desktop tree, where every protocol lookup
+ * would short-circuit on PROTOCOL_NONE forever. */
+static unsigned int presentation_get_parent( void *node, void *ctx )
+{
+    struct window *win = (struct window *)node;
+    (void)ctx;
+    if (!win->parent || is_desktop_window( win->parent )) return 0;
+    if ((win->style & (WS_CHILD | WS_POPUP)) != WS_CHILD) return 0;
+    return win->parent->handle;
+}
+
+/* Opaque desktop identity used for cross-desktop validation. The
+ * desktop pointer is stable for the lifetime of the desktop object,
+ * which outlives every window on it, so the resolver can compare
+ * these pointers without holding a refcount. */
+static const void *presentation_get_desktop( void *node, void *ctx )
+{
+    struct window *win = (struct window *)node;
+    (void)ctx;
+    return win->desktop;
+}
+
+static const struct presentation_query_ops presentation_ops =
+{
+    presentation_lookup,
+    presentation_get_owner,
+    presentation_get_protocol,
+    presentation_get_pid,
+    presentation_get_parent,
+    presentation_get_desktop,
+};
+
+/* Resolve the presentation parent of the window with `handle` for
+ * cross-process linking. Thin wrapper around the unit-tested resolver
+ * in presentation.c. Returns the resolved struct window (or NULL if no
+ * anchor). */
+struct window *resolve_window_presentation_parent_handle( unsigned int handle,
+                                                          unsigned int *reason_out )
+{
+    struct window *win = get_user_object( handle, NTUSER_OBJ_WINDOW );
+    unsigned int querying_pid = 0;
+    unsigned int anchor_handle;
+
+    if (!win)
+    {
+        if (reason_out) *reason_out = PRESENTATION_REASON_NO_ANCHOR;
+        return NULL;
+    }
+    if (win->thread && win->thread->process)
+        querying_pid = get_process_id( win->thread->process );
+
+    anchor_handle = resolve_presentation_parent( win->handle, querying_pid,
+                                                 &presentation_ops, NULL,
+                                                 reason_out );
+    if (!anchor_handle) return NULL;
+    return get_user_object( anchor_handle, NTUSER_OBJ_WINDOW );
 }
 
 /* check if window is orphaned */
@@ -448,6 +635,12 @@ static int set_parent_window( struct window *win, struct window *parent )
         win->is_linked = 0;
         win->is_orphan = 1;
     }
+
+    /* The parent change may shift the resolved presentation parent
+     * for our children. Bump our own generation and theirs so any
+     * driver-side cache invalidates. */
+    bump_presentation_generation( win );
+    bump_owned_generations( win );
     return 1;
 }
 
@@ -657,6 +850,10 @@ static struct window *create_window( struct window *parent, struct window *owner
     if (!(win = alloc_object( &window_ops ))) goto failed;
     win->parent         = parent ? (struct window *)grab_object( parent ) : NULL;
     win->owner          = owner ? owner->handle : 0;
+    win->presentation   = NULL;
+    list_init( &win->owned_windows );
+    list_init( &win->owner_entry );
+    if (owner) list_add_tail( &owner->owned_windows, &win->owner_entry );
     win->thread         = current;
     win->desktop        = desktop;
     win->class          = class;
@@ -2390,6 +2587,17 @@ DECL_HANDLER(set_window_owner)
     }
 
     reply->prev_owner = win->owner;
+    /* Maintain the reverse-owner-index: remove from old owner's
+     * owned_windows list, add to the new owner's. Bump our own
+     * generation since our resolved presentation parent may have
+     * changed. */
+    if (!list_empty( &win->owner_entry ))
+        list_remove( &win->owner_entry );
+    list_init( &win->owner_entry );
+    if (owner) list_add_tail( &owner->owned_windows, &win->owner_entry );
+    bump_presentation_generation( win );
+    bump_owned_generations( win );
+
     reply->full_owner = win->owner = owner ? owner->handle : 0;
 }
 
@@ -3283,4 +3491,127 @@ DECL_HANDLER(set_window_layered_info)
         if (!was_layered) redraw_window( win, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0, 0 );
     }
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
+}
+
+
+/* Sane upper bound for an opaque presentation token. xdg_foreign
+ * tokens are short ASCII (typically <64 bytes); 4096 is generous
+ * headroom for future protocols without inviting abuse. */
+#define MAX_PRESENTATION_TOKEN_SIZE 4096
+
+/* set a window's presentation export */
+DECL_HANDLER(set_window_presentation)
+{
+    struct window *win = get_window( req->handle );
+    data_size_t token_size = get_req_data_size();
+    struct presentation_export *prev = NULL;
+    struct presentation_export *exp;
+    char *token_copy;
+
+    if (!win) return;
+
+    /* Reject NONE explicitly - callers should use clear_window_presentation
+     * to remove an export. Reject unknown protocol ids so the server
+     * never silently accepts garbage. */
+    if (req->protocol != PRESENTATION_PROTOCOL_XDG_FOREIGN_V2)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if (token_size == 0 || token_size > MAX_PRESENTATION_TOKEN_SIZE)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if (!(exp = mem_alloc( sizeof(*exp) ))) return;
+    if (!(token_copy = mem_alloc( token_size )))
+    {
+        free( exp );
+        return;
+    }
+    memcpy( token_copy, get_req_data(), token_size );
+
+    /* Allocate-then-replace. If the window already had an export,
+     * preserve its generation counter so importers see a strictly
+     * monotonic sequence across a re-export - they can't tell whether
+     * the value changed but the export was rebuilt. */
+    prev = win->presentation;
+    exp->protocol   = req->protocol;
+    exp->token      = token_copy;
+    exp->token_len  = token_size;
+    exp->generation = prev ? prev->generation : 0;
+    exp->owner_pid  = (current && current->process) ? get_process_id( current->process ) : 0;
+    win->presentation = exp;
+
+    if (prev)
+    {
+        free( prev->token );
+        free( prev );
+    }
+
+    /* Bump after the swap so the new export's generation is what
+     * gets advanced. Owned-windows generations also bump because
+     * their resolved anchor (us) just changed export state. */
+    bump_presentation_generation( win );
+    bump_owned_generations( win );
+}
+
+
+/* clear a window's presentation export */
+DECL_HANDLER(clear_window_presentation)
+{
+    struct window *win = get_window( req->handle );
+    struct presentation_export *prev;
+
+    if (!win) return;
+    if (!(prev = win->presentation)) return;  /* already clear */
+
+    win->presentation = NULL;
+    free( prev->token );
+    free( prev );
+
+    /* Importers must re-resolve: our anchor just disappeared, so
+     * windows that resolved through us pick the next exporter up
+     * the owner chain. */
+    bump_presentation_generation( win );
+    bump_owned_generations( win );
+}
+
+
+/* resolve a window's presentation parent */
+DECL_HANDLER(get_window_presentation_parent)
+{
+    struct window *win = get_window( req->handle );
+    struct window *anchor;
+    unsigned int reason = PRESENTATION_REASON_NO_ANCHOR;
+
+    if (!win) return;
+
+    anchor = resolve_window_presentation_parent_handle( win->handle, &reason );
+    reply->reason = reason;
+
+    if (!anchor || !anchor->presentation)
+    {
+        reply->parent     = 0;
+        reply->protocol   = PRESENTATION_PROTOCOL_NONE;
+        reply->generation = 0;
+        return;
+    }
+
+    reply->parent     = anchor->handle;
+    reply->protocol   = anchor->presentation->protocol;
+    reply->generation = anchor->presentation->generation;
+
+    /* Copy the parent's opaque token into the reply VARARG. If the
+     * client's reply buffer is too small the call still succeeds
+     * with a partial token - clients are expected to size their
+     * buffer with get_reply_max_size beforehand. */
+    if (anchor->presentation->token_len)
+    {
+        data_size_t copy = min( anchor->presentation->token_len,
+                                get_reply_max_size() );
+        if (copy) set_reply_data( anchor->presentation->token, copy );
+    }
 }
