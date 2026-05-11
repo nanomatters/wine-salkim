@@ -1128,7 +1128,7 @@ static void start_thread( struct thread_data *data )
 
     teb_data->syscall_table = KeServiceDescriptorTable;
     teb_data->syscall_trace = TRACE_ON(syscall);
-    server_init_thread( data->start, &suspend );
+    server_init_thread( data, &suspend );
     signal_start_thread( data->start, data->param, suspend, data->teb );
 }
 
@@ -1511,7 +1511,7 @@ static void start_system_thread( struct thread_data *data )
     data->pthread_id = pthread_self();
     data->system_thread = TRUE;
     pthread_setspecific( thread_data_key, data );
-    server_init_thread( NULL, &suspend );
+    server_init_thread( data, &suspend );
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
     ((PRTL_THREAD_START_ROUTINE)data->start)( data->param );
     PsTerminateSystemThread( 0 );
