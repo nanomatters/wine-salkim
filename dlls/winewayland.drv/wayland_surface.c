@@ -1093,7 +1093,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         /* Drop the inbound import: its destroyed event may otherwise
          * fire during teardown and re-enter a partially destroyed
-         * surface. */
+         * surface.  Symmetric with mark_surface_presentation_orphan:
+         * if this surface was waiting for a retry, clear its orphan
+         * bookkeeping before tearing the import down, so the global
+         * presentation_orphan_count stays balanced and the retry
+         * thread doesn't keep polling a destroyed surface. */
+        clear_surface_presentation_orphan(surface);
         if (surface->zxdg_imported_v2)
         {
             zxdg_imported_v2_destroy(surface->zxdg_imported_v2);
