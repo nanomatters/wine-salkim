@@ -64,7 +64,6 @@ struct presentation_export
     unsigned int   protocol;       /* PRESENTATION_PROTOCOL_* */
     unsigned int   token_len;      /* byte length of token */
     unsigned int   generation;     /* monotonic, bumped on any state change */
-    unsigned int   owner_pid;      /* pid that published */
     char          *token;          /* opaque bytes (mem_alloc'd); may contain NULs */
 };
 
@@ -3542,7 +3541,6 @@ DECL_HANDLER(set_window_presentation)
     exp->token      = token_copy;
     exp->token_len  = token_size;
     exp->generation = prev ? prev->generation : 0;
-    exp->owner_pid  = (current && current->process) ? get_process_id( current->process ) : 0;
     win->presentation = exp;
 
     if (prev)
