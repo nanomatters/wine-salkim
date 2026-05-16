@@ -66,12 +66,13 @@
 #define HASH_CHUNK_SIZE (8 * 1024 * 1024) /* 8 MB. */
 #define HASH_STRIDE     (HASH_CHUNK_SIZE * 6)
 
-#define VIDEO_CONV_FOZ_TAG_VIDEODATA 0
-#define VIDEO_CONV_FOZ_TAG_OGVDATA   1
-#define VIDEO_CONV_FOZ_TAG_STREAM    2
-#define VIDEO_CONV_FOZ_TAG_MKVDATA   3
-#define VIDEO_CONV_FOZ_TAG_CODEC     4
-#define VIDEO_CONV_FOZ_NUM_TAGS      5
+#define VIDEO_CONV_FOZ_TAG_VIDEODATA        0
+#define VIDEO_CONV_FOZ_TAG_OGVDATA          1
+#define VIDEO_CONV_FOZ_TAG_STREAM           2
+#define VIDEO_CONV_FOZ_TAG_MKVDATA          3
+#define VIDEO_CONV_FOZ_TAG_CODEC            4
+#define VIDEO_CONV_FOZ_TAG_ORIGINAL_ENTRIES 5
+#define VIDEO_CONV_FOZ_NUM_TAGS             6
 
 #define DURATION_NONE (UINT64_MAX)
 
@@ -124,6 +125,16 @@ typedef struct
 {
     GstElementClass class;
 } VideoConvClass;
+
+#define SHA1_DIGEST_LENGTH 20
+
+typedef struct
+{
+    uint32_t tag;
+    struct fozdb_hash hash;
+    uint8_t sha1[SHA1_DIGEST_LENGTH];
+} original_entries_slot;
+C_ASSERT(sizeof(original_entries_slot) == 40);
 
 G_DEFINE_TYPE(VideoConv, video_conv, GST_TYPE_ELEMENT);
 #define VIDEO_CONV_TYPE (video_conv_get_type())
@@ -391,6 +402,77 @@ static void video_conv_state_release(struct video_conv_state *state)
     free(state);
 }
 
+static void mark_transcoded_stream(struct fozdb *fozdb, struct fozdb_hash *hash)
+{
+    struct fozdb *played_fozdb;
+    uint32_t original_size;
+    size_t read_size;
+    char *played_filename;
+    char *transcoded_file;
+    char *ptr;
+    size_t len;
+    uint8_t *slots;
+
+    if (fozdb_entry_size(fozdb, VIDEO_CONV_FOZ_TAG_ORIGINAL_ENTRIES, hash, &original_size) != CONV_OK)
+    {
+        GST_TRACE("No original entries stream found. Not dumping played chunks.\n");
+        return;
+    }
+    if (!original_size || (original_size % sizeof(original_entries_slot)))
+    {
+        GST_TRACE("Unexpected orginal entries stream size %d.\n", original_size);
+        return;
+    }
+    /* FIXME until we get a proper output file name,
+     * store played_chunks.foz in same directory as MEDIACONV_VIDEO_TRANSCODED_FILE
+     */
+    if (!(transcoded_file = getenv("MEDIACONV_VIDEO_TRANSCODED_FILE")))
+    {
+        GST_DEBUG("No transcoded filename, aborting\n");
+        return;
+    }
+    ptr = strrchr(transcoded_file, '/');
+    len = ptr ? ptr + 1 - transcoded_file : 0;
+    if (!(played_filename = malloc(len + strlen("played_chunks.foz") + 1)))
+    {
+        GST_DEBUG("OOM\n");
+        return;
+    }
+    if (len) memcpy(played_filename, transcoded_file, len);
+    strcpy(played_filename + len, "played_chunks.foz");
+
+    GST_TRACE("Writing played chunks into %s\n", played_filename);
+    /* ensure file exists */
+    if (create_file(played_filename) != CONV_OK ||
+        fozdb_create(played_filename, O_RDWR, false, VIDEO_CONV_FOZ_NUM_TAGS, &played_fozdb) != CONV_OK)
+    {
+        GST_ERROR("Couldn't create or open %s fozdb\n", played_filename);
+        return;
+    }
+
+    slots = malloc(original_size);
+    if (slots &&
+        fozdb_read_entry_data(fozdb, VIDEO_CONV_FOZ_TAG_ORIGINAL_ENTRIES, hash, 0,
+                              slots, original_size, &read_size, false) == CONV_OK &&
+        original_size == read_size)
+    {
+        original_entries_slot *slot;
+        original_entries_slot *last_slot = (void *)(slots + original_size);
+
+        for (slot = (void *)slots; slot < last_slot; slot++)
+        {
+            if (!fozdb_has_entry(played_fozdb, slot->tag, &slot->hash))
+            {
+                struct bytes_reader bytes_reader;
+                bytes_reader_init(&bytes_reader, slot->sha1, SHA1_DIGEST_LENGTH);
+                fozdb_write_entry(played_fozdb, slot->tag, &slot->hash, &bytes_reader, bytes_reader_read, true);
+            }
+        }
+    }
+    free(slots);
+    fozdb_release(played_fozdb);
+}
+
 /* Return true if the file is transcoded, false if not. */
 bool video_conv_state_begin_transcode(struct video_conv_state *state, struct fozdb_hash *hash)
 {
@@ -408,6 +490,7 @@ bool video_conv_state_begin_transcode(struct video_conv_state *state, struct foz
             state->our_duration = entry_size;
             state->transcoded_tag = VIDEO_CONV_FOZ_TAG_MKVDATA;
             state->state_flags |= VIDEO_CONV_HAS_TRANSCODED;
+            mark_transcoded_stream(state->read_fozdb, hash);
             return true;
         }
 
@@ -417,6 +500,7 @@ bool video_conv_state_begin_transcode(struct video_conv_state *state, struct foz
             state->our_duration = entry_size;
             state->transcoded_tag = VIDEO_CONV_FOZ_TAG_OGVDATA;
             state->state_flags |= VIDEO_CONV_HAS_TRANSCODED;
+            mark_transcoded_stream(state->read_fozdb, hash);
             return true;
         }
     }
@@ -468,9 +552,9 @@ int video_conv_state_fill_buffer(struct video_conv_state *state, uint64_t offset
 static struct video_conv_state *video_conv_lock_state(VideoConv *conv)
 {
     pthread_mutex_lock(&conv->state_mutex);
-    if (!conv->state)
-        pthread_mutex_unlock(&conv->state_mutex);
-    return conv->state;
+    if (conv->state) return conv->state;
+    pthread_mutex_unlock(&conv->state_mutex);
+    return NULL;
 }
 
 static GstStateChangeReturn video_conv_change_state(GstElement *element, GstStateChange transition)
@@ -1276,79 +1360,60 @@ static void video_conv_init(VideoConv *conv)
     conv->active_mode = GST_PAD_MODE_NONE;
 }
 
-static bool codec_info_to_wg_format(char *codec_info, struct wg_format *codec_format)
+static bool codec_stamp_to_wg_format(unsigned int stamp, struct wg_format *codec_format)
 {
-    char *codec_name = codec_info;
-
-    /* Get codec name. */
-    while (*codec_info && *codec_info != ' ')
-        ++codec_info;
-    *(codec_info++) = 0;
-
-    /* FIXME: Get width, height, fps etc. from codec info string. */
-    if (strcmp(codec_name, "cinepak") == 0)
+    switch (stamp)
     {
+    case 0x7d:
         codec_format->major_type = WG_MAJOR_TYPE_VIDEO_CINEPAK;
-    }
-    else if (strcmp(codec_name, "h264") == 0)
-    {
+        break;
+    case 0xc7:
         codec_format->major_type = WG_MAJOR_TYPE_VIDEO_H264;
-    }
-    else if (strcmp(codec_name, "wmv1") == 0)
-    {
+        break;
+    case 0x1ec:
         codec_format->major_type = WG_MAJOR_TYPE_VIDEO_WMV;
         codec_format->u.video.format = WG_VIDEO_FORMAT_WMV1;
-    }
-    else if (strcmp(codec_name, "wmv2") == 0)
-    {
+        break;
+    case 0x1ed:
         codec_format->major_type = WG_MAJOR_TYPE_VIDEO_WMV;
         codec_format->u.video.format = WG_VIDEO_FORMAT_WMV2;
-    }
-    else if (strcmp(codec_name, "wmv3") == 0)
-    {
+        break;
+    case 0x1ee:
         codec_format->major_type = WG_MAJOR_TYPE_VIDEO_WMV;
         codec_format->u.video.format = WG_VIDEO_FORMAT_WMV3;
-    }
-    else if  (strcmp(codec_name, "vc1") == 0)
-    {
+        break;
+    case 0x1c8:
         codec_format->major_type = WG_MAJOR_TYPE_VIDEO_WMV;
         codec_format->u.video.format = WG_VIDEO_FORMAT_WVC1;
-    }
-    else if  (strcmp(codec_name, "wmav1") == 0)
-    {
+        break;
+    case 0x1e9:
         codec_format->major_type = WG_MAJOR_TYPE_AUDIO_WMA;
         codec_format->u.audio.version = 1;
-    }
-    else if  (strcmp(codec_name, "wmav2") == 0)
-    {
+        break;
+    case 0x1ea:
         codec_format->major_type = WG_MAJOR_TYPE_AUDIO_WMA;
         codec_format->u.audio.version = 2;
-    }
-    else if  (strcmp(codec_name, "wmapro") == 0)
-    {
+        break;
+    case 0x1e8:
         codec_format->major_type = WG_MAJOR_TYPE_AUDIO_WMA;
         codec_format->u.audio.version = 3;
-    }
-    else if  (strcmp(codec_name, "wmalossless") == 0)
-    {
+        break;
+    case 0x1e7:
         codec_format->major_type = WG_MAJOR_TYPE_AUDIO_WMA;
         codec_format->u.audio.version = 4;
-    }
-    else if  (strcmp(codec_name, "xma1") == 0)
-    {
+        break;
+    case 0x1f9:
         codec_format->major_type = WG_MAJOR_TYPE_AUDIO_WMA;
         codec_format->u.audio.version = 1;
         codec_format->u.audio.is_xma = true;
-    }
-    else if  (strcmp(codec_name, "xma2") == 0)
-    {
+        break;
+    case 0x1fa:
         codec_format->major_type = WG_MAJOR_TYPE_AUDIO_WMA;
         codec_format->u.audio.version = 2;
         codec_format->u.audio.is_xma = true;
-    }
-    else
-    {
-        GST_FIXME("Unsupported codec name: %s.\n", codec_name);
+        break;
+    default:
+        GST_FIXME("Unsupported codec stamp: %u.\n", stamp);
         return false;
     }
 
@@ -1388,7 +1453,7 @@ bool get_untranscoded_stream_format(GstElement *container, uint32_t stream_index
 {
     struct video_conv_state *state;
     uint8_t *buffer = NULL;
-    uint32_t entry_size, i;
+    uint32_t entry_size;
     char *codec_info;
     size_t read_size;
     bool ret = false;
@@ -1412,26 +1477,36 @@ bool get_untranscoded_stream_format(GstElement *container, uint32_t stream_index
         goto done;
     }
 
-    buffer = calloc(1, entry_size + 1);
+    if (!(buffer = calloc(1, entry_size + 1)))
+    {
+        GST_ERROR("Failed to allocate memory.");
+        goto done;
+    }
     if ((conv_ret = fozdb_read_entry_data(state->read_fozdb, VIDEO_CONV_FOZ_TAG_CODEC, &state->transcode_hash, 0,
             buffer, entry_size, &read_size, false)) < 0)
     {
-        GST_ERROR("Failed to read codec info, ret %d.", ret);
+        GST_ERROR("Failed to read codec info, ret %d.", conv_ret);
         goto done;
     }
 
     /* Get stream codec info line by line. */
-    codec_info = strtok((char *)buffer, "\n");
-    for (i = 0; codec_info && i < stream_index; ++i)
-        codec_info = strtok(NULL, "\n");
+    for (codec_info = (char *)buffer; codec_info < (char *)buffer + entry_size && !ret; )
+    {
+        unsigned int idx, from, stamp;
+        char *end = strchr(codec_info, '\n');
 
-    GST_INFO("Got codec info \"%s\" for stream %d.\n", codec_info, stream_index);
-
-   ret = codec_info_to_wg_format(codec_info, codec_format);
+        if (sscanf(codec_info, "Stream %u: from=%u stamp=%x", &idx, &from, &stamp) == 3 && idx == stream_index)
+        {
+            GST_INFO("Got codec info \"%.*s\" for stream %u => from=%u stamp=%x.\n",
+                     (unsigned)(end ? (end - codec_info) : strlen(codec_info)), codec_info, stream_index, from, stamp);
+            ret = codec_stamp_to_wg_format(stamp, codec_format);
+        }
+        codec_info = end ? end + 1 : codec_info + strlen(codec_info);
+    }
 
 done:
-    if (buffer)
-        free(buffer);
+    free(buffer);
     pthread_mutex_unlock(&conv->state_mutex);
+
     return ret;
 }
