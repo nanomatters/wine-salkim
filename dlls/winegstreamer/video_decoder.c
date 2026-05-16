@@ -109,6 +109,7 @@ struct video_decoder
     IMFVideoSampleAllocatorEx *allocator;
     BOOL allocator_initialized;
     IMFTransform *copier;
+    BOOL copier_initialized;
     IMFMediaBuffer *temp_buffer;
 
     DMO_MEDIA_TYPE dmo_input_type;
@@ -446,6 +447,22 @@ done:
     return hr;
 }
 
+static HRESULT init_copier(struct video_decoder *decoder)
+{
+    HRESULT hr;
+
+    if (decoder->copier_initialized)
+        return S_OK;
+
+    if (FAILED(hr = IMFTransform_SetInputType(decoder->copier, 0, decoder->output_type, 0)))
+        return hr;
+    if (FAILED(hr = IMFTransform_SetOutputType(decoder->copier, 0, decoder->output_type, 0)))
+        return hr;
+
+    decoder->copier_initialized = TRUE;
+    return S_OK;
+}
+
 static HRESULT init_allocator(struct video_decoder *decoder)
 {
     HRESULT hr;
@@ -453,9 +470,7 @@ static HRESULT init_allocator(struct video_decoder *decoder)
     if (decoder->allocator_initialized)
         return S_OK;
 
-    if (FAILED(hr = IMFTransform_SetInputType(decoder->copier, 0, decoder->output_type, 0)))
-        return hr;
-    if (FAILED(hr = IMFTransform_SetOutputType(decoder->copier, 0, decoder->output_type, 0)))
+    if (FAILED(hr = init_copier(decoder)))
         return hr;
 
     if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 10,
@@ -469,6 +484,56 @@ static void uninit_allocator(struct video_decoder *decoder)
 {
     IMFVideoSampleAllocatorEx_UninitializeSampleAllocator(decoder->allocator);
     decoder->allocator_initialized = FALSE;
+    decoder->copier_initialized = FALSE;
+}
+
+static BOOL decoder_output_is_non_dxgi(struct video_decoder *decoder)
+{
+    GUID subtype;
+
+    if (!decoder->output_type)
+        return FALSE;
+    if (!(decoder->output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES))
+        return FALSE;
+    if (FAILED(IMFMediaType_GetGUID(decoder->output_type, &MF_MT_SUBTYPE, &subtype)))
+        return FALSE;
+
+    return IsEqualGUID(&subtype, &MFVideoFormat_YV12)
+            || IsEqualGUID(&subtype, &MFVideoFormat_IYUV)
+            || IsEqualGUID(&subtype, &MFVideoFormat_I420);
+}
+
+static HRESULT decoder_allocate_sysmem_sample(struct video_decoder *decoder, IMFSample **ret)
+{
+    IMFMediaBuffer *buffer = NULL;
+    IMFSample *sample = NULL;
+    UINT64 frame_size;
+    GUID subtype;
+    DWORD fourcc;
+    HRESULT hr;
+
+    if (FAILED(hr = IMFMediaType_GetGUID(decoder->output_type, &MF_MT_SUBTYPE, &subtype)))
+        return hr;
+    if (FAILED(hr = IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_SIZE, &frame_size)))
+        return hr;
+    if (!(fourcc = get_subtype_compression(&subtype)))
+        return MF_E_INVALIDMEDIATYPE;
+
+    if (FAILED(hr = MFCreateSample(&sample)))
+        return hr;
+    if (FAILED(hr = MFCreate2DMediaBuffer(frame_size >> 32, (UINT32)frame_size, fourcc, FALSE, &buffer)))
+        goto done;
+    hr = IMFSample_AddBuffer(sample, buffer);
+
+done:
+    if (buffer) IMFMediaBuffer_Release(buffer);
+    if (FAILED(hr) && sample)
+    {
+        IMFSample_Release(sample);
+        sample = NULL;
+    }
+    *ret = sample;
+    return hr;
 }
 
 static HRESULT WINAPI transform_QueryInterface(IMFTransform *iface, REFIID iid, void **out)
@@ -860,6 +925,8 @@ static HRESULT WINAPI transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_
         return S_OK;
 
     case MFT_MESSAGE_COMMAND_DRAIN:
+        if (decoder->output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)
+            return S_OK;
         return decoder->wg_transform ? wg_transform_drain(decoder->wg_transform) : MF_E_TRANSFORM_TYPE_NOT_SET;
 
     case MFT_MESSAGE_COMMAND_FLUSH:
@@ -900,13 +967,23 @@ static HRESULT output_sample(struct video_decoder *decoder, IMFSample **out, IMF
     DWORD status;
     HRESULT hr;
 
-    if (FAILED(hr = init_allocator(decoder)))
+    if (decoder_output_is_non_dxgi(decoder))
     {
-        ERR("Failed to initialize allocator, hr %#lx.\n", hr);
-        return hr;
+        if (FAILED(hr = init_copier(decoder)))
+            return hr;
+        if (FAILED(hr = decoder_allocate_sysmem_sample(decoder, &sample)))
+            return hr;
     }
-    if (FAILED(hr = IMFVideoSampleAllocatorEx_AllocateSample(decoder->allocator, &sample)))
-        return hr;
+    else
+    {
+        if (FAILED(hr = init_allocator(decoder)))
+        {
+            ERR("Failed to initialize allocator, hr %#lx.\n", hr);
+            return hr;
+        }
+        if (FAILED(hr = IMFVideoSampleAllocatorEx_AllocateSample(decoder->allocator, &sample)))
+            return hr;
+    }
 
     if (FAILED(hr = IMFTransform_ProcessInput(decoder->copier, 0, src_sample, 0)))
     {
