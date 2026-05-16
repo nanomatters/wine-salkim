@@ -34,6 +34,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
+/* Forward declarations: the xdg_toplevel_handle_configure handler
+ * applies any pending parent that was queued before the role was
+ * ready, but the apply helpers themselves are defined further down
+ * with the rest of the import code. */
+static BOOL apply_local_parent(struct wayland_surface *surface, HWND parent_hwnd);
+static void apply_imported_parent(struct wayland_surface *surface);
+static void mark_surface_presentation_orphan(struct wayland_surface *surface);
+static void clear_surface_presentation_orphan(struct wayland_surface *surface);
+
 static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
                                          uint32_t serial)
 {
@@ -131,6 +140,34 @@ static void xdg_toplevel_handle_configure(void *private,
         surface->pending.width = width;
         surface->pending.height = height;
         surface->pending.state = config_state;
+
+        /* Role guard: a parent assignment that arrived before the
+         * xdg_toplevel role was ready was queued in pending_parent_apply.
+         * The role is now live, so apply. For same-process, the parent
+         * might still not be ready - keep the queued state so the retry
+         * thread / next configure tries again. For cross-process the
+         * imported handle is always usable here. */
+        if (surface->pending_parent_apply)
+        {
+            BOOL applied = TRUE;
+            if (surface->pending_local_parent_hwnd)
+                applied = apply_local_parent(surface,
+                                             surface->pending_local_parent_hwnd);
+            else if (surface->zxdg_imported_v2)
+                apply_imported_parent(surface);
+            if (applied)
+            {
+                surface->pending_parent_apply = FALSE;
+                surface->pending_local_parent_hwnd = 0;
+            }
+        }
+
+        /* A configure arriving while no_current_parent is set is a
+         * free opportunistic rediscovery - the compositor is
+         * progressing this surface, so it's a good moment to ask the
+         * broker again. Bridges any gap before the 250ms retry tick. */
+        if (surface->no_current_parent)
+            wayland_surface_apply_presentation_parent(surface);
     }
 
     wayland_win_data_release(data);
@@ -203,6 +240,427 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener =
     xdg_toplevel_handle_configure_bounds,
     xdg_toplevel_handle_wm_caps
 };
+
+/* MAX_PRESENTATION_IMPORT_ATTEMPTS lives in waylanddrv.h so window.c
+ * can read it from the snapshot helper. With ~250ms retry ticks the
+ * 5-attempt cap covers ~1.25s - long enough to ride out the us-ms
+ * transient where the compositor hasn't yet processed the exporter's
+ * publication. Reset on every broker generation change so a
+ * legitimate state change earns a fresh batch of retries. */
+
+/* Adjust process_wayland.presentation_orphan_count on flag transitions
+ * and signal the retry thread to wake (no-op if it's already
+ * scheduled). Caller holds the surface's wayland_win_data lock. */
+static void mark_surface_presentation_orphan(struct wayland_surface *surface)
+{
+    if (surface->no_current_parent) return;
+    surface->no_current_parent = TRUE;
+    /* Force the next apply_presentation_parent to re-query the
+     * broker rather than short-circuit on cached generation. */
+    surface->presentation_generation = 0;
+    pthread_mutex_lock(&process_wayland.presentation_retry_mutex);
+    process_wayland.presentation_orphan_count++;
+    pthread_cond_signal(&process_wayland.presentation_retry_cond);
+    pthread_mutex_unlock(&process_wayland.presentation_retry_mutex);
+}
+
+static void clear_surface_presentation_orphan(struct wayland_surface *surface)
+{
+    if (!surface->no_current_parent) return;
+    surface->no_current_parent = FALSE;
+    pthread_mutex_lock(&process_wayland.presentation_retry_mutex);
+    if (process_wayland.presentation_orphan_count)
+        process_wayland.presentation_orphan_count--;
+    pthread_mutex_unlock(&process_wayland.presentation_retry_mutex);
+}
+
+/**********************************************************************
+ *          xdg-foreign-v2 import side
+ *
+ * The destroyed event fires when the exporter clears its export, the
+ * exporter exits, or the compositor rejected our import (transient
+ * timing). We mark the surface as orphaned and let the retry thread
+ * (presentation_retry_thread_func) decide whether to keep trying,
+ * based on whether the broker still advertises a parent and whether
+ * parent_import_attempts is still below the cap. */
+static void xdg_imported_v2_handle_destroyed(void *data,
+                                             struct zxdg_imported_v2 *imported)
+{
+    HWND hwnd = data;
+    struct wayland_win_data *win_data;
+    struct wayland_surface *surface;
+
+    TRACE("hwnd=%p\n", hwnd);
+
+    if (!(win_data = wayland_win_data_get(hwnd))) return;
+    if ((surface = win_data->wayland_surface) &&
+        wayland_surface_is_toplevel(surface) &&
+        surface->zxdg_imported_v2 == imported)
+    {
+        zxdg_imported_v2_destroy(surface->zxdg_imported_v2);
+        surface->zxdg_imported_v2 = NULL;
+        mark_surface_presentation_orphan(surface);
+    }
+    wayland_win_data_release(win_data);
+}
+
+static const struct zxdg_imported_v2_listener xdg_imported_v2_listener =
+{
+    xdg_imported_v2_handle_destroyed,
+};
+
+/* Look up another HWND's wayland_surface for the same-process parent
+ * shortcut. The caller already holds the child's wayland_win_data
+ * lock; using the _nolock helper avoids re-locking the same data. */
+static struct wayland_surface *get_local_toplevel_surface(HWND hwnd)
+{
+    struct wayland_win_data *peer_data;
+    struct wayland_surface *peer_surface;
+
+    if (!hwnd) return NULL;
+    if (!(peer_data = wayland_win_data_get_nolock(hwnd))) return NULL;
+    peer_surface = peer_data->wayland_surface;
+    if (peer_surface && wayland_surface_is_toplevel(peer_surface) &&
+        peer_surface->xdg_toplevel)
+        return peer_surface;
+    return NULL;
+}
+
+/* Apply a same-process parent: both child and parent xdg_toplevels
+ * are local objects, so xdg_toplevel_set_parent suffices - no
+ * xdg-foreign roundtrip. Returns TRUE on success; FALSE if the
+ * parent isn't ready yet (caller queues a retry). */
+static BOOL apply_local_parent(struct wayland_surface *surface, HWND parent_hwnd)
+{
+    struct wayland_surface *parent = get_local_toplevel_surface(parent_hwnd);
+
+    if (!parent)
+    {
+        TRACE("parent hwnd=%p has no toplevel surface yet, will retry\n", parent_hwnd);
+        return FALSE;
+    }
+    xdg_toplevel_set_parent(surface->xdg_toplevel, parent->xdg_toplevel);
+    TRACE("set local parent: child hwnd=%p parent hwnd=%p\n",
+          surface->hwnd, parent_hwnd);
+    return TRUE;
+}
+
+/* Apply a cross-process parent via xdg-foreign-v2: zxdg_imported_v2
+ * has already been imported by the caller; this just calls
+ * set_parent_of with the child's wl_surface. */
+static void apply_imported_parent(struct wayland_surface *surface)
+{
+    zxdg_imported_v2_set_parent_of(surface->zxdg_imported_v2, surface->wl_surface);
+    TRACE("set foreign parent on hwnd=%p via imported=%p\n",
+          surface->hwnd, surface->zxdg_imported_v2);
+}
+
+/**********************************************************************
+ *          wayland_surface_apply_presentation_parent
+ *
+ * Queries the wineserver for this surface's resolved presentation
+ * parent, then applies xdg_toplevel.set_parent (locally for same-
+ * process, via xdg-foreign-v2 import for cross-process). Idempotent:
+ * if the cached generation matches the server's current generation,
+ * returns without re-querying.
+ *
+ * Caller must hold the surface's wayland_win_data lock.
+ */
+void wayland_surface_apply_presentation_parent(struct wayland_surface *surface)
+{
+    HWND parent_hwnd = 0;
+    unsigned int reason = 0, protocol = 0, generation = 0;
+    char token[4096];
+    data_size_t token_len = 0;
+
+    if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return;
+
+    SERVER_START_REQ(get_window_presentation_parent)
+    {
+        req->handle = wine_server_user_handle(surface->hwnd);
+        wine_server_set_reply(req, token, sizeof(token));
+        if (!wine_server_call(req))
+        {
+            parent_hwnd = wine_server_ptr_handle(reply->parent);
+            protocol   = reply->protocol;
+            reason     = reply->reason;
+            generation = reply->generation;
+            token_len  = wine_server_reply_size(reply);
+        }
+    }
+    SERVER_END_REQ;
+
+    /* Idempotency: nothing to do if state hasn't changed since our last
+     * apply. The presentation_generation==0 case forces a refresh,
+     * which is what destroyed-listener resets do. */
+    if (generation && generation == surface->presentation_generation) return;
+    /* Generation moved - broker has new state for this window, so
+     * retry attempts from prior generations no longer apply. */
+    if (generation != surface->presentation_generation)
+        surface->parent_import_attempts = 0;
+    surface->presentation_generation = generation;
+
+    /* No anchor - drop any prior import. The broker has confirmed
+     * there's nothing to find, so the surface is no longer an orphan
+     * (we're correctly unparented). */
+    if (!parent_hwnd || protocol == PRESENTATION_PROTOCOL_NONE)
+    {
+        if (surface->zxdg_imported_v2)
+        {
+            zxdg_imported_v2_destroy(surface->zxdg_imported_v2);
+            surface->zxdg_imported_v2 = NULL;
+        }
+        clear_surface_presentation_orphan(surface);
+        TRACE("hwnd=%p has no presentation anchor (reason=%#x)\n",
+              surface->hwnd, reason);
+        return;
+    }
+
+    /* Same-process shortcut: the parent's xdg_toplevel is local, so
+     * skip xdg-foreign entirely. */
+    if (reason & PRESENTATION_REASON_SAME_PROCESS)
+    {
+        if (surface->zxdg_imported_v2)
+        {
+            zxdg_imported_v2_destroy(surface->zxdg_imported_v2);
+            surface->zxdg_imported_v2 = NULL;
+        }
+        if (!surface->xdg_toplevel)
+        {
+            surface->pending_parent_apply = TRUE;
+            surface->pending_local_parent_hwnd = parent_hwnd;
+            return;
+        }
+        if (apply_local_parent(surface, parent_hwnd))
+        {
+            surface->pending_parent_apply = FALSE;
+            surface->pending_local_parent_hwnd = 0;
+            clear_surface_presentation_orphan(surface);
+        }
+        else
+        {
+            /* Parent's xdg_toplevel isn't ready yet. Queue and let
+             * the retry thread (or the next configure) try again
+             * once the parent finishes its role assignment. */
+            surface->pending_parent_apply = TRUE;
+            surface->pending_local_parent_hwnd = parent_hwnd;
+            mark_surface_presentation_orphan(surface);
+        }
+        return;
+    }
+
+    /* Cross-process: import the foreign handle. */
+    if (!process_wayland.zxdg_importer_v2 || !token_len)
+    {
+        TRACE("hwnd=%p: no importer or empty token, skipping import\n",
+              surface->hwnd);
+        return;
+    }
+
+    /* Bounded retry: the retry thread polls every ~250ms while
+     * no_current_parent is set, but we cap attempts so a permanently
+     * broken handshake doesn't spin forever. The cap resets when the
+     * broker's generation changes. */
+    if (surface->parent_import_attempts >= MAX_PRESENTATION_IMPORT_ATTEMPTS)
+    {
+        WARN("hwnd=%p: cross-process import gave up after %u attempts; "
+             "waiting for broker generation change\n",
+             surface->hwnd, surface->parent_import_attempts);
+        clear_surface_presentation_orphan(surface);
+        return;
+    }
+    surface->parent_import_attempts++;
+
+    /* Drop any prior import before replacing. */
+    if (surface->zxdg_imported_v2)
+    {
+        zxdg_imported_v2_destroy(surface->zxdg_imported_v2);
+        surface->zxdg_imported_v2 = NULL;
+    }
+
+    /* The token isn't NUL-terminated on the wire (it's VARARG bytes);
+     * import_toplevel takes a const char* expected to be a C string,
+     * so terminate locally before the call. */
+    if (token_len >= sizeof(token)) token_len = sizeof(token) - 1;
+    token[token_len] = '\0';
+
+    surface->zxdg_imported_v2 =
+        zxdg_importer_v2_import_toplevel(process_wayland.zxdg_importer_v2, token);
+    if (!surface->zxdg_imported_v2)
+    {
+        ERR("zxdg_importer_v2_import_toplevel failed for hwnd=%p\n",
+            surface->hwnd);
+        mark_surface_presentation_orphan(surface);
+        return;
+    }
+    zxdg_imported_v2_add_listener(surface->zxdg_imported_v2,
+                                  &xdg_imported_v2_listener,
+                                  surface->hwnd);
+
+    /* Role guard: defer set_parent_of if our own xdg_toplevel isn't
+     * ready yet. */
+    if (!surface->xdg_toplevel)
+    {
+        surface->pending_parent_apply = TRUE;
+        surface->pending_local_parent_hwnd = 0;
+        return;
+    }
+    apply_imported_parent(surface);
+    surface->pending_parent_apply = FALSE;
+    /* Note: we don't clear_surface_presentation_orphan here yet - the
+     * import handshake is still in flight. The compositor either
+     * accepts (silence) or rejects (destroyed event); the latter
+     * will re-mark the orphan, the former leaves it cleared on the
+     * next successful apply when generation matches. We clear
+     * defensively only after the destroyed window has passed without
+     * firing, which we approximate by clearing on the same-process
+     * path (that's synchronous) and on NO_ANCHOR. For cross-process
+     * a successful import is observed indirectly: parent_import_attempts
+     * stops growing because subsequent apply_presentation_parent
+     * short-circuits on matching generation. */
+    clear_surface_presentation_orphan(surface);
+}
+
+/**********************************************************************
+ *          presentation_retry_thread_func
+ *
+ * Retry-and-rediscovery worker. Sleeps on the presentation_retry_cond;
+ * wakes either on a 250 ms timeout (while presentation_orphan_count
+ * > 0) or on demand from mark_surface_presentation_orphan.
+ *
+ * On each wake:
+ *   1. Snapshot HWNDs of all toplevel surfaces flagged
+ *      no_current_parent (under the win_data lock).
+ *   2. Drop the lock and, for each HWND, re-acquire its per-window
+ *      lock and call wayland_surface_apply_presentation_parent.
+ *      apply_presentation_parent decides what to do:
+ *        - NO_ANCHOR -> clear orphan, stop chasing.
+ *        - SAME_PROCESS or cross-process within retry cap -> re-import.
+ *        - retry cap exceeded -> clear orphan, log warning, give up
+ *          until generation changes.
+ *
+ * The two-phase walk avoids holding the global win_data lock while
+ * blocked on the wineserver round-trip in apply_presentation_parent.
+ */
+static void *presentation_retry_thread_func(void *arg)
+{
+    HWND orphans[64];
+    unsigned int count, i;
+    struct timespec deadline;
+    struct wayland_win_data *data;
+
+    while (TRUE)
+    {
+        pthread_mutex_lock(&process_wayland.presentation_retry_mutex);
+
+        /* Sleep indefinitely when there's nothing to chase; this
+         * keeps the thread completely idle for the common case
+         * where every surface has a parent. */
+        while (!process_wayland.presentation_retry_quit &&
+               process_wayland.presentation_orphan_count == 0)
+        {
+            pthread_cond_wait(&process_wayland.presentation_retry_cond,
+                              &process_wayland.presentation_retry_mutex);
+        }
+
+        if (process_wayland.presentation_retry_quit)
+        {
+            pthread_mutex_unlock(&process_wayland.presentation_retry_mutex);
+            break;
+        }
+
+        /* Wake every 250 ms while orphans exist. */
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_nsec += 250 * 1000 * 1000;
+        if (deadline.tv_nsec >= 1000 * 1000 * 1000)
+        {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000 * 1000 * 1000;
+        }
+        pthread_cond_timedwait(&process_wayland.presentation_retry_cond,
+                               &process_wayland.presentation_retry_mutex,
+                               &deadline);
+
+        if (process_wayland.presentation_retry_quit)
+        {
+            pthread_mutex_unlock(&process_wayland.presentation_retry_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&process_wayland.presentation_retry_mutex);
+
+        count = wayland_win_data_snapshot_orphans(orphans, ARRAY_SIZE(orphans));
+        for (i = 0; i < count; i++)
+        {
+            if (!(data = wayland_win_data_get(orphans[i]))) continue;
+            if (data->wayland_surface &&
+                data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+                data->wayland_surface->no_current_parent)
+                wayland_surface_apply_presentation_parent(data->wayland_surface);
+            wayland_win_data_release(data);
+        }
+        /* Push pending Wayland writes (set_parent_of, import_toplevel)
+         * since this thread is outside the main dispatch loop. */
+        wl_display_flush(process_wayland.wl_display);
+    }
+    return NULL;
+}
+
+BOOL wayland_presentation_retry_start(void)
+{
+    pthread_condattr_t cond_attr;
+
+    if (process_wayland.presentation_retry_thread_started) return TRUE;
+    if (pthread_mutex_init(&process_wayland.presentation_retry_mutex, NULL) != 0)
+    {
+        ERR("pthread_mutex_init failed\n");
+        return FALSE;
+    }
+    /* Pair the cond with CLOCK_MONOTONIC so pthread_cond_timedwait
+     * interprets the absolute deadline we pass against the same clock
+     * we read from clock_gettime. Default-initialized conds use
+     * CLOCK_REALTIME, which would silently misinterpret our deadlines
+     * (and is sensitive to NTP / manual clock changes). */
+    if (pthread_condattr_init(&cond_attr) != 0)
+    {
+        pthread_mutex_destroy(&process_wayland.presentation_retry_mutex);
+        ERR("pthread_condattr_init failed\n");
+        return FALSE;
+    }
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    if (pthread_cond_init(&process_wayland.presentation_retry_cond, &cond_attr) != 0)
+    {
+        pthread_condattr_destroy(&cond_attr);
+        pthread_mutex_destroy(&process_wayland.presentation_retry_mutex);
+        ERR("pthread_cond_init failed\n");
+        return FALSE;
+    }
+    pthread_condattr_destroy(&cond_attr);
+    if (pthread_create(&process_wayland.presentation_retry_thread, NULL,
+                       presentation_retry_thread_func, NULL) != 0)
+    {
+        pthread_cond_destroy(&process_wayland.presentation_retry_cond);
+        pthread_mutex_destroy(&process_wayland.presentation_retry_mutex);
+        ERR("pthread_create failed for presentation retry thread\n");
+        return FALSE;
+    }
+    process_wayland.presentation_retry_thread_started = TRUE;
+    return TRUE;
+}
+
+void wayland_presentation_retry_stop(void)
+{
+    if (!process_wayland.presentation_retry_thread_started) return;
+    pthread_mutex_lock(&process_wayland.presentation_retry_mutex);
+    process_wayland.presentation_retry_quit = TRUE;
+    pthread_cond_broadcast(&process_wayland.presentation_retry_cond);
+    pthread_mutex_unlock(&process_wayland.presentation_retry_mutex);
+    pthread_join(process_wayland.presentation_retry_thread, NULL);
+    pthread_cond_destroy(&process_wayland.presentation_retry_cond);
+    pthread_mutex_destroy(&process_wayland.presentation_retry_mutex);
+    process_wayland.presentation_retry_thread_started = FALSE;
+}
+
+
 
 void wp_fractional_scale_handle_scale(void* user_data,
                                       struct wp_fractional_scale_v1 *fractional_scale_v1,
@@ -391,6 +849,47 @@ static void wayland_surface_init_decoration(struct wayland_surface *surface)
 }
 
 /**********************************************************************
+ *          xdg-foreign-v2 export listener
+ *
+ * Called by the compositor once the export handle is ready. Ships the
+ * token bytes to the wineserver via set_window_presentation so other
+ * processes querying the broker can import this toplevel as a parent.
+ *
+ * The handle string is NUL-terminated per the xdg-foreign-v2 spec, so
+ * strlen is correct. The server's VARARG(token,bytes) carries the
+ * length explicitly; the wire format is byte-buffer + size, not a C
+ * string, which keeps the protocol open to future binary tokens.
+ */
+static void xdg_exported_v2_handle_handle(void *data,
+                                          struct zxdg_exported_v2 *exported,
+                                          const char *handle)
+{
+    HWND hwnd = data;
+    size_t handle_len = handle ? strlen(handle) : 0;
+
+    if (!handle_len)
+    {
+        ERR("xdg-foreign export delivered an empty handle for hwnd=%p\n", hwnd);
+        return;
+    }
+
+    SERVER_START_REQ(set_window_presentation)
+    {
+        req->handle   = wine_server_user_handle(hwnd);
+        req->protocol = PRESENTATION_PROTOCOL_XDG_FOREIGN_V2;
+        wine_server_add_data(req, handle, handle_len);
+        if (wine_server_call(req))
+            ERR("set_window_presentation failed for hwnd=%p\n", hwnd);
+    }
+    SERVER_END_REQ;
+}
+
+static const struct zxdg_exported_v2_listener xdg_exported_v2_listener =
+{
+    xdg_exported_v2_handle_handle,
+};
+
+/**********************************************************************
  *          wayland_surface_make_toplevel
  *
  * Gives the toplevel role to a plain wayland surface.
@@ -464,6 +963,25 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
     wayland_surface_set_title(surface, text);
 
     wayland_surface_assign_icon(surface);
+
+    /* Export the toplevel via xdg-foreign-v2 so other processes can
+     * import it as a presentation parent. The handle event arrives
+     * asynchronously; the listener publishes the token to wineserver
+     * when it does. If the compositor doesn't expose the global, the
+     * server's default state (no presentation) is the correct
+     * "unexported" indication - no explicit marking needed. */
+    if (process_wayland.zxdg_exporter_v2)
+    {
+        surface->zxdg_exported_v2 =
+            zxdg_exporter_v2_export_toplevel(process_wayland.zxdg_exporter_v2,
+                                             surface->wl_surface);
+        if (surface->zxdg_exported_v2)
+            zxdg_exported_v2_add_listener(surface->zxdg_exported_v2,
+                                          &xdg_exported_v2_listener,
+                                          surface->hwnd);
+        else
+            ERR("Failed to export toplevel via xdg-foreign-v2\n");
+    }
 
     if (process_wayland.wp_fractional_scale_manager_v1)
     {
@@ -573,6 +1091,37 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
         break;
 
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+        /* Drop the inbound import: its destroyed event may otherwise
+         * fire during teardown and re-enter a partially destroyed
+         * surface. */
+        if (surface->zxdg_imported_v2)
+        {
+            zxdg_imported_v2_destroy(surface->zxdg_imported_v2);
+            surface->zxdg_imported_v2 = NULL;
+        }
+        surface->pending_parent_apply = FALSE;
+        surface->pending_local_parent_hwnd = 0;
+        surface->presentation_generation = 0;
+
+        /* Tear the xdg-foreign export down before the xdg_toplevel
+         * itself: the exported handle is bound to the toplevel and
+         * destroying the toplevel without first destroying the
+         * exported can leave the compositor in an undefined state.
+         * Clear the wineserver-side presentation so importers in
+         * other processes re-resolve immediately. */
+        if (surface->zxdg_exported_v2)
+        {
+            zxdg_exported_v2_destroy(surface->zxdg_exported_v2);
+            surface->zxdg_exported_v2 = NULL;
+
+            SERVER_START_REQ(clear_window_presentation)
+            {
+                req->handle = wine_server_user_handle(surface->hwnd);
+                wine_server_call(req);
+            }
+            SERVER_END_REQ;
+        }
+
         if (surface->xdg_toplevel_icon)
         {
             xdg_toplevel_icon_manager_v1_set_icon(

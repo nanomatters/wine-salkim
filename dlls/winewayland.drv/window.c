@@ -151,6 +151,35 @@ void wayland_win_data_release(struct wayland_win_data *data)
     pthread_mutex_unlock(&win_data_mutex);
 }
 
+/***********************************************************************
+ *           wayland_win_data_snapshot_orphans
+ *
+ * Walks the win_data tree and copies up to `max` HWNDs of toplevel
+ * surfaces flagged with no_current_parent into the caller's array.
+ * Returns the count written. Used by the presentation retry thread
+ * to gather candidates for rediscovery without holding the global
+ * tree lock during the per-surface server round-trip.
+ */
+unsigned int wayland_win_data_snapshot_orphans(HWND *out, unsigned int max)
+{
+    struct wayland_win_data *data;
+    unsigned int n = 0;
+
+    pthread_mutex_lock(&win_data_mutex);
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        struct wayland_surface *surface = data->wayland_surface;
+        if (n >= max) break;
+        if (!surface || !wayland_surface_is_toplevel(surface)) continue;
+        if (!surface->no_current_parent) continue;
+        if (surface->parent_import_attempts >= MAX_PRESENTATION_IMPORT_ATTEMPTS)
+            continue;
+        out[n++] = data->hwnd;
+    }
+    pthread_mutex_unlock(&win_data_mutex);
+    return n;
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
@@ -564,6 +593,16 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         wayland_win_data_update_wayland_state(data);
     }
+
+    /* Ask the wineserver who the resolved presentation parent is for
+     * this window and apply xdg_toplevel.set_parent (locally for
+     * same-process, via xdg-foreign-v2 import for cross-process).
+     * The helper is a no-op for surfaces that aren't toplevels. The
+     * deprecated owner_hint argument is no longer consulted - the
+     * server-authoritative answer replaces the previous
+     * WindowFromPoint heuristic. */
+    if (data->wayland_surface)
+        wayland_surface_apply_presentation_parent(data->wayland_surface);
 
     wayland_win_data_release(data);
 }

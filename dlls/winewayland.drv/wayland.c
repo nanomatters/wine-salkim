@@ -267,6 +267,16 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_pointer_warp_v1 =
             wl_registry_bind(registry, id, &wp_pointer_warp_v1_interface, 1);
     }
+    else if (strcmp(interface, "zxdg_exporter_v2") == 0)
+    {
+        process_wayland.zxdg_exporter_v2 =
+            wl_registry_bind(registry, id, &zxdg_exporter_v2_interface, 1);
+    }
+    else if (strcmp(interface, "zxdg_importer_v2") == 0)
+    {
+        process_wayland.zxdg_importer_v2 =
+            wl_registry_bind(registry, id, &zxdg_importer_v2_interface, 1);
+    }
     else if (strcmp(interface, "zwp_keyboard_shortcuts_inhibit_manager_v1") == 0)
     {
         process_wayland.zwp_keyboard_shortcuts_inhibit_manager_v1 =
@@ -420,6 +430,16 @@ BOOL wayland_process_init(void)
 
     if (!process_wayland.xdg_activation_v1)
         ERR("Wayland compositor doesn't support xdg_activation_v1! (Flash Window will not be supported)\n");
+
+    if (!process_wayland.zxdg_exporter_v2 || !process_wayland.zxdg_importer_v2)
+        ERR("Wayland compositor doesn't support xdg-foreign-unstable-v2 (cross-process modal/owner windows will not be linked)\n");
+
+    /* Spawn the presentation retry/rediscovery worker. Started
+     * unconditionally - it sleeps indefinitely when there are no
+     * orphaned surfaces, so the cost on compositors without
+     * xdg-foreign is exactly one idle pthread. */
+    if (!wayland_presentation_retry_start())
+        WARN("Failed to start presentation retry thread; orphan rediscovery disabled\n");
 
     process_wayland.initialized = TRUE;
 

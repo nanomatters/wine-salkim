@@ -39,6 +39,7 @@ struct xkb_compose_table;
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "xdg-foreign-unstable-v2-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
@@ -241,6 +242,27 @@ struct wayland
     struct xdg_activation_v1 *xdg_activation_v1;
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
     struct zwp_keyboard_shortcuts_inhibit_manager_v1* zwp_keyboard_shortcuts_inhibit_manager_v1;
+    /* xdg-foreign-v2: cross-process surface linking. NULL on
+     * compositors that don't expose the global; the driver still
+     * creates xdg_toplevels normally, just without foreign export. */
+    struct zxdg_exporter_v2 *zxdg_exporter_v2;
+    struct zxdg_importer_v2 *zxdg_importer_v2;
+
+    /* Retry-thread infrastructure for surfaces whose presentation
+     * parent could not be applied immediately (parent xdg_toplevel
+     * not yet roled, exporter handle not yet available, etc.). The
+     * thread sleeps on presentation_retry_cond with a 250ms timeout
+     * and walks the win_data tree looking for surfaces whose
+     * no_current_parent flag is set, re-running
+     * wayland_surface_apply_presentation_parent on each.
+     * presentation_orphan_count is a fast path: when zero the thread
+     * sleeps indefinitely instead of waking every 250ms. */
+    pthread_t       presentation_retry_thread;
+    pthread_mutex_t presentation_retry_mutex;
+    pthread_cond_t  presentation_retry_cond;
+    BOOL            presentation_retry_thread_started;
+    BOOL            presentation_retry_quit;
+    unsigned int    presentation_orphan_count;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
     struct wayland_pointer pointer;
@@ -381,6 +403,36 @@ struct wayland_surface
             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
             struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1;
             struct wl_output *requested_output;
+            /* xdg-foreign-v2 export handle for this toplevel; NULL if
+             * the compositor doesn't expose zxdg_exporter_v2. The
+             * token published by the handle event is shipped to the
+             * wineserver via set_window_presentation. */
+            struct zxdg_exported_v2 *zxdg_exported_v2;
+            /* xdg-foreign-v2 import handle for our resolved
+             * presentation parent. NULL when the parent is
+             * same-process or unresolved. */
+            struct zxdg_imported_v2 *zxdg_imported_v2;
+            /* Last presentation_generation observed when we last
+             * resolved this surface's parent. Used to skip re-query
+             * on WindowPosChanged when nothing has changed. */
+            unsigned int presentation_generation;
+            /* Role guard: xdg_toplevel_set_parent / set_parent_of
+             * require an xdg_toplevel role. If a parent resolves
+             * before we've assigned the role, we stash the import or
+             * same-process peer here and apply on the next configure. */
+            BOOL pending_parent_apply;
+            HWND pending_local_parent_hwnd;
+            /* Orphan rediscovery state. no_current_parent is set when
+             * we expect a parent (broker has anchor, or had one) but
+             * don't currently have one - typically because the exporter
+             * went away or the compositor rejected our import. The
+             * retry thread scans surfaces with this flag every ~250ms
+             * and re-runs apply_presentation_parent.
+             * parent_import_attempts is bounded so a permanently-broken
+             * import doesn't spin forever; it resets when the broker's
+             * generation changes (which signals a new export to try). */
+            BOOL no_current_parent;
+            unsigned int parent_import_attempts;
         };
         struct
         {
@@ -422,6 +474,16 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_clear_role(struct wayland_surface *surface);
+void wayland_surface_apply_presentation_parent(struct wayland_surface *surface);
+BOOL wayland_presentation_retry_start(void);
+void wayland_presentation_retry_stop(void);
+
+/* Bound for cross-process import retries; see wayland_surface.c. */
+#define MAX_PRESENTATION_IMPORT_ATTEMPTS 5
+
+/* Snapshot HWNDs of toplevel surfaces marked no_current_parent.
+ * See window.c for the implementation. */
+unsigned int wayland_win_data_snapshot_orphans(HWND *out, unsigned int max);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
