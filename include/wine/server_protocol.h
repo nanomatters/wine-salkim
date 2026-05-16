@@ -1046,6 +1046,7 @@ typedef volatile struct
 {
     struct obj_locator   class;
     unsigned int         dpi_context;
+    unsigned int         presentation_generation;
 } window_shm_t;
 
 typedef volatile union
@@ -6326,6 +6327,80 @@ struct dcomp_get_shared_visual_info_reply
 };
 
 
+/* Presentation export protocol identifiers. Names which Wayland-side
+ * protocol the opaque token belongs to. */
+enum presentation_protocol
+{
+    PRESENTATION_PROTOCOL_NONE,
+    PRESENTATION_PROTOCOL_XDG_FOREIGN_V2
+};
+
+
+/* Bitmask flags returned in get_window_presentation_parent.reason
+ * describing how the resolver reached its answer. NO_ANCHOR is the
+ * absence of any flag. Multiple flags may be set simultaneously. */
+enum presentation_reason
+{
+    PRESENTATION_REASON_NO_ANCHOR    = 0x0000,
+    PRESENTATION_REASON_OWNER_CHAIN  = 0x0001,
+    PRESENTATION_REASON_EXPORT_FOUND = 0x0002,
+    PRESENTATION_REASON_SAME_PROCESS = 0x0004,
+    PRESENTATION_REASON_CYCLE_BROKEN = 0x0008
+};
+
+
+/* Set a window's presentation export.
+ * The opaque token in VARARG identifies the window in the named
+ * compositor protocol. Calling this on a window that already has
+ * an export replaces the prior token. */
+struct set_window_presentation_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    unsigned int   protocol;
+    /* VARARG(token,bytes); */
+    char __pad_20[4];
+};
+struct set_window_presentation_reply
+{
+    struct reply_header __header;
+};
+
+
+
+struct clear_window_presentation_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+};
+struct clear_window_presentation_reply
+{
+    struct reply_header __header;
+};
+
+
+/* Resolve a window's presentation parent.
+ * Walks the GW_OWNER chain starting from `handle` and returns the
+ * first ancestor whose presentation_protocol is not NONE. The
+ * reply carries the resolved parent's token so the caller can
+ * import it without a second round-trip. Generation is the
+ * invalidation cookie callers should re-query when it changes. */
+struct get_window_presentation_parent_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+};
+struct get_window_presentation_parent_reply
+{
+    struct reply_header __header;
+    user_handle_t  parent;
+    unsigned int   protocol;
+    unsigned int   reason;
+    unsigned int   generation;
+    /* VARARG(token,bytes); */
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6643,6 +6718,9 @@ enum request
     REQ_dcomp_create_shared_visual,
     REQ_dcomp_set_shared_visual_info,
     REQ_dcomp_get_shared_visual_info,
+    REQ_set_window_presentation,
+    REQ_clear_window_presentation,
+    REQ_get_window_presentation_parent,
     REQ_NB_REQUESTS
 };
 
@@ -6965,6 +7043,9 @@ union generic_request
     struct dcomp_create_shared_visual_request dcomp_create_shared_visual_request;
     struct dcomp_set_shared_visual_info_request dcomp_set_shared_visual_info_request;
     struct dcomp_get_shared_visual_info_request dcomp_get_shared_visual_info_request;
+    struct set_window_presentation_request set_window_presentation_request;
+    struct clear_window_presentation_request clear_window_presentation_request;
+    struct get_window_presentation_parent_request get_window_presentation_parent_request;
 };
 union generic_reply
 {
@@ -7285,8 +7366,11 @@ union generic_reply
     struct dcomp_create_shared_visual_reply dcomp_create_shared_visual_reply;
     struct dcomp_set_shared_visual_info_reply dcomp_set_shared_visual_info_reply;
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
+    struct set_window_presentation_reply set_window_presentation_reply;
+    struct clear_window_presentation_reply clear_window_presentation_reply;
+    struct get_window_presentation_parent_reply get_window_presentation_parent_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 932
+#define SERVER_PROTOCOL_VERSION 933
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

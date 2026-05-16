@@ -322,6 +322,9 @@ DECL_HANDLER(fsync_free_shm_idx);
 DECL_HANDLER(dcomp_create_shared_visual);
 DECL_HANDLER(dcomp_set_shared_visual_info);
 DECL_HANDLER(dcomp_get_shared_visual_info);
+DECL_HANDLER(set_window_presentation);
+DECL_HANDLER(clear_window_presentation);
+DECL_HANDLER(get_window_presentation_parent);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -641,6 +644,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_dcomp_create_shared_visual,
     (req_handler)req_dcomp_set_shared_visual_info,
     (req_handler)req_dcomp_get_shared_visual_info,
+    (req_handler)req_set_window_presentation,
+    (req_handler)req_clear_window_presentation,
+    (req_handler)req_get_window_presentation_parent,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2438,3 +2444,15 @@ C_ASSERT( offsetof(struct dcomp_get_shared_visual_info_request, handle) == 12 );
 C_ASSERT( sizeof(struct dcomp_get_shared_visual_info_request) == 16 );
 C_ASSERT( offsetof(struct dcomp_get_shared_visual_info_reply, target_root) == 8 );
 C_ASSERT( sizeof(struct dcomp_get_shared_visual_info_reply) == 16 );
+C_ASSERT( offsetof(struct set_window_presentation_request, handle) == 12 );
+C_ASSERT( offsetof(struct set_window_presentation_request, protocol) == 16 );
+C_ASSERT( sizeof(struct set_window_presentation_request) == 24 );
+C_ASSERT( offsetof(struct clear_window_presentation_request, handle) == 12 );
+C_ASSERT( sizeof(struct clear_window_presentation_request) == 16 );
+C_ASSERT( offsetof(struct get_window_presentation_parent_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_window_presentation_parent_request) == 16 );
+C_ASSERT( offsetof(struct get_window_presentation_parent_reply, parent) == 8 );
+C_ASSERT( offsetof(struct get_window_presentation_parent_reply, protocol) == 12 );
+C_ASSERT( offsetof(struct get_window_presentation_parent_reply, reason) == 16 );
+C_ASSERT( offsetof(struct get_window_presentation_parent_reply, generation) == 20 );
+C_ASSERT( sizeof(struct get_window_presentation_parent_reply) == 24 );

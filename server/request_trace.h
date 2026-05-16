@@ -3608,6 +3608,32 @@ static void dump_dcomp_get_shared_visual_info_reply( const struct dcomp_get_shar
     dump_uint64( " target_root=", &req->target_root );
 }
 
+static void dump_set_window_presentation_request( const struct set_window_presentation_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", protocol=%08x", req->protocol );
+    dump_varargs_bytes( ", token=", cur_size );
+}
+
+static void dump_clear_window_presentation_request( const struct clear_window_presentation_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+}
+
+static void dump_get_window_presentation_parent_request( const struct get_window_presentation_parent_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+}
+
+static void dump_get_window_presentation_parent_reply( const struct get_window_presentation_parent_reply *req )
+{
+    fprintf( stderr, " parent=%08x", req->parent );
+    fprintf( stderr, ", protocol=%08x", req->protocol );
+    fprintf( stderr, ", reason=%08x", req->reason );
+    fprintf( stderr, ", generation=%08x", req->generation );
+    dump_varargs_bytes( ", token=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3927,6 +3953,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_dcomp_create_shared_visual_request,
     (dump_func)dump_dcomp_set_shared_visual_info_request,
     (dump_func)dump_dcomp_get_shared_visual_info_request,
+    (dump_func)dump_set_window_presentation_request,
+    (dump_func)dump_clear_window_presentation_request,
+    (dump_func)dump_get_window_presentation_parent_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4246,6 +4275,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_dcomp_create_shared_visual_reply,
     NULL,
     (dump_func)dump_dcomp_get_shared_visual_info_reply,
+    NULL,
+    NULL,
+    (dump_func)dump_get_window_presentation_parent_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4565,6 +4597,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "dcomp_create_shared_visual",
     "dcomp_set_shared_visual_info",
     "dcomp_get_shared_visual_info",
+    "set_window_presentation",
+    "clear_window_presentation",
+    "get_window_presentation_parent",
 };
 
 static const struct
