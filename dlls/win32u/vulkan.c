@@ -925,6 +925,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     unsigned int queue_count, props_count, i;
     struct vulkan_device *device;
     struct mempool pool = {0};
+    VkPhysicalDeviceFeatures features = {0};
     VkResult res;
 
     if (TRACE_ON(vulkan))
@@ -945,8 +946,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     device->queues = (void *)(device + 1);
     device->queue_props = (void *)(device->queues + queue_count);
 
-{
-        VkPhysicalDeviceFeatures features = {0};
+    {
         VkPhysicalDeviceFeatures2 *features2;
 
         /* Enable shaderStorageImageWriteWithoutFormat for fshack
@@ -967,7 +967,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
             features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
             create_info->pEnabledFeatures = &features;
         }
-}
+    }
 
     if (device->extensions.has_VK_WINE_openvr_device_extensions)
     {
