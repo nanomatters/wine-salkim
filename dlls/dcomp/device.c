@@ -85,6 +85,23 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
     else if (device->version >= 2
              && IsEqualGUID(iid, &IID_IDCompositionDevice3))
     {
+        /* Device3 is only advertised under winewayland.drv. Other
+         * display drivers do not provide an overlay surface capable
+         * of carrying the DirectComposition visual tree to the screen
+         * alongside an application's own swapchain blits, so
+         * advertising Device3 there gains nothing over the GDI
+         * fallback the application would otherwise take. */
+        static volatile LONG wayland_resolved;
+        static BOOL is_wayland;
+        if (!InterlockedCompareExchange( &wayland_resolved, 1, 0 ))
+            is_wayland = (GetModuleHandleW( L"winewayland.drv" ) != NULL);
+        if (!is_wayland)
+        {
+            FIXME("IDCompositionDevice3 disabled (winewayland.drv not loaded).\n");
+            *out = NULL;
+            return E_NOINTERFACE;
+        }
+
         /* IUnknown and IDCompositionDevice2 methods forward to the
          * desktop_device implementations on the same backing object;
          * the 13 Device3-only filter-effect creators stub to
