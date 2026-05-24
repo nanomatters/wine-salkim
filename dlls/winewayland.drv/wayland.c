@@ -319,6 +319,7 @@ static const struct wl_registry_listener registry_listener = {
  */
 BOOL wayland_process_init(void)
 {
+    struct wayland_output *output;
     struct wl_display *wl_display_wrapper;
 
     process_wayland.wl_display = wl_display_connect(NULL);
@@ -356,6 +357,17 @@ BOOL wayland_process_init(void)
     /* We need two roundtrips. One to get and bind globals, one to handle all
      * initial events produced from registering the globals. */
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+    wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+
+    /* globals are not exposed in any defined order,
+     * so the output may have been binded before the extensions it depends on */
+    wl_list_for_each(output, &process_wayland.output_list, link)
+    {
+        if (process_wayland.zxdg_output_manager_v1) wayland_output_use_xdg_extension(output);
+        if (process_wayland.wp_color_manager_v1) wayland_output_use_image_description(output);
+    }
+
+    /* One more roundtrip for color management and zxdg output extensions */
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
 
     /* Check for required protocol globals. */
