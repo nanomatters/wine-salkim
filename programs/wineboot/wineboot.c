@@ -1762,8 +1762,9 @@ static void update_user_profile(void)
 
 static void update_win_version(void)
 {
-    static const WCHAR win10_buildW[] = L"19045";
+    static const WCHAR win10_buildW[] = L"22000";
     static const WCHAR win10_ntW[] = L"6.3";
+    static const DWORD win11_maj_ver = 10;
 
     HKEY cv_h;
     DWORD type, sz;
@@ -1779,6 +1780,7 @@ static void update_win_version(void)
                 RegSetValueExW(cv_h, L"CurrentVersion", 0, REG_SZ, (const BYTE *)win10_ntW, sizeof(win10_ntW));
                 RegSetValueExW(cv_h, L"CurrentBuild", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
                 RegSetValueExW(cv_h, L"CurrentBuildNumber", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
+                RegSetValueExW(cv_h, L"CurrentMajorVersionNumber", 0, REG_DWORD, (const BYTE *)win11_maj_ver, sizeof(DWORD));
             }
         }
         RegCloseKey(cv_h);
@@ -1794,6 +1796,7 @@ static void update_win_version(void)
                 RegSetValueExW(cv_h, L"CurrentVersion", 0, REG_SZ, (const BYTE *)win10_ntW, sizeof(win10_ntW));
                 RegSetValueExW(cv_h, L"CurrentBuild", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
                 RegSetValueExW(cv_h, L"CurrentBuildNumber", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
+                RegSetValueExW(cv_h, L"CurrentMajorVersionNumber", 0, REG_DWORD, (const BYTE *)win11_maj_ver, sizeof(DWORD));
             }
         }
         RegCloseKey(cv_h);
