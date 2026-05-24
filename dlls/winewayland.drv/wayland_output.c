@@ -562,43 +562,6 @@ static const struct wp_image_description_v1_listener image_description_listener 
 };
 
 static void wayland_color_management_output_image_description_changed(void *user_data,
-                            struct wp_color_management_output_v1 *wp_color_management_output_v1);
-
-static const struct wp_color_management_output_v1_listener color_management_output_listener = {
-    wayland_color_management_output_image_description_changed
-};
-
-static void wayland_output_use_image_description(struct wayland_output *output)
-{
-    if (!output->wp_color_management_output_v1)
-    {
-        output->wp_color_management_output_v1 =
-            wp_color_manager_v1_get_output(
-                        process_wayland.wp_color_manager_v1,
-                                    output->wl_output);
-        wp_color_management_output_v1_add_listener(
-            output->wp_color_management_output_v1,
-            &color_management_output_listener, output);
-        if (!output->wp_color_management_output_v1)
-        {
-            ERR("Failed to allocate color management output object!\n");
-            return;
-        }
-    }
-    output->wp_image_description_v1 =
-        wp_color_management_output_v1_get_image_description(
-            output->wp_color_management_output_v1);
-    if (!output->wp_image_description_v1)
-    {
-        ERR("Failed to allocate image description object!\n");
-        return;
-    }
-    wp_image_description_v1_add_listener(
-        output->wp_image_description_v1,
-        &image_description_listener, output);
-}
-
-static void wayland_color_management_output_image_description_changed(void *user_data,
                 struct wp_color_management_output_v1 *wp_color_management_output_v1)
 {
     struct wayland_output *output = user_data;
@@ -616,6 +579,41 @@ static void wayland_color_management_output_image_description_changed(void *user
     }
 
     wayland_output_use_image_description(output);
+}
+
+static const struct wp_color_management_output_v1_listener color_management_output_listener = {
+    wayland_color_management_output_image_description_changed
+};
+
+void wayland_output_use_image_description(struct wayland_output *output)
+{
+    if (!output->wp_color_management_output_v1)
+    {
+        output->wp_color_management_output_v1 =
+            wp_color_manager_v1_get_output(
+                        process_wayland.wp_color_manager_v1,
+                                    output->wl_output);
+        wp_color_management_output_v1_add_listener(
+            output->wp_color_management_output_v1,
+            &color_management_output_listener, output);
+        if (!output->wp_color_management_output_v1)
+        {
+            ERR("Failed to allocate color management output object!\n");
+            return;
+        }
+    }
+    if (output->wp_image_description_v1) return;
+    output->wp_image_description_v1 =
+        wp_color_management_output_v1_get_image_description(
+            output->wp_color_management_output_v1);
+    if (!output->wp_image_description_v1)
+    {
+        ERR("Failed to allocate image description object!\n");
+        return;
+    }
+    wp_image_description_v1_add_listener(
+        output->wp_image_description_v1,
+        &image_description_listener, output);
 }
 
 /**********************************************************************
@@ -728,6 +726,7 @@ void wayland_output_destroy(struct wayland_output *output)
  */
 void wayland_output_use_xdg_extension(struct wayland_output *output)
 {
+    if (output->zxdg_output_v1) return;
     output->zxdg_output_v1 =
         zxdg_output_manager_v1_get_xdg_output(process_wayland.zxdg_output_manager_v1,
                                               output->wl_output);

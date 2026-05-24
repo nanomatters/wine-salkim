@@ -411,6 +411,7 @@ BOOL wayland_process_init(void);
 BOOL wayland_output_create(uint32_t id, uint32_t version);
 void wayland_output_destroy(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
+void wayland_output_use_image_description(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect);
 void wayland_color_manager_init(void);
 
