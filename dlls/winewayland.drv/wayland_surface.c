@@ -311,6 +311,33 @@ static void wayland_surface_init_fractional_scale(struct wayland_surface *surfac
     }
 }
 
+void wayland_surface_sync_alpha(struct wayland_surface *surface)
+{
+    if (!process_wayland.wp_alpha_modifier_v1) return;
+
+    if (surface->alpha_multiplier != UINT32_MAX)
+    {
+        if (!surface->wp_alpha_modifier_surface_v1)
+        {
+            surface->wp_alpha_modifier_surface_v1 =
+                wp_alpha_modifier_v1_get_surface(process_wayland.wp_alpha_modifier_v1,
+                                                 surface->wl_surface);
+        }
+        if (!surface->wp_alpha_modifier_surface_v1)
+        {
+            ERR("Failed to create alpha modifier surface\n");
+            return;
+        }
+        wp_alpha_modifier_surface_v1_set_multiplier(surface->wp_alpha_modifier_surface_v1,
+                                                    surface->alpha_multiplier);
+    }
+    else if (surface->wp_alpha_modifier_surface_v1)
+    {
+        wp_alpha_modifier_surface_v1_destroy(surface->wp_alpha_modifier_surface_v1);
+        surface->wp_alpha_modifier_surface_v1 = NULL;
+    }
+}
+
 /**********************************************************************
  *          wayland_surface_make_toplevel
  *
@@ -347,6 +374,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
     wayland_surface_assign_icon(surface);
 
     wayland_surface_init_fractional_scale(surface, 1.0);
+    wayland_surface_sync_alpha(surface);
 
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
@@ -386,6 +414,8 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
 
     wayland_surface_init_fractional_scale(surface, parent->window.fractional_scale);
 
+    wayland_surface_sync_alpha(surface);
+
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     surface->toplevel_hwnd = parent->hwnd;
 
@@ -418,6 +448,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
     {
         wp_fractional_scale_v1_destroy(surface->wp_fractional_scale_v1);
         surface->wp_fractional_scale_v1 = NULL;
+    }
+
+    if (surface->wp_alpha_modifier_surface_v1)
+    {
+        wp_alpha_modifier_surface_v1_destroy(surface->wp_alpha_modifier_surface_v1);
+        surface->wp_alpha_modifier_surface_v1 = NULL;
     }
 
     switch (surface->role)

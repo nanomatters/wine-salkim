@@ -39,6 +39,7 @@
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "alpha-modifier-v1-client-protocol.h"
 
 #include "windef.h"
 #include "winbase.h"
@@ -173,6 +174,7 @@ struct wayland
     struct wp_viewporter *wp_viewporter;
     struct wl_subcompositor *wl_subcompositor;
     struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
+    struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
     struct zwp_relative_pointer_manager_v1 *zwp_relative_pointer_manager_v1;
     struct zwp_text_input_manager_v3 *zwp_text_input_manager_v3;
@@ -270,6 +272,7 @@ struct wayland_surface
     struct wl_surface *wl_surface;
     struct wp_viewport *wp_viewport;
     struct wp_fractional_scale_v1 *wp_fractional_scale_v1;
+    struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
     struct wayland_shm_buffer *small_icon_buffer;
     struct wayland_shm_buffer *big_icon_buffer;
 
@@ -293,6 +296,7 @@ struct wayland_surface
     BOOL resizing;
     struct wayland_window_config window;
     int content_width, content_height;
+    UINT32 alpha_multiplier;
     HCURSOR hcursor;
 };
 
@@ -336,6 +340,7 @@ void wayland_surface_coords_to_window(struct wayland_surface *surface,
 struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
 void wayland_surface_ensure_contents(struct wayland_surface *surface);
+void wayland_surface_sync_alpha(struct wayland_surface *surface);
 void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
 void wayland_surface_assign_icon(struct wayland_surface *surface);
 void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
@@ -377,6 +382,7 @@ struct wayland_win_data
     BOOL is_fullscreen;
     BOOL managed;
     BOOL layered_attribs_set;
+    UINT32 alpha_multiplier;
 };
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
@@ -451,6 +457,7 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect);
 void WAYLAND_SetCursor(HWND hwnd, HCURSOR hcursor);
 BOOL WAYLAND_SetCursorPos(INT x, INT y);
 void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags);
+void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small);
 void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
