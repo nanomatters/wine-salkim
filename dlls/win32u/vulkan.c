@@ -6190,6 +6190,8 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkQueueSubmit2KHR = win32u_vkQueueSubmit2KHR,
     .p_vkUnmapMemory = win32u_vkUnmapMemory,
     .p_vkUnmapMemory2KHR = win32u_vkUnmapMemory2KHR,
+    .p_vkWaitForPresentKHR = win32u_vkWaitForPresentKHR,
+    .p_vkWaitForPresent2KHR = win32u_vkWaitForPresent2KHR,
 };
 
 static VkResult nulldrv_vulkan_surface_create( HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
