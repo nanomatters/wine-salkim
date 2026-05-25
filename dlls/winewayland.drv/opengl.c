@@ -170,6 +170,9 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
 {
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
 
+    /* cannot swap when the window is not visible */
+    if (base->interval && !NtUserIsWindowVisible(base->client->hwnd)) return TRUE;
+
     client_surface_present(base->client);
     funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
 
