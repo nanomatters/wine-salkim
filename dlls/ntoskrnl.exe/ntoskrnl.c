@@ -4098,34 +4098,58 @@ static void update_security_cookie( void *module, IMAGE_NT_HEADERS *nt )
     ULONG size;
 
     cfg = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size );
-    if (!cfg) return;
+    if (!cfg || size < sizeof(cfg->Size)) return;
     size = min( size, cfg->Size );
-    if (size > offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie ) &&
+    if (size >= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie ) + sizeof(cfg->SecurityCookie) &&
         cfg->SecurityCookie > (ULONG_PTR)module &&
-        cfg->SecurityCookie < (ULONG_PTR)module + nt->OptionalHeader.SizeOfImage)
+        nt->OptionalHeader.SizeOfImage >= sizeof(ULONG_PTR) &&
+        cfg->SecurityCookie - (ULONG_PTR)module <= nt->OptionalHeader.SizeOfImage - sizeof(ULONG_PTR))
     {
         static ULONG seed;
         ULONG_PTR *cookie = (ULONG_PTR *)cfg->SecurityCookie;
+        ULONG_PTR new_cookie;
+        SIZE_T prot_size;
+        void *prot_addr;
+        ULONG old_prot;
+        NTSTATUS status;
 
         TRACE( "initializing security cookie %p\n", cookie );
 
         if (!seed) seed = NtGetTickCount() ^ GetCurrentProcessId();
+
+        new_cookie = *cookie;
         for (;;)
         {
-            if (*cookie == DEFAULT_SECURITY_COOKIE_16)
-                *cookie = RtlRandom( &seed ) >> 16; /* leave the high word clear */
-            else if (*cookie == DEFAULT_SECURITY_COOKIE_32)
-                *cookie = RtlRandom( &seed );
+            if (new_cookie == DEFAULT_SECURITY_COOKIE_16)
+                new_cookie = RtlRandom( &seed ) >> 16; /* leave the high word clear */
+            else if (new_cookie == DEFAULT_SECURITY_COOKIE_32)
+                new_cookie = RtlRandom( &seed );
 #ifdef DEFAULT_SECURITY_COOKIE_64
-            else if (*cookie == DEFAULT_SECURITY_COOKIE_64)
+            else if (new_cookie == DEFAULT_SECURITY_COOKIE_64)
             {
-                *cookie = RtlRandom( &seed );
+                new_cookie = RtlRandom( &seed );
                 /* fill up, but keep the highest word clear */
-                *cookie ^= (ULONG_PTR)RtlRandom( &seed ) << 16;
+                new_cookie ^= (ULONG_PTR)RtlRandom( &seed ) << 16;
             }
 #endif
-            else break;
+            else
+                break;
         }
+
+        if (new_cookie == *cookie) return;  /* already initialized */
+
+        prot_addr = cookie;
+        prot_size = sizeof(*cookie);
+        if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &prot_addr, &prot_size,
+                                              PAGE_READWRITE, &old_prot )))
+        {
+            WARN( "failed to protect security cookie, status %#lx\n", status );
+            return;
+        }
+
+        *cookie = new_cookie;
+        if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &prot_addr, &prot_size, old_prot, &old_prot )))
+            WARN( "failed to restore security cookie protection, status %#lx\n", status );
     }
 }
 
