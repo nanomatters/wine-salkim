@@ -38,6 +38,13 @@ struct stream
 {
     AVBSFContext *filter;
     BOOL eos;
+    /* Big-endian PCM has no ffmpeg public bitstream filter and a custom
+     * one would need ffmpeg's internal FFBitStreamFilter ABI (only
+     * available when building against a bundled ffmpeg).  Building
+     * against the system ffmpeg we reverse the sample bytes inline on
+     * the demuxed packet instead; pcm_swap_bytes is the sample width in
+     * bytes (0 when no swap is needed). */
+    unsigned int pcm_swap_bytes;
 };
 
 struct demuxer
@@ -120,6 +127,41 @@ static BOOL codec_is_big_endian_pcm(enum AVCodecID codec_id)
     }
 }
 
+/* Map a big-endian PCM codec id to its little-endian equivalent.  The
+ * demuxed sample bytes are reversed inline (see read_packet) so the
+ * stream is reported to the Windows side as little-endian PCM. */
+static enum AVCodecID pcm_codec_to_little_endian(enum AVCodecID codec_id)
+{
+    switch (codec_id)
+    {
+    case AV_CODEC_ID_PCM_S16BE: return AV_CODEC_ID_PCM_S16LE;
+    case AV_CODEC_ID_PCM_S24BE: return AV_CODEC_ID_PCM_S24LE;
+    case AV_CODEC_ID_PCM_S32BE: return AV_CODEC_ID_PCM_S32LE;
+    case AV_CODEC_ID_PCM_S64BE: return AV_CODEC_ID_PCM_S64LE;
+    case AV_CODEC_ID_PCM_F32BE: return AV_CODEC_ID_PCM_F32LE;
+    case AV_CODEC_ID_PCM_F64BE: return AV_CODEC_ID_PCM_F64LE;
+    default: return codec_id;
+    }
+}
+
+/* Reverse each sample's bytes in place (big-endian -> little-endian). */
+static void pcm_reverse_sample_bytes(AVPacket *packet, unsigned int bytes_per_sample)
+{
+    uint8_t *buf = packet->data, *buf_end = packet->data + packet->size;
+
+    if (bytes_per_sample < 2) return;
+    for (; buf + bytes_per_sample <= buf_end; buf += bytes_per_sample)
+    {
+        unsigned int i;
+        for (i = 0; i < bytes_per_sample / 2; ++i)
+        {
+            uint8_t tmp = buf[i];
+            buf[i] = buf[bytes_per_sample - i - 1];
+            buf[bytes_per_sample - i - 1] = tmp;
+        }
+    }
+}
+
 static NTSTATUS demuxer_create_streams( struct demuxer *demuxer )
 {
     UINT i;
@@ -144,9 +186,16 @@ static NTSTATUS demuxer_create_streams( struct demuxer *demuxer )
         }
         else if (codec_is_big_endian_pcm(par->codec_id))
         {
-            /* WAVEFORMATEX does not contain endianness info, so this needs to be converted here. */
-            if (av_bsf_alloc( &ff_pcm_byte_order_reverse_bsf, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+            /* WAVEFORMATEX does not contain endianness info, so big-endian
+             * PCM is reported as little-endian and the sample bytes are
+             * reversed inline on each demuxed packet (read_packet).  A
+             * passthrough null filter carries the packets; par_out is
+             * rewritten to the little-endian codec id. */
+            if (av_bsf_get_null_filter( &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
             avcodec_parameters_copy( stream->filter->par_in, par );
+            avcodec_parameters_copy( stream->filter->par_out, par );
+            stream->filter->par_out->codec_id = pcm_codec_to_little_endian( par->codec_id );
+            stream->pcm_swap_bytes = par->bits_per_coded_sample / 8u;
             av_bsf_init( stream->filter );
             continue;
         }
@@ -344,7 +393,11 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
         if (!(stream = demuxer->last_stream)) ret = 0;
         else
         {
-            if (!(ret = av_bsf_receive_packet( stream->filter, *packet ))) return STATUS_SUCCESS;
+            if (!(ret = av_bsf_receive_packet( stream->filter, *packet )))
+            {
+                if (stream->pcm_swap_bytes) pcm_reverse_sample_bytes( *packet, stream->pcm_swap_bytes );
+                return STATUS_SUCCESS;
+            }
             if (ret == AVERROR_EOF) stream->eos = TRUE;
             if (!ret || ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) ret = 0;
             else WARN( "Failed to read packet from filter, error %s.\n", debugstr_averr( ret ) );
