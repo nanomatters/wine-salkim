@@ -1363,10 +1363,8 @@ INT WINAPI NtUserToUnicodeEx( UINT virt, UINT scan, const BYTE *state,
         if (key->dwBoth) str[0] = key->wchComposed;
         else
         {
-            if (size > 2) str[2] = 0;
-            str[1] = str[0];
-            str[0] = deadkey;
-            len = 2;
+            if (size > 1) str[1] = 0;
+            len = 1;
         }
     }
 
