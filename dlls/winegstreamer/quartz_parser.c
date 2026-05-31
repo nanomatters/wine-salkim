@@ -1629,6 +1629,22 @@ static HRESULT parser_init_stream(struct strmbase_filter *iface)
         {
             ret = amt_to_wg_format(&source->pin.pin.mt, &source->current_format);
             assert(ret);
+
+            /* compensate wrong biHeight for DirectDraw streams */
+            if (source->current_format.major_type == WG_MAJOR_TYPE_VIDEO
+                    && source->current_format.u.video.height < 0)
+            {
+                static const GUID iid_ddraw_stream =
+                    {0xF4104FCE,0x9A70,0x11d0,{0x8F,0xDE,0x00,0xC0,0x4F,0xD9,0x18,0x9D}};
+                void *ddraw;
+
+                if (SUCCEEDED(IPin_QueryInterface(source->pin.pin.peer, &iid_ddraw_stream, &ddraw)))
+                {
+                    source->current_format.u.video.height = -source->current_format.u.video.height;
+                    IUnknown_Release((IUnknown *)ddraw);
+                }
+            }
+
             wg_parser_stream_enable(source->wg_stream, &source->current_format);
         }
         else
