@@ -191,7 +191,9 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
-static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *toplevel_surface)
+static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                    struct wayland_surface *toplevel_surface,
+                                                    struct wayland_surface *owner_surface)
 {
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *surface;
@@ -206,6 +208,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+    else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
 
@@ -234,6 +237,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     {
     case WAYLAND_SURFACE_ROLE_NONE:
         wayland_surface_clear_role(surface);
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        wayland_surface_make_popup(surface, owner_surface, &data->rects.window);
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         wayland_surface_make_toplevel(surface);
@@ -306,6 +312,8 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
     switch (surface->role)
     {
     case WAYLAND_SURFACE_ROLE_NONE:
+    /* popups do not have any state to update */
+    case WAYLAND_SURFACE_ROLE_POPUP:
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
@@ -443,10 +451,10 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-    struct wayland_surface *toplevel_surface;
+    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL;
+    struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
     struct wayland_client_surface *client;
-    struct wayland_win_data *data, *toplevel_data;
+    struct wayland_win_data *data, *toplevel_data, *owner_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
@@ -454,11 +462,35 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* Get the managed state with win_data unlocked, as is_window_managed
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
-    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) toplevel = owner_hint;
+    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+    owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
+    owner_surface = owner_data ? owner_data->wayland_surface : NULL;
+    if (owner_surface && owner_surface->xdg_surface)
+    {
+        toplevel_data = NULL;
+        toplevel_surface = NULL;
+        /* There are cases where we can have a circular parent relation with unmanaged windows.
+         * There are also cases where the toplevel is not yet mapped.
+         * So, we need to check if there is a circular relationship here,
+         * if there is then continue treating this hwnd as a toplevel */
+        if ((owner_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+            owner_surface->toplevel_hwnd == hwnd) ||
+            (owner_surface->role == WAYLAND_SURFACE_ROLE_POPUP &&
+             owner_surface->owner_hwnd == hwnd))
+        {
+            WARN("owner %p forms a cycle!\n", owner);
+            owner_surface = NULL;
+        }
+    }
+    else
+    {
+        owner_surface = NULL;
+        owner_data = NULL;
+    }
 
     data->rects = *new_rects;
     data->is_fullscreen = fullscreen;
@@ -480,7 +512,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             data->wayland_surface = NULL;
         }
     }
-    else if (wayland_win_data_create_wayland_surface(data, toplevel_surface))
+    else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface))
     {
         wayland_win_data_update_wayland_state(data);
     }
