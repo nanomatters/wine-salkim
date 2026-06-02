@@ -594,7 +594,10 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             if (toplevel && NtUserIsWindowVisible(hwnd))
                 wayland_client_surface_attach(client, toplevel);
             else
+            {
                 wayland_client_surface_attach(client, NULL);
+                data->client_surface = NULL;
+            }
         }
 
         if (data->wayland_surface)
@@ -1068,7 +1071,10 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
             if (toplevel && NtUserIsWindowVisible(hwnd))
                 wayland_client_surface_attach(new_client, toplevel);
             else
+            {
                 wayland_client_surface_attach(new_client, NULL);
+                data->client_surface = NULL;
+            }
         }
     }
 
