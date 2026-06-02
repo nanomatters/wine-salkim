@@ -1879,6 +1879,10 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface,
         wayland_surface_attach_shm(surface, dummy_shm_buffer, damage);
         wl_surface_commit(surface->wl_surface);
     }
+    else
+    {
+        TRACE("Wayland surface not configured yet, not flushing\n");
+    }
 
     if (damage) NtGdiDeleteObjectApp(damage);
 }
