@@ -2315,6 +2315,10 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface,
         surface->content_height = height;
         wl_surface_commit(surface->wl_surface);
     }
+    else
+    {
+        TRACE("Wayland surface not configured yet, not flushing\n");
+    }
 
     if (damage) NtGdiDeleteObjectApp(damage);
     wayland_surface_update_hwnd_dmabufs(surface);
