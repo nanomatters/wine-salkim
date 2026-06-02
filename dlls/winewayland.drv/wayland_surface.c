@@ -1611,7 +1611,10 @@ static void wayland_client_surface_update(struct client_surface *client)
     if (toplevel && NtUserIsWindowVisible(hwnd))
         wayland_client_surface_attach(surface, toplevel);
     else
+    {
         wayland_client_surface_attach(surface, NULL);
+        data->client_surface = NULL;
+    }
 
     wayland_win_data_release(data);
 }
