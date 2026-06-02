@@ -607,6 +607,11 @@ static gboolean autoplug_query_cb(GstElement *bin, GstPad *child,
     {
         result = gst_caps_new_empty();
         gst_query_parse_caps(query, &filter);
+        if (!filter)
+        {
+            gst_caps_unref(result);
+            return FALSE;
+        }
         for (i = 0; i < gst_caps_get_size(filter); i++)
         {
             if (!(features = gst_caps_get_features(filter, i))
