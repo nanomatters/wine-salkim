@@ -53,6 +53,7 @@ struct xkb_compose_table;
 #include "pointer-warp-v1-client-protocol.h"
 #include "keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
 
 #include "windef.h"
 #include "winbase.h"
@@ -82,6 +83,8 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    WM_WAYLAND_DMABUF_FRAME,
+    WM_WAYLAND_DMABUF_VSYNC,
 };
 
 enum wayland_surface_config_state
@@ -258,6 +261,8 @@ struct wayland
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
     struct zwp_keyboard_shortcuts_inhibit_manager_v1* zwp_keyboard_shortcuts_inhibit_manager_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
+    struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+    struct wl_list dmabuf_formats;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
     struct wayland_pointer pointer;
@@ -370,6 +375,15 @@ struct wayland_client_surface
     BOOL has_alpha;
 };
 
+struct wayland_dmabuf_format
+{
+    struct wl_list link;
+    uint32_t format;
+    uint64_t modifier;
+};
+
+#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+
 struct wayland_shm_buffer
 {
     struct wl_list link;
@@ -425,6 +439,8 @@ struct wayland_surface
     struct wayland_window_config window;
     RECT geometry;
     int content_width, content_height;
+    struct wl_list hwnd_dmabuf_surfaces;
+    struct wl_callback *dmabuf_frame_cb; /* pending vsync-throttle frame callback, or NULL */
     UINT32 alpha_multiplier;
     HCURSOR hcursor;
 };
@@ -442,6 +458,7 @@ BOOL wayland_process_init(void);
 BOOL wayland_output_create(uint32_t id, uint32_t version);
 void wayland_output_destroy(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
+BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier);
 void wayland_output_use_image_description(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect);
 void wayland_color_manager_init(void);

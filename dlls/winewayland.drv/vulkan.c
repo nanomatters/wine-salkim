@@ -26,6 +26,7 @@
 
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -33,6 +34,7 @@
 #include "wine/debug.h"
 
 #include "wine/vulkan.h"
+#include "wine/hwnd_dmabuf.h"
 #include "wine/vulkan_driver.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
@@ -138,6 +140,12 @@ static void wayland_map_device_extensions(struct vulkan_device_extensions *exten
     if (extensions->has_VK_KHR_external_semaphore_fd) extensions->has_VK_KHR_external_semaphore_win32 = 1;
     if (extensions->has_VK_KHR_external_fence_win32) extensions->has_VK_KHR_external_fence_fd = 1;
     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
+
+    /* Wayland Win32 client surfaces may be presented indirectly via HWND dmabuf
+     * import in another process, so Vulkan present completion is not a reliable
+     * frame pacing signal for these surfaces. */
+    extensions->has_VK_KHR_present_wait = 0;
+    extensions->has_VK_KHR_present_wait2 = 0;
 }
 
 static VkResult wayland_vulkan_surface_configure(VkColorSpaceKHR *colorspace,
@@ -178,10 +186,73 @@ err:
     return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
+static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void *format_modifiers_ptr,
+                                                UINT max_format_modifiers, UINT *format_modifier_count)
+{
+    hwnd_dmabuf_host_caps_t *caps = caps_ptr;
+    hwnd_dmabuf_format_modifier_t *format_modifiers = format_modifiers_ptr;
+    struct wayland_dmabuf_format *entry;
+    UINT count = 0, copied = 0;
+
+    if (format_modifier_count) *format_modifier_count = 0;
+    if (!caps || !format_modifier_count || (max_format_modifiers && !format_modifiers))
+        return HWND_DMABUF_INVALID_ARGS;
+    if (!process_wayland.zwp_linux_dmabuf_v1)
+        return HWND_DMABUF_NOT_FOUND;
+
+    /* Only cross-process windows need the bridge: if the top-level has a local
+     * wayland surface the swapchain is presented directly (Vulkan WSI), so do
+     * not advertise caps -- otherwise DXVK routes same-process windows (e.g.
+     * games) onto the cross-process dmabuf path and loses FIFO vsync pacing. */
+    {
+        HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+        struct wayland_win_data *toplevel_data;
+        BOOL toplevel_presentable_locally = FALSE;
+
+        if (toplevel && (toplevel_data = wayland_win_data_get(toplevel)))
+        {
+            toplevel_presentable_locally = toplevel_data->wayland_surface != NULL;
+            wayland_win_data_release(toplevel_data);
+        }
+
+        if (toplevel_presentable_locally)
+        {
+            TRACE("hwnd %p toplevel %p has a local wayland surface; direct present, no dmabuf bridge\n",
+                  hwnd, toplevel);
+            return HWND_DMABUF_NOT_FOUND;
+        }
+    }
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+        count++;
+
+    memset(caps, 0, sizeof(*caps));
+    caps->version = HWND_DMABUF_HOST_CAPS_VERSION_V2;
+    caps->feedback_gen = 1;
+    caps->dmabuf_protocol_version = zwp_linux_dmabuf_v1_get_version(process_wayland.zwp_linux_dmabuf_v1);
+    caps->format_modifiers = format_modifiers;
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (copied >= max_format_modifiers)
+            break;
+        format_modifiers[copied].fourcc = entry->format;
+        format_modifiers[copied].modifier = entry->modifier;
+        if (entry->modifier == DRM_FORMAT_MOD_INVALID)
+            caps->caps_flags |= HWND_DMABUF_CAPS_HAS_MOD_INVALID;
+        copied++;
+    }
+
+    caps->format_modifier_count = copied;
+    *format_modifier_count = count;
+    return HWND_DMABUF_OK;
+}
+
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = wayland_vulkan_surface_create,
     .p_vulkan_surface_configure = wayland_vulkan_surface_configure,
+    .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
     .p_map_instance_extensions = wayland_map_instance_extensions,
     .p_map_device_extensions = wayland_map_device_extensions,
