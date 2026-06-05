@@ -42,6 +42,7 @@ struct wayland process_wayland =
     .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
     .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
     .output_list = {&process_wayland.output_list, &process_wayland.output_list},
+    .dmabuf_formats = {&process_wayland.dmabuf_formats, &process_wayland.dmabuf_formats},
     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
     .supports_extended_volume = FALSE,
     .supports_pq = FALSE,
@@ -96,6 +97,54 @@ static const struct wl_seat_listener seat_listener =
     wl_seat_handle_capabilities,
     wl_seat_handle_name
 };
+
+static void wayland_dmabuf_add_format(uint32_t format, uint64_t modifier)
+{
+    struct wayland_dmabuf_format *entry;
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (entry->format == format && entry->modifier == modifier)
+            return;
+    }
+
+    if (!(entry = calloc(1, sizeof(*entry)))) return;
+    entry->format = format;
+    entry->modifier = modifier;
+    wl_list_insert(process_wayland.dmabuf_formats.prev, &entry->link);
+}
+
+static void zwp_linux_dmabuf_v1_handle_format(void *data, struct zwp_linux_dmabuf_v1 *dmabuf,
+                                              uint32_t format)
+{
+    wayland_dmabuf_add_format(format, DRM_FORMAT_MOD_INVALID);
+}
+
+static void zwp_linux_dmabuf_v1_handle_modifier(void *data, struct zwp_linux_dmabuf_v1 *dmabuf,
+                                                uint32_t format, uint32_t modifier_hi,
+                                                uint32_t modifier_lo)
+{
+    wayland_dmabuf_add_format(format, ((uint64_t)modifier_hi << 32) | modifier_lo);
+}
+
+static const struct zwp_linux_dmabuf_v1_listener zwp_linux_dmabuf_v1_listener =
+{
+    zwp_linux_dmabuf_v1_handle_format,
+    zwp_linux_dmabuf_v1_handle_modifier
+};
+
+BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier)
+{
+    struct wayland_dmabuf_format *entry;
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (entry->format == format && entry->modifier == modifier)
+            return TRUE;
+    }
+
+    return FALSE;
+}
 
 static int wayland_disable_ssd(void)
 {
@@ -279,6 +328,14 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_pointer_warp_v1 =
             wl_registry_bind(registry, id, &wp_pointer_warp_v1_interface, 1);
     }
+    else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)
+    {
+        process_wayland.zwp_linux_dmabuf_v1 =
+            wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface,
+                             version < 3 ? version : 3);
+        zwp_linux_dmabuf_v1_add_listener(process_wayland.zwp_linux_dmabuf_v1,
+                                         &zwp_linux_dmabuf_v1_listener, NULL);
+    }
     else if (strcmp(interface, "zwp_keyboard_shortcuts_inhibit_manager_v1") == 0)
     {
         process_wayland.zwp_keyboard_shortcuts_inhibit_manager_v1 =
@@ -449,6 +506,9 @@ BOOL wayland_process_init(void)
 
     if (!process_wayland.xdg_activation_v1)
         ERR("Wayland compositor doesn't support xdg_activation_v1! (Flash Window will not be supported)\n");
+
+    if (!process_wayland.zwp_linux_dmabuf_v1)
+        WARN("Wayland compositor doesn't support optional zwp_linux_dmabuf_v1 (HWND dmabuf forwarding won't work)\n");
 
     process_wayland.initialized = TRUE;
 

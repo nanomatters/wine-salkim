@@ -22,6 +22,7 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <sys/socket.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -31,6 +32,7 @@
 
 #include "object.h"
 #include "file.h"
+#include "handle.h"
 #include "request.h"
 #include "thread.h"
 #include "process.h"
@@ -98,6 +100,8 @@ struct window
     int              nb_extra_bytes;  /* number of extra bytes */
     char            *extra_bytes;     /* extra bytes storage */
     window_shm_t    *shared;          /* window in session shared memory */
+    struct object   *dmabuf_channel_producer; /* producer end of the frame socket */
+    struct object   *dmabuf_channel_consumer; /* consumer end of the frame socket */
 };
 
 static void window_dump( struct object *obj, int verbose );
@@ -168,6 +172,9 @@ static void window_destroy( struct object *obj )
     struct window *win = (struct window *)obj;
 
     assert( !win->handle );
+
+    if (win->dmabuf_channel_producer) release_object( win->dmabuf_channel_producer );
+    if (win->dmabuf_channel_consumer) release_object( win->dmabuf_channel_consumer );
 
     if (win->parent)
     {
@@ -683,6 +690,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->nb_extra_bytes = 0;
     win->extra_bytes    = NULL;
     win->shared         = NULL;
+    win->dmabuf_channel_producer = NULL;
+    win->dmabuf_channel_consumer = NULL;
     win->window_rect = win->visible_rect = win->surface_rect = win->client_rect = empty_rect;
     list_init( &win->children );
     list_init( &win->unlinked );
@@ -1259,6 +1268,65 @@ static inline struct window *get_top_clipping_window( struct window *win )
     while (!(win->paint_flags & PAINT_HAS_SURFACE) && win->parent && !is_desktop_window(win->parent))
         win = win->parent;
     return win;
+}
+
+static void hwnd_dmabuf_host_client_origin( struct window *host, int *x, int *y )
+{
+    *x = *y = 0;
+    client_to_screen( host, x, y );
+}
+
+static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct window *win,
+                                                hwnd_dmabuf_frame_info_t *info )
+{
+    int host_x, host_y;
+
+    memset( info, 0, sizeof(*info) );
+    info->hwnd = win->handle;
+    info->host_hwnd = host->handle;
+    info->window = win->window_rect;
+    info->client = win->client_rect;
+    client_to_screen_rect( win->parent, &info->window );
+    client_to_screen_rect( win->parent, &info->client );
+    hwnd_dmabuf_host_client_origin( host, &host_x, &host_y );
+    offset_rect( &info->window, -host_x, -host_y );
+    offset_rect( &info->client, -host_x, -host_y );
+    info->style = win->style;
+    info->ex_style = win->ex_style;
+    info->dpi = get_window_dpi( win );
+}
+
+/* A window is a composited dmabuf child when it owns a frame socket (a channel producer). */
+static int hwnd_dmabuf_is_producer( struct window *win )
+{
+    return win->dmabuf_channel_producer != NULL;
+}
+
+static unsigned int hwnd_dmabuf_count_frames( struct window *win )
+{
+    struct window *child;
+    unsigned int count = 0;
+
+    if (hwnd_dmabuf_is_producer( win ) && is_visible( win )) count++;
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        count += hwnd_dmabuf_count_frames( child );
+    return count;
+}
+
+static void hwnd_dmabuf_fill_frame_info( struct window *host, struct window *win,
+                                         hwnd_dmabuf_frame_info_t *frames,
+                                         unsigned int max_count, unsigned int *count )
+{
+    struct window *child;
+
+    if (hwnd_dmabuf_is_producer( win ) && is_visible( win ))
+    {
+        if (*count < max_count)
+            hwnd_dmabuf_frame_info_from_window( host, win, &frames[*count] );
+        (*count)++;
+    }
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        hwnd_dmabuf_fill_frame_info( host, child, frames, max_count, count );
 }
 
 
@@ -2959,6 +3027,109 @@ DECL_HANDLER(set_window_region)
         if (win->ex_style & WS_EX_LAYOUTRTL) mirror_region( &win->window_rect, region );
     }
     set_window_region( win, region, req->redraw );
+}
+
+
+/* enumerate dmabuf-producing children below a top-level HWND */
+DECL_HANDLER(hwnd_list_dmabuf_frames)
+{
+    struct window *host = get_window( req->host_hwnd );
+    hwnd_dmabuf_frame_info_t *frames;
+    unsigned int count, copied = 0, max_count;
+
+    reply->status = HWND_DMABUF_NOT_FOUND;
+    reply->count = 0;
+
+    if (!host)
+        return;
+
+    count = hwnd_dmabuf_count_frames( host );
+    reply->count = count;
+    reply->status = HWND_DMABUF_OK;
+    if (!count)
+        return;
+
+    max_count = min( count, get_reply_max_size() / sizeof(*frames) );
+    if (!max_count)
+        return;
+    if (!(frames = set_reply_data_size( max_count * sizeof(*frames) )))
+        return;
+    hwnd_dmabuf_fill_frame_info( host, host, frames, max_count, &copied );
+}
+
+
+/* Wrap a server-owned unix fd as a handle-passable object (fd consumed on failure). */
+static struct object *hwnd_dmabuf_wrap_fd( int unix_fd )
+{
+    struct object *obj;
+    struct fd *fd;
+
+    if (!(fd = create_anonymous_fd( NULL, unix_fd, NULL, 0 ))) return NULL;
+    obj = create_file_obj( fd, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0, NULL );
+    release_object( fd );
+    return obj;
+}
+
+/* Hand the producer its end of the frame socket. Minted once and retained, so a resize
+ * (new swapchain) re-grants the same socket and the consumer keeps reading. */
+DECL_HANDLER(hwnd_dmabuf_get_channel)
+{
+    struct window *win = get_window( req->hwnd );
+    int fds[2];
+
+    reply->status = HWND_DMABUF_INVALID_ARGS;
+    reply->channel_handle = 0;
+    if (!win) return;
+
+    if (!win->dmabuf_channel_producer)
+    {
+        struct object *producer_end, *consumer_end;
+
+        if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
+        {
+            reply->status = HWND_DMABUF_NOT_FOUND;
+            return;
+        }
+        producer_end = hwnd_dmabuf_wrap_fd( fds[0] );
+        consumer_end = hwnd_dmabuf_wrap_fd( fds[1] );
+        if (!producer_end || !consumer_end)
+        {
+            if (producer_end) release_object( producer_end );
+            if (consumer_end) release_object( consumer_end );
+            return;
+        }
+        win->dmabuf_channel_producer = producer_end;
+        win->dmabuf_channel_consumer = consumer_end;
+    }
+
+    reply->channel_handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
+                                                          GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
+    if (!reply->channel_handle) return;
+    reply->status = HWND_DMABUF_OK;
+}
+
+/* Hand the consumer its end of the frame socket. Retained, so a hidden/shown child can re-claim it. */
+DECL_HANDLER(hwnd_dmabuf_claim_channel)
+{
+    struct window *win = get_window( req->hwnd );
+
+    reply->status = HWND_DMABUF_NOT_FOUND;
+    reply->channel_handle = 0;
+    if (!win) return;
+    if (!win->dmabuf_channel_consumer)
+    {
+        reply->status = HWND_DMABUF_NO_FRAME;
+        return;
+    }
+
+    reply->channel_handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_consumer,
+                                                          GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
+    if (!reply->channel_handle)
+    {
+        reply->status = HWND_DMABUF_INVALID_ARGS;
+        return;
+    }
+    reply->status = HWND_DMABUF_OK;
 }
 
 

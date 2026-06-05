@@ -276,6 +276,74 @@ struct rectangle
     int  bottom;
 };
 
+#define HWND_DMABUF_DESC_VERSION_V1       1
+#define HWND_DMABUF_MAX_DIRTY_RECTS       7
+
+enum hwnd_dmabuf_status
+{
+    HWND_DMABUF_OK = 0,
+    HWND_DMABUF_INVALID_ARGS = 1,
+    HWND_DMABUF_NOT_FOUND = 2,
+    HWND_DMABUF_NO_FRAME = 3,
+    HWND_DMABUF_BUSY = 4
+};
+
+#define HWND_DMABUF_RELEASE_PRESENTED     0x00000001
+#define HWND_DMABUF_RELEASE_FAILED        0x00000002
+#define HWND_DMABUF_RELEASE_DROPPED       0x00000004
+#define HWND_DMABUF_RELEASE_ORPHANED      0x00000008
+
+typedef struct
+{
+    unsigned short RedPrimary[2];
+    unsigned short GreenPrimary[2];
+    unsigned short BluePrimary[2];
+    unsigned short WhitePoint[2];
+    unsigned int   MaxMasteringLuminance;
+    unsigned int   MinMasteringLuminance;
+    unsigned short MaxContentLightLevel;
+    unsigned short MaxFrameAverageLightLevel;
+} hwnd_dmabuf_hdr_metadata_hdr10_t;
+
+typedef struct
+{
+    unsigned int     version;
+    unsigned int     flags;
+    unsigned int     width;
+    unsigned int     height;
+    unsigned int     fourcc;
+    unsigned int     stride;
+    unsigned int     offset;
+    unsigned int     frame_seq;
+    unsigned int     ring_generation;
+    unsigned int     image_id;
+    unsigned int     sync_fd_kind;
+    unsigned int     dirty_count;
+    unsigned short   dirty_rects[HWND_DMABUF_MAX_DIRTY_RECTS][4];
+    unsigned __int64 modifier;
+    unsigned __int64 producer_unique_id;
+    unsigned __int64 sync_timeline_point;
+    unsigned __int64 release_token;
+    unsigned int     dxgi_format;
+    unsigned int     alpha_mode;
+    unsigned int     color_space;
+    unsigned int     hdr_metadata_type;
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
+} hwnd_dmabuf_frame_desc_t;
+
+typedef struct
+{
+    user_handle_t hwnd;
+    user_handle_t host_hwnd;
+    struct rectangle window;
+    struct rectangle client;
+    unsigned int style;
+    unsigned int ex_style;
+    unsigned int dpi;
+    unsigned int frame_seq;
+    unsigned int opened;
+} hwnd_dmabuf_frame_info_t;
+
 /* structure for parameters of async I/O calls */
 struct async_data
 {
@@ -2889,7 +2957,6 @@ enum coords_relative
     VARARG(region,rectangles);    /* list of rectangles for the region (in window coords) */
 @END
 
-
 /* Get the window update region */
 @REQ(get_update_region)
     user_handle_t  window;        /* handle to the window */
@@ -4363,4 +4430,32 @@ enum fsync_type
 @REQ(fsync_free_shm_idx)
     unsigned int shm_idx;
 @REPLY
+@END
+
+
+/* Enumerate dmabuf-producing children below a top-level HWND. */
+@REQ(hwnd_list_dmabuf_frames)
+    user_handle_t  host_hwnd;           /* top-level host HWND */
+@REPLY
+    unsigned int   status;              /* enum hwnd_dmabuf_status */
+    unsigned int   count;               /* total frame count, may exceed reply capacity */
+    VARARG(frames,bytes);               /* hwnd_dmabuf_frame_info_t[count] */
+@END
+
+
+/* Producer: mint and return the producer end of hwnd's private frame socket. */
+@REQ(hwnd_dmabuf_get_channel)
+    user_handle_t  hwnd;                /* child HWND being produced for */
+@REPLY
+    unsigned int   status;              /* enum hwnd_dmabuf_status */
+    obj_handle_t   channel_handle;      /* producer end of the socketpair */
+@END
+
+
+/* Consumer: claim the consumer end of the channel minted for hwnd, if any. */
+@REQ(hwnd_dmabuf_claim_channel)
+    user_handle_t  hwnd;                /* child HWND owned by the caller */
+@REPLY
+    unsigned int   status;              /* enum hwnd_dmabuf_status */
+    obj_handle_t   channel_handle;      /* consumer end, or zero if none */
 @END

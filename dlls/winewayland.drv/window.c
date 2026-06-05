@@ -202,6 +202,8 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
+static BOOL is_menu_popup(HWND hwnd);
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *toplevel_surface)
 {
     struct wayland_client_surface *client = data->client_surface;
@@ -228,6 +230,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     }
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+    else if (toplevel_surface && toplevel_surface->xdg_surface && is_menu_popup(data->hwnd))
+        role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
 
@@ -291,6 +295,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, toplevel_surface);
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        wayland_surface_make_popup(surface, toplevel_surface);
         break;
     }
 
@@ -398,6 +405,9 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
         surface->processing.serial = 1;
         surface->processing.processed = TRUE;
         break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        /* Positioned by the compositor via the positioner; no state to apply. */
+        break;
     }
 
     wl_display_flush(process_wayland.wl_display);
@@ -458,6 +468,22 @@ static inline HWND get_active_window(void)
  *
  * Check if a given window should be managed
  */
+/* Owned, caption-less popups (menus, dropdowns, tooltips) are positioned by the
+ * compositor as xdg_popups relative to their owner, never as managed toplevels
+ * (a Wayland toplevel has no client-set position). */
+static BOOL is_menu_popup(HWND hwnd)
+{
+    DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+
+    if (!(style & WS_POPUP)) return FALSE;
+    if ((style & WS_CAPTION) == WS_CAPTION) return FALSE;
+    if (style & WS_SYSMENU) return FALSE;
+    if (NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW) return FALSE;
+    /* must be owned, so there is a parent toplevel/popup to anchor against */
+    if (NtUserGetAncestor(hwnd, GA_ROOTOWNER) == hwnd) return FALSE;
+    return TRUE;
+}
+
 static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
 {
     DWORD style, ex_style;
@@ -465,6 +491,9 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
     /* child windows are not managed */
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
+    /* owned, caption-less popup menus are never managed toplevels, so they keep
+     * their xdg_popup role and position across focus changes */
+    if (is_menu_popup(hwnd)) return FALSE;
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
     if (hwnd == get_active_window()) return TRUE;
@@ -727,6 +756,8 @@ static void wayland_configure_window(HWND hwnd)
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
 }
 
+static void wayland_dmabuf_vsync(HWND hwnd);
+
 /**********************************************************************
  *           WAYLAND_WindowMessage
  */
@@ -757,6 +788,16 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                  focused, hwnd, wp ? "focus loss" : "focus gain");
         return 0;
     }
+    case WM_WAYLAND_DMABUF_FRAME:
+        /* A producer published an HWND dmabuf frame for a descendant of this
+         * toplevel, possibly from another process (e.g. a CEF GPU/render
+         * subprocess). Consume it here, in the process that owns this
+         * toplevel's wayland surface. */
+        ensure_window_surface_contents(hwnd);
+        return 0;
+    case WM_WAYLAND_DMABUF_VSYNC:
+        wayland_dmabuf_vsync(hwnd);
+        return 0;
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;
@@ -1011,7 +1052,11 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
     /* ownership is shared with the callers, the last caller to release
      * its reference will also destroy it and clear our pointer. */
 
-    if (!(data = wayland_win_data_get(hwnd))) return;
+    if (!(data = wayland_win_data_get(hwnd)))
+    {
+        TRACE("hwnd=%p no wayland data for client surface\n", hwnd);
+        return;
+    }
 
     if (new_client != data->client_surface)
     {
@@ -1088,12 +1133,36 @@ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd)
     return shm_buffer;
 }
 
+/* Throttle frame callback fired (vsync): clear it and run the update for the next frame. */
+static void wayland_dmabuf_vsync(HWND hwnd)
+{
+    struct wayland_surface *wayland_surface;
+    struct wayland_win_data *data;
+
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        if ((wayland_surface = data->wayland_surface) && wayland_surface->dmabuf_frame_cb)
+        {
+            wl_callback_destroy(wayland_surface->dmabuf_frame_cb);
+            wayland_surface->dmabuf_frame_cb = NULL;
+        }
+        wayland_win_data_release(data);
+    }
+    ensure_window_surface_contents(hwnd);
+}
+
 void ensure_window_surface_contents(HWND hwnd)
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
 
-    if (!(data = wayland_win_data_get(hwnd))) return;
+    if (!(data = wayland_win_data_get(hwnd)))
+    {
+        TRACE("hwnd=%p no wayland data for ensure contents\n", hwnd);
+        return;
+    }
+
+    TRACE("hwnd=%p wayland_surface=%p\n", hwnd, data->wayland_surface);
 
     if ((wayland_surface = data->wayland_surface))
     {
@@ -1107,6 +1176,11 @@ void ensure_window_surface_contents(HWND hwnd)
         {
             wl_surface_commit(wayland_surface->wl_surface);
         }
+
+        /* Flush the queued commits now: the dmabuf present path has no other
+         * flush point, so they would otherwise wait in the output buffer until
+         * the event thread next wakes, throttling presentation to that rate. */
+        wl_display_flush(process_wayland.wl_display);
     }
 
     wayland_win_data_release(data);
