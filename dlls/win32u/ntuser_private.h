@@ -238,9 +238,12 @@ extern void release_opengl_drawables( struct list *drawables );
 extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_instance_extensions *extensions );
 
 /* hwnd_dmabuf.c */
+extern UINT hwnd_dmabuf_publish( HWND hwnd, int dmabuf_fd, int acquire_sync_fd,
+                                 const void *desc, UINT *frame_seq );
 extern int hwnd_dmabuf_open_channel( HWND hwnd );
 extern void hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd );
 extern void hwnd_dmabuf_post_wake( HWND hwnd );
+extern void hwnd_dmabuf_drop_channel( HWND hwnd );
 
 /* window.c */
 HANDLE alloc_user_handle( void *ptr, unsigned short type );

@@ -59,12 +59,25 @@ struct wgl_pixel_format
     int float_components;
 };
 
+struct wgl_dmabuf_desc
+{
+    UINT fourcc;
+    UINT stride;
+    UINT offset;
+    UINT64 modifier;
+};
+
+typedef BOOL (GLAPIENTRY *PFN_wglWineExportDmaBufWINE)( GLuint texture, GLenum target,
+        struct wgl_dmabuf_desc *desc, int *fd );
+typedef void (GLAPIENTRY *PFN_wglWineCloseDmaBufWINE)( int fd );
+typedef BOOL (GLAPIENTRY *PFN_wglWineDmaBufExportSupportedWINE)( void );
+
 #ifdef WINE_UNIX_LIB
 
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 37
+#define WINE_OPENGL_DRIVER_VERSION 38
 
 struct opengl_drawable;
 struct wgl_context;
@@ -131,6 +144,16 @@ struct opengl_funcs
     struct wgl_context * (*p_wglCreateContextAttribsARB)( HDC hDC, struct wgl_context * hShareContext, const int *attribList );
     struct wgl_pbuffer * (*p_wglCreatePbufferARB)( HDC hDC, int iPixelFormat, int iWidth, int iHeight, const int *piAttribList );
     BOOL       (*p_wglDestroyPbufferARB)( struct wgl_pbuffer * hPbuffer );
+    PFN_wglDXCloseDeviceNV p_wglDXCloseDeviceNV;
+    PFN_wglDXLockObjectsNV p_wglDXLockObjectsNV;
+    PFN_wglDXObjectAccessNV p_wglDXObjectAccessNV;
+    PFN_wglDXOpenDeviceNV p_wglDXOpenDeviceNV;
+    PFN_wglDXRegisterObjectNV p_wglDXRegisterObjectNV;
+    PFN_wglDXSetResourceShareHandleNV p_wglDXSetResourceShareHandleNV;
+    PFN_wglDXUnlockObjectsNV p_wglDXUnlockObjectsNV;
+    PFN_wglDXUnregisterObjectNV p_wglDXUnregisterObjectNV;
+    PFN_wglWineDmaBufExportSupportedWINE p_wglWineDmaBufExportSupportedWINE;
+    PFN_wglWineExportDmaBufWINE p_wglWineExportDmaBufWINE;
     void       (*p_wglFreeMemoryNV)( void *pointer );
     HDC        (*p_wglGetCurrentReadDCARB)(void);
     const char * (*p_wglGetExtensionsStringARB)( HDC hdc );
@@ -175,6 +198,11 @@ struct egl_platform
     EGLConfig           *configs;
     BOOL                 has_EGL_EXT_present_opaque;
     BOOL                 has_EGL_EXT_pixel_format_float;
+    BOOL                 has_EGL_KHR_image_base;
+    BOOL                 has_EGL_KHR_gl_renderbuffer_image;
+    BOOL                 has_EGL_KHR_gl_texture_2D_image;
+    BOOL                 has_EGL_KHR_image;
+    BOOL                 has_EGL_MESA_image_dma_buf_export;
 
     /* WGL_WINE_query_renderer info */
     UINT                 device_id;

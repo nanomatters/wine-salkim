@@ -359,3 +359,6 @@
 @ stdcall wglUseFontBitmapsW(long long long long)
 @ stdcall wglUseFontOutlinesA(long long long long float float long ptr)
 @ stdcall wglUseFontOutlinesW(long long long long float float long ptr)
+@ stdcall wglWineCloseDmaBufWINE(long)
+@ stdcall wglWineDmaBufExportSupportedWINE()
+@ stdcall wglWineExportDmaBufWINE(long long ptr ptr)

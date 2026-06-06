@@ -980,6 +980,57 @@ BOOL WINAPI DECLSPEC_HOTPATCH wglSwapBuffers( HDC hdc )
     return args.ret;
 }
 
+void WINAPI wglWineCloseDmaBufWINE( int fd )
+{
+    struct wglWineCloseDmaBufWINE_params args = { .fd = fd };
+    NTSTATUS status;
+
+    TRACE( "fd %d.\n", fd );
+
+    if ((status = UNIX_CALL( wglWineCloseDmaBufWINE, &args )))
+        WARN( "wglWineCloseDmaBufWINE returned %#lx\n", status );
+}
+
+BOOL WINAPI wglWineDmaBufExportSupportedWINE( void )
+{
+    struct wglWineDmaBufExportSupportedWINE_params args = { .teb = NtCurrentTeb() };
+    NTSTATUS status;
+
+    TRACE( "\n" );
+
+    if ((status = UNIX_CALL( wglWineDmaBufExportSupportedWINE, &args )))
+    {
+        WARN( "wglWineDmaBufExportSupportedWINE returned %#lx\n", status );
+        return FALSE;
+    }
+
+    return args.ret;
+}
+
+BOOL WINAPI wglWineExportDmaBufWINE( GLuint texture, GLenum target, struct wgl_dmabuf_desc *desc, int *fd )
+{
+    struct wglWineExportDmaBufWINE_params args =
+    {
+        .teb = NtCurrentTeb(),
+        .texture = texture,
+        .target = target,
+        .desc = desc,
+        .fd = fd,
+    };
+    NTSTATUS status;
+
+    TRACE( "texture %u, target %#x, desc %p, fd %p.\n", texture, target, desc, fd );
+
+    if ((status = UNIX_CALL( wglWineExportDmaBufWINE, &args )))
+    {
+        if (status != STATUS_NOT_IMPLEMENTED)
+            WARN( "wglWineExportDmaBufWINE returned %#lx\n", status );
+        return FALSE;
+    }
+
+    return args.ret;
+}
+
 /***********************************************************************
  *		wglCreateLayerContext (OPENGL32.@)
  */

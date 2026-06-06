@@ -1492,6 +1492,11 @@ static BOOL init_egl_platform( struct egl_platform *egl, const struct opengl_fun
 
     egl->has_EGL_EXT_present_opaque = has_extension( extensions, "EGL_EXT_present_opaque" );
     egl->has_EGL_EXT_pixel_format_float = has_extension( extensions, "EGL_EXT_pixel_format_float" );
+    egl->has_EGL_KHR_image_base = has_extension( extensions, "EGL_KHR_image_base" );
+    egl->has_EGL_KHR_gl_renderbuffer_image = has_extension( extensions, "EGL_KHR_gl_renderbuffer_image" );
+    egl->has_EGL_KHR_gl_texture_2D_image = has_extension( extensions, "EGL_KHR_gl_texture_2D_image" );
+    egl->has_EGL_KHR_image = has_extension( extensions, "EGL_KHR_image" );
+    egl->has_EGL_MESA_image_dma_buf_export = has_extension( extensions, "EGL_MESA_image_dma_buf_export" );
     return TRUE;
 }
 
@@ -3353,6 +3358,8 @@ static void display_funcs_init(void)
     strcpy( wgl_extensions, driver_funcs->p_init_wgl_extensions( &display_funcs ) );
     display_funcs.p_wglGetPixelFormat = win32u_wglGetPixelFormat;
     display_funcs.p_wglSetPixelFormat = win32u_wglSetPixelFormat;
+    display_funcs.p_wglWineDmaBufExportSupportedWINE = driver_funcs->p_get_proc_address( "wglWineDmaBufExportSupportedWINE" );
+    display_funcs.p_wglWineExportDmaBufWINE = driver_funcs->p_get_proc_address( "wglWineExportDmaBufWINE" );
 
     display_funcs.p_wglCreateContext = (void *)1; /* never called */
     display_funcs.p_wglDeleteContext = (void *)1; /* never called */
@@ -3409,6 +3416,37 @@ static void display_funcs_init(void)
     display_funcs.p_wglBindTexImageARB     = win32u_wglBindTexImageARB;
     display_funcs.p_wglReleaseTexImageARB  = win32u_wglReleaseTexImageARB;
     display_funcs.p_wglSetPbufferAttribARB = win32u_wglSetPbufferAttribARB;
+
+    /* WGL_NV_DX_interop: expose the extension only if the driver provides the
+     * complete function family. The driver-side lookup gates this on EGL/GL
+     * capabilities before returning these entry points. */
+    display_funcs.p_wglDXOpenDeviceNV             = driver_funcs->p_get_proc_address( "wglDXOpenDeviceNV" );
+    display_funcs.p_wglDXCloseDeviceNV            = driver_funcs->p_get_proc_address( "wglDXCloseDeviceNV" );
+    display_funcs.p_wglDXRegisterObjectNV         = driver_funcs->p_get_proc_address( "wglDXRegisterObjectNV" );
+    display_funcs.p_wglDXUnregisterObjectNV       = driver_funcs->p_get_proc_address( "wglDXUnregisterObjectNV" );
+    display_funcs.p_wglDXLockObjectsNV            = driver_funcs->p_get_proc_address( "wglDXLockObjectsNV" );
+    display_funcs.p_wglDXUnlockObjectsNV          = driver_funcs->p_get_proc_address( "wglDXUnlockObjectsNV" );
+    display_funcs.p_wglDXObjectAccessNV           = driver_funcs->p_get_proc_address( "wglDXObjectAccessNV" );
+    display_funcs.p_wglDXSetResourceShareHandleNV = driver_funcs->p_get_proc_address( "wglDXSetResourceShareHandleNV" );
+    if (display_funcs.p_wglDXOpenDeviceNV && display_funcs.p_wglDXCloseDeviceNV &&
+        display_funcs.p_wglDXRegisterObjectNV && display_funcs.p_wglDXUnregisterObjectNV &&
+        display_funcs.p_wglDXLockObjectsNV && display_funcs.p_wglDXUnlockObjectsNV &&
+        display_funcs.p_wglDXObjectAccessNV && display_funcs.p_wglDXSetResourceShareHandleNV)
+    {
+        register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_NV_DX_interop" );
+        register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_NV_DX_interop2" );
+    }
+    else
+    {
+        display_funcs.p_wglDXOpenDeviceNV = NULL;
+        display_funcs.p_wglDXCloseDeviceNV = NULL;
+        display_funcs.p_wglDXRegisterObjectNV = NULL;
+        display_funcs.p_wglDXUnregisterObjectNV = NULL;
+        display_funcs.p_wglDXLockObjectsNV = NULL;
+        display_funcs.p_wglDXUnlockObjectsNV = NULL;
+        display_funcs.p_wglDXObjectAccessNV = NULL;
+        display_funcs.p_wglDXSetResourceShareHandleNV = NULL;
+    }
 
     register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_EXT_swap_control" );
     register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_EXT_swap_control_tear" );

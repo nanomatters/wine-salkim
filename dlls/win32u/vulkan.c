@@ -82,6 +82,12 @@ static UINT hwnd_dmabuf_get_caps( HWND hwnd, void *caps, void *format_modifiers,
                                                         max_format_modifiers, format_modifier_count );
 }
 
+UINT WINAPI NtUserGetHwndDmabufCaps( HWND hwnd, void *caps, void *format_modifiers,
+                                     UINT max_format_modifiers, UINT *format_modifier_count )
+{
+    return hwnd_dmabuf_get_caps( hwnd, caps, format_modifiers, max_format_modifiers, format_modifier_count );
+}
+
 #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
 
 static BOOL use_external_memory(void)

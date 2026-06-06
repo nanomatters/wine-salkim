@@ -2155,7 +2155,8 @@ enum wined3d_pci_device
     CARD_AMD_RADEON_RX_NAVI_10      = 0x731f,
     CARD_AMD_RADEON_RX_NAVI_14      = 0x7340,
     CARD_AMD_RADEON_RX_NAVI_21      = 0x73bf,
-    CARD_AMD_RADEON_RX_NAVI_44      = 0x7590,
+    CARD_AMD_RADEON_RX_NAVI_44      = 0x7590,   /* RX 9060 / 9060 XT */
+    CARD_AMD_RADEON_RX_NAVI_48      = 0x7550,   /* RX 9070 / 9070 XT / 9070 GRE */
     CARD_AMD_RADEON_PRO_V620        = 0x73a1,
     CARD_AMD_RADEON_PRO_V620_VF     = 0x73ae,
     CARD_AMD_RADEON_RX_6700_XT      = 0x73df,
@@ -2336,6 +2337,18 @@ enum wined3d_pci_device
     CARD_NVIDIA_GEFORCE_RTX4080     = 0x2704,
     CARD_NVIDIA_GEFORCE_RTX4080SUPER = 0x2702,
     CARD_NVIDIA_GEFORCE_RTX4090     = 0x2684,
+    /* Blackwell (RTX 50 series). PCI device IDs from pci.ids; without
+     * these entries Wine falls back to GTX 470 (Fermi) for unknown
+     * Nvidia D3D11 cards, which can trigger driver-version blocklists
+     * on modern hardware. */
+    CARD_NVIDIA_GEFORCE_RTX5060     = 0x2d05,
+    CARD_NVIDIA_GEFORCE_RTX5060TI   = 0x2d04,
+    CARD_NVIDIA_GEFORCE_RTX5070     = 0x2f04,
+    CARD_NVIDIA_GEFORCE_RTX5070TI   = 0x2c05,
+    CARD_NVIDIA_GEFORCE_RTX5080     = 0x2c02,
+    CARD_NVIDIA_GEFORCE_RTX5090     = 0x2b85,
+    CARD_NVIDIA_GEFORCE_RTX5090D    = 0x2b87,   /* China-only variant */
+    CARD_NVIDIA_GEFORCE_RTX5090DV2  = 0x2b8c,   /* China-only variant */
 
     CARD_REDHAT_VIRGL               = 0x1010,
 
@@ -4098,6 +4111,11 @@ struct wined3d_swapchain_ops
     void (*swapchain_present)(struct wined3d_swapchain *swapchain,
             const RECT *src_rect, const RECT *dst_rect, unsigned int swap_interval, uint32_t flags);
     void (*swapchain_frontbuffer_updated)(struct wined3d_swapchain *swapchain);
+    HRESULT (*swapchain_get_composition_dmabuf)(struct wined3d_swapchain *swapchain,
+        UINT expected_present_count, struct wined3d_dcomp_dmabuf_desc *desc,
+        int *dmabuf_fd, int *acquire_sync_fd);
+    void (*swapchain_release_composition_dmabuf)(struct wined3d_swapchain *swapchain,
+        UINT64 release_token, UINT release_flags);
 };
 
 struct wined3d_swapchain

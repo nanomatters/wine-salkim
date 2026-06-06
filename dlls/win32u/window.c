@@ -5414,6 +5414,7 @@ LRESULT destroy_window( HWND hwnd )
     }
 
     detach_client_surfaces( hwnd );
+    hwnd_dmabuf_drop_channel( hwnd );
     if (win->current_drawable) opengl_drawable_release( win->current_drawable );
     if (win->unused_drawable) opengl_drawable_release( win->unused_drawable );
     user_driver->pDestroyWindow( hwnd );

@@ -1539,4 +1539,6 @@
 @ stub -syscall NtUserZapActiveAndFocus
 @ stub -syscall NtValidateCompositionSurfaceHandle
 @ stub -syscall NtVisualCaptureBits
+@ stdcall -syscall=0x1604 NtUserPublishHwndDmabuf(long long long ptr ptr)
+@ stdcall -syscall=0x1605 NtUserGetHwndDmabufCaps(long ptr ptr long ptr)
 # extern gDispatchTableValues

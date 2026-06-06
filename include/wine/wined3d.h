@@ -800,6 +800,46 @@ enum wined3d_stateblock_type
     WINED3D_SBT_PRIMARY                     = 5, /* WineD3D private */
 };
 
+/* Backend-neutral hooks that capture the last presented swapchain image and
+ * export it as a Linux dmabuf. The GL backend implements them via the
+ * WGL_WINE_dmabuf_export extension (wglWineExportDmaBufWINE). The caller owns
+ * the exported descriptor and fd. */
+enum wined3d_dcomp_dmabuf_sync_fd_kind
+{
+    WINED3D_DCOMP_DMABUF_SYNC_NONE = 0,
+    WINED3D_DCOMP_DMABUF_SYNC_FILE = 1,
+    WINED3D_DCOMP_DMABUF_SYNC_DRM_SYNCOBJ_TIMELINE = 2,
+};
+
+#define WINED3D_DCOMP_DMABUF_DESC_RING_POISONED 0x00000001
+
+#define WINED3D_DCOMP_DMABUF_RELEASE_OK        0x00000001
+#define WINED3D_DCOMP_DMABUF_RELEASE_DROPPED   0x00000002
+#define WINED3D_DCOMP_DMABUF_RELEASE_FAILED    0x00000004
+#define WINED3D_DCOMP_DMABUF_RELEASE_ORPHANED  0x00000008
+
+struct wined3d_dcomp_dmabuf_desc
+{
+    UINT version;
+    UINT desc_flags;
+    UINT present_count;
+    UINT producer_pid;
+    UINT ring_generation;
+    UINT image_id;
+    UINT width;
+    UINT height;
+    UINT fourcc;
+    UINT stride;
+    UINT offset;
+    UINT sync_fd_kind;
+    UINT64 producer_unique_id;
+    UINT64 modifier;
+    UINT64 release_token;
+    UINT64 sync_timeline_point;
+    UINT frame_seq;
+    UINT dirty_count;
+};
+
 enum wined3d_decl_method
 {
     WINED3D_DECL_METHOD_DEFAULT             = 0,
@@ -2905,6 +2945,12 @@ HRESULT __cdecl wined3d_swapchain_get_front_buffer_data(const struct wined3d_swa
         struct wined3d_texture *dst_texture, unsigned int sub_resource_idx);
 HRESULT __cdecl wined3d_swapchain_get_gamma_ramp(const struct wined3d_swapchain *swapchain,
         struct wined3d_gamma_ramp *ramp);
+HRESULT __cdecl wined3d_swapchain_get_composition_dmabuf(struct wined3d_swapchain *swapchain,
+        UINT expected_present_count, struct wined3d_dcomp_dmabuf_desc *desc,
+        int *dmabuf_fd, int *acquire_sync_fd);
+void __cdecl wined3d_swapchain_release_composition_dmabuf(struct wined3d_swapchain *swapchain,
+        UINT64 release_token, UINT release_flags);
+BOOL __cdecl wined3d_swapchain_supports_composition_dmabuf(const struct wined3d_swapchain *swapchain);
 void * __cdecl wined3d_swapchain_get_parent(const struct wined3d_swapchain *swapchain);
 void __cdecl wined3d_swapchain_get_desc(const struct wined3d_swapchain *swapchain,
         struct wined3d_swapchain_desc *desc);
@@ -2912,6 +2958,9 @@ HRESULT __cdecl wined3d_swapchain_get_raster_status(const struct wined3d_swapcha
         struct wined3d_raster_status *raster_status);
 struct wined3d_swapchain_state * __cdecl wined3d_swapchain_get_state(struct wined3d_swapchain *swapchain);
 ULONG __cdecl wined3d_swapchain_incref(struct wined3d_swapchain *swapchain);
+
+#define WINED3D_PRESENT_NO_WINDOW_UPDATE 0x80000000u
+
 HRESULT __cdecl wined3d_swapchain_present(struct wined3d_swapchain *swapchain, const RECT *src_rect,
         const RECT *dst_rect, HWND dst_window_override, unsigned int swap_interval, uint32_t flags);
 HRESULT __cdecl wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapchain, unsigned int buffer_count,

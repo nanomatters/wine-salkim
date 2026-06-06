@@ -27,6 +27,8 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
 
+static void wined3d_gl_dcomp_dmabuf_cleanup(struct wined3d_swapchain_gl *swapchain_gl);
+
 static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT height)
 {
     RECT rect = {x, y, x + width, y + height};
@@ -101,8 +103,18 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
     }
 }
 
+static void wined3d_swapchain_gl_destroy_object(void *object)
+{
+    wined3d_gl_dcomp_dmabuf_cleanup(object);
+}
+
 void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
 {
+    struct wined3d_cs *cs = swapchain_gl->s.device->cs;
+
+    wined3d_cs_destroy_object(cs, wined3d_swapchain_gl_destroy_object, swapchain_gl);
+    wined3d_cs_finish(cs, WINED3D_CS_QUEUE_DEFAULT);
+
     wined3d_swapchain_cleanup(&swapchain_gl->s);
 }
 
@@ -222,8 +234,8 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
             swapchain, wine_dbgstr_rect(src_rect), wine_dbgstr_rect(dst_rect),
             dst_window_override, swap_interval, flags);
 
-    if (flags)
-        FIXME("Ignoring flags %#x.\n", flags);
+    if (flags & ~WINED3D_PRESENT_NO_WINDOW_UPDATE)
+        FIXME("Ignoring flags %#x.\n", flags & ~WINED3D_PRESENT_NO_WINDOW_UPDATE);
 
     wined3d_mutex_lock();
 
@@ -276,6 +288,59 @@ HRESULT CDECL wined3d_swapchain_get_front_buffer_data(const struct wined3d_swapc
 
     return wined3d_device_context_blt(&swapchain->device->cs->c, dst_texture, sub_resource_idx, &dst_rect,
             swapchain->front_buffer, 0, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
+}
+
+HRESULT CDECL wined3d_swapchain_get_composition_dmabuf(struct wined3d_swapchain *swapchain,
+        UINT expected_present_count, struct wined3d_dcomp_dmabuf_desc *desc,
+        int *dmabuf_fd, int *acquire_sync_fd)
+{
+    HRESULT hr;
+
+    TRACE("swapchain %p, expected_present_count %u, desc %p, dmabuf_fd %p, acquire_sync_fd %p.\n",
+            swapchain, expected_present_count, desc, dmabuf_fd, acquire_sync_fd);
+
+    if (!swapchain || !desc || !dmabuf_fd || !acquire_sync_fd)
+        return WINED3DERR_INVALIDCALL;
+
+    memset(desc, 0, sizeof(*desc));
+    *dmabuf_fd = -1;
+    *acquire_sync_fd = -1;
+
+    if (!swapchain->swapchain_ops->swapchain_get_composition_dmabuf)
+        return WINED3DERR_NOTAVAILABLE;
+
+    if (expected_present_count)
+        wined3d_cs_finish(swapchain->device->cs, WINED3D_CS_QUEUE_DEFAULT);
+
+    wined3d_mutex_lock();
+    hr = swapchain->swapchain_ops->swapchain_get_composition_dmabuf(swapchain,
+            expected_present_count, desc, dmabuf_fd, acquire_sync_fd);
+    wined3d_mutex_unlock();
+    return hr;
+}
+
+void CDECL wined3d_swapchain_release_composition_dmabuf(struct wined3d_swapchain *swapchain,
+        UINT64 release_token, UINT release_flags)
+{
+    TRACE("swapchain %p, release_token %s, release_flags %#x.\n",
+            swapchain, wine_dbgstr_longlong(release_token), release_flags);
+
+    if (!swapchain || !release_token)
+        return;
+    if (!swapchain->swapchain_ops->swapchain_release_composition_dmabuf)
+        return;
+
+    wined3d_mutex_lock();
+    swapchain->swapchain_ops->swapchain_release_composition_dmabuf(swapchain,
+            release_token, release_flags);
+    wined3d_mutex_unlock();
+}
+
+BOOL CDECL wined3d_swapchain_supports_composition_dmabuf(const struct wined3d_swapchain *swapchain)
+{
+    TRACE("swapchain %p.\n", swapchain);
+
+    return swapchain && !!swapchain->swapchain_ops->swapchain_get_composition_dmabuf;
 }
 
 struct wined3d_texture * CDECL wined3d_swapchain_get_back_buffer(const struct wined3d_swapchain *swapchain,
@@ -580,6 +645,465 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
     device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
 }
 
+static void wined3d_gl_dcomp_dmabuf_close_fd(struct wined3d_gl_dcomp_dmabuf_ring *ring, int *fd)
+{
+    if (*fd < 0)
+        return;
+
+    if (ring->p_wglWineCloseDmaBufWINE)
+        ring->p_wglWineCloseDmaBufWINE(*fd);
+    else
+        ERR("Leaking composition dmabuf fd %d, no close helper.\n", *fd);
+
+    *fd = -1;
+}
+
+static void wined3d_gl_dcomp_dmabuf_destroy_image(struct wined3d_gl_dcomp_dmabuf_ring *ring,
+        struct wined3d_gl_dcomp_dmabuf_image *image, struct wined3d_context_gl *context_gl)
+{
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+
+    wined3d_gl_dcomp_dmabuf_close_fd(ring, &image->dmabuf_fd);
+
+    if (image->fbo)
+    {
+        gl_info->fbo_ops.glDeleteFramebuffers(1, &image->fbo);
+        image->fbo = 0;
+    }
+    if (image->texture)
+    {
+        gl_info->gl_ops.gl.p_glDeleteTextures(1, &image->texture);
+        image->texture = 0;
+    }
+
+    image->valid = false;
+    image->busy = false;
+    image->width = 0;
+    image->height = 0;
+    image->present_count = 0;
+    image->release_token = 0;
+    memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
+}
+
+static void wined3d_gl_dcomp_dmabuf_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
+{
+    struct wined3d_gl_dcomp_dmabuf_ring *ring = &swapchain_gl->dcomp_dmabuf;
+    struct wined3d_context_gl *context_gl;
+    struct wined3d_context *context;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+        wined3d_gl_dcomp_dmabuf_close_fd(ring, &ring->images[i].dmabuf_fd);
+
+    if (!swapchain_gl->s.front_buffer)
+        return;
+
+    context = context_acquire(swapchain_gl->s.device, swapchain_gl->s.front_buffer, 0);
+    context_gl = wined3d_context_gl(context);
+    if (context_gl->valid)
+    {
+        for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+            wined3d_gl_dcomp_dmabuf_destroy_image(ring, &ring->images[i], context_gl);
+    }
+    context_release(context);
+}
+
+static bool wined3d_gl_dcomp_dmabuf_ensure_image(struct wined3d_swapchain_gl *swapchain_gl,
+        struct wined3d_gl_dcomp_dmabuf_image *image, struct wined3d_context_gl *context_gl,
+        unsigned int width, unsigned int height)
+{
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    struct wined3d_gl_dcomp_dmabuf_ring *ring = &swapchain_gl->dcomp_dmabuf;
+    GLenum status;
+
+    if (image->texture && image->width == width && image->height == height)
+        return true;
+
+    if (image->busy)
+        return false;
+
+    if (image->texture || image->fbo)
+    {
+        wined3d_gl_dcomp_dmabuf_destroy_image(ring, image, context_gl);
+        ++ring->ring_generation;
+        ring->next_desc_flags |= WINED3D_DCOMP_DMABUF_DESC_RING_POISONED;
+    }
+
+    gl_info->gl_ops.gl.p_glGenTextures(1, &image->texture);
+    wined3d_context_gl_bind_texture(context_gl, GL_TEXTURE_2D, image->texture);
+    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl_info->gl_ops.gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+            GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    checkGLcall("create composition dmabuf texture");
+
+    gl_info->fbo_ops.glGenFramebuffers(1, &image->fbo);
+    gl_info->fbo_ops.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, image->fbo);
+    context_gl->fbo_draw_binding = image->fbo;
+    gl_info->fbo_ops.glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, image->texture, 0);
+    gl_info->gl_ops.gl.p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    status = gl_info->fbo_ops.glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE)
+    {
+        WARN("Failed to create composition dmabuf FBO, status %#x.\n", status);
+        wined3d_gl_dcomp_dmabuf_destroy_image(ring, image, context_gl);
+        device_invalidate_state(swapchain_gl->s.device, STATE_FRAMEBUFFER);
+        return false;
+    }
+
+    image->width = width;
+    image->height = height;
+    device_invalidate_state(swapchain_gl->s.device, STATE_FRAMEBUFFER);
+    return true;
+}
+
+static void wined3d_gl_dcomp_dmabuf_capture(struct wined3d_swapchain *swapchain,
+        struct wined3d_context *context)
+{
+    struct wined3d_swapchain_gl *swapchain_gl = wined3d_swapchain_gl(swapchain);
+    struct wined3d_gl_dcomp_dmabuf_ring *ring = &swapchain_gl->dcomp_dmabuf;
+    struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
+    struct wined3d_gl_dcomp_dmabuf_image *image = NULL;
+    const struct wined3d_gl_info *gl_info;
+    struct wined3d_context_gl *context_gl;
+    unsigned int width, height, i, idx;
+    DWORD src_location;
+
+    context_gl = wined3d_context_gl(context);
+    gl_info = context_gl->gl_info;
+    if (!gl_info->p_wglWineCloseDmaBufWINE || !gl_info->p_wglWineDmaBufExportSupportedWINE
+            || !gl_info->p_wglWineExportDmaBufWINE || !gl_info->p_wglWineDmaBufExportSupportedWINE())
+        return;
+    ring->p_wglWineCloseDmaBufWINE = gl_info->p_wglWineCloseDmaBufWINE;
+
+    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+    {
+        idx = (ring->next_image + i) % ARRAY_SIZE(ring->images);
+        if (!ring->images[idx].busy)
+        {
+            image = &ring->images[idx];
+            break;
+        }
+    }
+    if (!image)
+    {
+        TRACE("No free composition dmabuf image for present %s.\n",
+                wine_dbgstr_longlong(ring->present_count));
+        return;
+    }
+
+    width = back_buffer->resource.width;
+    height = back_buffer->resource.height;
+    if (!width || !height)
+        return;
+
+    if (!wined3d_gl_dcomp_dmabuf_ensure_image(swapchain_gl, image, context_gl, width, height))
+        return;
+
+    src_location = back_buffer->resource.multisample_type ? WINED3D_LOCATION_RB_RESOLVED
+            : WINED3D_LOCATION_TEXTURE_RGB;
+    wined3d_texture_load_location(back_buffer, 0, context, src_location);
+
+    wined3d_context_gl_apply_fbo_state_explicit(context_gl, GL_READ_FRAMEBUFFER,
+            &back_buffer->resource, 0, NULL, 0, src_location);
+    gl_info->gl_ops.gl.p_glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    gl_info->fbo_ops.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, image->fbo);
+    context_gl->fbo_draw_binding = image->fbo;
+    gl_info->gl_ops.gl.p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    gl_info->gl_ops.gl.p_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    context_invalidate_state(context, STATE_BLEND);
+
+    gl_info->gl_ops.gl.p_glDisable(GL_SCISSOR_TEST);
+    context_invalidate_state(context, STATE_RASTERIZER);
+
+    gl_info->fbo_ops.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    /* The composition dmabuf path currently exports SYNC_NONE descriptors.
+     * Complete the copy before exporting the fd instead of relying on implicit
+     * synchronization across processes. */
+    gl_info->gl_ops.gl.p_glFinish();
+    checkGLcall("copy composition dmabuf image");
+
+    wined3d_gl_dcomp_dmabuf_close_fd(ring, &image->dmabuf_fd);
+    memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
+    if (!gl_info->p_wglWineExportDmaBufWINE(image->texture, GL_TEXTURE_2D,
+            &image->dmabuf_desc, &image->dmabuf_fd))
+    {
+        image->valid = false;
+        image->dmabuf_fd = -1;
+        return;
+    }
+
+    image->present_count = ring->present_count;
+    image->release_token = ++ring->next_release_token;
+    if (!image->release_token)
+        image->release_token = ++ring->next_release_token;
+    image->valid = true;
+    image->busy = false;
+    ring->last_image = idx;
+    ring->next_image = (idx + 1) % ARRAY_SIZE(ring->images);
+
+    device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
+}
+
+static HRESULT swapchain_gl_get_composition_dmabuf(struct wined3d_swapchain *swapchain,
+        UINT expected_present_count, struct wined3d_dcomp_dmabuf_desc *desc,
+        int *dmabuf_fd, int *acquire_sync_fd)
+{
+    struct wined3d_swapchain_gl *swapchain_gl = wined3d_swapchain_gl(swapchain);
+    struct wined3d_gl_dcomp_dmabuf_ring *ring = &swapchain_gl->dcomp_dmabuf;
+    struct wined3d_gl_dcomp_dmabuf_image *image = NULL;
+    unsigned int i;
+
+    if (!expected_present_count)
+    {
+        if (ring->images[ring->last_image].valid)
+            image = &ring->images[ring->last_image];
+    }
+    for (i = 0; expected_present_count && i < ARRAY_SIZE(ring->images); ++i)
+    {
+        if (ring->images[i].valid && ring->images[i].present_count == expected_present_count)
+        {
+            image = &ring->images[i];
+            break;
+        }
+    }
+    if (!image || image->busy || image->dmabuf_fd < 0)
+        return WINED3DERR_NOTAVAILABLE;
+
+    desc->version = 1;
+    desc->desc_flags = ring->next_desc_flags;
+    ring->next_desc_flags = 0;
+    desc->present_count = image->present_count;
+    desc->producer_pid = GetCurrentProcessId();
+    desc->ring_generation = ring->ring_generation;
+    desc->image_id = image->image_id;
+    desc->width = image->width;
+    desc->height = image->height;
+    desc->fourcc = image->dmabuf_desc.fourcc;
+    desc->stride = image->dmabuf_desc.stride;
+    desc->offset = image->dmabuf_desc.offset;
+    desc->sync_fd_kind = WINED3D_DCOMP_DMABUF_SYNC_NONE;
+    desc->producer_unique_id = (UINT_PTR)swapchain;
+    desc->modifier = image->dmabuf_desc.modifier;
+    desc->release_token = image->release_token;
+    desc->frame_seq = image->present_count;
+    desc->dirty_count = 0;
+    *dmabuf_fd = image->dmabuf_fd;
+    image->dmabuf_fd = -1;
+    *acquire_sync_fd = -1;
+    image->busy = true;
+
+    return WINED3D_OK;
+}
+
+static void swapchain_gl_release_composition_dmabuf(struct wined3d_swapchain *swapchain,
+        UINT64 release_token, UINT release_flags)
+{
+    struct wined3d_gl_dcomp_dmabuf_ring *ring = &wined3d_swapchain_gl(swapchain)->dcomp_dmabuf;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+    {
+        struct wined3d_gl_dcomp_dmabuf_image *image = &ring->images[i];
+
+        if (image->release_token != release_token)
+            continue;
+
+        image->busy = false;
+        if (release_flags & (WINED3D_DCOMP_DMABUF_RELEASE_FAILED | WINED3D_DCOMP_DMABUF_RELEASE_ORPHANED))
+            image->valid = false;
+        return;
+    }
+}
+
+/* Cross-process HWND dmabuf publishing: export the just-presented frame as a
+ * dmabuf and hand it to the compositor through the per-HWND bridge
+ * (NtUserGetHwndDmabufCaps, NtUserPublishHwndDmabuf). The server never reports
+ * when the compositor releases a buffer, so reuse safety relies on the ring
+ * depth, the glFinish before export, and a one-frame-deferred release. */
+
+UINT WINAPI NtUserPublishHwndDmabuf( HWND hwnd, int dmabuf_fd, int acquire_sync_fd,
+                                     const void *desc, UINT *frame_seq );
+UINT WINAPI NtUserGetHwndDmabufCaps( HWND hwnd, void *caps, void *format_modifiers,
+                                     UINT max_format_modifiers, UINT *format_modifier_count );
+
+#define WINED3D_HWND_DMABUF_OK            0
+#define WINED3D_HWND_DMABUF_DESC_VERSION  1
+#define WINED3D_HWND_DMABUF_MAX_DIRTY     7
+#define WINED3D_DRM_FORMAT_MOD_INVALID    0x00ffffffffffffffull
+
+struct wined3d_hwnd_dmabuf_format_modifier
+{
+    unsigned int fourcc;
+    unsigned int tranche_index;
+    unsigned int tranche_flags;
+    UINT64 modifier;
+};
+
+struct wined3d_hwnd_dmabuf_host_caps
+{
+    unsigned int version;
+    unsigned int feedback_gen;
+    unsigned int dmabuf_protocol_version;
+    unsigned int caps_source;
+    unsigned int caps_flags;
+    unsigned int has_drm_syncobj;
+    unsigned int has_zwp_explicit_sync;
+    unsigned int main_device_major;
+    unsigned int main_device_minor;
+    unsigned int format_modifier_count;
+    const struct wined3d_hwnd_dmabuf_format_modifier *format_modifiers;
+};
+
+struct wined3d_hwnd_dmabuf_hdr_metadata
+{
+    unsigned short RedPrimary[2];
+    unsigned short GreenPrimary[2];
+    unsigned short BluePrimary[2];
+    unsigned short WhitePoint[2];
+    unsigned int   MaxMasteringLuminance;
+    unsigned int   MinMasteringLuminance;
+    unsigned short MaxContentLightLevel;
+    unsigned short MaxFrameAverageLightLevel;
+};
+
+/* Wire-compatible copy of hwnd_dmabuf_frame_desc_t, passed to
+ * NtUserPublishHwndDmabuf as an opaque blob. */
+struct wined3d_hwnd_dmabuf_frame_desc
+{
+    unsigned int version;
+    unsigned int flags;
+    unsigned int width;
+    unsigned int height;
+    unsigned int fourcc;
+    unsigned int stride;
+    unsigned int offset;
+    unsigned int frame_seq;
+    unsigned int ring_generation;
+    unsigned int image_id;
+    unsigned int sync_fd_kind;
+    unsigned int dirty_count;
+    unsigned short dirty_rects[WINED3D_HWND_DMABUF_MAX_DIRTY][4];
+    UINT64 modifier;
+    UINT64 producer_unique_id;
+    UINT64 sync_timeline_point;
+    UINT64 release_token;
+    unsigned int dxgi_format;
+    unsigned int alpha_mode;
+    unsigned int color_space;
+    unsigned int hdr_metadata_type;
+    struct wined3d_hwnd_dmabuf_hdr_metadata hdr_metadata;
+};
+
+C_ASSERT(sizeof(struct wined3d_hwnd_dmabuf_frame_desc) == 184);
+
+/* The compositor silently drops a frame whose fourcc/modifier it does not
+ * advertise (a black window), and it only advertises caps for cross-process
+ * child windows. A normal local window returns no caps, which also keeps us
+ * from publishing where an on-screen present is wanted. */
+static bool wined3d_hwnd_dmabuf_format_supported(HWND hwnd, unsigned int fourcc, UINT64 modifier)
+{
+    struct wined3d_hwnd_dmabuf_format_modifier *modifiers;
+    struct wined3d_hwnd_dmabuf_host_caps caps;
+    UINT count = 0, i;
+    bool supported = false;
+
+    memset(&caps, 0, sizeof(caps));
+    if (NtUserGetHwndDmabufCaps(hwnd, &caps, NULL, 0, &count) != WINED3D_HWND_DMABUF_OK || !count)
+        return false;
+
+    if (!(modifiers = malloc(count * sizeof(*modifiers))))
+        return false;
+
+    memset(&caps, 0, sizeof(caps));
+    if (NtUserGetHwndDmabufCaps(hwnd, &caps, modifiers, count, &count) == WINED3D_HWND_DMABUF_OK)
+    {
+        for (i = 0; i < caps.format_modifier_count; ++i)
+        {
+            if (modifiers[i].fourcc != fourcc)
+                continue;
+            if (modifiers[i].modifier == modifier
+                    || modifiers[i].modifier == WINED3D_DRM_FORMAT_MOD_INVALID)
+            {
+                supported = true;
+                break;
+            }
+        }
+    }
+
+    free(modifiers);
+    return supported;
+}
+
+static void wined3d_swapchain_gl_publish_dmabuf(struct wined3d_swapchain *swapchain)
+{
+    struct wined3d_gl_dcomp_dmabuf_ring *ring = &wined3d_swapchain_gl(swapchain)->dcomp_dmabuf;
+    struct wined3d_hwnd_dmabuf_frame_desc frame_desc;
+    struct wined3d_dcomp_dmabuf_desc desc;
+    int dmabuf_fd = -1, acquire_sync_fd = -1;
+    HWND hwnd = swapchain->win_handle;
+    UINT frame_seq = 0, status;
+
+    if (!hwnd)
+        return;
+    if (FAILED(swapchain_gl_get_composition_dmabuf(swapchain, 0, &desc, &dmabuf_fd, &acquire_sync_fd)))
+        return;
+
+    if (!wined3d_hwnd_dmabuf_format_supported(hwnd, desc.fourcc, desc.modifier))
+    {
+        if (dmabuf_fd >= 0 && ring->p_wglWineCloseDmaBufWINE)
+            ring->p_wglWineCloseDmaBufWINE(dmabuf_fd);
+        if (acquire_sync_fd >= 0 && ring->p_wglWineCloseDmaBufWINE)
+            ring->p_wglWineCloseDmaBufWINE(acquire_sync_fd);
+        swapchain_gl_release_composition_dmabuf(swapchain, desc.release_token,
+                WINED3D_DCOMP_DMABUF_RELEASE_OK);
+        return;
+    }
+
+    memset(&frame_desc, 0, sizeof(frame_desc));
+    frame_desc.version = WINED3D_HWND_DMABUF_DESC_VERSION;
+    frame_desc.width = desc.width;
+    frame_desc.height = desc.height;
+    frame_desc.fourcc = desc.fourcc;
+    frame_desc.stride = desc.stride;
+    frame_desc.offset = desc.offset;
+    frame_desc.frame_seq = desc.frame_seq;
+    frame_desc.ring_generation = desc.ring_generation;
+    frame_desc.image_id = desc.image_id;
+    frame_desc.sync_fd_kind = desc.sync_fd_kind;
+    frame_desc.dirty_count = 0;
+    frame_desc.modifier = desc.modifier;
+    frame_desc.producer_unique_id = desc.producer_unique_id;
+    frame_desc.sync_timeline_point = desc.sync_timeline_point;
+    frame_desc.release_token = desc.release_token;
+
+    /* NtUserPublishHwndDmabuf takes ownership of the fds and closes them. */
+    status = NtUserPublishHwndDmabuf(hwnd, dmabuf_fd, acquire_sync_fd, &frame_desc, &frame_seq);
+
+    if (status == WINED3D_HWND_DMABUF_OK)
+    {
+        /* One-frame-deferred release: the previous frame is assumed retired by
+         * the compositor once this one is accepted (the ring depth gives slack).
+         * The server provides no release callback. */
+        if (ring->pending_release_token)
+            swapchain_gl_release_composition_dmabuf(swapchain, ring->pending_release_token,
+                    WINED3D_DCOMP_DMABUF_RELEASE_OK);
+        ring->pending_release_token = desc.release_token;
+    }
+    else
+    {
+        swapchain_gl_release_composition_dmabuf(swapchain, desc.release_token,
+                WINED3D_DCOMP_DMABUF_RELEASE_FAILED);
+    }
+}
+
 static bool swapchain_present_is_partial_copy(struct wined3d_swapchain *swapchain, const RECT *dst_rect)
 {
     enum wined3d_swap_effect swap_effect = swapchain->state.desc.swap_effect;
@@ -631,7 +1155,14 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     TRACE("Presenting DC %p.\n", context_gl->dc);
 
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
-    if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
+    /* WINED3D_PRESENT_NO_WINDOW_UPDATE produces a frame for dmabuf export
+     * without painting the on-screen window: skip the blit and wglSwapBuffers,
+     * but still capture and rotate below. */
+    if (flags & WINED3D_PRESENT_NO_WINDOW_UPDATE)
+    {
+        TRACE("Skipping window update.\n");
+    }
+    else if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
             && swapchain_present_is_partial_copy(swapchain, dst_rect)))
     {
@@ -664,10 +1195,19 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     TRACE("SwapBuffers called, Starting new frame\n");
 
-    wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
-    wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
+    if (!(flags & WINED3D_PRESENT_NO_WINDOW_UPDATE))
+    {
+        wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
+        wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
+    }
 
     context_release(context);
+
+    /* Publish the captured frame to the compositor via the HWND dmabuf bridge.
+     * Inert unless the export producer is enabled and the window is a
+     * cross-process child that the compositor advertises caps for. */
+    if (wined3d_swapchain_gl(swapchain)->dcomp_dmabuf.enabled)
+        wined3d_swapchain_gl_publish_dmabuf(swapchain);
 }
 
 static void swapchain_frontbuffer_updated(struct wined3d_swapchain *swapchain)
@@ -685,6 +1225,8 @@ static const struct wined3d_swapchain_ops swapchain_gl_ops =
 {
     swapchain_gl_present,
     swapchain_frontbuffer_updated,
+    swapchain_gl_get_composition_dmabuf,
+    swapchain_gl_release_composition_dmabuf,
 };
 
 static bool wined3d_swapchain_vk_present_mode_supported(struct wined3d_swapchain_vk *swapchain_vk,
@@ -1261,6 +1803,14 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
 
     context_vk = wined3d_context_vk(context_acquire(swapchain->device, back_buffer, 0));
 
+    if (flags & WINED3D_PRESENT_NO_WINDOW_UPDATE)
+    {
+        TRACE("Skipping window update.\n");
+        wined3d_swapchain_vk_rotate(swapchain, context_vk);
+        context_release(&context_vk->c);
+        return;
+    }
+
     if (!swapchain_vk->vk_swapchain || swapchain_present_is_partial_copy(swapchain, dst_rect))
     {
         swapchain_blit_gdi(swapchain, &context_vk->c, src_rect, dst_rect);
@@ -1373,7 +1923,10 @@ static void swapchain_gdi_present(struct wined3d_swapchain *swapchain,
     SetRect(&swapchain->front_buffer_update, 0, 0,
             swapchain->front_buffer->resource.width,
             swapchain->front_buffer->resource.height);
-    swapchain_gdi_frontbuffer_updated(swapchain);
+    if (flags & WINED3D_PRESENT_NO_WINDOW_UPDATE)
+        SetRectEmpty(&swapchain->front_buffer_update);
+    else
+        swapchain_gdi_frontbuffer_updated(swapchain);
 }
 
 static const struct wined3d_swapchain_ops swapchain_no3d_ops =
@@ -1736,11 +2289,27 @@ HRESULT wined3d_swapchain_gl_init(struct wined3d_swapchain_gl *swapchain_gl, str
         const struct wined3d_swapchain_desc *desc, struct wined3d_swapchain_state_parent *state_parent,
         void *parent, const struct wined3d_parent_ops *parent_ops)
 {
+    HRESULT hr;
+    unsigned int i;
+
     TRACE("swapchain_gl %p, device %p, desc %p, state_parent %p, parent %p, parent_ops %p.\n",
             swapchain_gl, device, desc, state_parent, parent, parent_ops);
 
-    return wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
-            parent_ops, &swapchain_gl_ops);
+    if (FAILED(hr = wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
+            parent_ops, &swapchain_gl_ops)))
+        return hr;
+
+    swapchain_gl->dcomp_dmabuf.ring_generation = 1;
+    /* The producer is always on: the format gate (host caps) makes it inert for
+     * windows the compositor does not want frames for. */
+    swapchain_gl->dcomp_dmabuf.enabled = true;
+    for (i = 0; i < ARRAY_SIZE(swapchain_gl->dcomp_dmabuf.images); ++i)
+    {
+        swapchain_gl->dcomp_dmabuf.images[i].image_id = i + 1;
+        swapchain_gl->dcomp_dmabuf.images[i].dmabuf_fd = -1;
+    }
+
+    return WINED3D_OK;
 }
 
 HRESULT wined3d_swapchain_vk_init(struct wined3d_swapchain_vk *swapchain_vk, struct wined3d_device *device,

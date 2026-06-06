@@ -1298,6 +1298,17 @@ static const struct wined3d_renderer_table
 cards_nvidia_binary[] =
 {
     /* Direct 3D 11 */
+    /* Blackwell (RTX 50 series). Order matters: more specific names
+     * (e.g. "RTX 5090 D V2" / "RTX 5070 Ti") must come before less
+     * specific ("RTX 5090" / "RTX 5070") since matching is by strstr. */
+    {"RTX 5090 D V2",               CARD_NVIDIA_GEFORCE_RTX5090DV2},
+    {"RTX 5090 D",                  CARD_NVIDIA_GEFORCE_RTX5090D},
+    {"RTX 5090",                    CARD_NVIDIA_GEFORCE_RTX5090},
+    {"RTX 5080",                    CARD_NVIDIA_GEFORCE_RTX5080},
+    {"RTX 5070 Ti",                 CARD_NVIDIA_GEFORCE_RTX5070TI},
+    {"RTX 5070",                    CARD_NVIDIA_GEFORCE_RTX5070},
+    {"RTX 5060 Ti",                 CARD_NVIDIA_GEFORCE_RTX5060TI},
+    {"RTX 5060",                    CARD_NVIDIA_GEFORCE_RTX5060},
     {"RTX 4090",                    CARD_NVIDIA_GEFORCE_RTX4090},
     {"RTX 4080 SUPER",              CARD_NVIDIA_GEFORCE_RTX4080SUPER},
     {"RTX 4080",                    CARD_NVIDIA_GEFORCE_RTX4080},
@@ -1666,6 +1677,7 @@ cards_intel[] =
 cards_amd_mesa[] =
 {
     /* Navi 4x */
+    {"gfx1201",                     CARD_AMD_RADEON_RX_NAVI_48},
     {"gfx1200",                     CARD_AMD_RADEON_RX_NAVI_44},
     /* Navi 10/14 */
     {"NAVI10",                      CARD_AMD_RADEON_RX_NAVI_10},
@@ -5055,6 +5067,9 @@ static BOOL wined3d_adapter_gl_init(struct wined3d_adapter_gl *adapter_gl,
 #undef USE_GL_FUNC
         gl_info->gl_ops.wgl.p_wglSwapBuffers = (void *)GetProcAddress(mod_gl, "wglSwapBuffers");
         gl_info->gl_ops.wgl.p_wglGetPixelFormat = (void *)GetProcAddress(mod_gl, "wglGetPixelFormat");
+        gl_info->p_wglWineCloseDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineCloseDmaBufWINE");
+        gl_info->p_wglWineDmaBufExportSupportedWINE = (void *)GetProcAddress(mod_gl, "wglWineDmaBufExportSupportedWINE");
+        gl_info->p_wglWineExportDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineExportDmaBufWINE");
     }
 
     gl_info->p_glEnableWINE = gl_info->gl_ops.gl.p_glEnable;

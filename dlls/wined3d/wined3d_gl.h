@@ -30,6 +30,7 @@
 #include <stdint.h>
 
 #include "wine/wgl.h"
+#include "wine/opengl_driver.h"
 
 struct wined3d_swapchain_gl;
 struct wined3d_texture_gl;
@@ -372,6 +373,9 @@ struct wined3d_gl_info
     struct wined3d_gl_funcs gl_ops;
     struct wined3d_fbo_ops fbo_ops;
 
+    PFN_wglWineCloseDmaBufWINE p_wglWineCloseDmaBufWINE;
+    PFN_wglWineDmaBufExportSupportedWINE p_wglWineDmaBufExportSupportedWINE;
+    PFN_wglWineExportDmaBufWINE p_wglWineExportDmaBufWINE;
     void (WINE_GLAPI *p_glDisableWINE)(GLenum cap);
     void (WINE_GLAPI *p_glEnableWINE)(GLenum cap);
 };
@@ -1139,9 +1143,45 @@ HRESULT wined3d_unordered_access_view_gl_init(struct wined3d_unordered_access_vi
 void wined3d_unordered_access_view_gl_update(struct wined3d_unordered_access_view_gl *uav_gl,
         struct wined3d_context_gl *context_gl);
 
+/* The composition dmabuf ring is produced by the GL present path and drained by
+ * the composition-dmabuf Get/Release ops. Nonzero-present-count Get calls first
+ * drain the CS, and external Get/Release calls hold the global wined3d mutex.
+ * Keep image valid/busy/fd/token updates within that ordering contract. */
+struct wined3d_gl_dcomp_dmabuf_image
+{
+    struct wgl_dmabuf_desc dmabuf_desc;
+    GLuint texture;
+    GLuint fbo;
+    int dmabuf_fd;
+    unsigned int width;
+    unsigned int height;
+    uint64_t present_count;
+    uint64_t release_token;
+    unsigned int image_id;
+    bool valid;
+    bool busy;
+};
+
+#define WINED3D_GL_DCOMP_DMABUF_RING_SIZE 4
+
+struct wined3d_gl_dcomp_dmabuf_ring
+{
+    struct wined3d_gl_dcomp_dmabuf_image images[WINED3D_GL_DCOMP_DMABUF_RING_SIZE];
+    unsigned int next_image;
+    unsigned int last_image;
+    uint64_t present_count;
+    uint64_t ring_generation;
+    uint64_t next_release_token;
+    uint64_t pending_release_token;
+    uint32_t next_desc_flags;
+    PFN_wglWineCloseDmaBufWINE p_wglWineCloseDmaBufWINE;
+    bool enabled;
+};
+
 struct wined3d_swapchain_gl
 {
     struct wined3d_swapchain s;
+    struct wined3d_gl_dcomp_dmabuf_ring dcomp_dmabuf;
 };
 
 static inline struct wined3d_swapchain_gl *wined3d_swapchain_gl(struct wined3d_swapchain *swapchain)

@@ -956,6 +956,10 @@ W32KAPI BOOL    WINAPI NtUserPostMessage( HWND hwnd, UINT msg, WPARAM wparam, LP
 W32KAPI BOOL    WINAPI NtUserPostQuitMessage( INT exit_code );
 W32KAPI BOOL    WINAPI NtUserPostThreadMessage( DWORD thread, UINT msg, WPARAM wparam, LPARAM lparam );
 W32KAPI BOOL    WINAPI NtUserPrintWindow( HWND hwnd, HDC hdc, UINT flags );
+W32KAPI UINT    WINAPI NtUserPublishHwndDmabuf( HWND hwnd, INT dmabuf_fd, INT acquire_sync_fd,
+                                                const void *desc, UINT *frame_seq );
+W32KAPI UINT    WINAPI NtUserGetHwndDmabufCaps( HWND hwnd, void *caps, void *format_modifiers,
+                                                UINT max_format_modifiers, UINT *format_modifier_count );
 W32KAPI LONG    WINAPI NtUserQueryDisplayConfig( UINT32 flags, UINT32 *paths_count, DISPLAYCONFIG_PATH_INFO *paths,
                                                  UINT32 *modes_count, DISPLAYCONFIG_MODE_INFO *modes,
                                                  DISPLAYCONFIG_TOPOLOGY_ID *topology_id);

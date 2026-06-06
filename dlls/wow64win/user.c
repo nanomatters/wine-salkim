@@ -28,6 +28,7 @@
 #include "shellapi.h"
 #include "shlobj.h"
 #include "wow64win_private.h"
+#include "wine/hwnd_dmabuf.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
@@ -76,6 +77,47 @@ typedef struct
     UINT32 hDevice;
     UINT32 wParam;
 } RAWINPUTHEADER32;
+
+typedef struct
+{
+    unsigned int     version;
+    unsigned int     feedback_gen;
+    unsigned int     dmabuf_protocol_version;
+    unsigned int     caps_source;
+    unsigned int     caps_flags;
+    unsigned int     has_drm_syncobj;
+    unsigned int     has_zwp_explicit_sync;
+    unsigned int     main_device_major;
+    unsigned int     main_device_minor;
+    unsigned int     format_modifier_count;
+    UINT32           format_modifiers;
+} hwnd_dmabuf_host_caps32_t;
+
+typedef struct
+{
+    unsigned int     version;
+    unsigned int     flags;
+    unsigned int     width;
+    unsigned int     height;
+    unsigned int     fourcc;
+    unsigned int     stride;
+    unsigned int     offset;
+    unsigned int     frame_seq;
+    unsigned int     ring_generation;
+    unsigned int     image_id;
+    unsigned int     sync_fd_kind;
+    unsigned int     dirty_count;
+    unsigned short   dirty_rects[HWND_DMABUF_MAX_DIRTY_RECTS][4];
+    unsigned __int64 modifier;
+    unsigned __int64 producer_unique_id;
+    unsigned __int64 sync_timeline_point;
+    unsigned __int64 release_token;
+    unsigned int     dxgi_format;
+    unsigned int     alpha_mode;
+    unsigned int     color_space;
+    unsigned int     hdr_metadata_type;
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
+} hwnd_dmabuf_frame_desc32_t;
 
 typedef struct
 {
@@ -2600,6 +2642,43 @@ NTSTATUS WINAPI wow64_NtUserGetGUIThreadInfo( UINT *args )
     return TRUE;
 }
 
+NTSTATUS WINAPI wow64_NtUserGetHwndDmabufCaps( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    hwnd_dmabuf_host_caps32_t *caps32 = get_ptr( &args );
+    hwnd_dmabuf_format_modifier_t *format_modifiers32 = get_ptr( &args );
+    UINT max_format_modifiers = get_ulong( &args );
+    UINT *format_modifier_count = get_ptr( &args );
+    hwnd_dmabuf_host_caps_t caps;
+    UINT status;
+
+    if (!caps32)
+        return NtUserGetHwndDmabufCaps( hwnd, NULL, format_modifiers32,
+                                        max_format_modifiers, format_modifier_count );
+
+    memset( &caps, 0, sizeof(caps) );
+    memset( caps32, 0, sizeof(*caps32) );
+
+    status = NtUserGetHwndDmabufCaps( hwnd, &caps, format_modifiers32,
+                                      max_format_modifiers, format_modifier_count );
+    if (status == HWND_DMABUF_OK)
+    {
+        caps32->version = caps.version;
+        caps32->feedback_gen = caps.feedback_gen;
+        caps32->dmabuf_protocol_version = caps.dmabuf_protocol_version;
+        caps32->caps_source = caps.caps_source;
+        caps32->caps_flags = caps.caps_flags;
+        caps32->has_drm_syncobj = caps.has_drm_syncobj;
+        caps32->has_zwp_explicit_sync = caps.has_zwp_explicit_sync;
+        caps32->main_device_major = caps.main_device_major;
+        caps32->main_device_minor = caps.main_device_minor;
+        caps32->format_modifier_count = caps.format_modifier_count;
+        caps32->format_modifiers = PtrToUlong( format_modifiers32 );
+    }
+
+    return status;
+}
+
 NTSTATUS WINAPI wow64_NtUserGetIconInfo( UINT *args )
 {
     HICON icon = get_handle( &args );
@@ -3985,6 +4064,45 @@ NTSTATUS WINAPI wow64_NtUserPostThreadMessage( UINT *args )
     LPARAM lparam = get_ulong( &args );
 
     return NtUserPostThreadMessage( thread, msg, wparam, lparam );
+}
+
+NTSTATUS WINAPI wow64_NtUserPublishHwndDmabuf( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    INT dmabuf_fd = (INT)get_ulong( &args );
+    INT acquire_sync_fd = (INT)get_ulong( &args );
+    const hwnd_dmabuf_frame_desc32_t *desc32 = get_ptr( &args );
+    UINT *frame_seq = get_ptr( &args );
+    hwnd_dmabuf_frame_desc_t desc;
+
+    if (!desc32)
+        return NtUserPublishHwndDmabuf( hwnd, dmabuf_fd, acquire_sync_fd, NULL, frame_seq );
+
+    memset( &desc, 0, sizeof(desc) );
+    desc.version = desc32->version;
+    desc.flags = desc32->flags;
+    desc.width = desc32->width;
+    desc.height = desc32->height;
+    desc.fourcc = desc32->fourcc;
+    desc.stride = desc32->stride;
+    desc.offset = desc32->offset;
+    desc.frame_seq = desc32->frame_seq;
+    desc.ring_generation = desc32->ring_generation;
+    desc.image_id = desc32->image_id;
+    desc.sync_fd_kind = desc32->sync_fd_kind;
+    desc.dirty_count = desc32->dirty_count;
+    memcpy( desc.dirty_rects, desc32->dirty_rects, sizeof(desc.dirty_rects) );
+    desc.modifier = desc32->modifier;
+    desc.producer_unique_id = desc32->producer_unique_id;
+    desc.sync_timeline_point = desc32->sync_timeline_point;
+    desc.release_token = desc32->release_token;
+    desc.dxgi_format = desc32->dxgi_format;
+    desc.alpha_mode = desc32->alpha_mode;
+    desc.color_space = desc32->color_space;
+    desc.hdr_metadata_type = desc32->hdr_metadata_type;
+    desc.hdr_metadata = desc32->hdr_metadata;
+
+    return NtUserPublishHwndDmabuf( hwnd, dmabuf_fd, acquire_sync_fd, &desc, frame_seq );
 }
 
 NTSTATUS WINAPI wow64_NtUserPrintWindow( UINT *args )
