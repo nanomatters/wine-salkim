@@ -1617,6 +1617,7 @@ static struct file *open_include_file( const struct makefile *make, struct incl_
     }
 
     if (make->extlib || make->is_external) return NULL; /* ignore missing files in external libs */
+    if (pFile->included_by && pFile->included_by->is_external) return NULL;
 
     fprintf( stderr, "%s:%d: error: ", pFile->included_by->file->name, pFile->included_line );
     perror( pFile->name );
