@@ -10,6 +10,7 @@ SOURCES = \
 	content-type-v1.xml \
 	cursor-shape-v1.xml \
 	display.c \
+	linux-dmabuf-unstable-v1.xml \
 	dllmain.c \
 	ext-data-control-v1.xml \
 	fractional-scale-v1.xml \

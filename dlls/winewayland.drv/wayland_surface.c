@@ -26,13 +26,187 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 #include "waylanddrv.h"
+#include "dxgi1_2.h"
 #include "wine/debug.h"
+#include "wine/hwnd_dmabuf.h"
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+
+struct wayland_hwnd_dmabuf_surface;
+
+struct wayland_hwnd_dmabuf_buffer
+{
+    struct wl_list link;
+    struct wayland_hwnd_dmabuf_surface *surface;
+    struct wl_buffer *wl_buffer;
+    UINT64 producer_unique_id;
+    UINT64 release_token;
+    UINT64 modifier;              /* cached-slot layout identity */
+    unsigned int image_id;        /* producer ring slot; cache key (stable-slot path) */
+    unsigned int ring_generation; /* swapchain-rebuild counter; invalidates a cached slot */
+    unsigned int fourcc;
+    unsigned int stride;
+    unsigned int offset;
+    unsigned int alpha_mode;
+    int width;
+    int height;
+    LONG ref;          /* owner ref + one ref per outstanding compositor commit */
+    LONG released;     /* uncached path: set by wl_buffer.release, reaped next pass */
+    LONG cache_valid;  /* stable-slot cache entry is still retained by this surface */
+    BOOL stable_slot;  /* cached and reused per slot; release token sent on release */
+    unsigned int release_flags;
+    int channel_fd;    /* dup of surface->channel_fd for sending release tokens */
+};
+
+struct wayland_hwnd_dmabuf_surface
+{
+    struct wl_list link;
+    HWND hwnd;
+    struct wl_surface *wl_surface;
+    struct wl_subsurface *wl_subsurface;
+    struct wp_viewport *wp_viewport;
+    struct wayland_hwnd_dmabuf_buffer *current;
+    struct wl_list buffers;
+    UINT frame_seq;
+    BOOL seen;
+    unsigned long long last_seen_ms; /* tick when last present in the child list */
+    int channel_fd;                 /* consumer end of the producer socket, or -1 */
+};
+
+/* A child may briefly drop out of the descendant list between frames; tearing its surface
+ * (and dmabuf cache) down on a single miss churns the cache and, with fd-once, strands slots
+ * the producer thinks are still cached. Keep an unseen surface for a grace window first. */
+#define WAYLAND_DMABUF_SURFACE_GRACE_MS 1000
+
+static unsigned long long wayland_dmabuf_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static unsigned int wayland_hwnd_dmabuf_buffer_cache_flags(struct wayland_hwnd_dmabuf_buffer *buffer)
+{
+    if (buffer->stable_slot && InterlockedCompareExchange(&buffer->cache_valid, FALSE, FALSE))
+        return HWND_DMABUF_RELEASE_CACHED;
+    return 0;
+}
+
+static UINT64 wayland_hwnd_dmabuf_buffer_exchange_release_token(struct wayland_hwnd_dmabuf_buffer *buffer,
+                                                                UINT64 release_token)
+{
+    LONGLONG volatile *token = (LONGLONG volatile *)&buffer->release_token;
+    LONGLONG old;
+
+    do old = *token;
+    while (InterlockedCompareExchange64(token, release_token, old) != old);
+    return old;
+}
+
+static void wayland_hwnd_dmabuf_buffer_send_release(struct wayland_hwnd_dmabuf_buffer *buffer,
+                                                    unsigned int flags)
+{
+    UINT64 release_token;
+
+    if (buffer->channel_fd < 0) return;
+    release_token = wayland_hwnd_dmabuf_buffer_exchange_release_token(buffer, 0);
+    if (release_token)
+    {
+        hwnd_dmabuf_release_t rel = { buffer->producer_unique_id, release_token,
+                                      flags | wayland_hwnd_dmabuf_buffer_cache_flags(buffer),
+                                      buffer->image_id, buffer->ring_generation, 0 };
+        send(buffer->channel_fd, &rel, sizeof(rel), MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+}
+
+/* Drop a buffer reference; on the last unref destroy the wl_buffer and free.
+ * This is lock-free and may run on either the present thread or the event
+ * thread: the last unref happens either inside the wl_buffer.release handler
+ * (event thread) or on the present thread after release already fired, so the
+ * wl_buffer_destroy is never concurrent with a release dispatch. */
+static void wayland_hwnd_dmabuf_buffer_unref(struct wayland_hwnd_dmabuf_buffer *buffer)
+{
+    if (InterlockedDecrement(&buffer->ref) > 0) return;
+    wayland_hwnd_dmabuf_buffer_send_release(buffer, buffer->release_flags ?
+                                            buffer->release_flags : HWND_DMABUF_RELEASE_ORPHANED);
+    if (buffer->channel_fd >= 0) close(buffer->channel_fd);
+    if (buffer->wl_buffer) wl_buffer_destroy(buffer->wl_buffer);
+    free(buffer);
+}
+
+/* Send a release token to the producer over its channel so it can recycle the image. */
+static void wayland_hwnd_dmabuf_send_release(struct wayland_hwnd_dmabuf_surface *surface,
+                                             UINT64 producer_unique_id, UINT64 release_token,
+                                             unsigned int flags, unsigned int image_id,
+                                             unsigned int ring_generation)
+{
+    hwnd_dmabuf_release_t rel = { producer_unique_id, release_token, flags, image_id, ring_generation, 0 };
+
+    if (release_token && surface->channel_fd >= 0)
+        send(surface->channel_fd, &rel, sizeof(rel), MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
+/* Present-thread teardown: detach from the surface, and drop the owner ref.
+ * Must be called with win_data_mutex held.
+ * If the compositor still holds the buffer it survives as an orphan until its
+ * release handler drops the last ref. */
+static void wayland_hwnd_dmabuf_buffer_reap(struct wayland_hwnd_dmabuf_buffer *buffer)
+{
+    struct wayland_hwnd_dmabuf_surface *surface = buffer->surface;
+
+    if (surface && surface->current == buffer) surface->current = NULL;
+    InterlockedExchange(&buffer->cache_valid, FALSE);
+    wl_list_remove(&buffer->link);
+    buffer->surface = NULL;
+    wayland_hwnd_dmabuf_buffer_unref(buffer);
+}
+
+/* wl_buffer.release runs on the event thread: lock-free only (no surface/list
+ * mutation). Cached (stable-slot) buffers stay cached for the slot's next frame,
+ * so send the release token now to recycle the slot; the busy gate keeps the
+ * producer from overwriting it until then. Uncached buffers are flagged for the
+ * present thread to reap next pass (their token is sent on destroy). Either way
+ * drop the per-commit ref. */
+static void wayland_hwnd_dmabuf_buffer_handle_release(void *data, struct wl_buffer *wl_buffer)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = data;
+
+    if (buffer->stable_slot)
+        wayland_hwnd_dmabuf_buffer_send_release(buffer, HWND_DMABUF_RELEASE_PRESENTED);
+    else
+    {
+        buffer->release_flags = HWND_DMABUF_RELEASE_PRESENTED;
+        InterlockedExchange(&buffer->released, TRUE);
+    }
+    wayland_hwnd_dmabuf_buffer_unref(buffer);
+}
+
+static const struct wl_buffer_listener wayland_hwnd_dmabuf_buffer_listener =
+{
+    wayland_hwnd_dmabuf_buffer_handle_release
+};
+
+static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer, *buffer_next;
+
+    wl_list_for_each_safe(buffer, buffer_next, &surface->buffers, link)
+        wayland_hwnd_dmabuf_buffer_reap(buffer);
+
+    wl_list_remove(&surface->link);
+    if (surface->wl_subsurface) wl_subsurface_destroy(surface->wl_subsurface);
+    if (surface->wp_viewport) wp_viewport_destroy(surface->wp_viewport);
+    if (surface->wl_surface) wl_surface_destroy(surface->wl_surface);
+    if (surface->channel_fd >= 0) close(surface->channel_fd);
+    free(surface);
+}
 
 static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
                                          uint32_t serial)
@@ -48,26 +222,36 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
 
     /* Handle this event only if wayland_surface is still associated with
      * the target xdg_surface. */
-    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
-        surface->xdg_surface == xdg_surface)
+    if ((surface = data->wayland_surface) && surface->xdg_surface == xdg_surface)
     {
-        /* If we have a previously requested config, we have already sent a
-         * WM_WAYLAND_CONFIGURE which hasn't been handled yet. In that case,
-         * avoid sending another message to reduce message queue traffic. */
-        should_post = surface->requested.serial == 0;
-        initial_configure = surface->current.serial == 0;
-        surface->pending.serial = serial;
-        if (!surface->pending.caps && surface->current.caps)
-            surface->pending.caps = surface->current.caps;
-        if (!surface->pending.decor && surface->current.decor)
-            surface->pending.decor = surface->current.decor;
-        else if (surface->pending.decor)
+        if (wayland_surface_is_toplevel(surface))
         {
-            should_post |= (surface->pending.decor != surface->current.decor);
-            initial_configure |= (surface->pending.decor != surface->current.decor);
+            /* If we have a previously requested config, we have already sent a
+             * WM_WAYLAND_CONFIGURE which hasn't been handled yet. In that case,
+             * avoid sending another message to reduce message queue traffic. */
+            should_post = surface->requested.serial == 0;
+            initial_configure = surface->current.serial == 0;
+            surface->pending.serial = serial;
+            if (!surface->pending.caps && surface->current.caps)
+                surface->pending.caps = surface->current.caps;
+            if (!surface->pending.decor && surface->current.decor)
+                surface->pending.decor = surface->current.decor;
+            else if (surface->pending.decor)
+            {
+                should_post |= (surface->pending.decor != surface->current.decor);
+                initial_configure |= (surface->pending.decor != surface->current.decor);
+            }
+            surface->requested = surface->pending;
+            memset(&surface->pending, 0, sizeof(surface->pending));
         }
-        surface->requested = surface->pending;
-        memset(&surface->pending, 0, sizeof(surface->pending));
+        else if (wayland_surface_is_popup(surface))
+        {
+            /* Popups take their geometry from the positioner, not configure
+             * negotiation, so ack immediately and expose so the surface maps. */
+            xdg_surface_ack_configure(surface->xdg_surface, serial);
+            initial_configure = surface->current.serial == 0;
+            surface->current.serial = serial;
+        }
     }
 
     wayland_win_data_release(data);
@@ -140,6 +324,30 @@ static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_tople
 {
     NtUserPostMessage((HWND)data, WM_SYSCOMMAND, SC_CLOSE, 0);
 }
+static void xdg_popup_handle_configure(void *data, struct xdg_popup *xdg_popup,
+                                       int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    /* Compositor-chosen geometry (relative to parent). Trace only: the popup's
+     * content is composited at its surface regardless of this. */
+    TRACE("hwnd=%p pos=%d,%d size=%dx%d\n", (HWND)data, x, y, width, height);
+}
+
+static void xdg_popup_handle_popup_done(void *data, struct xdg_popup *xdg_popup)
+{
+    HWND hwnd = data;
+    TRACE("hwnd=%p dismissed by compositor\n", hwnd);
+    /* Let Win32's own menu loop tear the window down (it then hides the window,
+     * which clears the role and destroys the xdg_popup in clear_role). Do not
+     * destroy the xdg_popup here, to keep a single, correctly-ordered teardown. */
+    NtUserPostMessage(hwnd, WM_CANCELMODE, 0, 0);
+}
+
+static const struct xdg_popup_listener xdg_popup_listener =
+{
+    xdg_popup_handle_configure,
+    xdg_popup_handle_popup_done,
+};
+
 
 static void xdg_toplevel_handle_configure_bounds(void *private, struct xdg_toplevel *xdg_toplevel, int width, int height)
 {
@@ -296,6 +504,7 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
     TRACE("surface=%p\n", surface);
 
     surface->hwnd = hwnd;
+    wl_list_init(&surface->hwnd_dmabuf_surfaces);
     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
     if (!surface->wl_surface)
     {
@@ -329,6 +538,14 @@ err:
  */
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *dmabuf_surface_next;
+
+    wl_list_for_each_safe(dmabuf_surface, dmabuf_surface_next,
+                          &surface->hwnd_dmabuf_surfaces, link)
+        wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
+
+    if (surface->dmabuf_frame_cb) wl_callback_destroy(surface->dmabuf_frame_cb);
+
     pthread_mutex_lock(&process_wayland.pointer.mutex);
     if (process_wayland.pointer.focused_hwnd == surface->hwnd)
     {
@@ -592,6 +809,89 @@ err:
 }
 
 /**********************************************************************
+ *          wayland_surface_make_popup
+ *
+ * Gives the xdg_popup role to a plain wayland surface, positioned by the
+ * compositor relative to the parent (owner) surface. Used for owned,
+ * caption-less popups (menus, dropdowns, tooltips): a Wayland toplevel has no
+ * client-set position, so these must be popups to land where the app intends.
+ */
+void wayland_surface_make_popup(struct wayland_surface *surface,
+                                struct wayland_surface *parent)
+{
+    struct xdg_positioner *positioner;
+    int x, y, w, h;
+
+    TRACE("surface=%p parent=%p\n", surface, parent);
+
+    assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_POPUP);
+    if (surface->xdg_surface && surface->xdg_popup) return;
+
+    wayland_surface_clear_role(surface);
+    surface->role = WAYLAND_SURFACE_ROLE_POPUP;
+
+    surface->xdg_surface =
+        xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base, surface->wl_surface);
+    if (!surface->xdg_surface) goto err;
+    xdg_surface_add_listener(surface->xdg_surface, &xdg_surface_listener, surface->hwnd);
+
+    if (!(positioner = xdg_wm_base_create_positioner(process_wayland.xdg_wm_base)))
+        goto err;
+
+    /* Anchor the popup's top-left at the popup's offset from the parent window
+     * origin (in parent-surface coords), growing down and to the right. */
+    wayland_surface_coords_from_window(parent,
+                                       surface->window.rect.left - parent->window.rect.left,
+                                       surface->window.rect.top - parent->window.rect.top,
+                                       &x, &y);
+    wayland_surface_coords_from_window(surface,
+                                       surface->window.rect.right - surface->window.rect.left,
+                                       surface->window.rect.bottom - surface->window.rect.top,
+                                       &w, &h);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    xdg_positioner_set_size(positioner, w, h);
+    xdg_positioner_set_anchor_rect(positioner, x, y, 1, 1);
+    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    xdg_positioner_set_constraint_adjustment(positioner,
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+
+    surface->xdg_popup = xdg_surface_get_popup(surface->xdg_surface,
+                                               parent->xdg_surface, positioner);
+    xdg_positioner_destroy(positioner);
+    if (!surface->xdg_popup) goto err;
+    xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
+
+    /* Grab so the compositor routes input to the menu and dismisses it
+     * (xdg_popup.popup_done) when the user clicks outside it -- including onto
+     * another window -- the way a menu is expected to behave. The grab uses the
+     * most recent input serial (menus open in response to a click); if the
+     * compositor does not accept the serial it simply ignores the grab and the
+     * popup still positions correctly. */
+    {
+        uint32_t serial = process_wayland.input_serial;
+        pthread_mutex_lock(&process_wayland.seat.mutex);
+        if (process_wayland.seat.wl_seat && serial)
+            xdg_popup_grab(surface->xdg_popup, process_wayland.seat.wl_seat, serial);
+        pthread_mutex_unlock(&process_wayland.seat.mutex);
+    }
+
+    wl_surface_commit(surface->wl_surface);
+    wl_display_flush(process_wayland.wl_display);
+
+    return;
+
+err:
+    wayland_surface_clear_role(surface);
+    ERR("Failed to assign popup role to wayland surface\n");
+}
+
+/**********************************************************************
  *          wayland_surface_clear_role
  *
  * Clears the role related Wayland objects of a Wayland surface, making it a
@@ -667,6 +967,21 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
         }
 
         surface->toplevel_hwnd = 0;
+        break;
+
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        /* The xdg_popup must be destroyed before its xdg_surface. */
+        if (surface->xdg_popup)
+        {
+            xdg_popup_destroy(surface->xdg_popup);
+            surface->xdg_popup = NULL;
+        }
+
+        if (surface->xdg_surface)
+        {
+            xdg_surface_destroy(surface->xdg_surface);
+            surface->xdg_surface = NULL;
+        }
         break;
     }
 
@@ -927,6 +1242,521 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
         wp_viewport_set_destination(client->wp_viewport, 1, 1);
 }
 
+static struct wayland_hwnd_dmabuf_surface *wayland_hwnd_dmabuf_surface_get(struct wayland_surface *parent,
+                                                                           HWND hwnd)
+{
+    struct wayland_hwnd_dmabuf_surface *surface;
+
+    wl_list_for_each(surface, &parent->hwnd_dmabuf_surfaces, link)
+        if (surface->hwnd == hwnd) return surface;
+    return NULL;
+}
+
+static struct wayland_hwnd_dmabuf_surface *wayland_hwnd_dmabuf_surface_create(struct wayland_surface *parent,
+                                                                              HWND hwnd)
+{
+    struct wayland_hwnd_dmabuf_surface *surface;
+    struct wl_region *empty_region;
+
+    if (!(surface = calloc(1, sizeof(*surface)))) return NULL;
+    surface->hwnd = hwnd;
+    surface->channel_fd = -1;
+    wl_list_init(&surface->buffers);
+
+    if (!(surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor))) goto err;
+    wl_surface_set_user_data(surface->wl_surface, hwnd);
+
+    empty_region = wl_compositor_create_region(process_wayland.wl_compositor);
+    if (!empty_region) goto err;
+    wl_surface_set_input_region(surface->wl_surface, empty_region);
+    wl_region_destroy(empty_region);
+
+    if (!(surface->wp_viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter,
+                                                            surface->wl_surface))) goto err;
+
+    if (!(surface->wl_subsurface = wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
+                                                                   surface->wl_surface,
+                                                                   parent->wl_surface))) goto err;
+    wl_subsurface_set_desync(surface->wl_subsurface);
+
+    wl_list_insert(parent->hwnd_dmabuf_surfaces.prev, &surface->link);
+    return surface;
+
+err:
+    if (surface->wl_subsurface) wl_subsurface_destroy(surface->wl_subsurface);
+    if (surface->wp_viewport) wp_viewport_destroy(surface->wp_viewport);
+    if (surface->wl_surface) wl_surface_destroy(surface->wl_surface);
+    free(surface);
+    return NULL;
+}
+
+static void wayland_hwnd_dmabuf_surface_set_opaque(struct wayland_hwnd_dmabuf_surface *surface,
+                                                   int width, int height)
+{
+    struct wl_region *region = NULL;
+
+    if (surface->current && surface->current->alpha_mode == DXGI_ALPHA_MODE_IGNORE &&
+        (region = wl_compositor_create_region(process_wayland.wl_compositor)))
+    {
+        wl_region_add(region, 0, 0, width, height);
+        wl_surface_set_opaque_region(surface->wl_surface, region);
+        wl_region_destroy(region);
+    }
+    else wl_surface_set_opaque_region(surface->wl_surface, NULL);
+}
+
+static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent,
+                                                  struct wayland_hwnd_dmabuf_surface *surface,
+                                                  const hwnd_dmabuf_frame_info_t *info,
+                                                  struct wl_surface *above)
+{
+    RECT rect = wine_server_get_rect(info->client), clipped, client;
+    double source_x, source_y, source_width, source_height;
+    int rect_width, rect_height;
+    int x, y, width, height;
+
+    rect_width = rect.right - rect.left;
+    rect_height = rect.bottom - rect.top;
+    if (rect_width <= 0 || rect_height <= 0) return FALSE;
+
+    client.left = client.top = 0;
+    client.right = parent->window.client_rect.right - parent->window.client_rect.left;
+    client.bottom = parent->window.client_rect.bottom - parent->window.client_rect.top;
+
+    clipped.left = max(rect.left, client.left);
+    clipped.top = max(rect.top, client.top);
+    clipped.right = min(rect.right, client.right);
+    clipped.bottom = min(rect.bottom, client.bottom);
+    if (IsRectEmpty(&clipped)) return FALSE;
+
+    source_x = (double)(clipped.left - rect.left) * surface->current->width / rect_width;
+    source_y = (double)(clipped.top - rect.top) * surface->current->height / rect_height;
+    source_width = (double)(clipped.right - clipped.left) * surface->current->width / rect_width;
+    source_height = (double)(clipped.bottom - clipped.top) * surface->current->height / rect_height;
+
+    rect = clipped;
+    OffsetRect(&rect, parent->window.client_rect.left - parent->window.rect.left,
+               parent->window.client_rect.top - parent->window.rect.top);
+
+    wayland_surface_coords_from_window(parent, rect.left, rect.top, &x, &y);
+    wayland_surface_coords_from_window(parent, rect.right - rect.left,
+                                       rect.bottom - rect.top, &width, &height);
+    width = max(1, width);
+    height = max(1, height);
+
+    wl_subsurface_set_position(surface->wl_subsurface, x, y);
+    wl_subsurface_place_above(surface->wl_subsurface, above);
+    wp_viewport_set_source(surface->wp_viewport,
+                           wl_fixed_from_double(source_x), wl_fixed_from_double(source_y),
+                           wl_fixed_from_double(source_width), wl_fixed_from_double(source_height));
+    wp_viewport_set_destination(surface->wp_viewport, width, height);
+    wayland_hwnd_dmabuf_surface_set_opaque(surface, width, height);
+    return TRUE;
+}
+
+/* Claim this child's consumer channel end once; the producer mints it lazily, so retry. */
+static void wayland_hwnd_dmabuf_surface_claim_channel(struct wayland_hwnd_dmabuf_surface *surface)
+{
+    HANDLE handle = 0;
+    int fd = -1;
+
+    if (surface->channel_fd >= 0) return;
+    if (wine_hwnd_dmabuf_claim_channel(surface->hwnd, &handle) != HWND_DMABUF_OK || !handle)
+        return;
+    if (wine_server_handle_to_fd(handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL))
+        fd = -1;
+    NtClose(handle);
+    surface->channel_fd = fd;
+    if (fd >= 0) TRACE("hwnd=%p claimed dmabuf socket channel fd %d\n", surface->hwnd, fd);
+}
+
+/* Drain the channel to the newest frame; returns its fd and fills desc, or -1 if none. */
+/* Receive one frame. Returns 1 with *out_fd set (a dmabuf fd >= 0, or -1 for an fd-less
+ * slot-reference frame) when a frame was read, 0 when the channel is empty, -1 on EOF.
+ * The caller drains in a loop so it can import every fd-bearing slot, not just the newest. */
+static int wayland_hwnd_dmabuf_channel_recv_one(int channel_fd, hwnd_dmabuf_frame_desc_t *desc,
+                                                int *out_fd)
+{
+    char control[CMSG_SPACE(sizeof(int))];
+    struct msghdr msg = {0};
+    struct cmsghdr *cmsg;
+    struct iovec iov;
+    int fd = -1;
+    ssize_t n;
+
+    iov.iov_base = desc;
+    iov.iov_len = sizeof(*desc);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    n = recvmsg(channel_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+    if (n == 0) return -1;                       /* peer closed the channel */
+    if (n != (ssize_t)sizeof(*desc)) return 0;   /* EAGAIN or short read: nothing usable now */
+
+    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
+            memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+    *out_fd = fd;
+    return 1;
+}
+
+/* Build a wl_buffer wrapping the dmabuf fd plus its tracking buffer, cached on the
+ * surface. Does not close fd (caller owns it). Returns NULL on failure. */
+static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
+        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_desc_t *desc,
+        int fd, BOOL stable_slot)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer;
+    struct zwp_linux_buffer_params_v1 *params;
+
+    if (!(params = zwp_linux_dmabuf_v1_create_params(process_wayland.zwp_linux_dmabuf_v1)))
+        return NULL;
+    zwp_linux_buffer_params_v1_add(params, fd, 0, desc->offset, desc->stride,
+                                   desc->modifier >> 32, desc->modifier & 0xffffffff);
+    if (!(buffer = calloc(1, sizeof(*buffer))))
+    {
+        zwp_linux_buffer_params_v1_destroy(params);
+        return NULL;
+    }
+    buffer->channel_fd = -1;
+    buffer->wl_buffer = zwp_linux_buffer_params_v1_create_immed(params, desc->width, desc->height,
+                                                                desc->fourcc, 0);
+    zwp_linux_buffer_params_v1_destroy(params);
+    if (!buffer->wl_buffer)
+    {
+        free(buffer);
+        return NULL;
+    }
+    buffer->ref = 1;  /* owner ref; a compositor ref is added per attach in the update loop */
+    buffer->surface = surface;
+    buffer->producer_unique_id = desc->producer_unique_id;
+    buffer->image_id = desc->image_id;
+    buffer->ring_generation = desc->ring_generation;
+    buffer->fourcc = desc->fourcc;
+    buffer->stride = desc->stride;
+    buffer->offset = desc->offset;
+    buffer->modifier = desc->modifier;
+    buffer->width = desc->width;
+    buffer->height = desc->height;
+    buffer->stable_slot = stable_slot;
+    buffer->cache_valid = stable_slot ? TRUE : FALSE;
+    buffer->release_flags = HWND_DMABUF_RELEASE_ORPHANED;
+    buffer->channel_fd = surface->channel_fd >= 0 ? dup(surface->channel_fd) : -1;
+    wl_list_insert(surface->buffers.prev, &buffer->link);
+    wl_buffer_add_listener(buffer->wl_buffer, &wayland_hwnd_dmabuf_buffer_listener, buffer);
+    return buffer;
+}
+
+/* Make buffer the surface's current frame and publish its (new) contents. */
+static void wayland_hwnd_dmabuf_attach_frame(struct wayland_hwnd_dmabuf_surface *surface,
+        struct wayland_hwnd_dmabuf_buffer *buffer, const hwnd_dmabuf_frame_desc_t *desc)
+{
+    if (wayland_hwnd_dmabuf_buffer_exchange_release_token(buffer, desc->release_token))
+        WARN("hwnd=%p slot=%u overwrote an unreleased token\n", surface->hwnd, desc->image_id);
+    buffer->alpha_mode = desc->alpha_mode;
+    buffer->release_flags = HWND_DMABUF_RELEASE_PRESENTED;
+    surface->current = buffer;
+    surface->frame_seq = desc->frame_seq;
+    wl_surface_attach(surface->wl_surface, buffer->wl_buffer, 0, 0);
+    wl_surface_damage_buffer(surface->wl_surface, 0, 0, desc->width, desc->height);
+    wp_viewport_set_source(surface->wp_viewport, 0, 0,
+                           wl_fixed_from_int(desc->width), wl_fixed_from_int(desc->height));
+}
+
+static void wayland_hwnd_dmabuf_drop_current_frame(struct wayland_hwnd_dmabuf_surface *surface,
+                                                   unsigned int flags)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
+
+    if (!buffer) return;
+    wayland_hwnd_dmabuf_buffer_send_release(buffer, flags);
+    surface->current = NULL;
+    if (!buffer->stable_slot) wayland_hwnd_dmabuf_buffer_reap(buffer);
+}
+
+/* Stable-slot path (HWND_DMABUF_FLAG_STABLE_SLOT): ensure this slot is imported and cached
+ * (no attach). The producer sends a slot's dmabuf fd only once, then fd-less references, so:
+ *  - cache hit (exact layout match): reuse the cached wl_buffer.
+ *  - fd-bearing miss: import and cache it.
+ *  - fd-less miss: the slot is not cached -> return NULL; the failed release clears the
+ *    producer's cache state so it resends the fd.
+ * Stale slots (new producer/ring generation, or a changed layout) are reaped first. */
+static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_cache_slot(
+        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_desc_t *desc,
+        int fd, BOOL *created_buffer)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = NULL, *it, *it_next;
+
+    wl_list_for_each_safe(it, it_next, &surface->buffers, link)
+        if (it->producer_unique_id != desc->producer_unique_id ||
+            it->ring_generation != desc->ring_generation)
+        {
+            TRACE("hwnd=%p cache-drop stale producer/gen slot=%u gen %u->%u\n",
+                  surface->hwnd, it->image_id, it->ring_generation, desc->ring_generation);
+            wayland_hwnd_dmabuf_buffer_reap(it);
+        }
+
+    wl_list_for_each_safe(it, it_next, &surface->buffers, link)
+    {
+        if (it->image_id != desc->image_id) continue;
+        if (it->width == (int)desc->width && it->height == (int)desc->height &&
+            it->fourcc == desc->fourcc && it->modifier == desc->modifier &&
+            it->stride == desc->stride && it->offset == desc->offset)
+            buffer = it;
+        else
+        {
+            TRACE("hwnd=%p cache-drop layout-mismatch slot=%u\n", surface->hwnd, it->image_id);
+            wayland_hwnd_dmabuf_buffer_reap(it);
+        }
+        break;
+    }
+
+    if (buffer)
+    {
+        TRACE("hwnd=%p cache-hit slot=%u gen=%u frame_seq=%u\n",
+              surface->hwnd, desc->image_id, desc->ring_generation, desc->frame_seq);
+        return buffer;
+    }
+    if (fd < 0)
+    {
+        TRACE("hwnd=%p cache-miss-no-fd slot=%u (awaiting fd resend)\n",
+              surface->hwnd, desc->image_id);
+        return NULL;
+    }
+    if (!(buffer = wayland_hwnd_dmabuf_create_buffer(surface, desc, fd, TRUE))) return NULL;
+    TRACE("hwnd=%p cache-miss import slot=%u gen=%u frame_seq=%u\n",
+          surface->hwnd, desc->image_id, desc->ring_generation, desc->frame_seq);
+    *created_buffer = TRUE;
+    return buffer;
+}
+
+/* A queued frame superseded by a newer one. For a stable slot, still import/cache it so a
+ * later reference resolves; then release the present so the producer can recycle the slot.
+ * Uncached frames are simply dropped (each is a fresh dmabuf, nothing to keep). */
+static void wayland_hwnd_dmabuf_retire_frame(struct wayland_hwnd_dmabuf_surface *surface,
+        const hwnd_dmabuf_frame_desc_t *desc, int fd, BOOL *created_buffer)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = NULL;
+    unsigned int flags = HWND_DMABUF_RELEASE_DROPPED;
+
+    if (desc->flags & HWND_DMABUF_FLAG_STABLE_SLOT)
+    {
+        buffer = wayland_hwnd_dmabuf_cache_slot(surface, desc, fd, created_buffer);
+        if (buffer) flags |= HWND_DMABUF_RELEASE_CACHED;
+        else flags = HWND_DMABUF_RELEASE_FAILED;
+    }
+    if (fd >= 0) close(fd);
+    wayland_hwnd_dmabuf_send_release(surface, desc->producer_unique_id, desc->release_token,
+                                     flags, desc->image_id, desc->ring_generation);
+}
+
+/* Drain the channel, importing every fd-bearing slot so none is lost, then show the newest
+ * frame. Stable-slot producers send a slot's fd once and fd-less references after, so the fd
+ * is dup'd + passed via SCM_RIGHTS once per slot, not once per frame. created_buffer reports
+ * a freshly imported wl_buffer; attached_frame reports a frame was published. */
+static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buffer(
+        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_info_t *info,
+        BOOL *created_buffer, BOOL *attached_frame)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = NULL;
+    hwnd_dmabuf_frame_desc_t pdesc, desc;
+    BOOL have_pending = FALSE;
+    int pfd = -1, fd, r;
+
+    *created_buffer = FALSE;
+    *attached_frame = FALSE;
+    memset(&pdesc, 0, sizeof(pdesc));
+
+    wayland_hwnd_dmabuf_surface_claim_channel(surface);
+    if (surface->channel_fd < 0) return surface->current;
+
+    while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc, &fd)) > 0)
+    {
+        if (desc.version != HWND_DMABUF_DESC_VERSION_V1 || !desc.width || !desc.height ||
+            !desc.stride || !desc.fourcc || !desc.release_token ||
+            !wayland_dmabuf_format_supported(desc.fourcc, desc.modifier))
+        {
+            WARN("hwnd=%p import rejected info_seq=%u desc_seq=%u fourcc=%#x\n",
+                 surface->hwnd, info->frame_seq, desc.frame_seq, desc.fourcc);
+            if (fd >= 0) close(fd);
+            if (desc.release_token)
+                wayland_hwnd_dmabuf_send_release(surface, desc.producer_unique_id, desc.release_token,
+                                                 HWND_DMABUF_RELEASE_FAILED,
+                                                 desc.image_id, desc.ring_generation);
+            continue;
+        }
+        if (have_pending)
+            wayland_hwnd_dmabuf_retire_frame(surface, &pdesc, pfd, created_buffer);
+        pdesc = desc;
+        pfd = fd;
+        have_pending = TRUE;
+    }
+
+    if (!have_pending) return surface->current;
+
+    /* Show the newest drained frame. */
+    if (pdesc.flags & HWND_DMABUF_FLAG_STABLE_SLOT)
+        buffer = wayland_hwnd_dmabuf_cache_slot(surface, &pdesc, pfd, created_buffer);
+    else if ((buffer = wayland_hwnd_dmabuf_create_buffer(surface, &pdesc, pfd, FALSE)))
+        *created_buffer = TRUE;
+
+    if (pfd >= 0) close(pfd);
+
+    if (!buffer)
+    {
+        wayland_hwnd_dmabuf_send_release(surface, pdesc.producer_unique_id, pdesc.release_token,
+                                         HWND_DMABUF_RELEASE_FAILED,
+                                         pdesc.image_id, pdesc.ring_generation);
+        return surface->current;
+    }
+    wayland_hwnd_dmabuf_attach_frame(surface, buffer, &pdesc);
+    *attached_frame = TRUE;
+    return buffer;
+}
+
+/* Frame callback (event thread): just post a message; the present thread owns the throttle. */
+static void wayland_dmabuf_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    NtUserPostMessage((HWND)data, WM_WAYLAND_DMABUF_VSYNC, 0, 0);
+}
+
+static const struct wl_callback_listener wayland_dmabuf_frame_listener =
+{
+    wayland_dmabuf_frame_done
+};
+
+static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+{
+    hwnd_dmabuf_frame_info_t stack_frames[16], *frames = stack_frames;
+    unsigned int total = 0, count = 0, i;
+    struct wayland_hwnd_dmabuf_buffer *buffer, *buffer_next;
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *next;
+    enum hwnd_dmabuf_status status;
+    struct wayland_win_data *data;
+    struct wl_surface *above;
+    unsigned long long now = wayland_dmabuf_now_ms();
+    BOOL any_new = FALSE;
+
+    if (!process_wayland.zwp_linux_dmabuf_v1) return;
+    /* dmabuf children are composited for primary surfaces: toplevels and popups
+     * (menus). The popup runs this with its own hwnd, importing its own
+     * cross-process dmabuf content; the frozen import/release logic is unchanged. */
+    if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface)) return;
+
+    /* Throttle to vsync: a pending frame callback means we already committed this frame.
+     * Its WM_WAYLAND_DMABUF_VSYNC clears it and runs us again, pacing the producers. */
+    if (surface->dmabuf_frame_cb) return;
+
+    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+        dmabuf_surface->seen = FALSE;
+
+    status = wine_hwnd_dmabuf_list(surface->hwnd, frames, ARRAY_SIZE(stack_frames), &total, &count);
+    if (status != HWND_DMABUF_OK)
+    {
+        TRACE("hwnd=%p wine_hwnd_dmabuf_list status=%u\n", surface->hwnd, status);
+        return;
+    }
+    if (total > count)
+    {
+        if (!(frames = calloc(total, sizeof(*frames)))) return;
+        status = wine_hwnd_dmabuf_list(surface->hwnd, frames, total, &total, &count);
+        if (status != HWND_DMABUF_OK) count = 0;
+    }
+
+    TRACE("hwnd=%p listed total=%u count=%u\n", surface->hwnd, total, count);
+
+    /* Anchor the dmabuf chain above the client subsurface, not the main surface.
+     * Both used to place_above() main, so whichever committed last won the top,
+     * a per-frame z-order race (the flicker). A fixed sibling anchor makes
+     * [main, client, dmabuf...] resolve the same regardless. (win_data_mutex held.) */
+    above = surface->wl_surface;
+    if ((data = wayland_win_data_get_nolock(surface->hwnd)) &&
+        data->client_surface && data->client_surface->wl_subsurface &&
+        data->client_surface->toplevel == surface->hwnd)
+        above = data->client_surface->wl_surface;
+    /* Server child lists are returned in z-order from top to bottom, while
+     * Wayland subsurface stacking needs to be applied from bottom to top when
+     * chaining place_above() calls. */
+    for (i = count; i-- > 0; )
+    {
+        HWND hwnd = (HWND)(UINT_PTR)frames[i].hwnd;
+        BOOL created_buffer, attached_frame;
+
+        TRACE("hwnd=%p child=%p frame_seq=%u opened=%u\n",
+              surface->hwnd, hwnd, frames[i].frame_seq, frames[i].opened);
+
+        if (!(dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)) &&
+            !(dmabuf_surface = wayland_hwnd_dmabuf_surface_create(surface, hwnd)))
+            continue;
+
+        dmabuf_surface->seen = TRUE;
+        dmabuf_surface->last_seen_ms = now;
+        /* Reap uncached buffers the compositor has released; cached stable-slot
+         * buffers set no released flag and stay cached for reuse. */
+        wl_list_for_each_safe(buffer, buffer_next, &dmabuf_surface->buffers, link)
+            if (buffer->released)
+                wayland_hwnd_dmabuf_buffer_reap(buffer);
+
+        wayland_hwnd_dmabuf_surface_import_buffer(dmabuf_surface, &frames[i],
+                                                  &created_buffer, &attached_frame);
+        if (attached_frame) any_new = TRUE;
+        if (!dmabuf_surface->current) continue;
+        if (!wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
+        {
+            TRACE("hwnd=%p child=%p configure failed frame_seq=%u\n",
+                  surface->hwnd, hwnd, frames[i].frame_seq);
+            wayland_hwnd_dmabuf_drop_current_frame(dmabuf_surface, HWND_DMABUF_RELEASE_DROPPED);
+            if (dmabuf_surface->wl_surface)
+            {
+                wl_surface_attach(dmabuf_surface->wl_surface, NULL, 0, 0);
+                wl_surface_commit(dmabuf_surface->wl_surface);
+            }
+            continue;
+        }
+
+        wl_surface_commit(dmabuf_surface->wl_surface);
+        /* One compositor ref per attached frame; the wl_buffer.release handler drops
+         * it. Cached slots re-attach the same wl_buffer each new frame, so the ref is
+         * per-attach; the busy gate keeps at most one attach of a slot outstanding. */
+        if (attached_frame)
+            InterlockedIncrement(&dmabuf_surface->current->ref);
+        above = dmabuf_surface->wl_surface;
+    }
+
+    /* A child absent from the descendant list: hide its now-stale overlay at once so the
+     * content showing through (e.g. the client surface) is not occluded -- but keep the
+     * dmabuf cache for a grace window so a brief gap does not force a re-import when the
+     * child returns. Reap the cache only once the grace expires. */
+    wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
+    {
+        if (dmabuf_surface->seen) continue;
+        if (now - dmabuf_surface->last_seen_ms > WAYLAND_DMABUF_SURFACE_GRACE_MS)
+        {
+            wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
+            any_new = TRUE;
+        }
+        else if (dmabuf_surface->current)
+        {
+            wl_surface_attach(dmabuf_surface->wl_surface, NULL, 0, 0);
+            wl_surface_commit(dmabuf_surface->wl_surface);
+            dmabuf_surface->current = NULL;
+            any_new = TRUE;
+        }
+    }
+
+    /* Commit and arm the next vsync only when something changed, so an idle window costs nothing. */
+    if (any_new)
+    {
+        surface->dmabuf_frame_cb = wl_surface_frame(surface->wl_surface);
+        wl_callback_add_listener(surface->dmabuf_frame_cb, &wayland_dmabuf_frame_listener,
+                                 surface->hwnd);
+        wl_surface_commit(surface->wl_surface);
+    }
+    if (frames != stack_frames) free(frames);
+}
+
 /**********************************************************************
  *          wayland_surface_reconfigure_xdg
  *
@@ -1041,6 +1871,12 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         if (!surface->wl_subsurface) break; /* surface role has been cleared */
         wayland_surface_reconfigure_subsurface(surface);
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        if (!surface->xdg_popup) break; /* surface role has been cleared */
+        /* Defer attaching a buffer until the popup's xdg_surface has been
+         * configured and ack'd; attaching before that is a protocol error. */
+        if (!surface->current.serial) return FALSE;
         break;
     }
 
@@ -1405,10 +2241,39 @@ static void wayland_client_surface_update(struct client_surface *client)
     wayland_win_data_release(data);
 }
 
+static BOOL wayland_client_surface_is_hwnd_dmabuf_producer(struct wayland_client_surface *surface)
+{
+    struct wayland_win_data *data;
+    HANDLE handle = 0;
+    HWND hwnd = surface->client.hwnd;
+
+    if (surface->hwnd_dmabuf_producer) return TRUE;
+
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        wayland_win_data_release(data);
+        return FALSE;
+    }
+
+    if (wine_hwnd_dmabuf_claim_channel(hwnd, &handle) != HWND_DMABUF_OK || !handle)
+        return FALSE;
+
+    NtClose(handle);
+    surface->hwnd_dmabuf_producer = TRUE;
+    TRACE("hwnd=%p is an HWND dmabuf producer without local wayland data; skipping client surface presents\n",
+          hwnd);
+    return TRUE;
+}
+
 static void wayland_client_surface_present(struct client_surface *client, HDC hdc)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+
+    TRACE("%s hdc=%p toplevel=%p\n", debugstr_client_surface(client), hdc, toplevel);
+
+    if (wayland_client_surface_is_hwnd_dmabuf_producer(surface)) return;
+
     ensure_window_surface_contents(toplevel);
     set_client_surface(hwnd, surface);
 }
@@ -1637,7 +2502,11 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface,
                      (surface->content_width != width ||
                       surface->content_height != height);
 
-    if (!needs_contents) return;
+    if (!needs_contents)
+    {
+        wayland_surface_update_hwnd_dmabufs(surface);
+        return;
+    }
 
     TRACE("surface=%p hwnd=%p needs_contents=%d\n",
           surface, surface->hwnd, needs_contents);
@@ -1667,6 +2536,7 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface,
     }
 
     if (damage) NtGdiDeleteObjectApp(damage);
+    wayland_surface_update_hwnd_dmabufs(surface);
 }
 
 /**********************************************************************

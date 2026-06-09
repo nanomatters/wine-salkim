@@ -39,6 +39,7 @@ struct xkb_compose_table;
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
@@ -82,6 +83,8 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    WM_WAYLAND_DMABUF_FRAME,
+    WM_WAYLAND_DMABUF_VSYNC,
 };
 
 enum wayland_surface_config_state
@@ -97,6 +100,7 @@ enum wayland_surface_role
     WAYLAND_SURFACE_ROLE_NONE,
     WAYLAND_SURFACE_ROLE_TOPLEVEL,
     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+    WAYLAND_SURFACE_ROLE_POPUP,
 };
 
 enum wayland_surface_wm_caps
@@ -240,6 +244,8 @@ struct wayland
     struct wl_shm *wl_shm;
     struct wp_viewporter *wp_viewporter;
     struct wl_subcompositor *wl_subcompositor;
+    struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+    struct wl_list dmabuf_formats;
     struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
     struct zwp_relative_pointer_manager_v1 *zwp_relative_pointer_manager_v1;
@@ -313,6 +319,15 @@ struct wayland_output_state
     BOOL supports_hdr;
 };
 
+struct wayland_dmabuf_format
+{
+    struct wl_list link;
+    uint32_t format;
+    uint64_t modifier;
+};
+
+#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+
 struct wayland_output
 {
     struct wl_list link;
@@ -357,6 +372,7 @@ struct wayland_client_surface
 {
     struct client_surface client;
     HWND toplevel;
+    BOOL hwnd_dmabuf_producer;
     struct wl_surface *wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
@@ -383,6 +399,7 @@ struct wayland_surface
 {
     HWND hwnd;
 
+            struct xdg_popup *xdg_popup;
     struct wl_surface *wl_surface;
     struct wp_viewport *wp_viewport;
     struct wp_fractional_scale_v1 *wp_fractional_scale_v1;
@@ -411,12 +428,16 @@ struct wayland_surface
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
+    struct wl_list hwnd_dmabuf_surfaces;
+    struct wl_callback *dmabuf_frame_cb; /* pending vsync-throttle frame callback, or NULL */
     struct wayland_window_config window;
     RECT geometry;
     int content_width, content_height;
     UINT32 alpha_multiplier;
     HCURSOR hcursor;
 };
+
+BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier);
 
 /**********************************************************************
  *          Wayland initialization
@@ -444,6 +465,8 @@ void wayland_surface_destroy(struct wayland_surface *surface);
 void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
+void wayland_surface_make_popup(struct wayland_surface *surface,
+                                struct wayland_surface *parent);
 void wayland_surface_clear_role(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
@@ -475,6 +498,11 @@ void wayland_surface_sync_alpha(struct wayland_surface *surface);
 static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
 {
     return surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->xdg_toplevel;
+}
+
+static inline BOOL wayland_surface_is_popup(struct wayland_surface *surface)
+{
+    return surface->role == WAYLAND_SURFACE_ROLE_POPUP && surface->xdg_popup;
 }
 
 /**********************************************************************
