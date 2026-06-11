@@ -2463,8 +2463,11 @@ typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryBadInformationAllProcesses = 13,
     MemoryImageExtensionInformation = 14,
 #ifdef __WINESRC__
-    MemoryWineUnixFuncs = 1000,
-    MemoryWineUnixWow64Funcs,
+    MemoryWineLoadUnixLib = 1000,
+    MemoryWineLoadUnixLibWow64,
+    MemoryWineLoadUnixLibByName,
+    MemoryWineLoadUnixLibByNameWow64,
+    MemoryWineUnloadUnixLib,
 #endif
     MemoryFexStatsShm = 2000,
 } MEMORY_INFORMATION_CLASS;
@@ -5408,6 +5411,11 @@ NTSYSAPI LONGLONG  WINAPI RtlLargeIntegerShiftLeft(LONGLONG,INT);
 NTSYSAPI LONGLONG  WINAPI RtlLargeIntegerShiftRight(LONGLONG,INT);
 NTSYSAPI LONGLONG  WINAPI RtlLargeIntegerSubtract(LONGLONG,LONGLONG);
 NTSYSAPI NTSTATUS  WINAPI RtlLargeIntegerToChar(const ULONGLONG *,ULONG,ULONG,PCHAR);
+#endif
+
+#ifdef WINE_UNIX_LIB
+NTSYSAPI NTSTATUS  WINAPI PsCreateSystemThread(PHANDLE,ULONG,POBJECT_ATTRIBUTES,HANDLE,PCLIENT_ID,PRTL_THREAD_START_ROUTINE,PVOID);
+NTSYSAPI NTSTATUS  WINAPI PsTerminateSystemThread(NTSTATUS);
 #endif
 
 /* Wine internal functions */
