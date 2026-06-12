@@ -3397,7 +3397,7 @@ static void output_source_one_arch( struct makefile *make, struct incl_file *sou
         if (!(source->file->flags & FLAG_C_IMPLIB) && (!make->staticlib || make->extlib)) return;
     }
 
-    if (strendswith( source->name, ".S" ) && is_subdir_other_arch( source->name, arch )) return;
+    if (is_subdir_other_arch( source->name, arch )) return;
 
     obj_name = strmake( "%s%s.o", source->arch ? "" : arch_dirs[arch], obj );
     strarray_add( targets, obj_name );
