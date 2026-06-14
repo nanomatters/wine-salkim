@@ -1380,7 +1380,7 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
     char buf[24];
     char *Str = buf;
     KeySym keysym = 0;
-    WORD vkey = 0, scan;
+    WORD vkey = 0, bScan;
     DWORD dwFlags;
     int ascii_chars;
     XIC xic = X11DRV_get_ic( hwnd );
@@ -1456,10 +1456,10 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
     vkey = EVENT_event_to_vkey(xic,event);
     /* X returns keycode 0 for composed characters */
     if (!vkey && ascii_chars) vkey = VK_NONAME;
-    scan = keyc2scan[event->keycode];
+    bScan = keyc2scan[event->keycode] & 0xFF;
 
-    TRACE_(key)("keycode %u converted to vkey 0x%X scan %04x\n",
-                event->keycode, vkey, scan);
+    TRACE_(key)("keycode %u converted to vkey 0x%X scan %02x\n",
+                event->keycode, vkey, bScan);
 
     pthread_mutex_unlock( &kbd_mutex );
 
@@ -1467,11 +1467,11 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
 
     dwFlags = 0;
     if ( event->type == KeyRelease ) dwFlags |= KEYEVENTF_KEYUP;
-    if ( scan & 0x100 )             dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    if ( vkey & 0x100 )              dwFlags |= KEYEVENTF_EXTENDEDKEY;
 
     update_lock_state( hwnd, vkey, event->state, event_time );
 
-    X11DRV_send_keyboard_input( hwnd, vkey & 0xff, scan & 0xff, dwFlags, event_time );
+    X11DRV_send_keyboard_input( hwnd, vkey & 0xff, bScan, dwFlags, event_time );
     return TRUE;
 }
 
