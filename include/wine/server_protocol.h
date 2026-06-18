@@ -260,6 +260,87 @@ struct rectangle
     int  bottom;
 };
 
+#define HWND_DMABUF_DESC_VERSION_V1       1
+#define HWND_DMABUF_MAX_DIRTY_RECTS       7
+#define HWND_DMABUF_MAX_PLANES            4
+
+enum hwnd_dmabuf_status
+{
+    HWND_DMABUF_OK = 0,
+    HWND_DMABUF_INVALID_ARGS = 1,
+    HWND_DMABUF_NOT_FOUND = 2,
+    HWND_DMABUF_NO_FRAME = 3,
+    HWND_DMABUF_BUSY = 4
+};
+
+#define HWND_DMABUF_RELEASE_PRESENTED     0x00000001
+#define HWND_DMABUF_RELEASE_FAILED        0x00000002
+#define HWND_DMABUF_RELEASE_DROPPED       0x00000004
+#define HWND_DMABUF_RELEASE_ORPHANED      0x00000008
+#define HWND_DMABUF_RELEASE_CACHED        0x00000010
+
+
+/* image_id names a stable dmabuf the producer exports once and dups per frame,
+ * gated so the slot is not overwritten until its release token returns. Only
+ * then may the consumer cache and reuse the wl_buffer per slot. Producers that
+ * re-export a fresh dmabuf each publish (e.g. the wined3d GL path) must NOT set it. */
+#define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
+
+typedef struct
+{
+    unsigned short RedPrimary[2];
+    unsigned short GreenPrimary[2];
+    unsigned short BluePrimary[2];
+    unsigned short WhitePoint[2];
+    unsigned int   MaxMasteringLuminance;
+    unsigned int   MinMasteringLuminance;
+    unsigned short MaxContentLightLevel;
+    unsigned short MaxFrameAverageLightLevel;
+} hwnd_dmabuf_hdr_metadata_hdr10_t;
+
+typedef struct
+{
+    unsigned int     version;
+    unsigned int     flags;
+    unsigned int     width;
+    unsigned int     height;
+    unsigned int     fourcc;
+    unsigned int     stride;
+    unsigned int     offset;
+    unsigned int     frame_seq;
+    unsigned int     ring_generation;
+    unsigned int     image_id;
+    unsigned int     sync_fd_kind;
+    unsigned int     dirty_count;
+    unsigned short   dirty_rects[HWND_DMABUF_MAX_DIRTY_RECTS][4];
+    unsigned __int64 modifier;
+    unsigned __int64 producer_unique_id;
+    unsigned __int64 sync_timeline_point;
+    unsigned __int64 release_token;
+    unsigned int     dxgi_format;
+    unsigned int     alpha_mode;
+    unsigned int     color_space;
+    unsigned int     hdr_metadata_type;
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
+
+    unsigned int     plane_count;
+    unsigned int     plane_offsets[HWND_DMABUF_MAX_PLANES];
+    unsigned int     plane_strides[HWND_DMABUF_MAX_PLANES];
+} hwnd_dmabuf_frame_desc_t;
+
+typedef struct
+{
+    user_handle_t hwnd;
+    user_handle_t host_hwnd;
+    struct rectangle window;
+    struct rectangle client;
+    unsigned int style;
+    unsigned int ex_style;
+    unsigned int dpi;
+    unsigned int frame_seq;
+    unsigned int opened;
+} hwnd_dmabuf_frame_info_t;
+
 
 struct async_data
 {
@@ -3892,7 +3973,6 @@ struct set_window_region_reply
 };
 
 
-
 struct get_update_region_request
 {
     struct request_header __header;
@@ -6286,6 +6366,49 @@ struct fsync_free_shm_idx_reply
 };
 
 
+
+struct hwnd_list_dmabuf_frames_request
+{
+    struct request_header __header;
+    user_handle_t  host_hwnd;
+};
+struct hwnd_list_dmabuf_frames_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    unsigned int   count;
+    /* VARARG(frames,bytes); */
+};
+
+
+
+struct hwnd_dmabuf_get_channel_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+};
+struct hwnd_dmabuf_get_channel_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    obj_handle_t   channel_handle;
+};
+
+
+
+struct hwnd_dmabuf_claim_channel_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+};
+struct hwnd_dmabuf_claim_channel_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    obj_handle_t   channel_handle;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6600,6 +6723,9 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_fsync_free_shm_idx,
+    REQ_hwnd_list_dmabuf_frames,
+    REQ_hwnd_dmabuf_get_channel,
+    REQ_hwnd_dmabuf_claim_channel,
     REQ_NB_REQUESTS
 };
 
@@ -6919,6 +7045,9 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+    struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
+    struct hwnd_dmabuf_get_channel_request hwnd_dmabuf_get_channel_request;
+    struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
 };
 union generic_reply
 {
@@ -7236,6 +7365,9 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+    struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
+    struct hwnd_dmabuf_get_channel_reply hwnd_dmabuf_get_channel_reply;
+    struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
 };
 
 #define SERVER_PROTOCOL_VERSION 931

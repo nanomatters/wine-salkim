@@ -319,6 +319,9 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(fsync_free_shm_idx);
+DECL_HANDLER(hwnd_list_dmabuf_frames);
+DECL_HANDLER(hwnd_dmabuf_get_channel);
+DECL_HANDLER(hwnd_dmabuf_claim_channel);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -635,6 +638,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_fsync_free_shm_idx,
+    (req_handler)req_hwnd_list_dmabuf_frames,
+    (req_handler)req_hwnd_dmabuf_get_channel,
+    (req_handler)req_hwnd_dmabuf_claim_channel,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2422,3 +2428,18 @@ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
 C_ASSERT( offsetof(struct fsync_free_shm_idx_request, shm_idx) == 12 );
 C_ASSERT( sizeof(struct fsync_free_shm_idx_request) == 16 );
 C_ASSERT( sizeof(struct fsync_free_shm_idx_reply) == 8 );
+C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_request, host_hwnd) == 12 );
+C_ASSERT( sizeof(struct hwnd_list_dmabuf_frames_request) == 16 );
+C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_reply, count) == 12 );
+C_ASSERT( sizeof(struct hwnd_list_dmabuf_frames_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_request, hwnd) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_request) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, channel_handle) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, hwnd) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_request) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, channel_handle) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_reply) == 16 );

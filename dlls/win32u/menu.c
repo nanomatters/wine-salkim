@@ -4492,6 +4492,9 @@ track_menu:
     exit_tracking( hwnd, FALSE );
 }
 
+/* In sni.c. Moves a tray context menu to the published tray position. */
+extern void sni_adjust_menu_position( HWND hwnd, INT *x, INT *y );
+
 /**********************************************************************
  *           NtUserTrackPopupMenuEx   (win32u.@)
  */
@@ -4516,6 +4519,9 @@ BOOL WINAPI NtUserTrackPopupMenuEx( HMENU handle, UINT flags, INT x, INT y, HWND
         RtlSetLastWin32Error( ERROR_POPUP_ALREADY_ACTIVE );
         return FALSE;
     }
+
+    /* relocate a tray context menu to the published tray position */
+    sni_adjust_menu_position( hwnd, &x, &y );
 
     if (init_popup( hwnd, handle, flags ))
     {
