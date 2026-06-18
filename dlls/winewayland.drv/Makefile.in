@@ -10,6 +10,7 @@ SOURCES = \
 	cursor-shape-v1.xml \
 	display.c \
 	dllmain.c \
+	linux-dmabuf-unstable-v1.xml \
 	fractional-scale-v1.xml \
 	opengl.c \
 	pointer-constraints-unstable-v1.xml \
@@ -29,6 +30,7 @@ SOURCES = \
 	window.c \
 	window_surface.c \
 	wlr-data-control-unstable-v1.xml \
+	wlr-layer-shell-unstable-v1.xml \
 	xdg-output-unstable-v1.xml \
 	xdg-shell.xml \
 	xdg-toplevel-icon-v1.xml

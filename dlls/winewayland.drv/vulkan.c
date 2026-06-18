@@ -26,6 +26,7 @@
 
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -33,6 +34,7 @@
 #include "wine/debug.h"
 
 #include "wine/vulkan.h"
+#include "wine/hwnd_dmabuf.h"
 #include "wine/vulkan_driver.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
@@ -97,9 +99,57 @@ static void wayland_map_device_extensions(struct vulkan_device_extensions *exten
     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
 }
 
+static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void *format_modifiers_ptr,
+                                                UINT max_format_modifiers, UINT *format_modifier_count)
+{
+    hwnd_dmabuf_host_caps_t *caps = caps_ptr;
+    hwnd_dmabuf_format_modifier_t *format_modifiers = format_modifiers_ptr;
+    struct wayland_dmabuf_format *entry;
+    UINT count = 0, copied = 0;
+    HWND toplevel;
+    struct wayland_win_data *data;
+
+    if (format_modifier_count) *format_modifier_count = 0;
+    if (!caps || !format_modifier_count || (max_format_modifiers && !format_modifiers))
+        return HWND_DMABUF_INVALID_ARGS;
+    if (!process_wayland.zwp_linux_dmabuf_v1)
+        return HWND_DMABUF_NOT_FOUND;
+
+    toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+    if (toplevel && (data = wayland_win_data_get(toplevel)))
+    {
+        BOOL presentable_locally = data->wayland_surface != NULL;
+        wayland_win_data_release(data);
+        if (presentable_locally) return HWND_DMABUF_NOT_FOUND;
+    }
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link) count++;
+
+    memset(caps, 0, sizeof(*caps));
+    caps->version = HWND_DMABUF_HOST_CAPS_VERSION_V2;
+    caps->feedback_gen = 1;
+    caps->dmabuf_protocol_version = zwp_linux_dmabuf_v1_get_version(process_wayland.zwp_linux_dmabuf_v1);
+    caps->format_modifiers = format_modifiers;
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (copied >= max_format_modifiers) break;
+        format_modifiers[copied].fourcc = entry->format;
+        format_modifiers[copied].modifier = entry->modifier;
+        if (entry->modifier == DRM_FORMAT_MOD_INVALID)
+            caps->caps_flags |= HWND_DMABUF_CAPS_HAS_MOD_INVALID;
+        copied++;
+    }
+
+    caps->format_modifier_count = copied;
+    *format_modifier_count = count;
+    return HWND_DMABUF_OK;
+}
+
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = wayland_vulkan_surface_create,
+    .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
     .p_map_instance_extensions = wayland_map_instance_extensions,
     .p_map_device_extensions = wayland_map_device_extensions,

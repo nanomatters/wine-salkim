@@ -263,6 +263,7 @@ struct client_surface
     const struct client_surface_funcs *funcs;
     struct list                        entry;          /* entry in win32u managed list */
     LONG                               ref;            /* reference count */
+    LONG                               busy_ref;       /* drawables and swapchains referencing this surface */
     HWND                               hwnd;           /* window the surface was created for */
     LONG                               updated;        /* has been moved / resized / reparented */
     LONG                               offscreen;      /* client window is offscreen */
@@ -358,6 +359,7 @@ struct gdi_device_manager
 #define WINE_DM_UNSUPPORTED 0x80000000
 #define WINE_SWP_FULLSCREEN 0x80000000
 #define WINE_SWP_RESIZABLE  0x40000000
+#define WINE_SWP_TRAY_MENU  0x20000000
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;

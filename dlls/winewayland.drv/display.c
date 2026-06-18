@@ -263,6 +263,42 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
     free(modes);
 }
 
+/* The caller holds output_mutex while selecting a wl_output. */
+struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
+{
+    struct wayland_output *output, *best = NULL;
+    struct wl_array infos;
+    struct output_info *info;
+    HMONITOR target;
+
+    if (!(target = NtUserMonitorFromRect(window_rect, 0))) return NULL;
+
+    wl_array_init(&infos);
+    wl_list_for_each(output, &process_wayland.output_list, link)
+    {
+        if (!output->current.current_mode) continue;
+        if ((info = wl_array_add(&infos, sizeof(*info)))) info->output = &output->current;
+    }
+    output_info_array_arrange_physical_coords(&infos);
+
+    wl_array_for_each(info, &infos)
+    {
+        RECT rect;
+
+        SetRect(&rect, info->x, info->y,
+                info->x + info->output->current_mode->width,
+                info->y + info->output->current_mode->height);
+        if (NtUserMonitorFromRect(&rect, 0) == target)
+        {
+            best = CONTAINING_RECORD(info->output, struct wayland_output, current);
+            break;
+        }
+    }
+
+    wl_array_release(&infos);
+    return best;
+}
+
 /***********************************************************************
  *      UpdateDisplayDevices (WAYLAND.@)
  */
