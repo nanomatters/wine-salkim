@@ -186,7 +186,7 @@ sub get_makedep_flags($)
     {
         while (<FILE>)
         {
-            next unless /^#\s*pragma\s+makedep\s+(.*)/;
+            next unless /^[#%]\s*pragma\s+makedep\s+(.*)/;
             foreach my $flag (split /\s+/, $1)
             {
                 last if $flag eq "depend";
@@ -290,7 +290,7 @@ sub assign_sources_to_makefiles(@)
         {
             next unless $dir eq "dlls/winewayland.drv";
         }
-        elsif ($name !~ /\.(S|c|desktop|in|inl|l|m|mc|po|rc|rh|sfd|svg|x|y)$/)
+        elsif ($name !~ /\.(S|asm|c|desktop|in|inl|l|m|mc|po|rc|rh|sfd|svg|x|y)$/)
         {
             next;
         }
