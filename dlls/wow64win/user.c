@@ -3761,6 +3761,7 @@ NTSTATUS WINAPI wow64_NtUserMessageCall( UINT *args )
         switch (msg)
         {
         case WINE_SYSTRAY_NOTIFY_ICON:
+        case WINE_SYSTRAY_NOTIFY_ICON_SNI:
         {
             struct
             {
@@ -3790,12 +3791,14 @@ NTSTATUS WINAPI wow64_NtUserMessageCall( UINT *args )
             if (params.uFlags & NIF_TIP) wcscpy( params.szTip, params32->szTip );
             params.dwState = params32->dwState;
             params.dwStateMask = params32->dwStateMask;
+            /* uTimeout unions with uVersion. NIM_SETVERSION carries the version
+             * here without NIF_INFO. Copy it unconditionally. */
+            params.uTimeout = params32->uTimeout;
 
             if (params.uFlags & NIF_INFO)
             {
                 wcscpy( params.szInfoTitle, params32->szInfoTitle );
                 wcscpy( params.szInfo, params32->szInfo );
-                params.uTimeout = params32->uTimeout;
                 params.dwInfoFlags = params32->dwInfoFlags;
             }
 
