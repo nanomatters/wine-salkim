@@ -28,6 +28,7 @@
 #undef SW_MAX /* Also defined in winuser.rh */
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define OEMRESOURCE
 
@@ -108,6 +109,14 @@ static const struct
     {ole32_cursors, {'o','l','e','3','2','.','d','l','l',0}},
     {riched20_cursors, {'r','i','c','h','e','d','2','0','.','d','l','l',0}}
 };
+
+static UINT64 monotonic_time_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (UINT64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static HWND wayland_pointer_get_focused_hwnd(void)
 {
@@ -277,10 +286,17 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     }
 
     if (state == WL_POINTER_BUTTON_STATE_RELEASED) input.mi.dwFlags <<= 1;
+    else wayland_cancel_layer_menu_if_needed(hwnd);
 
     pthread_mutex_lock(&pointer->mutex);
     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
                              serial : 0;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+    {
+        pointer->popup_serial = serial;
+        pointer->popup_serial_hwnd = hwnd;
+        pointer->popup_serial_time = monotonic_time_ms();
+    }
     pthread_mutex_unlock(&pointer->mutex);
 
     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);

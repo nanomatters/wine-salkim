@@ -833,6 +833,7 @@ BOOL WINAPI NtUserGetCursorPos( POINT *pt )
     RECT rect;
 
     if (!pt) return FALSE;
+    if (sni_get_context_menu_pos( pt )) return TRUE;
 
     if (!get_shared_cursor_pos( pt, &last_change )) return FALSE;
 

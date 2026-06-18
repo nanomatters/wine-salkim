@@ -39,6 +39,7 @@ struct xkb_compose_table;
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
@@ -53,6 +54,7 @@ struct xkb_compose_table;
 #include "pointer-warp-v1-client-protocol.h"
 #include "keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 #include "windef.h"
 #include "winbase.h"
@@ -82,6 +84,7 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    WM_WAYLAND_DMABUF_FRAME,
 };
 
 enum wayland_surface_config_state
@@ -98,6 +101,7 @@ enum wayland_surface_role
     WAYLAND_SURFACE_ROLE_TOPLEVEL,
     WAYLAND_SURFACE_ROLE_SUBSURFACE,
     WAYLAND_SURFACE_ROLE_POPUP,
+    WAYLAND_SURFACE_ROLE_LAYER,
 };
 
 enum wayland_surface_wm_caps
@@ -166,6 +170,9 @@ struct wayland_pointer
     BOOL relative_mode;
     uint32_t enter_serial;
     uint32_t button_serial;
+    uint32_t popup_serial;
+    HWND popup_serial_hwnd;
+    UINT64 popup_serial_time;
     struct wayland_cursor cursor;
     struct wayland_pointer_frame frame;
     pthread_mutex_t mutex;
@@ -244,6 +251,8 @@ struct wayland
     struct wl_shm *wl_shm;
     struct wp_viewporter *wp_viewporter;
     struct wl_subcompositor *wl_subcompositor;
+    struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+    struct wl_list dmabuf_formats;
     struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
     struct zwp_relative_pointer_manager_v1 *zwp_relative_pointer_manager_v1;
@@ -261,6 +270,7 @@ struct wayland
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
     struct zwp_keyboard_shortcuts_inhibit_manager_v1* zwp_keyboard_shortcuts_inhibit_manager_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
+    struct zwlr_layer_shell_v1 *zwlr_layer_shell_v1;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
     struct wayland_pointer pointer;
@@ -317,6 +327,15 @@ struct wayland_output_state
     BOOL supports_hdr;
 };
 
+struct wayland_dmabuf_format
+{
+    struct wl_list link;
+    uint32_t format;
+    uint64_t modifier;
+};
+
+#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+
 struct wayland_output
 {
     struct wl_list link;
@@ -362,6 +381,7 @@ struct wayland_client_surface
 {
     struct client_surface client;
     HWND toplevel;
+    BOOL hwnd_dmabuf_producer;
     RECT rect;
     struct wl_surface *wl_surface;
     const struct wl_surface *toplevel_wl_surface;
@@ -371,6 +391,33 @@ struct wayland_client_surface
     struct wp_content_type_v1 *wp_content_type_v1;
     /* if true then the client surface has an alpha channel controlling transparency */
     BOOL has_alpha;
+    BOOL has_presented;
+};
+
+/* A GDI child window shown on its own wl_subsurface above a client surface. Its
+ * toplevel's GDI window-surface is hidden behind that client. */
+struct wayland_child_overlay
+{
+    struct wl_list link;
+    HWND hwnd;                          /* the child window */
+    struct wl_surface *wl_surface;
+    struct wl_subsurface *wl_subsurface;
+    struct wp_viewport *wp_viewport;
+    RECT rect;                          /* last rect, toplevel-window-relative */
+};
+
+/* Child window geometry captured via NtUser outside win_data_mutex. Querying
+ * win32u under the mutex can deadlock against threads holding win32u state and
+ * waiting for it. */
+struct child_overlay_snapshot
+{
+    unsigned int count;
+    struct child_overlay_snapshot_entry
+    {
+        HWND hwnd;
+        RECT rect;          /* child rect in screen coords */
+        int rx, ry, rw, rh; /* visible part, toplevel-window-relative */
+    } entries[];
 };
 
 struct wayland_shm_buffer
@@ -415,22 +462,37 @@ struct wayland_surface
         {
             struct xdg_popup *xdg_popup;
             HWND owner_hwnd;
+            BOOL xdg_popup_grabbed;
         };
         struct
         {
             struct wl_subsurface *wl_subsurface;
             HWND toplevel_hwnd;
         };
+        struct
+        {
+            struct zwlr_layer_surface_v1 *zwlr_layer_surface_v1;
+            struct wl_output *layer_output;
+        };
     };
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
+    struct wl_list hwnd_dmabuf_surfaces;
+    struct wl_list child_overlays; /* GDI child windows shown above a client surface */
+    BOOL client_placeholder;
+    /* Top of the dmabuf subsurface chain as last stacked. Overlays anchor above it,
+     * keeping the [base, client, dmabufs, overlays] order stable whichever chain
+     * restacks last. Validated against the live list before use, never freed. */
+    struct wl_surface *dmabuf_top;
     struct wayland_window_config window;
     RECT geometry;
     int content_width, content_height;
     UINT32 alpha_multiplier;
     HCURSOR hcursor;
 };
+
+BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier);
 
 /**********************************************************************
  *          Wayland initialization
@@ -460,14 +522,24 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_make_popup(struct wayland_surface *surface,
                                 struct wayland_surface *owner, const RECT *rect);
+void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect);
 void wayland_surface_clear_role(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
+struct wayland_shm_buffer *wayland_surface_create_dummy_buffer(struct wayland_surface *surface,
+                                                               enum wl_shm_format format,
+                                                               HRGN *damage);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
                                           int width, int height,
                                           enum wayland_surface_config_state state);
+struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
+void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
+                                          struct wayland_shm_buffer *shm_buffer,
+                                          const struct child_overlay_snapshot *snapshot);
+void wayland_surface_clear_child_overlays(struct wayland_surface *surface);
+void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND child);
 void wayland_surface_coords_from_window(struct wayland_surface *surface,
                                         int window_x, int window_y,
                                         int *surface_x, int *surface_y);
@@ -479,12 +551,21 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 void wayland_client_surface_attach_image_description(struct client_surface *client,
                                                      struct wp_image_description_v1 *image_desc);
 void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha);
+void wayland_surface_ensure_contents(struct wayland_surface *surface,
+                                     struct wayland_client_surface *client);
 void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
 void wayland_surface_assign_icon(struct wayland_surface *surface);
 void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
 void wayland_surface_activate(struct wayland_surface *surface);
 void wayland_surface_shortcut_control(struct wayland_surface *surface, BOOL inhibit);
 void wayland_surface_sync_alpha(struct wayland_surface *surface);
+BOOL wayland_is_popup_menu_class(HWND hwnd);
+BOOL wayland_is_menu_popup(HWND hwnd);
+BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
+void wayland_set_layer_menu_hwnd(HWND hwnd);
+void wayland_clear_layer_menu_hwnd(HWND hwnd);
+void wayland_cancel_layer_menu(HWND hwnd);
+void wayland_cancel_layer_menu_if_needed(HWND hwnd);
 
 static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
 {
@@ -494,6 +575,11 @@ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
 static inline BOOL wayland_surface_is_popup(struct wayland_surface *surface)
 {
     return surface->role == WAYLAND_SURFACE_ROLE_POPUP && surface->xdg_popup;
+}
+
+static inline BOOL wayland_surface_is_layer(struct wayland_surface *surface)
+{
+    return surface->role == WAYLAND_SURFACE_ROLE_LAYER && surface->zwlr_layer_surface_v1;
 }
 
 /**********************************************************************
@@ -541,7 +627,9 @@ void wayland_win_data_release(struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
+                                 const struct child_overlay_snapshot *overlay_snapshot);
+BOOL window_surface_needs_child_overlays(HWND hwnd);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
 
