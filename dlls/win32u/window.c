@@ -2027,6 +2027,52 @@ done:
 }
 
 
+static const WCHAR custom_frame_prop[] =
+    {'_','_','w','i','n','e','_','d','w','m','_','c','u','s','t','o','m','_','f','r','a','m','e',0};
+static const WCHAR frameless_window_prop[] =
+    {'_','_','w','i','n','e','_','w','i','n','3','2','u','_','f','r','a','m','e','l','e','s','s',0};
+
+static BOOL get_custom_frame( HWND hwnd )
+{
+    return NtUserGetProp( hwnd, custom_frame_prop ) != NULL;
+}
+
+static BOOL window_has_frame_style( UINT style )
+{
+    return !(style & WS_CHILD) && (style & (WS_CAPTION | WS_THICKFRAME));
+}
+
+static BOOL has_collapsed_frame( const RECT *window, const RECT *client, BOOL allow_small_frame )
+{
+    int left = client->left - window->left;
+    int top = client->top - window->top;
+    int right = window->right - client->right;
+    int bottom = window->bottom - client->bottom;
+
+    if (!left && !top && !right && !bottom) return TRUE;
+    return allow_small_frame && left >= 0 && top >= 0 && right >= 0 && bottom >= 0 &&
+           left <= 1 && top <= 1 && right <= 1 && bottom <= 1;
+}
+
+static BOOL is_frameless_window( HWND hwnd, UINT style, const struct window_rects *rects )
+{
+    if (!window_has_frame_style( style )) return FALSE;
+    if (NtUserGetProp( hwnd, frameless_window_prop )) return TRUE;
+    return get_custom_frame( hwnd ) && has_collapsed_frame( &rects->window, &rects->client, TRUE );
+}
+
+static void update_frameless_window( HWND hwnd, WND *win )
+{
+    BOOL frameless = FALSE;
+
+    if (win->dwStyle & WS_MAXIMIZE) return;
+    if (window_has_frame_style( win->dwStyle ))
+        frameless = has_collapsed_frame( &win->rects.window, &win->rects.client, get_custom_frame( hwnd ) );
+
+    if (frameless) NtUserSetProp( hwnd, frameless_window_prop, (HANDLE)1 );
+    else NtUserRemoveProp( hwnd, frameless_window_prop );
+}
+
 static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style, const struct window_rects *rects )
 {
     UINT dpi = get_dpi_for_window( hwnd ), style_mask, ex_style_mask;
@@ -2034,6 +2080,7 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
 
     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
+    if (is_frameless_window( hwnd, style, rects )) return rects->window;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
     if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
 
@@ -2352,6 +2399,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             win->dwStyle      = reply->new_style;
             win->dwExStyle    = reply->new_ex_style;
             win->rects        = *new_rects;
+            update_frameless_window( hwnd, win );
             if ((win->surface = new_surface)) window_surface_add_ref( win->surface );
             surface_win       = wine_server_ptr_handle( reply->surface_win );
             if (get_window_long( win->parent, GWL_EXSTYLE ) & WS_EX_LAYOUTRTL)
@@ -2401,6 +2449,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             if (is_fullscreen( &monitor_info, &new_rects->window )) swp_flags &= ~WINE_SWP_RESIZABLE;
             monitor_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
         }
+        if (!is_child && sni_should_layer_context_menu( hwnd, win->dwStyle, win->dwExStyle,
+                                                       &new_rects->window ))
+            swp_flags |= WINE_SWP_TRAY_MENU;
     }
 
     release_win_ptr( win );
@@ -5395,6 +5446,10 @@ static void free_window_handle( HWND hwnd )
  */
 LRESULT destroy_window( HWND hwnd )
 {
+    /* SNI tray backend (sni.c): drop any tray icons this window still owns when
+     * it is destroyed without a prior NIM_DELETE. Self-guards on sni_available,
+     * a no-op for apps not using the SNI tray. */
+    extern void sni_cleanup_icons( HWND owner );
     struct list drawables = LIST_INIT( drawables );
     struct window_surface *surface;
     HMENU menu = 0, sys_menu;
@@ -5403,6 +5458,7 @@ LRESULT destroy_window( HWND hwnd )
 
     TRACE( "%p\n", hwnd );
 
+    sni_cleanup_icons( hwnd );
     unregister_imm_window( hwnd );
 
     /* free child windows */

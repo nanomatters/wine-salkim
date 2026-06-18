@@ -937,6 +937,8 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
 
     NtUserPostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
     NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+    if (wayland_is_layer_menu_hwnd(hwnd))
+        NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
 }
 
 static BOOL wayland_disable_focus_loss(void)
@@ -957,7 +959,7 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
                                   uint32_t serial, struct wl_surface *wl_surface)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
-    HWND hwnd;
+    HWND foreground, hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
 
@@ -977,13 +979,17 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
      * and for any key repetition to stop. */
     release_all_keys(hwnd);
 
-    if (hwnd == NtUserGetForegroundWindow())
+    foreground = NtUserGetForegroundWindow();
+    if (wayland_is_layer_menu_hwnd(hwnd))
+        wayland_cancel_layer_menu(hwnd);
+    else if (hwnd == foreground || wayland_is_menu_popup(hwnd))
     {
         if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
             send_message(hwnd, WM_CANCELMODE, 0, 0);
+    }
 
-        if (hwnd != NtUserGetForegroundWindow()) return;
-
+    if (hwnd == foreground)
+    {
         if (!wayland_disable_focus_loss())
             NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
     }
@@ -1077,6 +1083,9 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
     if (!(hwnd = wayland_keyboard_get_focused_hwnd())) return;
 
     TRACE_(key)("serial=%u hwnd=%p key=%d scan=%#x state=%#x\n", serial, hwnd, key, scan, state);
+
+    if (key == KEY_ESC && state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        wayland_cancel_layer_menu_if_needed(NULL);
 
     /* NOTE: Windows normally sends VK_CONTROL + VK_MENU only if the layout has KLLF_ALTGR */
     if (key == KEY_RIGHTALT) send_right_control(hwnd, state);

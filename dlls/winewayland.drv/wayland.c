@@ -40,6 +40,7 @@ struct wayland process_wayland =
     .touch.touch_points = { &process_wayland.touch.touch_points,
                             &process_wayland.touch.touch_points },
     .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
+    .dmabuf_formats = {&process_wayland.dmabuf_formats, &process_wayland.dmabuf_formats},
     .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
     .output_list = {&process_wayland.output_list, &process_wayland.output_list},
     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -145,6 +146,54 @@ static int wayland_disable_ssd(void)
         disabled = (env = getenv("WAYLANDDRV_SSD")) && !strcmp(env, "0");
 
     return disabled;
+}
+
+static void wayland_dmabuf_add_format(uint32_t format, uint64_t modifier)
+{
+    struct wayland_dmabuf_format *entry;
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (entry->format == format && entry->modifier == modifier)
+            return;
+    }
+
+    if (!(entry = calloc(1, sizeof(*entry)))) return;
+    entry->format = format;
+    entry->modifier = modifier;
+    wl_list_insert(process_wayland.dmabuf_formats.prev, &entry->link);
+}
+
+static void zwp_linux_dmabuf_v1_handle_format(void *data, struct zwp_linux_dmabuf_v1 *dmabuf,
+                                              uint32_t format)
+{
+    wayland_dmabuf_add_format(format, DRM_FORMAT_MOD_INVALID);
+}
+
+static void zwp_linux_dmabuf_v1_handle_modifier(void *data, struct zwp_linux_dmabuf_v1 *dmabuf,
+                                                uint32_t format, uint32_t modifier_hi,
+                                                uint32_t modifier_lo)
+{
+    wayland_dmabuf_add_format(format, ((uint64_t)modifier_hi << 32) | modifier_lo);
+}
+
+static const struct zwp_linux_dmabuf_v1_listener zwp_linux_dmabuf_v1_listener =
+{
+    zwp_linux_dmabuf_v1_handle_format,
+    zwp_linux_dmabuf_v1_handle_modifier
+};
+
+BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier)
+{
+    struct wayland_dmabuf_format *entry;
+
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (entry->format == format && entry->modifier == modifier)
+            return TRUE;
+    }
+
+    return FALSE;
 }
 
 /**********************************************************************
@@ -325,6 +374,20 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.zwp_keyboard_shortcuts_inhibit_manager_v1 =
             wl_registry_bind(registry, id, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, 1);
     }
+    else if (strcmp(interface, "zwlr_layer_shell_v1") == 0)
+    {
+        process_wayland.zwlr_layer_shell_v1 =
+            wl_registry_bind(registry, id, &zwlr_layer_shell_v1_interface,
+                             version < 4 ? version : 4);
+    }
+    else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)
+    {
+        process_wayland.zwp_linux_dmabuf_v1 =
+            wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface,
+                             version < 3 ? version : 3);
+        zwp_linux_dmabuf_v1_add_listener(process_wayland.zwp_linux_dmabuf_v1,
+                                         &zwp_linux_dmabuf_v1_listener, NULL);
+    }
 }
 
 static void registry_handle_global_remove(void *data, struct wl_registry *registry,
@@ -489,6 +552,12 @@ BOOL wayland_process_init(void)
 
     if (!process_wayland.supports_win_scrgb)
         ERR("Wayland compositor doesn't expose windows_scrgb image description (HDR may look broken)!\n");
+
+    if (!process_wayland.zwp_linux_dmabuf_v1)
+        WARN("Wayland compositor doesn't support optional zwp_linux_dmabuf_v1 (HWND dmabuf forwarding won't work)\n");
+
+    if (!process_wayland.zwlr_layer_shell_v1)
+        WARN("Wayland compositor doesn't support optional zwlr_layer_shell_v1 (some tray menus may be misplaced)\n");
 
     process_wayland.initialized = TRUE;
 
