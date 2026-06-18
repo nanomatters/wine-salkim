@@ -834,11 +834,15 @@ BOOL WINAPI NtUserGetCursorPos( POINT *pt )
 
     if (!pt) return FALSE;
 
-    if (!get_shared_cursor_pos( pt, &last_change )) return FALSE;
+    /* tray override returns raw coords so let it flow through the shared map below */
+    if (!sni_get_context_menu_pos( pt ))
+    {
+        if (!get_shared_cursor_pos( pt, &last_change )) return FALSE;
 
-    /* query new position from graphics driver if we haven't updated recently */
-    if (NtGetTickCount() - last_change > 100) ret = user_driver->pGetCursorPos( pt );
-    if (!ret) return FALSE;
+        /* query new position from graphics driver if we haven't updated recently */
+        if (NtGetTickCount() - last_change > 100) ret = user_driver->pGetCursorPos( pt );
+        if (!ret) return FALSE;
+    }
 
     SetRect( &rect, pt->x, pt->y, pt->x, pt->y );
     rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
