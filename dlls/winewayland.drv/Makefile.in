@@ -10,6 +10,7 @@ SOURCES = \
 	content-type-v1.xml \
 	cursor-shape-v1.xml \
 	display.c \
+	linux-dmabuf-unstable-v1.xml \
 	dllmain.c \
 	ext-data-control-v1.xml \
 	fractional-scale-v1.xml \
@@ -34,6 +35,7 @@ SOURCES = \
 	window.c \
 	window_surface.c \
 	wlr-data-control-unstable-v1.xml \
+	wlr-layer-shell-unstable-v1.xml \
 	xdg-activation-v1.xml \
 	xdg-decoration-unstable-v1.xml \
 	xdg-output-unstable-v1.xml \
