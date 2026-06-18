@@ -229,6 +229,8 @@ extern void check_for_events( UINT flags );
 
 /* systray.c */
 extern LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *data );
+extern BOOL sni_get_context_menu_pos( POINT *pos );
+extern BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect );
 
 /* opengl.c */
 extern BOOL set_dc_pixel_format_internal( HDC hdc, int format, struct list *drawables );
@@ -236,6 +238,11 @@ extern void release_opengl_drawables( struct list *drawables );
 
 /* vulkan.c */
 extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_instance_extensions *extensions );
+
+/* hwnd_dmabuf.c */
+extern int hwnd_dmabuf_open_channel( HWND hwnd );
+extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd );
+extern void hwnd_dmabuf_post_wake( HWND hwnd );
 
 /* window.c */
 HANDLE alloc_user_handle( void *ptr, unsigned short type );
