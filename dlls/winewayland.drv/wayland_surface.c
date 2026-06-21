@@ -40,6 +40,20 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
+static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
+{
+    /* Inline exposes preserve the initial-configure path for windows that draw
+     * without pumping messages. Child-overlay windows must defer to avoid the
+     * event thread taking the surface lock before win_data_mutex. */
+    if (allow_inline && !window_surface_needs_child_overlays(hwnd))
+    {
+        NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+        return;
+    }
+
+    NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
+}
+
 struct wayland_hwnd_dmabuf_surface;
 
 struct wayland_hwnd_dmabuf_buffer
@@ -291,12 +305,8 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
 
     if (should_post) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
 
-    /* Flush the window surface in case there is content that we weren't
-     * able to flush before due to the lack of the initial configure. */
-    if (initial_configure)
-    {
-        NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
-    }
+    /* Flush content that could not be presented before the initial configure. */
+    if (initial_configure) request_window_surface_expose(hwnd, TRUE);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener =
@@ -501,7 +511,7 @@ static void zwlr_layer_surface_v1_handle_configure(void *private,
 
     wayland_win_data_release(data);
 
-    NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+    request_window_surface_expose(hwnd, FALSE);
 }
 
 static void zwlr_layer_surface_v1_handle_closed(void *private,
@@ -567,7 +577,7 @@ void wp_fractional_scale_handle_scale(void* user_data,
         wayland_win_data_release(data);
     }
 
-    if (updated) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+    if (updated) request_window_surface_expose(hwnd, FALSE);
 }
 
 static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener =
