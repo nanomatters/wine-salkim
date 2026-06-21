@@ -293,6 +293,9 @@ struct wine_managed_swapchain
     VkFence present_fence;          /* per-frame render-complete fence (export gate) */
     PFN_vkWaitForFences p_vkWaitForFences;
     PFN_vkResetFences p_vkResetFences;
+    HWND hwnd;                      /* server-visible producer HWND */
+    BOOL pending_registered;        /* server pending reference is live */
+    BOOL channel_registered;        /* server active producer reference is live */
 };
 
 struct swapchain
@@ -3088,6 +3091,10 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
         managed_destroy_image( device, &managed->images[i] );
     if (managed->present_fence) device->p_vkDestroyFence( device->host.device, managed->present_fence, NULL );
     if (managed->channel_fd >= 0) close( managed->channel_fd );
+    if (managed->channel_registered)
+        hwnd_dmabuf_release_channel( managed->hwnd );
+    if (managed->pending_registered)
+        hwnd_dmabuf_set_pending( managed->hwnd, FALSE );
     pthread_mutex_destroy( &managed->lock );
     free( managed );
 }
@@ -3276,6 +3283,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     uint32_t modifier_count, count, i;
     VkImageUsageFlags usage;
     VkResult res;
+    unsigned int status;
 
     *out = NULL;
 
@@ -3297,6 +3305,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     if (!(managed = calloc( 1, sizeof(*managed) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_init( &managed->lock, NULL );
     managed->channel_fd = -1;
+    managed->hwnd = surface->hwnd;
     managed->format = create_info->imageFormat;
     managed->fourcc = fourcc;
     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
@@ -3310,6 +3319,16 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     if (!managed->producer_unique_id)
         managed->producer_unique_id = InterlockedIncrement64( &managed_next_producer_id );
     managed->ring_generation = 1;
+
+    status = hwnd_dmabuf_set_pending( managed->hwnd, TRUE );
+    if (status != HWND_DMABUF_OK)
+    {
+        WARN( "failed to mark hwnd %p as pending dmabuf producer, status %u\n",
+              managed->hwnd, status );
+        managed_free( device, managed );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    managed->pending_registered = TRUE;
 
     /* At least 3 images for fire-and-forget publishing (no FIFO pacing). */
     count = max( create_info->minImageCount, 3u );
@@ -3341,6 +3360,15 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     }
 
     managed->channel_fd = hwnd_dmabuf_open_channel( surface->hwnd );
+    if (managed->channel_fd < 0)
+    {
+        WARN( "failed to open hwnd %p dmabuf producer channel, falling back to host swapchain\n",
+              surface->hwnd );
+        managed_free( device, managed );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    managed->channel_registered = TRUE;
+    managed->pending_registered = FALSE;
     managed->last_progress_ms = NtGetTickCount();
     TRACE( "managed swapchain %p hwnd %p socket channel fd %d\n", managed, surface->hwnd, managed->channel_fd );
 

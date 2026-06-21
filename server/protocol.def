@@ -4456,6 +4456,15 @@ enum fsync_type
 @END
 
 
+/* Producer: mark an HWND as about to become a dmabuf producer. */
+@REQ(hwnd_dmabuf_set_pending)
+    user_handle_t  hwnd;                /* child HWND being produced for */
+    unsigned int   pending;             /* nonzero increments, zero decrements */
+@REPLY
+    unsigned int   status;              /* enum hwnd_dmabuf_status */
+@END
+
+
 /* Producer: mint and return the producer end of hwnd's private frame socket. */
 @REQ(hwnd_dmabuf_get_channel)
     user_handle_t  hwnd;                /* child HWND being produced for */
@@ -4471,4 +4480,12 @@ enum fsync_type
 @REPLY
     unsigned int   status;              /* enum hwnd_dmabuf_status */
     obj_handle_t   channel_handle;      /* consumer end or zero if none */
+@END
+
+
+/* Producer: release one active producer reference for hwnd's frame socket. */
+@REQ(hwnd_dmabuf_release_channel)
+    user_handle_t  hwnd;                /* child HWND being produced for */
+@REPLY
+    unsigned int   status;              /* enum hwnd_dmabuf_status */
 @END
