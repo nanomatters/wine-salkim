@@ -493,6 +493,11 @@ struct wayland_win_data
     BOOL managed;
     BOOL layered_attribs_set;
     UINT32 alpha_multiplier;
+
+    UINT state_update_cmd;
+    UINT state_update_swp_flags;
+    RECT state_update_rect;
+    HWND state_update_foreground;
 };
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
@@ -579,6 +584,7 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface);
 BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground);
 BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
 UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
 UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
