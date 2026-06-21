@@ -102,6 +102,8 @@ struct window
     window_shm_t    *shared;          /* window in session shared memory */
     struct object   *dmabuf_channel_producer; /* producer end of the frame socket */
     struct object   *dmabuf_channel_consumer; /* consumer end of the frame socket */
+    unsigned int     dmabuf_pending_count;    /* swapchain creation in progress */
+    unsigned int     dmabuf_producer_count;   /* active users of the frame socket */
 };
 
 static void window_dump( struct object *obj, int verbose );
@@ -692,6 +694,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->shared         = NULL;
     win->dmabuf_channel_producer = NULL;
     win->dmabuf_channel_consumer = NULL;
+    win->dmabuf_pending_count = 0;
+    win->dmabuf_producer_count = 0;
     win->window_rect = win->visible_rect = win->surface_rect = win->client_rect = empty_rect;
     list_init( &win->children );
     list_init( &win->unlinked );
@@ -1294,12 +1298,28 @@ static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct wind
     info->style = win->style;
     info->ex_style = win->ex_style;
     info->dpi = get_window_dpi( win );
+    info->opened = win->dmabuf_producer_count != 0;
 }
 
-/* A window is a composited dmabuf child when it owns a frame socket. */
-static int hwnd_dmabuf_is_producer( struct window *win )
+static void hwnd_dmabuf_release_server_channel( struct window *win )
 {
-    return win->dmabuf_channel_producer != NULL;
+    if (win->dmabuf_channel_producer)
+    {
+        release_object( win->dmabuf_channel_producer );
+        win->dmabuf_channel_producer = NULL;
+    }
+    if (win->dmabuf_channel_consumer)
+    {
+        release_object( win->dmabuf_channel_consumer );
+        win->dmabuf_channel_consumer = NULL;
+    }
+}
+
+/* Pending producers are also listed so parents do not snapshot their GDI host
+ * while the producer is still allocating its first exportable images. */
+static int hwnd_dmabuf_is_listed( struct window *win )
+{
+    return win->dmabuf_producer_count || win->dmabuf_pending_count;
 }
 
 static unsigned int hwnd_dmabuf_count_frames( struct window *win )
@@ -1307,7 +1327,7 @@ static unsigned int hwnd_dmabuf_count_frames( struct window *win )
     struct window *child;
     unsigned int count = 0;
 
-    if (hwnd_dmabuf_is_producer( win ) && is_visible( win )) count++;
+    if (hwnd_dmabuf_is_listed( win ) && is_visible( win )) count++;
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         count += hwnd_dmabuf_count_frames( child );
     return count;
@@ -1319,7 +1339,7 @@ static void hwnd_dmabuf_fill_frame_info( struct window *host, struct window *win
 {
     struct window *child;
 
-    if (hwnd_dmabuf_is_producer( win ) && is_visible( win ))
+    if (hwnd_dmabuf_is_listed( win ) && is_visible( win ))
     {
         if (*count < max_count)
             hwnd_dmabuf_frame_info_from_window( host, win, &frames[*count] );
@@ -3058,6 +3078,24 @@ DECL_HANDLER(hwnd_list_dmabuf_frames)
 }
 
 
+/* Mark a child HWND as having a dmabuf producer under construction. */
+DECL_HANDLER(hwnd_dmabuf_set_pending)
+{
+    struct window *win = get_window( req->hwnd );
+
+    reply->status = HWND_DMABUF_INVALID_ARGS;
+    if (!win) return;
+
+    if (req->pending)
+        win->dmabuf_pending_count++;
+    else if (win->dmabuf_pending_count)
+        win->dmabuf_pending_count--;
+    if (!win->dmabuf_pending_count && !win->dmabuf_producer_count)
+        hwnd_dmabuf_release_server_channel( win );
+    reply->status = HWND_DMABUF_OK;
+}
+
+
 /* Wrap a server-owned unix fd as a handle-passable object (fd consumed on failure). */
 static struct object *hwnd_dmabuf_wrap_fd( int unix_fd )
 {
@@ -3076,6 +3114,7 @@ DECL_HANDLER(hwnd_dmabuf_get_channel)
 {
     struct window *win = get_window( req->hwnd );
     int fds[2];
+    int created = 0;
 
     reply->status = HWND_DMABUF_INVALID_ARGS;
     reply->channel_handle = 0;
@@ -3100,11 +3139,20 @@ DECL_HANDLER(hwnd_dmabuf_get_channel)
         }
         win->dmabuf_channel_producer = producer_end;
         win->dmabuf_channel_consumer = consumer_end;
+        created = 1;
     }
 
     reply->channel_handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
                                                           GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
-    if (!reply->channel_handle) return;
+    if (!reply->channel_handle)
+    {
+        if (created && !win->dmabuf_producer_count && !win->dmabuf_pending_count)
+            hwnd_dmabuf_release_server_channel( win );
+        return;
+    }
+    win->dmabuf_producer_count++;
+    if (win->dmabuf_pending_count)
+        win->dmabuf_pending_count--;
     reply->status = HWND_DMABUF_OK;
 }
 
@@ -3116,7 +3164,7 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
     reply->status = HWND_DMABUF_NOT_FOUND;
     reply->channel_handle = 0;
     if (!win) return;
-    if (!win->dmabuf_channel_consumer)
+    if (!win->dmabuf_producer_count || !win->dmabuf_channel_consumer)
     {
         reply->status = HWND_DMABUF_NO_FRAME;
         return;
@@ -3129,6 +3177,23 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
         reply->status = HWND_DMABUF_INVALID_ARGS;
         return;
     }
+    reply->status = HWND_DMABUF_OK;
+}
+
+
+/* Drop one active producer reference. Keep the retained socket through a pending
+ * recreate so the consumer fd survives resize handoff; release it when idle. */
+DECL_HANDLER(hwnd_dmabuf_release_channel)
+{
+    struct window *win = get_window( req->hwnd );
+
+    reply->status = HWND_DMABUF_INVALID_ARGS;
+    if (!win) return;
+
+    if (win->dmabuf_producer_count)
+        win->dmabuf_producer_count--;
+    if (!win->dmabuf_producer_count && !win->dmabuf_pending_count)
+        hwnd_dmabuf_release_server_channel( win );
     reply->status = HWND_DMABUF_OK;
 }
 

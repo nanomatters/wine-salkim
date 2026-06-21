@@ -411,6 +411,7 @@ struct wayland_child_overlay
  * waiting for it. */
 struct child_overlay_snapshot
 {
+    unsigned int producer_count; /* dmabuf producers visible while capturing */
     unsigned int count;
     struct child_overlay_snapshot_entry
     {
@@ -480,6 +481,9 @@ struct wayland_surface
     BOOL resizing;
     struct wl_list hwnd_dmabuf_surfaces;
     struct wl_list child_overlays; /* GDI child windows shown above a client surface */
+    /* Existing overlays were captured before any dmabuf producer was visible;
+     * refresh them once when the producer first wakes this toplevel. */
+    BOOL child_overlays_need_dmabuf_refresh;
     BOOL client_placeholder;
     /* Top of the dmabuf subsurface chain as last stacked. Overlays anchor above it,
      * keeping the [base, client, dmabufs, overlays] order stable whichever chain

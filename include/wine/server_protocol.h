@@ -6382,6 +6382,22 @@ struct hwnd_list_dmabuf_frames_reply
 
 
 
+struct hwnd_dmabuf_set_pending_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+    unsigned int   pending;
+    char __pad_20[4];
+};
+struct hwnd_dmabuf_set_pending_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    char __pad_12[4];
+};
+
+
+
 struct hwnd_dmabuf_get_channel_request
 {
     struct request_header __header;
@@ -6406,6 +6422,20 @@ struct hwnd_dmabuf_claim_channel_reply
     struct reply_header __header;
     unsigned int   status;
     obj_handle_t   channel_handle;
+};
+
+
+
+struct hwnd_dmabuf_release_channel_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+};
+struct hwnd_dmabuf_release_channel_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    char __pad_12[4];
 };
 
 
@@ -6724,8 +6754,10 @@ enum request
     REQ_d3dkmt_mutex_release,
     REQ_fsync_free_shm_idx,
     REQ_hwnd_list_dmabuf_frames,
+    REQ_hwnd_dmabuf_set_pending,
     REQ_hwnd_dmabuf_get_channel,
     REQ_hwnd_dmabuf_claim_channel,
+    REQ_hwnd_dmabuf_release_channel,
     REQ_NB_REQUESTS
 };
 
@@ -7046,8 +7078,10 @@ union generic_request
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
     struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
+    struct hwnd_dmabuf_set_pending_request hwnd_dmabuf_set_pending_request;
     struct hwnd_dmabuf_get_channel_request hwnd_dmabuf_get_channel_request;
     struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
+    struct hwnd_dmabuf_release_channel_request hwnd_dmabuf_release_channel_request;
 };
 union generic_reply
 {
@@ -7366,8 +7400,10 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
     struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
+    struct hwnd_dmabuf_set_pending_reply hwnd_dmabuf_set_pending_reply;
     struct hwnd_dmabuf_get_channel_reply hwnd_dmabuf_get_channel_reply;
     struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
+    struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
 #define SERVER_PROTOCOL_VERSION 932
