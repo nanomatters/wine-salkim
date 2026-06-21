@@ -52,6 +52,7 @@ static int wayland_win_data_cmp_rb(const void *key,
 
 static pthread_mutex_t win_data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
+static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd);
 
 static const WCHAR layer_menu_hwnd_prop[] =
     {'_','_','w','i','n','e','_','w','a','y','l','a','n','d','_','l','a','y','e','r','_','m','e','n','u',0};
@@ -924,8 +925,35 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         NtUserSetForegroundWindowInternal(hwnd);
         return 0;
     case WM_WAYLAND_DMABUF_FRAME:
+    {
+        struct child_overlay_snapshot *snapshot = NULL;
+
+        /* A producer published a frame for a descendant of this toplevel.
+         * Import it in the process that owns the toplevel's wayland surface.
+         * If GDI child overlays were captured before the producer existed,
+         * refresh them once with a producer-aware snapshot so stale host
+         * overlays do not stay stacked above the live dmabuf. */
+        if (window_surface_needs_dmabuf_overlay_refresh(hwnd))
+            snapshot = child_overlays_snapshot(hwnd);
         ensure_window_surface_contents(hwnd);
+        if (snapshot)
+        {
+            struct wayland_win_data *data;
+
+            if ((data = wayland_win_data_get(hwnd)))
+            {
+                if (data->wayland_surface)
+                {
+                    wayland_surface_apply_child_overlays(data->wayland_surface, NULL, snapshot);
+                    wl_surface_commit(data->wayland_surface->wl_surface);
+                    wl_display_flush(process_wayland.wl_display);
+                }
+                wayland_win_data_release(data);
+            }
+            free(snapshot);
+        }
         return 0;
+    }
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;
@@ -1153,6 +1181,18 @@ BOOL window_surface_needs_child_overlays(HWND hwnd)
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
     ret = window_client_surface_attached(data);
+    wayland_win_data_release(data);
+
+    return ret;
+}
+
+static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    BOOL ret;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    ret = data->wayland_surface && data->wayland_surface->child_overlays_need_dmabuf_refresh;
     wayland_win_data_release(data);
 
     return ret;
