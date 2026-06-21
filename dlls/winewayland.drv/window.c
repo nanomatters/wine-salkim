@@ -153,6 +153,15 @@ void wayland_win_data_release(struct wayland_win_data *data)
     pthread_mutex_unlock(&win_data_mutex);
 }
 
+static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
+                                                UINT state_cmd, const RECT *rect)
+{
+    data->state_update_cmd = state_cmd;
+    data->state_update_swp_flags = 0;
+    data->state_update_rect = *rect;
+    data->state_update_foreground = NULL;
+}
+
 static BOOL wayland_win_data_is_fullscreen(struct wayland_win_data *data, DWORD style)
 {
     RECT rect;
@@ -320,6 +329,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     }
 
+    if (client)
+    {
+        if (role != WAYLAND_SURFACE_ROLE_NONE) wayland_client_surface_attach(client, data->hwnd);
+        else wayland_client_surface_attach(client, NULL);
+    }
     /* Size/position changes affect the effective pointer constraint, so update
      * it as needed. */
     if (data->hwnd == NtUserGetForegroundWindow()) reapply_cursor_clipping();
@@ -847,6 +861,7 @@ static void wayland_configure_window(HWND hwnd)
     struct wayland_surface *surface;
     INT width, height, window_width, window_height, offset_x, offset_y;
     UINT flags = 0;
+    UINT state_cmd = 0;
     uint32_t state;
     DWORD style;
     BOOL needs_enter_size_move = FALSE;
@@ -960,12 +975,32 @@ static void wayland_configure_window(HWND hwnd)
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
     if (!IsRectEmpty(&rect)) rect = window_rect_from_visible(&data->rects, rect);
 
+    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+    {
+        if ((state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(style & WS_MAXIMIZE))
+            state_cmd = SC_MAXIMIZE;
+        else if (!(state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                            WAYLAND_SURFACE_CONFIG_STATE_TILED)) &&
+                 (style & WS_MAXIMIZE) && window_width && window_height)
+            state_cmd = SC_RESTORE;
+    }
+    if (state_cmd) wayland_win_data_queue_state_update(data, state_cmd, &rect);
+
     wayland_win_data_release(data);
 
     TRACE("hwnd=%p processing=%s,%#x\n", hwnd, wine_dbgstr_rect(&rect), state);
 
     if (needs_enter_size_move) send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
     if (needs_exit_size_move) send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
+
+    if (state_cmd)
+    {
+        TRACE("hwnd=%p queueing state update %#x rect=%s\n", hwnd, state_cmd,
+              wine_dbgstr_rect(&rect));
+        NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+        return;
+    }
 
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
     if (IsRectEmpty(&rect)) flags |= SWP_NOSIZE;
@@ -1351,13 +1386,34 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
                                    RECT *rect, HWND *foreground)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    struct wayland_win_data *data;
     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     HWND focused_hwnd, old_foreground = NtUserGetForegroundWindow();
+    BOOL ret;
+
+    *state_cmd = *swp_flags = 0;
+    *foreground = NULL;
+    SetRectEmpty(rect);
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+
+    *state_cmd = data->state_update_cmd;
+    *swp_flags = data->state_update_swp_flags;
+    *rect = data->state_update_rect;
+    *foreground = data->state_update_foreground;
+    ret = *state_cmd || *swp_flags || *foreground;
+
+    data->state_update_cmd = 0;
+    data->state_update_swp_flags = 0;
+    SetRectEmpty(&data->state_update_rect);
+    data->state_update_foreground = NULL;
+
+    wayland_win_data_release(data);
 
     /* in these cases we dont need to update the window focus, borrowed from winemac */
-    if (!(style & WS_VISIBLE)) return FALSE;
-    if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) return FALSE;
-    if (style & WS_DISABLED) return FALSE;
+    if (!(style & WS_VISIBLE)) return ret;
+    if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) return ret;
+    if (style & WS_DISABLED) return ret;
 
     pthread_mutex_lock(&keyboard->mutex);
     focused_hwnd = keyboard->focused_hwnd;
@@ -1368,14 +1424,15 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
         focused_hwnd = NtUserGetDesktopWindow();
     else if (focused_hwnd != hwnd) focused_hwnd = NULL;
 
-    if (old_foreground != focused_hwnd) *foreground = focused_hwnd;
+    if (!*foreground && old_foreground != focused_hwnd) *foreground = focused_hwnd;
 
     /* we can't track if the host window is minimized or unminimized, but
      * if we have keyboard focus on this window we can treat it as restored. */
-    if ((style & WS_MINIMIZE) && focused_hwnd == hwnd && old_foreground != hwnd)
+    if (!*state_cmd && (style & WS_MINIMIZE) && focused_hwnd == hwnd && old_foreground != hwnd)
         *state_cmd = MAKELONG(SC_RESTORE, 1);
 
-    TRACE("hwnd=%p foreground=%p state_low=%#x\n", hwnd, *foreground, LOWORD(*state_cmd));
+    TRACE("hwnd=%p foreground=%p state_cmd=%#x swp_flags=%#x rect=%s\n",
+          hwnd, *foreground, *state_cmd, *swp_flags, wine_dbgstr_rect(rect));
 
     return TRUE;
 }
