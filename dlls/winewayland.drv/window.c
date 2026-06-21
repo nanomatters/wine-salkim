@@ -161,6 +161,15 @@ void wayland_win_data_release(struct wayland_win_data *data)
     pthread_mutex_unlock(&win_data_mutex);
 }
 
+static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
+                                                UINT state_cmd, const RECT *rect)
+{
+    data->state_update_cmd = state_cmd;
+    data->state_update_swp_flags = 0;
+    data->state_update_rect = *rect;
+    data->state_update_foreground = NULL;
+}
+
 static BOOL wayland_win_data_is_fullscreen(struct wayland_win_data *data, DWORD style)
 {
     RECT rect;
@@ -351,7 +360,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     }
 
-    if (visible && client) wayland_client_surface_attach(client, data->hwnd);
+    if (client)
+    {
+        if (role != WAYLAND_SURFACE_ROLE_NONE) wayland_client_surface_attach(client, data->hwnd);
+        else wayland_client_surface_attach(client, NULL);
+    }
     wayland_win_data_get_config(data, &surface->window);
 
     /* Size/position changes affect the effective pointer constraint, so update
@@ -878,6 +891,7 @@ static void wayland_configure_window(HWND hwnd)
     INT width, height, window_width, window_height;
     INT window_surf_width, window_surf_height, offset_x, offset_y;
     UINT flags = 0;
+    UINT state_cmd = 0;
     uint32_t state;
     DWORD style;
     BOOL needs_enter_size_move = FALSE;
@@ -1010,6 +1024,18 @@ static void wayland_configure_window(HWND hwnd)
     SetRect(&rect, 0, 0, window_width, window_height);
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
 
+    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+    {
+        if ((state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(style & WS_MAXIMIZE))
+            state_cmd = SC_MAXIMIZE;
+        else if (!(state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                            WAYLAND_SURFACE_CONFIG_STATE_TILED)) &&
+                 (style & WS_MAXIMIZE) && window_width && window_height)
+            state_cmd = SC_RESTORE;
+    }
+    if (state_cmd) wayland_win_data_queue_state_update(data, state_cmd, &rect);
+
     wayland_win_data_release(data);
 
     TRACE("hwnd=%p processing=%dx%d,%#x\n", hwnd, width, height, state);
@@ -1017,7 +1043,14 @@ static void wayland_configure_window(HWND hwnd)
     if (needs_enter_size_move) send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
     if (needs_exit_size_move) send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
 
-    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    if (state_cmd)
+    {
+        TRACE("hwnd=%p queueing state update %#x rect=%s\n", hwnd, state_cmd,
+              wine_dbgstr_rect(&rect));
+        NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+        return;
+    }
+
     if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE)
         && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         NtUserSetWindowLong(hwnd, GWL_STYLE, style ^ WS_MAXIMIZE, FALSE);
@@ -1034,6 +1067,36 @@ static void wayland_configure_window(HWND hwnd)
     }
 
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+}
+
+BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
+                                   RECT *rect, HWND *foreground)
+{
+    struct wayland_win_data *data;
+    BOOL ret;
+
+    *state_cmd = *swp_flags = 0;
+    *foreground = NULL;
+    SetRectEmpty(rect);
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+
+    *state_cmd = data->state_update_cmd;
+    *swp_flags = data->state_update_swp_flags;
+    *rect = data->state_update_rect;
+    *foreground = data->state_update_foreground;
+    ret = *state_cmd || *swp_flags || *foreground;
+
+    data->state_update_cmd = 0;
+    data->state_update_swp_flags = 0;
+    SetRectEmpty(&data->state_update_rect);
+    data->state_update_foreground = NULL;
+
+    wayland_win_data_release(data);
+
+    TRACE("hwnd=%p returning state_cmd %#x, swp_flags %#x, rect %s, foreground %p\n",
+          hwnd, *state_cmd, *swp_flags, wine_dbgstr_rect(rect), *foreground);
+    return ret;
 }
 
 /**********************************************************************
