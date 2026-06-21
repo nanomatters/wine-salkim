@@ -240,7 +240,9 @@ extern void release_opengl_drawables( struct list *drawables );
 extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_instance_extensions *extensions );
 
 /* hwnd_dmabuf.c */
+extern unsigned int hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending );
 extern int hwnd_dmabuf_open_channel( HWND hwnd );
+extern unsigned int hwnd_dmabuf_release_channel( HWND hwnd );
 extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd );
 extern void hwnd_dmabuf_post_wake( HWND hwnd );
 
