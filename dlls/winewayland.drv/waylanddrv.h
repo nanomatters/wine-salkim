@@ -85,6 +85,7 @@ enum wayland_window_message
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
     WM_WAYLAND_DMABUF_FRAME,
+    WM_WAYLAND_EXPOSE,
 };
 
 enum wayland_surface_config_state
