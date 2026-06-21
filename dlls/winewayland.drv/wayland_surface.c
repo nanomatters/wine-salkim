@@ -646,6 +646,47 @@ void wayland_surface_clear_child_overlays(struct wayland_surface *surface)
     surface->child_overlays_need_dmabuf_refresh = FALSE;
 }
 
+static void wayland_surface_clear_child_surfaces(struct wayland_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *next;
+
+    wayland_surface_clear_child_overlays(surface);
+
+    wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
+        wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
+
+    surface->dmabuf_top = NULL;
+}
+
+static void wayland_surface_clear_input_state(struct wayland_surface *surface)
+{
+    pthread_mutex_lock(&process_wayland.pointer.mutex);
+    if (process_wayland.pointer.focused_hwnd == surface->hwnd)
+    {
+        process_wayland.pointer.focused_hwnd = NULL;
+        process_wayland.pointer.enter_serial = 0;
+    }
+    if (process_wayland.pointer.constraint_hwnd == surface->hwnd)
+        wayland_pointer_clear_constraint();
+    if (process_wayland.pointer.popup_serial_hwnd == surface->hwnd)
+    {
+        process_wayland.pointer.popup_serial = 0;
+        process_wayland.pointer.popup_serial_hwnd = NULL;
+        process_wayland.pointer.popup_serial_time = 0;
+    }
+    pthread_mutex_unlock(&process_wayland.pointer.mutex);
+
+    pthread_mutex_lock(&process_wayland.keyboard.mutex);
+    if (process_wayland.keyboard.focused_hwnd == surface->hwnd)
+        process_wayland.keyboard.focused_hwnd = NULL;
+    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+
+    pthread_mutex_lock(&process_wayland.text_input.mutex);
+    if (process_wayland.text_input.focused_hwnd == surface->hwnd)
+        process_wayland.text_input.focused_hwnd = NULL;
+    pthread_mutex_unlock(&process_wayland.text_input.mutex);
+}
+
 /* Prune on hide/destroy: a client-rendered toplevel may never flush GDI again. */
 void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND child)
 {
@@ -1001,40 +1042,6 @@ err:
  */
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
-    struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *dmabuf_surface_next;
-
-    wayland_surface_clear_child_overlays(surface);
-
-    wl_list_for_each_safe(dmabuf_surface, dmabuf_surface_next,
-                          &surface->hwnd_dmabuf_surfaces, link)
-        wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
-
-    pthread_mutex_lock(&process_wayland.pointer.mutex);
-    if (process_wayland.pointer.focused_hwnd == surface->hwnd)
-    {
-        process_wayland.pointer.focused_hwnd = NULL;
-        process_wayland.pointer.enter_serial = 0;
-    }
-    if (process_wayland.pointer.constraint_hwnd == surface->hwnd)
-        wayland_pointer_clear_constraint();
-    if (process_wayland.pointer.popup_serial_hwnd == surface->hwnd)
-    {
-        process_wayland.pointer.popup_serial = 0;
-        process_wayland.pointer.popup_serial_hwnd = NULL;
-        process_wayland.pointer.popup_serial_time = 0;
-    }
-    pthread_mutex_unlock(&process_wayland.pointer.mutex);
-
-    pthread_mutex_lock(&process_wayland.keyboard.mutex);
-    if (process_wayland.keyboard.focused_hwnd == surface->hwnd)
-        process_wayland.keyboard.focused_hwnd = NULL;
-    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
-
-    pthread_mutex_lock(&process_wayland.text_input.mutex);
-    if (process_wayland.text_input.focused_hwnd == surface->hwnd)
-        process_wayland.text_input.focused_hwnd = NULL;
-    pthread_mutex_unlock(&process_wayland.text_input.mutex);
-
     wayland_surface_clear_role(surface);
 
     if (surface->wp_viewport)
@@ -1584,6 +1591,9 @@ err:
 void wayland_surface_clear_role(struct wayland_surface *surface)
 {
     TRACE("surface=%p\n", surface);
+
+    wayland_surface_clear_input_state(surface);
+    wayland_surface_clear_child_surfaces(surface);
 
     /* some objects are shared between several roles */
 
@@ -3002,8 +3012,9 @@ static void wayland_client_surface_update(struct client_surface *client)
 
     if (!(data = wayland_win_data_get(hwnd))) return;
 
-    /* the client surface is not detached by update, only the geometry is updated */
-    if (toplevel) wayland_client_surface_attach(surface, toplevel);
+    /* the client surface is not dropped by update, only reparented or detached */
+    if (toplevel && NtUserIsWindowVisible(hwnd)) wayland_client_surface_attach(surface, toplevel);
+    else wayland_client_surface_attach(surface, NULL);
 
     wayland_win_data_release(data);
 }
@@ -3157,7 +3168,9 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         return;
     }
 
-    if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) || !(surface = toplevel_data->wayland_surface))
+    if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) ||
+        !(surface = toplevel_data->wayland_surface) ||
+        surface->role == WAYLAND_SURFACE_ROLE_NONE)
     {
         wayland_client_surface_attach(client, NULL);
         return;
