@@ -24,6 +24,11 @@ void hwnd_dmabuf_post_wake( HWND hwnd )
     if (toplevel) NtUserPostMessage( toplevel, WM_WINE_HWND_DMABUF_FRAME, 0, 0 );
 }
 
+unsigned int hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
+{
+    return wine_hwnd_dmabuf_set_pending( hwnd, pending );
+}
+
 /* Open the producer end of hwnd's channel. */
 int hwnd_dmabuf_open_channel( HWND hwnd )
 {
@@ -33,9 +38,17 @@ int hwnd_dmabuf_open_channel( HWND hwnd )
     if (wine_hwnd_dmabuf_get_channel( hwnd, &handle ) != HWND_DMABUF_OK || !handle)
         return -1;
     if (wine_server_handle_to_fd( handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL ))
+    {
         fd = -1;
+        wine_hwnd_dmabuf_release_channel( hwnd );
+    }
     NtClose( handle );
     return fd;
+}
+
+unsigned int hwnd_dmabuf_release_channel( HWND hwnd )
+{
+    return wine_hwnd_dmabuf_release_channel( hwnd );
 }
 
 /* Send one frame. The caller must reclaim the slot on error. */
