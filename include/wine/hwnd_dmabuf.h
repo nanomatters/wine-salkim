@@ -75,6 +75,22 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_list( HWND host_hwnd,
     return status;
 }
 
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
+{
+    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+
+    SERVER_START_REQ( hwnd_dmabuf_set_pending )
+    {
+        req->hwnd = wine_server_user_handle( hwnd );
+        req->pending = pending;
+        if (!wine_server_call_err( req ))
+            status = reply->status;
+    }
+    SERVER_END_REQ;
+
+    return status;
+}
+
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, HANDLE *channel_handle )
 {
     enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
@@ -113,6 +129,21 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd,
             if (status == HWND_DMABUF_OK)
                 *channel_handle = wine_server_ptr_handle( reply->channel_handle );
         }
+    }
+    SERVER_END_REQ;
+
+    return status;
+}
+
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_channel( HWND hwnd )
+{
+    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+
+    SERVER_START_REQ( hwnd_dmabuf_release_channel )
+    {
+        req->hwnd = wine_server_user_handle( hwnd );
+        if (!wine_server_call_err( req ))
+            status = reply->status;
     }
     SERVER_END_REQ;
 

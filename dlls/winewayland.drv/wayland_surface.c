@@ -630,8 +630,10 @@ static void wayland_child_overlay_destroy(struct wayland_child_overlay *overlay)
 void wayland_surface_clear_child_overlays(struct wayland_surface *surface)
 {
     struct wayland_child_overlay *overlay, *next;
+
     wl_list_for_each_safe(overlay, next, &surface->child_overlays, link)
         wayland_child_overlay_destroy(overlay);
+    surface->child_overlays_need_dmabuf_refresh = FALSE;
 }
 
 /* Prune on hide/destroy: a client-rendered toplevel may never flush GDI again. */
@@ -642,6 +644,9 @@ void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND 
 
     wl_list_for_each_safe(overlay, next, &surface->child_overlays, link)
         if (overlay->hwnd == child) { wayland_child_overlay_destroy(overlay); removed = TRUE; }
+
+    if (wl_list_empty(&surface->child_overlays))
+        surface->child_overlays_need_dmabuf_refresh = FALSE;
 
     /* commit the parent so the removal shows without a new client frame */
     if (removed) wl_surface_commit(surface->wl_surface);
@@ -758,7 +763,7 @@ struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd)
 {
     UINT dpi = NtUserGetDpiForWindow(hwnd);
     struct child_overlay_snapshot *snap;
-    unsigned int capacity = 8;
+    unsigned int capacity = 8, producer_total = 0;
     RECT top_rect, client_rect;
     HWND producers[16], child;
     unsigned int producer_count = 0;
@@ -770,6 +775,7 @@ struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd)
 
     if (!(snap = malloc(offsetof(struct child_overlay_snapshot, entries[capacity]))))
         return NULL;
+    snap->producer_count = 0;
     snap->count = 0;
 
     /* dmabuf producers under this toplevel, used below to skip their host children */
@@ -778,6 +784,7 @@ struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd)
         unsigned int total = 0, fcount = 0, i;
         if (wine_hwnd_dmabuf_list(hwnd, frames, ARRAY_SIZE(frames), &total, &fcount) == HWND_DMABUF_OK)
         {
+            producer_total = total;
             for (i = 0; i < fcount && producer_count < ARRAY_SIZE(producers); i++)
                 producers[producer_count++] = (HWND)(UINT_PTR)frames[i].hwnd;
             if (total > producer_count)
@@ -785,6 +792,7 @@ struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd)
                       hwnd, total, (unsigned int)ARRAY_SIZE(producers));
         }
     }
+    snap->producer_count = producer_total;
 
     for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
          child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
@@ -925,6 +933,9 @@ void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
 
         wl_list_for_each_safe(overlay, next, &old, link)
             wayland_child_overlay_destroy(overlay);
+
+        surface->child_overlays_need_dmabuf_refresh =
+            !wl_list_empty(&surface->child_overlays) && !snapshot->producer_count;
     }
 
     wayland_surface_raise_child_overlays(surface, wayland_surface_overlay_anchor(surface));
@@ -2260,12 +2271,14 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
     struct wayland_hwnd_dmabuf_buffer *buffer = NULL;
     hwnd_dmabuf_frame_desc_t pdesc, desc;
     BOOL have_pending = FALSE;
+    BOOL retried = FALSE;
     int pfd = -1, fd, r;
 
     *created_buffer = FALSE;
     *attached_frame = FALSE;
     memset(&pdesc, 0, sizeof(pdesc));
 
+retry:
     wayland_hwnd_dmabuf_surface_claim_channel(surface);
     if (surface->channel_fd < 0) return surface->current;
 
@@ -2289,6 +2302,16 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
         pdesc = desc;
         pfd = fd;
         have_pending = TRUE;
+    }
+    if (r < 0)
+    {
+        close(surface->channel_fd);
+        surface->channel_fd = -1;
+        if (!have_pending && !retried)
+        {
+            retried = TRUE;
+            goto retry;
+        }
     }
 
     if (!have_pending) return surface->current;
@@ -2373,6 +2396,23 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
 
         TRACE("hwnd=%p child=%p frame_seq=%u opened=%u\n",
               surface->hwnd, hwnd, frames[i].frame_seq, frames[i].opened);
+
+        if (!frames[i].opened)
+        {
+            if ((dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)))
+            {
+                dmabuf_surface->seen = TRUE;
+                dmabuf_surface->last_seen_ms = now;
+                if (dmabuf_surface->current &&
+                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
+                {
+                    wl_surface_commit(dmabuf_surface->wl_surface);
+                    above = dmabuf_surface->wl_surface;
+                    any_new = TRUE;
+                }
+            }
+            continue;
+        }
 
         if (!(dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)) &&
             !(dmabuf_surface = wayland_hwnd_dmabuf_surface_create(surface, hwnd)))
