@@ -601,9 +601,6 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
         {L"antenna\\antenna.exe", L" --use-angle=d3d9"},
         {L"Bloody Walls\\game.exe", L" --disable_direct_composition=1"},
         {L"Insanitys Blade\\nw.exe", L" --use-gl=swiftshader"},
-        {L"Warhammer2.exe", L" --in-process-gpu"},
-        {L"SummerIslands.exe", L" --in-process-gpu"},
-        {L"Paradox Launcher.exe", L" --use-angle=gl"},
         {L"Montaro\\nw.exe", L" --use-gl=swiftshader"},
         {L"Aisling and the Tavern of Elves\\nw.exe", L" --use-gl=swiftshader"},
         {L"Snares of Ruin 2\\SoR2.exe", L" --use-gl=swiftshader"},
@@ -614,7 +611,6 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
         {L"PaladinLias\\Game.exe", L" --use-gl=desktop"},
         {L"EverQuest 2\\LaunchPad.exe", L" --use-gl=swiftshader"},
         {L"Everquest F2P\\LaunchPad.exe", L" --use-gl=swiftshader"},
-        {L"Red Tie Runner.exe", L" --use-angle=gl"},
         {L"UnrealCEFSubProcess.exe", L" --use-gl=swiftshader", "2316580"},
         {L"UnrealCEFSubProcess.exe", L" --use-angle=d3d9", "2684500"},
     };
