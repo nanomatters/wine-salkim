@@ -346,8 +346,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
 {
     const RECT *rect = &surface->window.rect;
-    BOOL processing_config = surface->processing.serial &&
-                             !surface->processing.processed;
+    BOOL processing_config = surface->processing.serial;
 
     TRACE("hwnd=%p window_state=%#x %s->state=%#x\n",
           surface->hwnd, surface->window.state,
@@ -421,6 +420,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
     }
     else
     {
+        /* Keep compositor configures authoritative until promotion. */
         surface->processing.processed = TRUE;
     }
 }
@@ -1021,7 +1021,33 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_NOSENDCHANGING;
     }
 
+    /* Mark pending configures processed before rawpos can flush. */
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        surface = data->wayland_surface;
+        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            surface->xdg_surface && surface->processing.serial &&
+            !surface->processing.processed)
+            wayland_win_data_update_wayland_state(data);
+        wayland_win_data_release(data);
+    }
+
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+
+    /* Ack/promote the processed configure if rawpos did not flush it. */
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        surface = data->wayland_surface;
+        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            surface->xdg_surface && surface->processing.serial &&
+            surface->processing.processed)
+        {
+            wayland_win_data_release(data);
+            /* Preserve flush lock order: surface before win_data. */
+            ensure_window_surface_contents(hwnd);
+        }
+        else wayland_win_data_release(data);
+    }
 }
 
 /**********************************************************************
