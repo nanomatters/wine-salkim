@@ -52,6 +52,8 @@ static int wayland_win_data_cmp_rb(const void *key,
 
 static pthread_mutex_t win_data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
+static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd);
+static BOOL window_surface_has_requested_configure(HWND hwnd);
 static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd);
 
 static const WCHAR layer_menu_hwnd_prop[] =
@@ -1012,6 +1014,11 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         struct child_overlay_snapshot *snapshot = NULL;
 
+        if (window_surface_has_requested_configure(hwnd))
+            wayland_configure_window(hwnd);
+        if (window_surface_configure_blocks_dmabuf(hwnd))
+            return 0;
+
         /* A producer published a frame for a descendant of this toplevel.
          * Import it in the process that owns the toplevel's wayland surface.
          * If GDI child overlays were captured before the producer existed,
@@ -1282,6 +1289,43 @@ BOOL window_surface_needs_child_overlays(HWND hwnd)
     return ret;
 }
 
+static BOOL window_surface_has_requested_configure(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    BOOL ret = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    surface = data->wayland_surface;
+    if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+        surface->xdg_surface && surface->requested.serial)
+        ret = TRUE;
+    wayland_win_data_release(data);
+
+    return ret;
+}
+
+static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    BOOL ret = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    surface = data->wayland_surface;
+    if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->xdg_surface)
+    {
+        /* Keep producer frames flowing while a maximize/restore SysCommand is
+         * pending. Only an actual unconfigured parent blocks dmabuf commits. */
+        ret = surface->requested.serial ||
+              (surface->processing.serial && !surface->processing.processed &&
+               !surface->current.serial);
+    }
+    wayland_win_data_release(data);
+
+    return ret;
+}
+
 static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd)
 {
     struct wayland_win_data *data;
@@ -1299,8 +1343,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
-    struct wayland_shm_buffer *dummy_buffer = NULL;
-    HRGN dummy_damage = NULL;
     BOOL committed = FALSE;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
@@ -1316,20 +1358,14 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                 wayland_surface_sync_alpha(wayland_surface);
             }
 
-            if (window_client_surface_pending_first_frame(data))
-                dummy_buffer = wayland_surface_create_dummy_buffer(wayland_surface,
-                                                                   WL_SHM_FORMAT_ARGB8888,
-                                                                   &dummy_damage);
-
-            wayland_surface_attach_shm(wayland_surface, dummy_buffer ? dummy_buffer : shm_buffer,
-                                       dummy_buffer ? dummy_damage : damage_region);
-            wayland_surface->client_placeholder = !!dummy_buffer;
+            wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
+            wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
             if (window_client_surface_attached(data))
                 wayland_surface_apply_child_overlays(wayland_surface, shm_buffer, overlay_snapshot);
             else if (!wl_list_empty(&wayland_surface->child_overlays))
                 wayland_surface_clear_child_overlays(wayland_surface);
             wl_surface_commit(wayland_surface->wl_surface);
-            if (dummy_buffer) wayland_shm_buffer_unref(dummy_buffer);
+            wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
             committed = TRUE;
         }
         else
@@ -1351,7 +1387,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         wayland_shm_buffer_unref(data->window_contents);
     wayland_shm_buffer_ref((data->window_contents = shm_buffer));
 
-    if (dummy_damage) NtGdiDeleteObjectApp(dummy_damage);
     wayland_win_data_release(data);
 
     return committed;
@@ -1371,6 +1406,7 @@ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd)
 
 void ensure_window_surface_contents(HWND hwnd)
 {
+    BOOL has_dmabuf_content = FALSE, expose = FALSE;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
 
@@ -1379,16 +1415,33 @@ void ensure_window_surface_contents(HWND hwnd)
     if ((wayland_surface = data->wayland_surface))
     {
         wayland_surface_ensure_contents(wayland_surface, data->client_surface);
+        has_dmabuf_content = wayland_surface_has_hwnd_dmabuf_content(wayland_surface);
 
-        /* Handle any processed configure request, to ensure the related
-         * surface state is applied by the compositor. */
-        if (wayland_surface->processing.serial &&
-            wayland_surface->processing.processed &&
-            wayland_surface_reconfigure(wayland_surface))
+        if (wayland_surface->window.visible)
         {
-            wl_surface_commit(wayland_surface->wl_surface);
+            if (data->window_contents)
+            {
+                if (wayland_surface->processing.serial &&
+                    wayland_surface->processing.processed &&
+                    wayland_surface_reconfigure(wayland_surface))
+                {
+                    /* Handle any processed configure request, to ensure the
+                     * related surface state is applied by the compositor. */
+                    wl_surface_commit(wayland_surface->wl_surface);
+                }
+            }
+            /* Producer content already visible: do not create a fallback
+             * window surface that could replace its carrier with default pixels. */
+            else if (!has_dmabuf_content) expose = TRUE;
         }
+
+        /* Flush queued commits now: the dmabuf present path has no other flush
+         * point. They would otherwise sit in the output buffer until the event
+         * thread next wakes, throttling presentation to that rate. */
+        wl_display_flush(process_wayland.wl_display);
     }
 
     wayland_win_data_release(data);
+
+    if (expose) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
 }

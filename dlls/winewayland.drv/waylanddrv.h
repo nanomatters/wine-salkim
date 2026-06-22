@@ -317,6 +317,9 @@ struct wayland_shm_buffer
     HRGN damage_region;
 };
 
+struct wayland_hwnd_dmabuf_surface;
+struct wayland_win_data;
+
 struct wayland_surface
 {
     HWND hwnd;
@@ -361,10 +364,10 @@ struct wayland_surface
     BOOL resizing;
     struct wl_list hwnd_dmabuf_surfaces;
     struct wl_list child_overlays; /* GDI child windows shown above a client surface */
+    struct wayland_hwnd_dmabuf_surface *direct_dmabuf_surface;
     /* Existing overlays were captured before any dmabuf producer was visible;
      * refresh them once when the producer first wakes this toplevel. */
     BOOL child_overlays_need_dmabuf_refresh;
-    BOOL client_placeholder;
     /* Top of the dmabuf subsurface chain as last stacked. Overlays anchor above it,
      * keeping the [base, client, dmabufs, overlays] order stable whichever chain
      * restacks last. Validated against the live list before use, never freed. */
@@ -409,13 +412,13 @@ void wayland_surface_clear_role(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
-struct wayland_shm_buffer *wayland_surface_create_dummy_buffer(struct wayland_surface *surface,
-                                                               enum wl_shm_format format,
-                                                               HRGN *damage);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
                                           int width, int height,
                                           enum wayland_surface_config_state state);
+BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
 void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
                                           struct wayland_shm_buffer *shm_buffer,
