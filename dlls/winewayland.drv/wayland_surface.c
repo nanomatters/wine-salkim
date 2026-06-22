@@ -3005,18 +3005,10 @@ static void wayland_client_surface_detach(struct client_surface *client)
 static void wayland_client_surface_update(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-    struct wayland_win_data *data;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (!(data = wayland_win_data_get(hwnd))) return;
-
-    /* the client surface is not dropped by update, only reparented or detached */
-    if (toplevel && NtUserIsWindowVisible(hwnd)) wayland_client_surface_attach(surface, toplevel);
-    else wayland_client_surface_attach(surface, NULL);
-
-    wayland_win_data_release(data);
+    set_client_surface(client->hwnd, surface);
 }
 
 static BOOL wayland_client_surface_is_hwnd_dmabuf_producer(struct wayland_client_surface *surface)
