@@ -774,10 +774,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             if (toplevel && NtUserIsWindowVisible(hwnd))
                 wayland_client_surface_attach(client, toplevel);
             else
-            {
                 wayland_client_surface_attach(client, NULL);
-                data->client_surface = NULL;
-            }
         }
 
         if (data->wayland_surface)
@@ -1241,13 +1238,15 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
         if ((old_client = data->client_surface))
             wayland_client_surface_attach(old_client, NULL);
 
-        if ((data->client_surface = new_client))
-        {
-            if (toplevel && NtUserIsWindowVisible(hwnd))
-                wayland_client_surface_attach(new_client, toplevel);
-            else
-                wayland_client_surface_attach(new_client, NULL);
-        }
+        data->client_surface = new_client;
+    }
+
+    if (data->client_surface)
+    {
+        if (toplevel && NtUserIsWindowVisible(hwnd))
+            wayland_client_surface_attach(data->client_surface, toplevel);
+        else
+            wayland_client_surface_attach(data->client_surface, NULL);
     }
 
     wayland_win_data_release(data);
@@ -1259,6 +1258,11 @@ static BOOL window_client_surface_attached(struct wayland_win_data *data)
 {
     return data->client_surface && data->client_surface->wl_subsurface &&
            data->client_surface->toplevel == data->hwnd;
+}
+
+static BOOL window_client_surface_pending_first_frame(struct wayland_win_data *data)
+{
+    return data->client_surface && !data->client_surface->has_presented;
 }
 
 /* Whether the flush path should snapshot child geometry for overlays before
@@ -1312,7 +1316,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                 wayland_surface_sync_alpha(wayland_surface);
             }
 
-            if (window_client_surface_attached(data) && !data->client_surface->has_presented)
+            if (window_client_surface_pending_first_frame(data))
                 dummy_buffer = wayland_surface_create_dummy_buffer(wayland_surface,
                                                                    WL_SHM_FORMAT_ARGB8888,
                                                                    &dummy_damage);
@@ -1333,6 +1337,12 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             TRACE("Wayland surface not configured yet, not flushing\n");
         }
     }
+
+    /* An attached client stays attached on GDI commits. Detaching would flash
+     * the empty GDI buffer. Lifecycle callbacks clear dead client surfaces. */
+    if (committed && data->client_surface && !window_client_surface_attached(data) &&
+        !window_client_surface_pending_first_frame(data))
+        wayland_client_surface_attach(data->client_surface, NULL);
 
     /* Update the latest window buffer for the wayland surface. Note that we
      * only care whether the buffer contains the latest window contents,
