@@ -2955,19 +2955,10 @@ static BOOL is_client_visible(HWND hwnd)
 static void wayland_client_surface_update(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-    struct wayland_win_data *data;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (!(data = wayland_win_data_get(hwnd))) return;
-
-    if (toplevel && is_client_visible(hwnd))
-        wayland_client_surface_attach(surface, toplevel);
-    else
-        wayland_client_surface_attach(surface, NULL);
-
-    wayland_win_data_release(data);
+    set_client_surface(client->hwnd, surface);
 }
 
 static BOOL wayland_client_surface_is_hwnd_dmabuf_producer(struct wayland_client_surface *surface)
@@ -3049,13 +3040,15 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
         if ((old_client = data->client_surface))
             wayland_client_surface_attach(old_client, NULL);
 
-        if ((data->client_surface = new_client))
-        {
-            if (toplevel && is_client_visible(hwnd))
-                wayland_client_surface_attach(new_client, toplevel);
-            else
-                wayland_client_surface_attach(new_client, NULL);
-        }
+        data->client_surface = new_client;
+    }
+
+    if (data->client_surface)
+    {
+        if (toplevel && is_client_visible(hwnd))
+            wayland_client_surface_attach(data->client_surface, toplevel);
+        else
+            wayland_client_surface_attach(data->client_surface, NULL);
     }
 
     wayland_win_data_release(data);
