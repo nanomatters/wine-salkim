@@ -379,73 +379,69 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
 {
     const RECT *rect = &surface->window.rect;
-    BOOL processing_config = surface->processing.serial &&
-                             !surface->processing.processed;
+    BOOL processing_config = surface->processing.serial;
 
     TRACE("hwnd=%p window_state=%#x minimized=%u %s->state=%#x\n",
           surface->hwnd, surface->window.state, surface->window.minimized,
           processing_config ? "processing" : "current",
           processing_config ? surface->processing.state : surface->current.state);
 
-    /* If we are not processing a compositor requested config, use the
-     * window state to determine and update the Wayland state. */
-    if (!processing_config)
+    if (processing_config)
     {
-         /* First do all state unsettings, before setting new state. Some
-          * Wayland compositors misbehave if the order is reversed. */
-        if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
-        {
-            xdg_toplevel_unset_maximized(surface->xdg_toplevel);
-        }
-        if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
-        {
-            xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
-            wayland_surface_shortcut_control(surface, FALSE);
-            surface->requested_output = NULL;
-        }
-
-        if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-           !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
-        {
-            xdg_toplevel_set_maximized(surface->xdg_toplevel);
-        }
-        if (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
-        {
-            struct wayland_output *wayland_output;
-            struct wl_output *output = NULL;
-            pthread_mutex_lock(&process_wayland.output_mutex);
-
-            if ((wayland_output = wayland_output_for_rect(rect)))
-                output = wayland_output->wl_output;
-
-            if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
-            {
-                if (surface->requested_output != output)
-                {
-                    xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
-                    wl_display_flush(process_wayland.wl_display);
-                }
-                else
-                    goto skip_fullscreen;
-            }
-
-            xdg_toplevel_set_fullscreen(surface->xdg_toplevel, output);
-            wayland_surface_shortcut_control(surface, TRUE);
-            surface->requested_output = output;
-
-            skip_fullscreen:
-            pthread_mutex_unlock(&process_wayland.output_mutex);
-        }
-        if (surface->window.minimized)
-        {
-            xdg_toplevel_set_minimized(surface->xdg_toplevel);
-        }
-    }
-    else
-    {
+        /* Keep compositor configures authoritative until promotion. */
         surface->processing.processed = TRUE;
+        return;
+    }
+
+    /* Use window state for Wayland requests. Unset states first. */
+    if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+    {
+        xdg_toplevel_unset_maximized(surface->xdg_toplevel);
+    }
+    if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+    {
+        xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
+        wayland_surface_shortcut_control(surface, FALSE);
+        surface->requested_output = NULL;
+    }
+
+    if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+    {
+        xdg_toplevel_set_maximized(surface->xdg_toplevel);
+    }
+    if (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+    {
+        struct wayland_output *wayland_output;
+        struct wl_output *output = NULL;
+        pthread_mutex_lock(&process_wayland.output_mutex);
+
+        if ((wayland_output = wayland_output_for_rect(rect)))
+            output = wayland_output->wl_output;
+
+        if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+        {
+            if (surface->requested_output != output)
+            {
+                xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
+                wl_display_flush(process_wayland.wl_display);
+            }
+            else
+                goto skip_fullscreen;
+        }
+
+        xdg_toplevel_set_fullscreen(surface->xdg_toplevel, output);
+        wayland_surface_shortcut_control(surface, TRUE);
+        surface->requested_output = output;
+
+        skip_fullscreen:
+        pthread_mutex_unlock(&process_wayland.output_mutex);
+    }
+    if (surface->window.minimized)
+    {
+        xdg_toplevel_set_minimized(surface->xdg_toplevel);
     }
 }
 
@@ -1066,7 +1062,33 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_NOSENDCHANGING;
     }
 
+    /* Mark pending configures processed before rawpos can flush. */
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        surface = data->wayland_surface;
+        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            surface->xdg_surface && surface->processing.serial &&
+            !surface->processing.processed)
+            wayland_win_data_update_wayland_state(data);
+        wayland_win_data_release(data);
+    }
+
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+
+    /* Ack/promote the processed configure if rawpos did not flush it. */
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        surface = data->wayland_surface;
+        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            surface->xdg_surface && surface->processing.serial &&
+            surface->processing.processed)
+        {
+            wayland_win_data_release(data);
+            /* Preserve flush lock order: surface before win_data. */
+            ensure_window_surface_contents(hwnd);
+        }
+        else wayland_win_data_release(data);
+    }
 }
 
 BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
