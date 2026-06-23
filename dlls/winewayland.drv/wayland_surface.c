@@ -3530,8 +3530,19 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         TRACE("Created subsurface for toplevel=%p\n", toplevel);
     }
 
-    NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
-    NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+    if (hwnd == toplevel)
+    {
+        /* Keep own-toplevel client surfaces in the same geometry generation as
+         * the parent surface during xdg configure / rawpos transitions. */
+        SetRect(&client_rect, 0, 0,
+                surface->window.client_rect.right - surface->window.client_rect.left,
+                surface->window.client_rect.bottom - surface->window.client_rect.top);
+    }
+    else
+    {
+        NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+        NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+    }
 
     if (wayland_surface_reconfigure_client(surface, client, &client_rect))
     {
