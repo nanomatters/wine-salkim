@@ -601,6 +601,8 @@ static void wayland_surface_clear_child_surfaces(struct wayland_surface *surface
     surface->dmabuf_top = NULL;
 }
 
+/* Clear cached input state when the wl_surface is destroyed. Role changes are
+ * not input events; compositor enter/leave handles focus while the surface lives. */
 static void wayland_surface_clear_input_state(struct wayland_surface *surface)
 {
     pthread_mutex_lock(&process_wayland.pointer.mutex);
@@ -999,6 +1001,7 @@ err:
  */
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
+    wayland_surface_clear_input_state(surface);
     wayland_surface_clear_role(surface);
 
     if (surface->wp_alpha_modifier_surface_v1)
@@ -1530,7 +1533,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
 {
     TRACE("surface=%p\n", surface);
 
-    wayland_surface_clear_input_state(surface);
+    /* Keep input state across role churn; it follows wl_surface enter/leave. */
     wayland_surface_clear_child_surfaces(surface);
 
     /* some objects are shared between several roles */
