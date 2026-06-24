@@ -4520,6 +4520,17 @@ static void send_parent_notify( HWND hwnd, UINT msg )
     }
 }
 
+static void apply_driver_max_track_size( HWND hwnd, MINMAXINFO *minmax )
+{
+    SIZE max_track;
+
+    if (!user_driver->pGetWindowMaxTrackSize( hwnd, &max_track )) return;
+    if (max_track.cx > 0)
+        minmax->ptMaxTrackSize.x = min( minmax->ptMaxTrackSize.x, max_track.cx );
+    if (max_track.cy > 0)
+        minmax->ptMaxTrackSize.y = min( minmax->ptMaxTrackSize.y, max_track.cy );
+}
+
 /*******************************************************************
  *           get_min_max_info
  *
@@ -4598,6 +4609,8 @@ MINMAXINFO get_min_max_info( HWND hwnd )
             minmax.ptMaxPosition.y = rc_max.top - yinc;
         }
     }
+
+    apply_driver_max_track_size( hwnd, &minmax );
 
     TRACE( "%d %d / %d %d / %d %d / %d %d\n",
            minmax.ptMaxSize.x, minmax.ptMaxSize.y,

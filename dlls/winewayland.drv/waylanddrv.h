@@ -106,6 +106,15 @@ enum wayland_surface_role
     WAYLAND_SURFACE_ROLE_LAYER,
 };
 
+enum wayland_surface_wm_caps
+{
+    WAYLAND_SURFACE_WM_CAPS_CHANGED = (1 << 0),
+    WAYLAND_SURFACE_WM_CAPS_SHOW_WINDOW = (1 << 1),
+    WAYLAND_SURFACE_WM_CAPS_MAXIMIZE = (1 << 2),
+    WAYLAND_SURFACE_WM_CAPS_FULLSCREEN = (1 << 3),
+    WAYLAND_SURFACE_WM_CAPS_MINIMIZE = (1 << 4)
+};
+
 enum wayland_surface_ensure_type
 {
     WAYLAND_SURFACE_NOT_ENSURED = 0,
@@ -358,10 +367,20 @@ struct output_info
 struct wayland_surface_config
 {
     RECT rect;
+    int32_t bounds_width, bounds_height;
     enum wayland_surface_config_state state;
     enum zxdg_toplevel_decoration_v1_mode decor;
+    enum wayland_surface_wm_caps caps;
     uint32_t serial;
     BOOL processed;
+    BOOL bounds_set;
+};
+
+struct wayland_toplevel_size_limits
+{
+    int min_width, min_height;
+    int max_width, max_height;
+    BOOL valid;
 };
 
 struct wayland_window_config
@@ -483,6 +502,7 @@ struct wayland_surface
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
 
     struct wayland_surface_config pending, requested, processing, current;
+    struct wayland_toplevel_size_limits toplevel_size_limits;
     BOOL resizing;
     enum wayland_surface_ensure_type ensured_contents;
     struct wl_list hwnd_dmabuf_surfaces;
@@ -549,6 +569,7 @@ RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_to_surface(struct wayland_surface *surface, POINT point);
 RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
+BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
@@ -754,6 +775,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                               const struct window_rects *new_rects, struct window_surface *surface);
 BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
 BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground);
+BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size);
 BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
 BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd,  UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
 BOOL WAYLAND_HasWindowManager(const char *name);

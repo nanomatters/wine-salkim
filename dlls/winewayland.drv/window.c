@@ -1498,6 +1498,20 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
     return TRUE;
 }
 
+BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size)
+{
+    struct wayland_win_data *data;
+    BOOL ret = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+
+    if (data->wayland_surface)
+        ret = wayland_surface_get_max_track_size(data->wayland_surface, size);
+
+    wayland_win_data_release(data);
+    return ret;
+}
+
 /* True when the client surface occludes this window's GDI buffer. A detached
  * or reparented client does not count. */
 static BOOL window_client_surface_attached(struct wayland_win_data *data)
