@@ -250,6 +250,19 @@ RGNDATA *get_region_data(HRGN region)
     return data;
 }
 
+static void wayland_window_surface_sync_input_region(struct window_surface *window_surface)
+{
+    struct wayland_win_data *data;
+
+    if (!(data = wayland_win_data_get(window_surface->hwnd)))
+        return;
+
+    if (data->wayland_surface)
+        wayland_surface_sync_shape_input_region(data->wayland_surface, window_surface->shape_region);
+
+    wayland_win_data_release(data);
+}
+
 /**********************************************************************
  *          copy_pixel_region
  */
@@ -455,6 +468,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
+
+    if (shape_changed) wayland_window_surface_sync_input_region(window_surface);
 
     /* snapshot child geometry before set_window_surface_contents locks win_data_mutex */
     if (window_surface_needs_child_overlays(window_surface->hwnd))
