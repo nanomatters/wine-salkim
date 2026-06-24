@@ -3459,6 +3459,25 @@ err:
     return NULL;
 }
 
+static BOOL wayland_surface_has_live_role(struct wayland_surface *surface)
+{
+    switch (surface->role)
+    {
+    case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+        return surface->xdg_surface != NULL && surface->xdg_toplevel != NULL;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        return surface->xdg_surface != NULL && surface->xdg_popup != NULL;
+    case WAYLAND_SURFACE_ROLE_LAYER:
+        return surface->zwlr_layer_surface_v1 != NULL;
+    case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+        return surface->wl_subsurface != NULL;
+    case WAYLAND_SURFACE_ROLE_NONE:
+        return FALSE;
+    }
+
+    return FALSE;
+}
+
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
 {
     struct wayland_win_data *toplevel_data;
@@ -3480,7 +3499,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 
     if (!(toplevel_data = wayland_win_data_get(toplevel)) ||
         !(surface = toplevel_data->wayland_surface) ||
-        surface->role == WAYLAND_SURFACE_ROLE_NONE)
+        !wayland_surface_has_live_role(surface))
     {
         if (toplevel_data) wayland_win_data_release(toplevel_data);
         return wayland_client_surface_attach(client, NULL);
