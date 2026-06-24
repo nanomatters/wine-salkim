@@ -264,6 +264,35 @@ static inline BOOL popup_config_changed(struct wayland_surface_config *c1,
            c1->x != c2->x || c1->y != c2->y;
 }
 
+static BOOL wayland_surface_config_has_bounds(const struct wayland_surface_config *config)
+{
+    return config->bounds_set && config->bounds_width > 0 && config->bounds_height > 0;
+}
+
+static const struct wayland_surface_config *wayland_surface_latest_config(struct wayland_surface *surface)
+{
+    if (surface->requested.serial) return &surface->requested;
+    if (surface->processing.serial) return &surface->processing;
+    if (surface->current.serial) return &surface->current;
+    return NULL;
+}
+
+static void wayland_surface_config_inherit_caps_and_bounds(struct wayland_surface_config *config,
+                                                           struct wayland_surface *surface)
+{
+    const struct wayland_surface_config *prev = wayland_surface_latest_config(surface);
+
+    if (!prev) return;
+
+    if (!config->caps && prev->caps) config->caps = prev->caps;
+    if (!config->bounds_set)
+    {
+        config->bounds_set = prev->bounds_set;
+        config->bounds_width = prev->bounds_width;
+        config->bounds_height = prev->bounds_height;
+    }
+}
+
 static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
                                          uint32_t serial)
 {
@@ -292,8 +321,7 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
         should_post = surface->requested.serial == 0;
         initial_configure = surface->current.serial == 0;
         surface->pending.serial = serial;
-        if (!surface->pending.caps && surface->current.caps)
-            surface->pending.caps = surface->current.caps;
+        wayland_surface_config_inherit_caps_and_bounds(&surface->pending, surface);
         if (!surface->pending.decor && surface->current.decor)
             surface->pending.decor = surface->current.decor;
         else if (!surface->pending.decor && surface->requested.decor)
@@ -389,12 +417,26 @@ static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_tople
     NtUserPostMessage((HWND)data, WM_SYSCOMMAND, SC_CLOSE, 0);
 }
 
-static void xdg_toplevel_handle_configure_bounds(void *private, struct xdg_toplevel *xdg_toplevel, int width, int height)
+static void xdg_toplevel_handle_configure_bounds(void *private,
+                                                 struct xdg_toplevel *xdg_toplevel,
+                                                 int width, int height)
 {
+    struct wayland_surface *surface;
+    struct wayland_win_data *data;
     HWND hwnd = private;
 
-    /* FIXME: we don't respect these yet */
-    TRACE("hwnd %p, (%d, %d)\n", hwnd, width, height);
+    TRACE("hwnd=%p bounds=%dx%d\n", hwnd, width, height);
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+
+    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
+    {
+        surface->pending.bounds_width = width;
+        surface->pending.bounds_height = height;
+        surface->pending.bounds_set = TRUE;
+    }
+
+    wayland_win_data_release(data);
 }
 
 static void xdg_toplevel_handle_wm_caps(void *private, struct xdg_toplevel *xdg_toplevel, struct wl_array *caps)
@@ -1721,6 +1763,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
     memset(&surface->requested, 0, sizeof(surface->requested));
     memset(&surface->processing, 0, sizeof(surface->processing));
     memset(&surface->current, 0, sizeof(surface->current));
+    memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
     surface->toplevel_hwnd = 0;
 
     /* Ensure no buffer is attached, otherwise future role assignments may fail. */
@@ -1854,6 +1897,72 @@ static void wayland_surface_get_rect_in_monitor(struct wayland_surface *surface,
     OffsetRect(rect, -surface->window.rect.left, -surface->window.rect.top);
 }
 
+static BOOL wayland_surface_config_is_managed(const struct wayland_surface_config *config)
+{
+    return config->state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                            WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
+                            WAYLAND_SURFACE_CONFIG_STATE_TILED);
+}
+
+BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size)
+{
+    const struct wayland_surface_config *config = &surface->current;
+    int width, height;
+
+    if (!surface->window.resizeable || !wayland_surface_is_toplevel(surface) ||
+        !surface->xdg_toplevel)
+        return FALSE;
+    if (!config->serial || wayland_surface_config_is_managed(config) ||
+        !wayland_surface_config_has_bounds(config))
+        return FALSE;
+
+    wayland_surface_coords_to_window(surface, config->bounds_width,
+                                     config->bounds_height, &width, &height);
+    if (width <= 0 || height <= 0) return FALSE;
+
+    size->cx = width;
+    size->cy = height;
+    return TRUE;
+}
+
+static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *surface,
+                                                       int width, int height)
+{
+    struct wayland_toplevel_size_limits limits = {0};
+
+    if (!wayland_surface_is_toplevel(surface)) return;
+
+    if (surface->window.resizeable)
+    {
+        if (!wayland_surface_config_is_managed(&surface->current) &&
+            wayland_surface_config_has_bounds(&surface->current))
+        {
+            limits.max_width = surface->current.bounds_width;
+            limits.max_height = surface->current.bounds_height;
+        }
+    }
+    else
+    {
+        limits.min_width = limits.max_width = width;
+        limits.min_height = limits.max_height = height;
+    }
+
+    if (surface->toplevel_size_limits.valid &&
+        surface->toplevel_size_limits.min_width == limits.min_width &&
+        surface->toplevel_size_limits.min_height == limits.min_height &&
+        surface->toplevel_size_limits.max_width == limits.max_width &&
+        surface->toplevel_size_limits.max_height == limits.max_height)
+        return;
+
+    xdg_toplevel_set_min_size(surface->xdg_toplevel, limits.min_width,
+                              limits.min_height);
+    xdg_toplevel_set_max_size(surface->xdg_toplevel, limits.max_width,
+                              limits.max_height);
+
+    limits.valid = TRUE;
+    surface->toplevel_size_limits = limits;
+}
+
 /**********************************************************************
  *          wayland_surface_reconfigure_geometry
  *
@@ -1900,25 +2009,19 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 
     TRACE("hwnd=%p geometry=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
 
-    if (!IsRectEmpty(&rect) && !EqualRect(&surface->geometry, &rect))
+    if (!IsRectEmpty(&rect))
     {
         int width = rect.right - rect.left, height = rect.bottom - rect.top;
-        xdg_surface_set_window_geometry(surface->xdg_surface,
-                                        rect.left, rect.top,
-                                        width, height);
-        surface->geometry = rect;
-        /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
-        if (!wayland_surface_is_toplevel(surface)) return;
-        if (surface->window.resizeable)
+
+        if (!EqualRect(&surface->geometry, &rect))
         {
-            xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
-            xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+            xdg_surface_set_window_geometry(surface->xdg_surface,
+                                            rect.left, rect.top,
+                                            width, height);
+            surface->geometry = rect;
         }
-        else
-        {
-            xdg_toplevel_set_min_size(surface->xdg_toplevel, width, height);
-            xdg_toplevel_set_max_size(surface->xdg_toplevel, width, height);
-        }
+
+        wayland_surface_apply_toplevel_size_limits(surface, width, height);
     }
 }
 
