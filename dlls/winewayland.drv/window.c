@@ -265,6 +265,15 @@ static BOOL rect_intersects_virtual_screen(const RECT *rect)
     return intersect_rect(&intersect, rect, &virtual_rect);
 }
 
+static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface)
+{
+    if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
+    if (!surface->window.minimized) return FALSE;
+
+    return !surface->current.caps ||
+           (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
+}
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
                                                     struct wayland_surface *owner_surface,
@@ -294,7 +303,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     }
 
     if (visible && !owner_surface && !use_layer_shell && !toplevel_surface &&
-        !rect_intersects_virtual_screen(&data->rects.window))
+        !rect_intersects_virtual_screen(&data->rects.window) &&
+        !should_keep_minimized_toplevel_mapped(surface))
         visible = FALSE;
 
     /* If the toplevel has no observable area, make it roleless. */
