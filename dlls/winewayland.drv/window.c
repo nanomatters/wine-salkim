@@ -316,9 +316,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         else wayland_client_surface_attach(client, NULL);
     }
     wayland_win_data_get_config(data, &surface->window);
-    wayland_surface_sync_window_input_region(surface);
-    wayland_surface_set_occlusion_clip(surface,
-                                       wayland_window_surface_has_occlusion_clip(window_surface));
+    wayland_surface_sync_window_regions(surface, window_surface);
 
     /* Size/position changes affect the effective pointer constraint, so update
      * it as needed. */

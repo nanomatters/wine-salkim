@@ -45,6 +45,54 @@ static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
 static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
 static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd);
 
+static const char *wayland_child_visibility_str(enum wayland_child_visibility visibility)
+{
+    switch (visibility)
+    {
+    case WAYLAND_CHILD_VISIBILITY_AS_IS:
+        return "as-is";
+    case WAYLAND_CHILD_VISIBILITY_CROPPED:
+        return "cropped";
+    case WAYLAND_CHILD_VISIBILITY_UNMASKABLE:
+        return "unmaskable";
+    }
+
+    return "unknown";
+}
+
+struct wayland_child_visibility_info
+{
+    enum wayland_child_visibility visibility;
+    RECT rect;
+    unsigned int rect_count;
+};
+
+static HRGN create_child_region(HRGN shape_region)
+{
+    HRGN region;
+
+    if (!shape_region) return 0;
+    if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0))) return 0;
+
+    if (NtGdiCombineRgn(region, shape_region, 0, RGN_COPY) == ERROR)
+    {
+        NtGdiDeleteObjectApp(region);
+        return 0;
+    }
+
+    return region;
+}
+
+static void wayland_surface_set_region_constraints(struct wayland_surface *surface,
+                                                   HRGN shape_region, HRGN clip_region)
+{
+    if (surface->child_region) NtGdiDeleteObjectApp(surface->child_region);
+    surface->child_region = create_child_region(shape_region);
+    surface->shaped = shape_region != 0;
+    surface->occlusion_clipped = clip_region != 0 &&
+        (!shape_region || !NtGdiEqualRgn(clip_region, shape_region));
+}
+
 static struct wl_region *wayland_surface_create_shape_input_region(struct wayland_surface *surface,
                                                                    HRGN shape_region)
 {
@@ -77,13 +125,11 @@ static struct wl_region *wayland_surface_create_shape_input_region(struct waylan
     return region;
 }
 
-void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region)
+static void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region)
 {
     DWORD exstyle = NtUserGetWindowLongW(surface->hwnd, GWL_EXSTYLE);
     BOOL transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
     struct wl_region *region = NULL;
-
-    surface->shaped = shape_region != 0;
 
     if (transparent)
     {
@@ -100,32 +146,36 @@ void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HR
     if (region) wl_region_destroy(region);
 }
 
-void wayland_surface_sync_window_input_region(struct wayland_surface *surface)
+static HRGN wayland_surface_get_window_shape_region(HWND hwnd)
 {
     HRGN shape_region = NtGdiCreateRectRgn(0, 0, 0, 0);
 
-    if (!shape_region) return;
-    if (NtUserGetWindowRgnEx(surface->hwnd, shape_region, 0) == ERROR)
+    if (!shape_region) return 0;
+    if (NtUserGetWindowRgnEx(hwnd, shape_region, 0) == ERROR)
     {
         NtGdiDeleteObjectApp(shape_region);
-        shape_region = 0;
+        return 0;
     }
 
+    return shape_region;
+}
+
+void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+                                         struct window_surface *window_surface)
+{
+    HRGN shape_region, owned_shape_region = 0;
+
+    if (window_surface && window_surface->shape_region)
+        shape_region = window_surface->shape_region;
+    else
+        shape_region = owned_shape_region =
+            wayland_surface_get_window_shape_region(surface->hwnd);
+
     wayland_surface_sync_shape_input_region(surface, shape_region);
-    if (shape_region) NtGdiDeleteObjectApp(shape_region);
-}
+    wayland_surface_set_region_constraints(surface, shape_region,
+                                           window_surface ? window_surface->clip_region : 0);
 
-BOOL wayland_window_surface_has_occlusion_clip(struct window_surface *window_surface)
-{
-    if (!window_surface || !window_surface->clip_region) return FALSE;
-    if (!window_surface->shape_region) return TRUE;
-    return !NtGdiEqualRgn(window_surface->clip_region, window_surface->shape_region);
-}
-
-void wayland_surface_set_occlusion_clip(struct wayland_surface *surface, BOOL clipped)
-{
-    /* Mirror the window surface clip state for dmabuf eligibility. */
-    surface->occlusion_clipped = clipped;
+    if (owned_shape_region) NtGdiDeleteObjectApp(owned_shape_region);
 }
 
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
@@ -191,6 +241,7 @@ struct wayland_hwnd_dmabuf_surface
     unsigned long long last_seen_ms; /* tick when last present in the producer list */
     int committed_width, committed_height;
     int channel_fd;                 /* consumer end of the producer socket, or -1 */
+    struct wayland_visual_constraint_trace visual_constraint_trace;
 };
 
 /* A child may briefly drop out of the descendant list between frames. Tearing its surface
@@ -1133,6 +1184,12 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     {
         wayland_shm_buffer_unref(surface->small_icon_buffer);
         surface->small_icon_buffer = NULL;
+    }
+
+    if (surface->child_region)
+    {
+        NtGdiDeleteObjectApp(surface->child_region);
+        surface->child_region = 0;
     }
 
     wl_display_flush(process_wayland.wl_display);
@@ -2189,15 +2246,100 @@ static void wayland_hwnd_dmabuf_surface_set_opaque(struct wayland_hwnd_dmabuf_su
     else wl_surface_set_opaque_region(surface->wl_surface, NULL);
 }
 
-static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent,
-                                                  struct wayland_hwnd_dmabuf_surface *surface,
-                                                  const hwnd_dmabuf_frame_info_t *info,
-                                                  struct wl_surface *above)
+struct wayland_hwnd_dmabuf_geometry
+{
+    double source_x, source_y;
+    double source_width, source_height;
+    int x, y;
+    int width, height;
+};
+
+static void wayland_surface_classify_child_visibility(struct wayland_surface *surface,
+        const RECT *dst, struct wayland_child_visibility_info *info)
+{
+    HRGN dst_region, visible_region;
+    RGNDATA *data;
+
+    info->visibility = WAYLAND_CHILD_VISIBILITY_AS_IS;
+    info->rect = *dst;
+    info->rect_count = 0;
+    if (!surface->child_region) return;
+
+    info->visibility = WAYLAND_CHILD_VISIBILITY_UNMASKABLE;
+
+    if (!(dst_region = NtGdiCreateRectRgn(dst->left, dst->top, dst->right, dst->bottom)))
+        return;
+    if (!(visible_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+    {
+        NtGdiDeleteObjectApp(dst_region);
+        return;
+    }
+
+    if (NtGdiCombineRgn(visible_region, dst_region, surface->child_region, RGN_AND) != ERROR)
+    {
+        if (NtGdiEqualRgn(visible_region, dst_region))
+        {
+            info->visibility = WAYLAND_CHILD_VISIBILITY_AS_IS;
+        }
+        else if ((data = get_region_data(visible_region)))
+        {
+            info->rect = data->rdh.rcBound;
+            info->rect_count = data->rdh.nCount;
+            if (data->rdh.nCount == 1)
+            {
+                info->rect = *(RECT *)data->Buffer;
+                info->visibility = WAYLAND_CHILD_VISIBILITY_CROPPED;
+            }
+            free(data);
+        }
+    }
+
+    NtGdiDeleteObjectApp(visible_region);
+    NtGdiDeleteObjectApp(dst_region);
+}
+
+static void wayland_surface_trace_child_visibility(struct wayland_surface *surface, HWND child,
+        const RECT *dst, const struct wayland_child_visibility_info *info,
+        struct wayland_visual_constraint_trace *cache)
+{
+    if (info->visibility == WAYLAND_CHILD_VISIBILITY_AS_IS)
+    {
+        cache->valid = FALSE;
+        return;
+    }
+
+    if (cache->valid && cache->visibility == info->visibility &&
+        EqualRect(&cache->dst, dst) && EqualRect(&cache->rect, &info->rect) &&
+        cache->rect_count == info->rect_count)
+        return;
+
+    cache->valid = TRUE;
+    cache->visibility = info->visibility;
+    cache->dst = *dst;
+    cache->rect = info->rect;
+    cache->rect_count = info->rect_count;
+
+    if (info->visibility == WAYLAND_CHILD_VISIBILITY_UNMASKABLE)
+    {
+        TRACE("hwnd=%p child=%p visual constraint %s dst=%s bounds=%s rects=%u\n",
+              surface->hwnd, child, wayland_child_visibility_str(info->visibility),
+              wine_dbgstr_rect(dst), wine_dbgstr_rect(&info->rect), info->rect_count);
+        return;
+    }
+
+    TRACE("hwnd=%p child=%p visual constraint %s dst=%s visible=%s\n",
+          surface->hwnd, child, wayland_child_visibility_str(info->visibility),
+          wine_dbgstr_rect(dst), wine_dbgstr_rect(&info->rect));
+}
+
+static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface *parent,
+        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_info_t *info,
+        struct wayland_hwnd_dmabuf_geometry *geometry)
 {
     RECT rect = wine_server_get_rect(info->client), clipped, client;
-    double source_x, source_y, source_width, source_height;
+    RECT dst;
+    struct wayland_child_visibility_info visibility;
     int rect_width, rect_height;
-    int x, y, width, height;
 
     rect_width = rect.right - rect.left;
     rect_height = rect.bottom - rect.top;
@@ -2213,28 +2355,63 @@ static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent
     clipped.bottom = min(rect.bottom, client.bottom);
     if (IsRectEmpty(&clipped)) return FALSE;
 
-    source_x = (double)(clipped.left - rect.left) * surface->current->width / rect_width;
-    source_y = (double)(clipped.top - rect.top) * surface->current->height / rect_height;
-    source_width = (double)(clipped.right - clipped.left) * surface->current->width / rect_width;
-    source_height = (double)(clipped.bottom - clipped.top) * surface->current->height / rect_height;
-
-    rect = clipped;
-    OffsetRect(&rect, parent->window.client_rect.left - parent->window.rect.left,
+    dst = clipped;
+    OffsetRect(&dst, parent->window.client_rect.left - parent->window.rect.left,
                parent->window.client_rect.top - parent->window.rect.top);
 
-    wayland_surface_coords_from_window(parent, rect.left, rect.top, &x, &y);
-    wayland_surface_coords_from_window(parent, rect.right - rect.left,
-                                       rect.bottom - rect.top, &width, &height);
-    width = max(1, width);
-    height = max(1, height);
+    wayland_surface_classify_child_visibility(parent, &dst, &visibility);
+    wayland_surface_trace_child_visibility(parent, surface->hwnd, &dst, &visibility,
+                                           &surface->visual_constraint_trace);
 
-    wl_subsurface_set_position(surface->wl_subsurface, x, y);
+    if (visibility.visibility == WAYLAND_CHILD_VISIBILITY_CROPPED)
+        dst = visibility.rect;
+
+    clipped = dst;
+    OffsetRect(&clipped, parent->window.rect.left - parent->window.client_rect.left,
+               parent->window.rect.top - parent->window.client_rect.top);
+
+    geometry->source_x = (double)(clipped.left - rect.left) * surface->current->width / rect_width;
+    geometry->source_y = (double)(clipped.top - rect.top) * surface->current->height / rect_height;
+    geometry->source_width = (double)(clipped.right - clipped.left) * surface->current->width / rect_width;
+    geometry->source_height = (double)(clipped.bottom - clipped.top) * surface->current->height / rect_height;
+
+    wayland_surface_coords_from_window(parent, dst.left, dst.top,
+                                       &geometry->x, &geometry->y);
+    wayland_surface_coords_from_window(parent, dst.right - dst.left,
+                                       dst.bottom - dst.top,
+                                       &geometry->width, &geometry->height);
+    geometry->width = max(1, geometry->width);
+    geometry->height = max(1, geometry->height);
+
+    return TRUE;
+}
+
+static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabuf_surface *surface,
+                                                       const struct wayland_hwnd_dmabuf_geometry *geometry,
+                                                       struct wl_surface *above)
+{
+    wl_subsurface_set_position(surface->wl_subsurface, geometry->x, geometry->y);
     wl_subsurface_place_above(surface->wl_subsurface, above);
     wp_viewport_set_source(surface->wp_viewport,
-                           wl_fixed_from_double(source_x), wl_fixed_from_double(source_y),
-                           wl_fixed_from_double(source_width), wl_fixed_from_double(source_height));
-    wp_viewport_set_destination(surface->wp_viewport, width, height);
-    wayland_hwnd_dmabuf_surface_set_opaque(surface, width, height);
+                           wl_fixed_from_double(geometry->source_x),
+                           wl_fixed_from_double(geometry->source_y),
+                           wl_fixed_from_double(geometry->source_width),
+                           wl_fixed_from_double(geometry->source_height));
+    wp_viewport_set_destination(surface->wp_viewport, geometry->width, geometry->height);
+    wayland_hwnd_dmabuf_surface_set_opaque(surface, geometry->width, geometry->height);
+}
+
+static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent,
+                                                  struct wayland_hwnd_dmabuf_surface *surface,
+                                                  const hwnd_dmabuf_frame_info_t *info,
+                                                  struct wl_surface *above)
+{
+    struct wayland_hwnd_dmabuf_geometry geometry;
+
+    if (!wayland_hwnd_dmabuf_surface_compute_geometry(parent, surface, info, &geometry))
+        return FALSE;
+
+    wayland_hwnd_dmabuf_surface_apply_geometry(surface, &geometry, above);
     return TRUE;
 }
 
@@ -2558,7 +2735,11 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
     if (!data || data->client_surface) return FALSE;
     if (data->window_contents) return FALSE;
     if (!wl_list_empty(&surface->child_overlays)) return FALSE;
-    if (wayland_surface_has_region_constraints(surface)) return FALSE;
+    if (wayland_surface_has_region_constraints(surface))
+    {
+        TRACE("hwnd=%p direct parent dmabuf rejected for visual constraints\n", surface->hwnd);
+        return FALSE;
+    }
     if (!wayland_surface_client_fills_window(surface)) return FALSE;
     return wayland_hwnd_dmabuf_frame_covers_client(surface, &frames[0]);
 }
@@ -3464,7 +3645,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     struct wayland_win_data *toplevel_data;
     struct wayland_surface *surface;
     HWND hwnd = client->client.hwnd;
-    RECT client_rect;
+    RECT client_rect, dst;
+    struct wayland_child_visibility_info visibility;
 
     if (!toplevel)
     {
@@ -3521,6 +3703,13 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
         NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     }
+
+    dst = client_rect;
+    OffsetRect(&dst, surface->window.client_rect.left - surface->window.rect.left,
+               surface->window.client_rect.top - surface->window.rect.top);
+    wayland_surface_classify_child_visibility(surface, &dst, &visibility);
+    wayland_surface_trace_child_visibility(surface, hwnd, &dst, &visibility,
+                                           &client->visual_constraint_trace);
 
     if (wayland_surface_reconfigure_client(surface, client, &client_rect))
     {
