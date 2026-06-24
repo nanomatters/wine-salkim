@@ -172,7 +172,9 @@ static BOOL wayland_win_data_is_fullscreen(struct wayland_win_data *data, DWORD 
     RECT rect;
 
     if (!data->is_fullscreen) return FALSE;
-    if (style & WS_MAXIMIZE) return TRUE;
+    if (!(style & WS_POPUP) &&
+        (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
+        return FALSE;
     if (NtUserGetPresentRect(data->hwnd, &rect, -1)) return TRUE;
     return !(style & (WS_CAPTION | WS_THICKFRAME));
 }
@@ -327,6 +329,14 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     return TRUE;
 }
 
+static BOOL wayland_surface_has_pending_state(struct wayland_surface *surface,
+                                              enum wayland_surface_config_state state)
+{
+    if (surface->requested.serial && (surface->requested.state & state)) return TRUE;
+    if (surface->processing.serial && (surface->processing.state & state)) return TRUE;
+    return FALSE;
+}
+
 static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
 {
     BOOL processing_config = surface->processing.serial;
@@ -356,14 +366,22 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
     }
 
     if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        !wayland_surface_has_pending_state(surface,
+                                           WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
     {
         xdg_toplevel_set_maximized(surface->xdg_toplevel);
     }
     if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        !wayland_surface_has_pending_state(surface,
+                                           WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
     {
         xdg_toplevel_set_fullscreen(surface->xdg_toplevel, NULL);
+    }
+    if (NtUserGetWindowLongW(surface->hwnd, GWL_STYLE) & WS_MINIMIZE)
+    {
+        xdg_toplevel_set_minimized(surface->xdg_toplevel);
     }
 }
 
