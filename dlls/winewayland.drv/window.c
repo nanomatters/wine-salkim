@@ -231,13 +231,10 @@ static BOOL rect_intersects_virtual_screen(const RECT *rect)
     return intersect_rect(&intersect, rect, &virtual_rect);
 }
 
-static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface)
+static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface, DWORD style)
 {
     if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
-    if (!surface->window.minimized) return FALSE;
-
-    return !surface->current.caps ||
-           (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
+    return style & WS_MINIMIZE;
 }
 
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
@@ -246,20 +243,21 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                                                     BOOL use_layer_shell)
 {
     struct wayland_client_surface *client = data->client_surface;
-    struct wayland_surface *surface;
+    struct wayland_surface *surface = data->wayland_surface;
     enum wayland_surface_role role;
     BOOL visible;
+    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
     struct wl_region *input_region;
 
     TRACE("hwnd=%p\n", data->hwnd);
 
-    visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
+    visible = ((style & WS_VISIBLE) == WS_VISIBLE) &&
                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
 
     if (visible && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !rect_intersects_virtual_screen(&data->rects.window) &&
-        !should_keep_minimized_toplevel_mapped(surface))
+        !should_keep_minimized_toplevel_mapped(surface, style))
         visible = FALSE;
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
@@ -268,8 +266,6 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     else if (!IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     else role = WAYLAND_SURFACE_ROLE_NONE;
-
-    surface = data->wayland_surface;
 
     if (surface && role == WAYLAND_SURFACE_ROLE_LAYER &&
         (surface->role == WAYLAND_SURFACE_ROLE_NONE ||
@@ -1001,6 +997,20 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
 
     TRACE("hwnd=%p returning state_cmd %#x, swp_flags %#x, rect %s, foreground %p\n",
           hwnd, *state_cmd, *swp_flags, wine_dbgstr_rect(rect), *foreground);
+    return ret;
+}
+
+BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size)
+{
+    struct wayland_win_data *data;
+    BOOL ret = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+
+    if (data->wayland_surface)
+        ret = wayland_surface_get_max_track_size(data->wayland_surface, size);
+
+    wayland_win_data_release(data);
     return ret;
 }
 

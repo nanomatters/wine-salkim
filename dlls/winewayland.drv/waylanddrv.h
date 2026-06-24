@@ -249,9 +249,18 @@ struct wayland_surface_config
 {
     int32_t x, y;
     int32_t width, height;
+    int32_t bounds_width, bounds_height;
     enum wayland_surface_config_state state;
     uint32_t serial;
     BOOL processed;
+    BOOL bounds_set;
+};
+
+struct wayland_toplevel_size_limits
+{
+    int min_width, min_height;
+    int max_width, max_height;
+    BOOL valid;
 };
 
 struct wayland_window_config
@@ -361,6 +370,7 @@ struct wayland_surface
     };
 
     struct wayland_surface_config pending, requested, processing, current;
+    struct wayland_toplevel_size_limits toplevel_size_limits;
     BOOL resizing;
     struct wl_list hwnd_dmabuf_surfaces;
     struct wl_list child_overlays; /* GDI child windows shown above a client surface */
@@ -416,6 +426,7 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
                                           int width, int height,
                                           enum wayland_surface_config_state state);
+BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
@@ -588,6 +599,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                               const struct window_rects *new_rects, struct window_surface *surface);
 BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
 BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground);
+BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size);
 BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
 UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
 UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
