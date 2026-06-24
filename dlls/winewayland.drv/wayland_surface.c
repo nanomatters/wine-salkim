@@ -45,6 +45,74 @@ static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
 static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
 static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd);
 
+static struct wl_region *wayland_surface_create_shape_input_region(struct wayland_surface *surface,
+                                                                   HRGN shape_region)
+{
+    struct wl_region *region;
+    RGNDATA *data;
+    RECT *rect, *end;
+
+    if (!(region = wl_compositor_create_region(process_wayland.wl_compositor)))
+        return NULL;
+
+    if (!(data = get_region_data(shape_region)))
+    {
+        wl_region_destroy(region);
+        return NULL;
+    }
+
+    rect = (RECT *)data->Buffer;
+    end = rect + data->rdh.nCount;
+    for (; rect < end; rect++)
+    {
+        int left, top, right, bottom;
+
+        wayland_surface_coords_from_window(surface, rect->left, rect->top, &left, &top);
+        wayland_surface_coords_from_window(surface, rect->right, rect->bottom, &right, &bottom);
+        if (right > left && bottom > top)
+            wl_region_add(region, left, top, right - left, bottom - top);
+    }
+
+    free(data);
+    return region;
+}
+
+void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region)
+{
+    DWORD exstyle = NtUserGetWindowLongW(surface->hwnd, GWL_EXSTYLE);
+    BOOL transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
+    struct wl_region *region = NULL;
+
+    if (transparent)
+    {
+        region = wl_compositor_create_region(process_wayland.wl_compositor);
+        if (region) wl_surface_set_input_region(surface->wl_surface, region);
+    }
+    else if (shape_region)
+    {
+        region = wayland_surface_create_shape_input_region(surface, shape_region);
+        if (region) wl_surface_set_input_region(surface->wl_surface, region);
+    }
+    else wl_surface_set_input_region(surface->wl_surface, NULL);
+
+    if (region) wl_region_destroy(region);
+}
+
+void wayland_surface_sync_window_input_region(struct wayland_surface *surface)
+{
+    HRGN shape_region = NtGdiCreateRectRgn(0, 0, 0, 0);
+
+    if (!shape_region) return;
+    if (NtUserGetWindowRgnEx(surface->hwnd, shape_region, 0) == ERROR)
+    {
+        NtGdiDeleteObjectApp(shape_region);
+        shape_region = 0;
+    }
+
+    wayland_surface_sync_shape_input_region(surface, shape_region);
+    if (shape_region) NtGdiDeleteObjectApp(shape_region);
+}
+
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
 {
     /* The direct dmabuf fast path may run inline from event callbacks because

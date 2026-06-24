@@ -428,6 +428,8 @@ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
                                           enum wayland_surface_config_state state);
 BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region);
+void wayland_surface_sync_window_input_region(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
