@@ -46,6 +46,7 @@ struct wayland_window_surface
     struct window_surface header;
     struct wayland_buffer_queue *wayland_buffer_queue;
     BOOL layered;
+    BOOL occlusion_clipped;
 };
 
 static struct wayland_window_surface *wayland_window_surface_cast(
@@ -227,7 +228,29 @@ static void wayland_buffer_queue_add_damage(struct wayland_buffer_queue *queue, 
 static void wayland_window_surface_set_clip(struct window_surface *window_surface,
                                             const RECT *rects, UINT count)
 {
-    /* TODO */
+    struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+    struct wayland_win_data *data;
+    BOOL occlusion_clipped;
+
+    TRACE("hwnd=%p rects=%p count=%u\n", window_surface->hwnd, rects, count);
+
+    occlusion_clipped = wayland_window_surface_has_occlusion_clip(window_surface);
+
+    if (wws->occlusion_clipped || occlusion_clipped)
+    {
+        /* Repaint the full surface when the compositor-visible region changes. */
+        window_surface->bounds = window_surface->rect;
+        NtUserPostMessage(window_surface->hwnd, WM_WAYLAND_EXPOSE, 0, 0);
+    }
+    wws->occlusion_clipped = occlusion_clipped;
+
+    if (!(data = wayland_win_data_get(window_surface->hwnd)))
+        return;
+
+    if (data->wayland_surface)
+        wayland_surface_set_occlusion_clip(data->wayland_surface, occlusion_clipped);
+
+    wayland_win_data_release(data);
 }
 
 /**********************************************************************
@@ -337,6 +360,55 @@ static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
     free(rgndata);
 }
 
+static void clear_pixel_region(struct wayland_shm_buffer *buffer, HRGN region)
+{
+    RGNDATA *rgndata = get_region_data(region);
+    RECT buffer_rect = {0, 0, buffer->width, buffer->height};
+    RECT *rgn_rect, *rgn_rect_end;
+
+    if (!rgndata) return;
+
+    rgn_rect = (RECT *)rgndata->Buffer;
+    rgn_rect_end = rgn_rect + rgndata->rdh.nCount;
+
+    for (; rgn_rect < rgn_rect_end; rgn_rect++)
+    {
+        RECT rect;
+        int y, width;
+
+        if (!intersect_rect(&rect, rgn_rect, &buffer_rect)) continue;
+        width = rect.right - rect.left;
+
+        for (y = rect.top; y < rect.bottom; y++)
+            memset((char *)buffer->map_data + ((size_t)y * buffer->width + rect.left) * 4,
+                   0, (size_t)width * 4);
+    }
+
+    free(rgndata);
+}
+
+static void wayland_shm_buffer_clear_outside_clip(struct wayland_shm_buffer *buffer,
+                                                  const RECT *dirty, HRGN clip_region)
+{
+    HRGN dirty_region, clear_region;
+
+    if (!clip_region) return;
+
+    if (!(dirty_region = NtGdiCreateRectRgn(dirty->left, dirty->top, dirty->right, dirty->bottom)))
+        return;
+    if (!(clear_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+    {
+        NtGdiDeleteObjectApp(dirty_region);
+        return;
+    }
+
+    if (NtGdiCombineRgn(clear_region, dirty_region, clip_region, RGN_DIFF) != ERROR)
+        clear_pixel_region(buffer, clear_region);
+
+    NtGdiDeleteObjectApp(clear_region);
+    NtGdiDeleteObjectApp(dirty_region);
+}
+
 /**********************************************************************
  *          wayland_shm_buffer_copy_data
  */
@@ -412,7 +484,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         goto done;
     }
 
-    buffer_format = (shape_bits || wws->layered) ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+    buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered) ?
+                    WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
     if (wws->wayland_buffer_queue->format != buffer_format)
     {
         int width = wws->wayland_buffer_queue->width;
@@ -464,8 +537,10 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     }
 
     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
-                                 shape_bits && !wws->layered);
+                                 (shape_bits || wws->occlusion_clipped) && !wws->layered);
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
+    if (wws->occlusion_clipped)
+        wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
 
