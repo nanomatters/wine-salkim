@@ -83,6 +83,8 @@ void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HR
     BOOL transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
     struct wl_region *region = NULL;
 
+    surface->shaped = shape_region != 0;
+
     if (transparent)
     {
         region = wl_compositor_create_region(process_wayland.wl_compositor);
@@ -111,6 +113,19 @@ void wayland_surface_sync_window_input_region(struct wayland_surface *surface)
 
     wayland_surface_sync_shape_input_region(surface, shape_region);
     if (shape_region) NtGdiDeleteObjectApp(shape_region);
+}
+
+BOOL wayland_window_surface_has_occlusion_clip(struct window_surface *window_surface)
+{
+    if (!window_surface || !window_surface->clip_region) return FALSE;
+    if (!window_surface->shape_region) return TRUE;
+    return !NtGdiEqualRgn(window_surface->clip_region, window_surface->shape_region);
+}
+
+void wayland_surface_set_occlusion_clip(struct wayland_surface *surface, BOOL clipped)
+{
+    /* Mirror the window surface clip state for dmabuf eligibility. */
+    surface->occlusion_clipped = clipped;
 }
 
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
@@ -2528,6 +2543,11 @@ static BOOL wayland_hwnd_dmabuf_frame_covers_client(struct wayland_surface *surf
            rect.right >= width && rect.bottom >= height;
 }
 
+static BOOL wayland_surface_has_region_constraints(struct wayland_surface *surface)
+{
+    return surface->shaped || surface->occlusion_clipped;
+}
+
 static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surface,
                                                     struct wayland_win_data *data,
                                                     const hwnd_dmabuf_frame_info_t *frames,
@@ -2538,6 +2558,7 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
     if (!data || data->client_surface) return FALSE;
     if (data->window_contents) return FALSE;
     if (!wl_list_empty(&surface->child_overlays)) return FALSE;
+    if (wayland_surface_has_region_constraints(surface)) return FALSE;
     if (!wayland_surface_client_fills_window(surface)) return FALSE;
     return wayland_hwnd_dmabuf_frame_covers_client(surface, &frames[0]);
 }

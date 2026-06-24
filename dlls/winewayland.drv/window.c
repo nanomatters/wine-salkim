@@ -240,7 +240,8 @@ static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surfac
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
                                                     struct wayland_surface *owner_surface,
-                                                    BOOL use_layer_shell)
+                                                    BOOL use_layer_shell,
+                                                    struct window_surface *window_surface)
 {
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *surface = data->wayland_surface;
@@ -316,6 +317,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     }
     wayland_win_data_get_config(data, &surface->window);
     wayland_surface_sync_window_input_region(surface);
+    wayland_surface_set_occlusion_clip(surface,
+                                       wayland_window_surface_has_occlusion_clip(window_surface));
 
     /* Size/position changes affect the effective pointer constraint, so update
      * it as needed. */
@@ -784,7 +787,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         }
     }
     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
-                                                     use_layer_shell))
+                                                     use_layer_shell, surface))
     {
         wayland_win_data_update_wayland_state(data);
     }

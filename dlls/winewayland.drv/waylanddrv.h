@@ -382,6 +382,8 @@ struct wayland_surface
      * keeping the [base, client, dmabufs, overlays] order stable whichever chain
      * restacks last. Validated against the live list before use, never freed. */
     struct wl_surface *dmabuf_top;
+    BOOL shaped;
+    BOOL occlusion_clipped;
     struct wayland_window_config window;
     RECT geometry;
     int content_width, content_height;
@@ -430,6 +432,8 @@ BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *s
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region);
 void wayland_surface_sync_window_input_region(struct wayland_surface *surface);
+BOOL wayland_window_surface_has_occlusion_clip(struct window_surface *window_surface);
+void wayland_surface_set_occlusion_clip(struct wayland_surface *surface, BOOL clipped);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
