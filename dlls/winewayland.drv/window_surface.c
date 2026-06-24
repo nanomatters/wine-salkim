@@ -55,6 +55,13 @@ static struct wayland_window_surface *wayland_window_surface_cast(
     return (struct wayland_window_surface *)window_surface;
 }
 
+static BOOL window_surface_has_occlusion_clip(struct window_surface *window_surface)
+{
+    if (!window_surface->clip_region) return FALSE;
+    if (!window_surface->shape_region) return TRUE;
+    return !NtGdiEqualRgn(window_surface->clip_region, window_surface->shape_region);
+}
+
 static void buffer_release(void *data, struct wl_buffer *buffer)
 {
     struct wayland_shm_buffer *shm_buffer = data;
@@ -234,7 +241,7 @@ static void wayland_window_surface_set_clip(struct window_surface *window_surfac
 
     TRACE("hwnd=%p rects=%p count=%u\n", window_surface->hwnd, rects, count);
 
-    occlusion_clipped = wayland_window_surface_has_occlusion_clip(window_surface);
+    occlusion_clipped = window_surface_has_occlusion_clip(window_surface);
 
     if (wws->occlusion_clipped || occlusion_clipped)
     {
@@ -248,7 +255,7 @@ static void wayland_window_surface_set_clip(struct window_surface *window_surfac
         return;
 
     if (data->wayland_surface)
-        wayland_surface_set_occlusion_clip(data->wayland_surface, occlusion_clipped);
+        wayland_surface_sync_window_regions(data->wayland_surface, window_surface);
 
     wayland_win_data_release(data);
 }
@@ -273,7 +280,7 @@ RGNDATA *get_region_data(HRGN region)
     return data;
 }
 
-static void wayland_window_surface_sync_input_region(struct window_surface *window_surface)
+static void wayland_window_surface_sync_regions(struct window_surface *window_surface)
 {
     struct wayland_win_data *data;
 
@@ -281,7 +288,7 @@ static void wayland_window_surface_sync_input_region(struct window_surface *wind
         return;
 
     if (data->wayland_surface)
-        wayland_surface_sync_shape_input_region(data->wayland_surface, window_surface->shape_region);
+        wayland_surface_sync_window_regions(data->wayland_surface, window_surface);
 
     wayland_win_data_release(data);
 }
@@ -544,7 +551,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
 
-    if (shape_changed) wayland_window_surface_sync_input_region(window_surface);
+    if (shape_changed) wayland_window_surface_sync_regions(window_surface);
 
     /* snapshot child geometry before set_window_surface_contents locks win_data_mutex */
     if (window_surface_needs_child_overlays(window_surface->hwnd))

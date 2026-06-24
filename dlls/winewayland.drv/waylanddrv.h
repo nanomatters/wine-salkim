@@ -383,6 +383,22 @@ struct wayland_toplevel_size_limits
     BOOL valid;
 };
 
+enum wayland_child_visibility
+{
+    WAYLAND_CHILD_VISIBILITY_AS_IS,
+    WAYLAND_CHILD_VISIBILITY_CROPPED,
+    WAYLAND_CHILD_VISIBILITY_UNMASKABLE,
+};
+
+struct wayland_visual_constraint_trace
+{
+    BOOL valid;
+    enum wayland_child_visibility visibility;
+    RECT dst;
+    RECT rect;
+    unsigned int rect_count;
+};
+
 struct wayland_window_config
 {
     RECT rect;
@@ -413,6 +429,7 @@ struct wayland_client_surface
     /* if true then the client surface has an alpha channel controlling transparency */
     BOOL has_alpha;
     BOOL has_presented;
+    struct wayland_visual_constraint_trace visual_constraint_trace;
 };
 
 /* A GDI child window shown on its own wl_subsurface above a client surface. Its
@@ -515,6 +532,7 @@ struct wayland_surface
      * keeping the [base, client, dmabufs, overlays] order stable whichever chain
      * restacks last. Validated against the live list before use, never freed. */
     struct wl_surface *dmabuf_top;
+    HRGN child_region;
     BOOL shaped;
     BOOL occlusion_clipped;
     struct wayland_window_config window, comitted;
@@ -573,10 +591,8 @@ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
 BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
-void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region);
-void wayland_surface_sync_window_input_region(struct wayland_surface *surface);
-BOOL wayland_window_surface_has_occlusion_clip(struct window_surface *window_surface);
-void wayland_surface_set_occlusion_clip(struct wayland_surface *surface, BOOL clipped);
+void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+                                         struct window_surface *window_surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
