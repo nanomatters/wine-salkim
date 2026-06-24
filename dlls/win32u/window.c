@@ -2299,7 +2299,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     ICONINFO ii, ii_small;
 
     /* HACK: move windows within the virtual screen on winewayland */
-    if (use_move_hack())
+    if (use_move_hack() && !(get_window_long( hwnd, GWL_STYLE ) & WS_MAXIMIZE))
     {
         RECT temp, *adj;
         RECT virtual_screen = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
