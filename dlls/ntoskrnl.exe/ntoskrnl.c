@@ -2480,7 +2480,6 @@ static void *create_process_object( HANDLE handle )
 {
     char *p;
     ULONG len;
-    HANDLE token;
     PEPROCESS process;
     ANSI_STRING fullImageNameA;
     UNICODE_STRING *fullImageNameW = NULL;
@@ -2516,29 +2515,7 @@ static void *create_process_object( HANDLE handle )
 
     IsWow64Process( handle, &process->wow64 );
 
-    NtOpenProcessToken( handle, TOKEN_ALL_ACCESS, &token );
-    ObReferenceObjectByHandle( token, 0, SeTokenObjectType, KernelMode, &process->token, NULL );
-    NtClose(token);
-
     return process;
-}
-
-void release_process_object(void *obj)
-{
-    PEPROCESS process = obj;
-
-    if (process->token)
-        ObDereferenceObject(process->token);
-
-    process->token = NULL;
-
-    SERVER_START_REQ( release_kernel_object )
-    {
-        req->manager  = wine_server_obj_handle( get_device_manager() );
-        req->user_ptr = wine_server_client_ptr( obj );
-        if (wine_server_call( req )) FIXME( "failed to release %p\n", obj );
-    }
-    SERVER_END_REQ;
 }
 
 static const WCHAR process_type_name[] = {'P','r','o','c','e','s','s',0};
@@ -2546,8 +2523,7 @@ static const WCHAR process_type_name[] = {'P','r','o','c','e','s','s',0};
 static struct _OBJECT_TYPE process_type =
 {
     process_type_name,
-    create_process_object,
-    release_process_object
+    create_process_object
 };
 
 POBJECT_TYPE PsProcessType = &process_type;
@@ -2640,9 +2616,32 @@ const char *WINAPI PsGetProcessImageFileName( PEPROCESS process )
  */
 PACCESS_TOKEN WINAPI PsReferencePrimaryToken( PEPROCESS process )
 {
-    TRACE("%p -> %p\n", process, process->token);
-    ObReferenceObject(process->token);
-    return process->token;
+    NTSTATUS status;
+    HANDLE handle, token;
+    PACCESS_TOKEN ret = NULL;
+
+    TRACE("%p\n", process);
+
+    if ((status = ObOpenObjectByPointer(process, 0, NULL, PROCESS_ALL_ACCESS, NULL, KernelMode, &handle)))
+    {
+        WARN("Error opening process object, status %#lx.\n", status);
+        return NULL;
+    }
+
+    if ((status = NtOpenProcessToken(handle, TOKEN_ALL_ACCESS, &token)))
+    {
+        NtClose(handle);
+        return NULL;
+    }
+
+    if ((status = ObReferenceObjectByHandle(token, TOKEN_ALL_ACCESS, SeTokenObjectType,
+                                            KernelMode, &ret, NULL)))
+        ret = NULL;
+
+    NtClose(token);
+    NtClose(handle);
+
+    return ret;
 }
 
 static void *create_thread_object( HANDLE handle )

@@ -58,7 +58,6 @@ struct _EPROCESS
     KERNEL_USER_TIMES times;
     BOOL wow64;
     DWORD session_id;
-    PACCESS_TOKEN token;
     char imageName[15];
 };
 
