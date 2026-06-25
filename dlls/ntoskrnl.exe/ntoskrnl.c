@@ -4640,18 +4640,27 @@ NTSTATUS WINAPI SeLocateProcessImageName(PEPROCESS process, UNICODE_STRING **ima
 {
     ULONG len;
     NTSTATUS status;
-    HANDLE handle, id = PsGetProcessId(process);
+    HANDLE handle;
 
     TRACE("%p %p\n", process, image_name);
 
     if (!image_name) return STATUS_INVALID_PARAMETER;
+    *image_name = NULL;
 
-    if (!(handle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, HandleToUlong(id))))
-        return STATUS_NOT_FOUND;
+    if ((status = ObOpenObjectByPointer(process, 0, NULL, PROCESS_ALL_ACCESS, NULL, KernelMode, &handle)))
+    {
+        WARN("Error opening process object, status %#lx.\n", status);
+        return status;
+    }
 
-    NtQueryInformationProcess(handle, ProcessImageFileNameWin32, *image_name, 0, &len);
+    status = NtQueryInformationProcess(handle, ProcessImageFileName, NULL, 0, &len);
+    if (status != STATUS_INFO_LENGTH_MISMATCH)
+    {
+        NtClose(handle);
+        return status;
+    }
 
-    len += sizeof(WCHAR);
+    len += sizeof(WCHAR) + sizeof(UNICODE_STRING);
 
     *image_name = ExAllocatePool(PagedPool, len);
 
@@ -4661,19 +4670,16 @@ NTSTATUS WINAPI SeLocateProcessImageName(PEPROCESS process, UNICODE_STRING **ima
         return STATUS_NO_MEMORY;
     }
 
-    (*image_name)->MaximumLength = len;
-
-    if ((status = NtQueryInformationProcess(handle, ProcessImageFileNameWin32,
+    if ((status = NtQueryInformationProcess(handle, ProcessImageFileName,
                                             *image_name, len - sizeof(WCHAR), &len)))
     {
+        ExFreePool(*image_name);
+        *image_name = NULL;
         NtClose(handle);
         return status;
     }
 
-    TRACE("ret: %s\n", debugstr_us(*image_name));
-
     NtClose(handle);
-
     return STATUS_SUCCESS;
 }
 
