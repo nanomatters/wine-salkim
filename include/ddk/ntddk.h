@@ -288,6 +288,7 @@ void      WINAPI DECLSPEC_NORETURN KeBugCheck(ULONG);
 NTSTATUS  WINAPI KeExpandKernelStackAndCallout(PEXPAND_STACK_CALLOUT,void*,SIZE_T);
 void      WINAPI KeSetTargetProcessorDpc(PRKDPC,CCHAR);
 BOOLEAN   WINAPI MmIsAddressValid(void *);
+NTSTATUS  WINAPI PsGetContextThread(PETHREAD,CONTEXT*,KPROCESSOR_MODE);
 HANDLE    WINAPI PsGetProcessId(PEPROCESS);
 void *    WINAPI PsGetProcessSectionBaseAddress(PEPROCESS);
 HANDLE    WINAPI PsGetThreadId(PETHREAD);

@@ -2761,13 +2761,21 @@ HANDLE WINAPI PsGetThreadProcessId( PETHREAD thread )
 /*********************************************************************
  *           PsGetContextThread    (NTOSKRNL.@)
  */
-NTSTATUS WINAPI PsGetContextThread(PETHREAD thread, CONTEXT *context)
+NTSTATUS WINAPI PsGetContextThread(PETHREAD thread, CONTEXT *context, KPROCESSOR_MODE mode)
 {
     NTSTATUS status;
-    HANDLE handle, id = PsGetThreadId(thread);
+    HANDLE handle;
 
-    if (!(handle = OpenThread(THREAD_ALL_ACCESS, FALSE, HandleToUlong(id))))
-        return STATUS_NOT_FOUND;
+    TRACE("%p %p %u\n", thread, context, mode);
+
+    if (mode == KernelMode)
+        return STATUS_UNSUCCESSFUL;
+
+    if ((status = ObOpenObjectByPointer(thread, 0, NULL, THREAD_ALL_ACCESS, NULL, KernelMode, &handle)))
+    {
+        WARN("Error opening thread object, status %#lx.\n", status);
+        return status;
+    }
 
     status = NtGetContextThread(handle, context);
     NtClose(handle);
