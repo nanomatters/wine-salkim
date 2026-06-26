@@ -2771,15 +2771,31 @@ static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFo
                                               uint64_t *out_mods, uint64_t *out_wire_mods,
                                               uint32_t max_out )
 {
-    UINT i;
+    UINT best_tranche = ~0u, i;
     uint32_t out_count = 0;
+
+    for (i = 0; i < caps_count; i++)
+    {
+        uint64_t wire_modifier = caps_mods[i].modifier;
+        uint64_t modifier = wire_modifier;
+
+        if (caps_mods[i].fourcc != fourcc) continue;
+        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
+            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
+        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+        if (caps_mods[i].tranche_index < best_tranche)
+            best_tranche = caps_mods[i].tranche_index;
+    }
+
+    if (best_tranche == ~0u) return 0;
 
     for (i = 0; i < caps_count && out_count < max_out; i++)
     {
         uint64_t wire_modifier = caps_mods[i].modifier;
         uint64_t modifier = wire_modifier;
 
-        if (caps_mods[i].fourcc != fourcc) continue;
+        if (caps_mods[i].fourcc != fourcc || caps_mods[i].tranche_index != best_tranche)
+            continue;
         /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
         if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
             modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
