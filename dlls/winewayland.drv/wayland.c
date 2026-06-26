@@ -222,6 +222,14 @@ static void zwp_linux_dmabuf_feedback_v1_handle_done(void *data,
     struct wayland_dmabuf_format *entry, *next;
     unsigned int count = 0;
 
+    if (!state->valid)
+    {
+        wayland_dmabuf_clear_format_list(&state->pending_formats);
+        state->tranche_index = 0;
+        state->tranche_flags = 0;
+        return;
+    }
+
     pthread_mutex_lock(&process_wayland.dmabuf_mutex);
     wayland_dmabuf_clear_format_list(&process_wayland.dmabuf_formats);
     wl_list_for_each_safe(entry, next, &state->pending_formats, link)
@@ -248,6 +256,7 @@ static void zwp_linux_dmabuf_feedback_v1_handle_format_table(void *data,
     free(state->format_table);
     state->format_table = NULL;
     state->format_table_count = 0;
+    state->valid = FALSE;
 
     if (!size || size % sizeof(*state->format_table))
     {
@@ -269,6 +278,7 @@ static void zwp_linux_dmabuf_feedback_v1_handle_format_table(void *data,
         memcpy(table, map, size);
         state->format_table = table;
         state->format_table_count = size / sizeof(*state->format_table);
+        state->valid = TRUE;
     }
     munmap(map, size);
 }
@@ -304,6 +314,9 @@ static void zwp_linux_dmabuf_feedback_v1_handle_tranche_formats(void *data,
 {
     struct wayland_dmabuf_feedback *state = data;
     uint16_t *index;
+
+    if (!state->valid)
+        return;
 
     if (indices->size % sizeof(*index))
     {
