@@ -33,6 +33,8 @@ typedef struct
     unsigned int     format_modifier_count;
 } hwnd_dmabuf_host_caps_t;
 
+#define HWND_DMABUF_TRANCHE_FLAG_SCANOUT       0x1
+
 /* Release token sent from the consumer back to the producer over the channel. */
 typedef struct
 {
