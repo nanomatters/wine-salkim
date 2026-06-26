@@ -26,8 +26,10 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -45,6 +47,68 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 static const struct egl_platform *egl;
 static const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs wayland_drawable_funcs;
+
+/* Original (win32u) driver proc-address resolver, chained from
+ * wayland_get_proc_address so that names other than the WINE dmabuf-export
+ * extension keep their previous behavior. */
+static void *(*prev_get_proc_address)(const char *);
+
+/* dmabuf export leaf (GL texture/renderbuffer -> Linux dmabuf via
+ * EGL_MESA_image_dma_buf_export). Resolved lazily and gated behind the
+ * runtime extension check below. */
+static PFN_eglCreateImageKHR pfn_eglCreateImageKHR;
+static PFN_eglDestroyImageKHR pfn_eglDestroyImageKHR;
+static PFN_eglExportDMABUFImageMESA pfn_eglExportDMABUFImageMESA;
+static PFN_eglExportDMABUFImageQueryMESA pfn_eglExportDMABUFImageQueryMESA;
+
+static pthread_once_t dmabuf_export_init_once = PTHREAD_ONCE_INIT;
+static BOOL dmabuf_export_supported;
+
+static BOOL dmabuf_export_type_supported(GLenum type)
+{
+    if (!egl) return FALSE;
+    switch (type)
+    {
+    case GL_TEXTURE_2D:
+    case GL_RENDERBUFFER:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static void dmabuf_export_init_support(void)
+{
+    const char *extensions;
+
+    if (!egl || !funcs || !funcs->p_eglGetProcAddress || !funcs->p_eglQueryString ||
+        !funcs->p_eglGetCurrentContext)
+        return;
+    if (!(extensions = funcs->p_eglQueryString(egl->display, EGL_EXTENSIONS))) return;
+    if (!strstr(extensions, "EGL_KHR_image_base") && !strstr(extensions, "EGL_KHR_image"))
+        return;
+    if (!strstr(extensions, "EGL_MESA_image_dma_buf_export"))
+        return;
+    if (!dmabuf_export_type_supported(GL_TEXTURE_2D))
+        return;
+
+    pfn_eglCreateImageKHR = (void *)funcs->p_eglGetProcAddress("eglCreateImageKHR");
+    pfn_eglDestroyImageKHR = (void *)funcs->p_eglGetProcAddress("eglDestroyImageKHR");
+    pfn_eglExportDMABUFImageMESA = (void *)funcs->p_eglGetProcAddress("eglExportDMABUFImageMESA");
+    pfn_eglExportDMABUFImageQueryMESA = (void *)funcs->p_eglGetProcAddress("eglExportDMABUFImageQueryMESA");
+
+    if (!pfn_eglCreateImageKHR || !pfn_eglDestroyImageKHR || !pfn_eglExportDMABUFImageMESA ||
+        !pfn_eglExportDMABUFImageQueryMESA)
+        return;
+
+    dmabuf_export_supported = TRUE;
+}
+
+static BOOL dmabuf_export_bridge_supported(void)
+{
+    pthread_once(&dmabuf_export_init_once, dmabuf_export_init_support);
+    return dmabuf_export_supported;
+}
 
 struct wayland_gl_drawable
 {
@@ -265,6 +329,84 @@ static UINT wayland_pbuffer_bind(HDC hdc, struct opengl_drawable *base, GLenum b
     return -1; /* use default implementation */
 }
 
+static BOOL GLAPIENTRY wayland_wglWineExportDmaBufWINE(GLuint texture, GLenum target,
+        struct wgl_dmabuf_desc *desc, int *fd)
+{
+    const EGLint image_attribs[] = {EGL_NONE};
+    EGLuint64KHR modifiers[4] = {0};
+    EGLint offsets[4] = {0}, strides[4] = {0};
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    EGLClientBuffer client;
+    int export_fd = -1;
+    int fourcc = 0, planes = 0;
+    EGLenum egl_target;
+
+    TRACE("texture %u, target %#x, desc %p, fd %p.\n", texture, target, desc, fd);
+
+    if (!desc || !fd) return FALSE;
+    memset(desc, 0, sizeof(*desc));
+    *fd = -1;
+
+    if (!texture || !dmabuf_export_bridge_supported() || !dmabuf_export_type_supported(target))
+        return FALSE;
+
+    switch (target)
+    {
+    case GL_TEXTURE_2D:
+        egl_target = EGL_GL_TEXTURE_2D;
+        break;
+    case GL_RENDERBUFFER:
+        egl_target = EGL_GL_RENDERBUFFER;
+        break;
+    default:
+        return FALSE;
+    }
+
+    client = (EGLClientBuffer)(uintptr_t)texture;
+    image = pfn_eglCreateImageKHR(egl->display, funcs->p_eglGetCurrentContext(),
+            egl_target, client, image_attribs);
+    if (image == EGL_NO_IMAGE_KHR)
+        return FALSE;
+
+    /* The export path currently supports only single-plane RGB buffers. */
+    if (!pfn_eglExportDMABUFImageQueryMESA(egl->display, image, &fourcc, &planes, modifiers)
+            || planes != 1)
+        goto done;
+
+    if (!pfn_eglExportDMABUFImageMESA(egl->display, image, &export_fd, strides, offsets)
+            || export_fd < 0)
+        goto done;
+
+    desc->fourcc = fourcc;
+    desc->stride = strides[0];
+    desc->offset = offsets[0];
+    desc->modifier = modifiers[0];
+    *fd = export_fd;
+    export_fd = -1;
+
+done:
+    if (image != EGL_NO_IMAGE_KHR)
+        pfn_eglDestroyImageKHR(egl->display, image);
+    if (export_fd >= 0)
+        close(export_fd);
+    return *fd >= 0;
+}
+
+static BOOL GLAPIENTRY wayland_wglWineDmaBufExportSupportedWINE(void)
+{
+    return dmabuf_export_bridge_supported();
+}
+
+static void *wayland_get_proc_address(const char *name)
+{
+    if (!strcmp(name, "wglWineDmaBufExportSupportedWINE"))
+        return wayland_wglWineDmaBufExportSupportedWINE;
+    if (!strcmp(name, "wglWineExportDmaBufWINE"))
+        return dmabuf_export_bridge_supported() ? (void *)wayland_wglWineExportDmaBufWINE : NULL;
+
+    return prev_get_proc_address ? prev_get_proc_address(name) : NULL;
+}
+
 static struct opengl_driver_funcs wayland_driver_funcs =
 {
     .p_init_egl_platform = wayland_init_egl_platform,
@@ -296,7 +438,8 @@ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, c
     if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
     funcs = opengl_funcs;
 
-    wayland_driver_funcs.p_get_proc_address = (*driver_funcs)->p_get_proc_address;
+    prev_get_proc_address = (*driver_funcs)->p_get_proc_address;
+    wayland_driver_funcs.p_get_proc_address = wayland_get_proc_address;
     wayland_driver_funcs.p_init_pixel_formats = (*driver_funcs)->p_init_pixel_formats;
     wayland_driver_funcs.p_describe_pixel_format = (*driver_funcs)->p_describe_pixel_format;
     wayland_driver_funcs.p_init_wgl_extensions = (*driver_funcs)->p_init_wgl_extensions;

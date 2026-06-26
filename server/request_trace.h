@@ -3618,6 +3618,17 @@ static void dump_hwnd_dmabuf_get_channel_reply( const struct hwnd_dmabuf_get_cha
     fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
 }
 
+static void dump_hwnd_dmabuf_get_channel_exclusive_request( const struct hwnd_dmabuf_get_channel_exclusive_request *req )
+{
+    fprintf( stderr, " hwnd=%08x", req->hwnd );
+}
+
+static void dump_hwnd_dmabuf_get_channel_exclusive_reply( const struct hwnd_dmabuf_get_channel_exclusive_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+    fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
+}
+
 static void dump_hwnd_dmabuf_claim_channel_request( const struct hwnd_dmabuf_claim_channel_request *req )
 {
     fprintf( stderr, " hwnd=%08x", req->hwnd );
@@ -3958,6 +3969,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_hwnd_list_dmabuf_frames_request,
     (dump_func)dump_hwnd_dmabuf_set_pending_request,
     (dump_func)dump_hwnd_dmabuf_get_channel_request,
+    (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_request,
     (dump_func)dump_hwnd_dmabuf_claim_channel_request,
     (dump_func)dump_hwnd_dmabuf_release_channel_request,
 };
@@ -4279,6 +4291,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_hwnd_list_dmabuf_frames_reply,
     (dump_func)dump_hwnd_dmabuf_set_pending_reply,
     (dump_func)dump_hwnd_dmabuf_get_channel_reply,
+    (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_reply,
     (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
     (dump_func)dump_hwnd_dmabuf_release_channel_reply,
 };
@@ -4600,6 +4613,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "hwnd_list_dmabuf_frames",
     "hwnd_dmabuf_set_pending",
     "hwnd_dmabuf_get_channel",
+    "hwnd_dmabuf_get_channel_exclusive",
     "hwnd_dmabuf_claim_channel",
     "hwnd_dmabuf_release_channel",
 };

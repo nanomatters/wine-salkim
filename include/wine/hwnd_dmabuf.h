@@ -5,10 +5,20 @@
 
 #include <wine/server.h>
 
-#define HWND_DMABUF_HOST_CAPS_VERSION_V1       1
-#define HWND_DMABUF_HOST_CAPS_VERSION_V2       2
+#define HWND_DMABUF_MOD_LINEAR                 0
+#define HWND_DMABUF_MOD_INVALID                0x00ffffffffffffffull
 
-#define HWND_DMABUF_CAPS_HAS_MOD_INVALID       0x00000004
+/* DXGI alpha-mode values carried over the hwnd-dmabuf wire protocol. */
+#define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
+#define HWND_DMABUF_ALPHA_MODE_IGNORE          3
+
+enum hwnd_dmabuf_channel_result
+{
+    HWND_DMABUF_CHANNEL_OK = 0,
+    HWND_DMABUF_CHANNEL_EMPTY = 1,
+    HWND_DMABUF_CHANNEL_ERROR = 2,
+    HWND_DMABUF_CHANNEL_CLOSED = 3,
+};
 
 typedef struct
 {
@@ -20,17 +30,7 @@ typedef struct
 
 typedef struct
 {
-    unsigned int     version;
-    unsigned int     feedback_gen;
-    unsigned int     dmabuf_protocol_version;
-    unsigned int     caps_source;
-    unsigned int     caps_flags;
-    unsigned int     has_drm_syncobj;
-    unsigned int     has_zwp_explicit_sync;
-    unsigned int     main_device_major;
-    unsigned int     main_device_minor;
     unsigned int     format_modifier_count;
-    const hwnd_dmabuf_format_modifier_t *format_modifiers;
 } hwnd_dmabuf_host_caps_t;
 
 /* Release token sent from the consumer back to the producer over the channel. */
@@ -99,6 +99,29 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, H
     *channel_handle = 0;
 
     SERVER_START_REQ( hwnd_dmabuf_get_channel )
+    {
+        req->hwnd = wine_server_user_handle( hwnd );
+        if (!wine_server_call_err( req ))
+        {
+            status = reply->status;
+            if (status == HWND_DMABUF_OK)
+                *channel_handle = wine_server_ptr_handle( reply->channel_handle );
+        }
+    }
+    SERVER_END_REQ;
+
+    return status;
+}
+
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel_exclusive( HWND hwnd,
+                                                                              HANDLE *channel_handle )
+{
+    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+
+    if (!channel_handle) return status;
+    *channel_handle = 0;
+
+    SERVER_START_REQ( hwnd_dmabuf_get_channel_exclusive )
     {
         req->hwnd = wine_server_user_handle( hwnd );
         if (!wine_server_call_err( req ))
