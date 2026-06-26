@@ -221,19 +221,12 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
         count++;
 
     memset(caps, 0, sizeof(*caps));
-    caps->version = HWND_DMABUF_HOST_CAPS_VERSION_V2;
-    caps->feedback_gen = 1;
-    caps->dmabuf_protocol_version = zwp_linux_dmabuf_v1_get_version(process_wayland.zwp_linux_dmabuf_v1);
-    caps->format_modifiers = format_modifiers;
-
     wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
     {
         if (copied >= max_format_modifiers)
             break;
         format_modifiers[copied].fourcc = entry->format;
         format_modifiers[copied].modifier = entry->modifier;
-        if (entry->modifier == DRM_FORMAT_MOD_INVALID)
-            caps->caps_flags |= HWND_DMABUF_CAPS_HAS_MOD_INVALID;
         copied++;
     }
 

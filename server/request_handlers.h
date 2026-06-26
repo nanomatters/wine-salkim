@@ -322,6 +322,7 @@ DECL_HANDLER(fsync_free_shm_idx);
 DECL_HANDLER(hwnd_list_dmabuf_frames);
 DECL_HANDLER(hwnd_dmabuf_set_pending);
 DECL_HANDLER(hwnd_dmabuf_get_channel);
+DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
 DECL_HANDLER(hwnd_dmabuf_claim_channel);
 DECL_HANDLER(hwnd_dmabuf_release_channel);
 
@@ -643,6 +644,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_hwnd_list_dmabuf_frames,
     (req_handler)req_hwnd_dmabuf_set_pending,
     (req_handler)req_hwnd_dmabuf_get_channel,
+    (req_handler)req_hwnd_dmabuf_get_channel_exclusive,
     (req_handler)req_hwnd_dmabuf_claim_channel,
     (req_handler)req_hwnd_dmabuf_release_channel,
 };
@@ -2447,6 +2449,11 @@ C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_request) == 16 );
 C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, status) == 8 );
 C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, channel_handle) == 12 );
 C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_request, hwnd) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_request) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, channel_handle) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_reply) == 16 );
 C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, hwnd) == 12 );
 C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_request) == 16 );
 C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, status) == 8 );
