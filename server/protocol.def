@@ -4463,6 +4463,15 @@ enum fsync_type
 @END
 
 
+/* Producer: mint the channel only if no producer is already active. */
+@REQ(hwnd_dmabuf_get_channel_exclusive)
+    user_handle_t  hwnd;                /* child HWND being produced for */
+@REPLY
+    unsigned int   status;              /* enum hwnd_dmabuf_status */
+    obj_handle_t   channel_handle;      /* producer end of the socketpair */
+@END
+
+
 /* Consumer: claim the consumer end of the channel minted for hwnd, if any. */
 @REQ(hwnd_dmabuf_claim_channel)
     user_handle_t  hwnd;                /* child HWND owned by the caller */

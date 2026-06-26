@@ -225,7 +225,31 @@ extern NTSTATUS d3dkmt_destroy_mutex( D3DKMT_HANDLE local );
 extern HANDLE open_shared_resource_from_name( const WCHAR *name );
 extern HANDLE open_shared_semaphore_from_name( const WCHAR *name );
 
+enum d3dkmt_resource_desc_type
+{
+    D3DKMT_RESOURCE_DESC_UNKNOWN,
+    D3DKMT_RESOURCE_DESC_TEXTURE_2D,
+};
+
+struct d3dkmt_resource_desc
+{
+    enum d3dkmt_resource_desc_type type;
+    UINT width;
+    UINT height;
+    UINT format;
+    UINT mip_levels;
+    UINT array_size;
+    UINT sample_count;
+    UINT sample_quality;
+    BOOL keyed_mutex;
+    BOOL nt_shared;
+};
+
 extern D3DKMT_HANDLE d3dkmt_create_resource( int fd, D3DKMT_HANDLE *global );
+extern D3DKMT_HANDLE d3dkmt_open_resource_with_desc( D3DKMT_HANDLE global, HANDLE shared,
+        D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc );
+extern D3DKMT_HANDLE d3dkmt_open_shared_resource_with_desc( HANDLE shared, D3DKMT_HANDLE *mutex_local,
+        D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc );
 extern D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local );
 extern NTSTATUS d3dkmt_destroy_resource( D3DKMT_HANDLE local );
 

@@ -83,6 +83,13 @@ static UINT hwnd_dmabuf_get_caps( HWND hwnd, void *caps, void *format_modifiers,
                                                         max_format_modifiers, format_modifier_count );
 }
 
+UINT WINAPI NtUserHwndDmaBufGetCaps( HWND hwnd, void *caps, void *format_modifiers,
+                                     UINT max_format_modifiers, UINT *format_modifier_count )
+{
+    return hwnd_dmabuf_get_caps( hwnd, caps, format_modifiers,
+                                 max_format_modifiers, format_modifier_count );
+}
+
 #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
 
 static BOOL use_external_memory(void)
@@ -2758,11 +2765,12 @@ static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat 
 }
 
 /* Build the candidate modifier list = caps modifiers (matching fourcc) that the
- * host can also export as a single-plane dmabuf. Returns the count placed in
+ * host can also export as a single-plane dmabuf. out_mods is what Vulkan gets,
+ * out_wire_mods is what the consumer must see. Returns the count placed in
  * out_mods. 0 means no intersection -> caller falls back to the host swapchain. */
 static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND hwnd, VkFormat format,
                                              VkImageUsageFlags usage, BOOL opaque, unsigned int *fourcc_out,
-                                             uint64_t *out_mods, uint32_t max_out )
+                                             uint64_t *out_mods, uint64_t *out_wire_mods, uint32_t max_out )
 {
     hwnd_dmabuf_format_modifier_t *caps_mods;
     hwnd_dmabuf_host_caps_t caps = {0};
@@ -2790,6 +2798,11 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
         free( caps_mods );
         return 0;
     }
+    if (!(caps_count = caps.format_modifier_count))
+    {
+        free( caps_mods );
+        return 0;
+    }
 
     *fourcc_out = 0;
     for (i = 0; i < caps_count && !*fourcc_out; i++)
@@ -2801,7 +2814,8 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
 
     for (i = 0; i < caps_count && out_count < max_out; i++)
     {
-        uint64_t modifier = caps_mods[i].modifier;
+        uint64_t wire_modifier = caps_mods[i].modifier;
+        uint64_t modifier = wire_modifier;
 
         if (caps_mods[i].fourcc != *fourcc_out) continue;
         /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
@@ -2815,7 +2829,9 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
             for (j = 0; j < out_count; j++) if (out_mods[j] == modifier) { dup = TRUE; break; }
             if (dup) continue;
         }
-        out_mods[out_count++] = modifier;
+        out_mods[out_count] = modifier;
+        out_wire_mods[out_count] = wire_modifier;
+        out_count++;
     }
 
     free( caps_mods );
@@ -2853,7 +2869,8 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
 /* Create one exportable DRM-modifier image + dedicated exportable memory, export
  * its dmabuf fd and cache the realized modifier + per-plane layouts. */
 static VkResult managed_create_image( struct vulkan_device *device, struct wine_managed_swapchain *managed,
-                                      const uint64_t *modifiers, uint32_t modifier_count,
+                                      const uint64_t *modifiers, const uint64_t *wire_modifiers,
+                                      uint32_t modifier_count,
                                       struct wine_managed_image *image )
 {
     VkImageDrmFormatModifierListCreateInfoEXT mod_list =
@@ -2902,6 +2919,7 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     struct vulkan_physical_device *physical_device = device->physical_device;
     VkSubresourceLayout layout = {0};
     uint32_t mem_type_index = ~0u, plane_count, i;
+    uint64_t wire_modifier;
     int fd = -1;
     VkResult res;
 
@@ -2965,6 +2983,15 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
      * image still publishes its own modifier/stride/offset below in case the
      * host picks differently per image. */
     managed->realized_modifier = mod_props.drmFormatModifier;
+    wire_modifier = mod_props.drmFormatModifier;
+    for (i = 0; i < modifier_count; i++)
+    {
+        if (modifiers[i] == mod_props.drmFormatModifier)
+        {
+            wire_modifier = wire_modifiers[i];
+            break;
+        }
+    }
 
     /* Publish every plane of the realized modifier. A missing auxiliary plane
      * (e.g. AMD DCC) makes the consumer-side dmabuf import fail fatally. */
@@ -3006,7 +3033,7 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     image->desc.fourcc = managed->fourcc;
     image->desc.stride = image->desc.plane_strides[0];
     image->desc.offset = image->desc.plane_offsets[0];
-    image->desc.modifier = mod_props.drmFormatModifier; /* this image's realized modifier */
+    image->desc.modifier = wire_modifier;
     image->desc.alpha_mode = managed->alpha_mode;
     image->desc.sync_fd_kind = 0; /* HWND_DMABUF_SYNC_NONE: consumer ignores acquire today */
     image->desc.producer_unique_id = 0; /* set from the managed producer id at present */
@@ -3028,6 +3055,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
                                           struct wine_managed_swapchain **out )
 {
     uint64_t modifiers[WINE_VK_MANAGED_MAX_MODIFIERS];
+    uint64_t wire_modifiers[WINE_VK_MANAGED_MAX_MODIFIERS];
     struct wine_managed_swapchain *managed;
     BOOL opaque_alpha;
     unsigned int fourcc = 0;
@@ -3045,7 +3073,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
      * host can export as a single-plane dmabuf, against the realized usage. */
     modifier_count = vk_select_managed_modifiers( device, surface->hwnd, create_info->imageFormat,
                                                   usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, opaque_alpha,
-                                                  &fourcc, modifiers, ARRAY_SIZE(modifiers) );
+                                                  &fourcc, modifiers, wire_modifiers, ARRAY_SIZE(modifiers) );
     if (!modifier_count)
     {
         TRACE( "no host-exportable modifier intersection for hwnd %p format %u, falling back to host swapchain\n",
@@ -3060,9 +3088,9 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     managed->format = create_info->imageFormat;
     managed->fourcc = fourcc;
     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
-     * alpha (DXGI_ALPHA_MODE_IGNORE == 3). Otherwise leave alpha as straight. */
+     * alpha. Otherwise leave alpha as straight. */
     managed->alpha_mode = (fourcc == vk_format_to_drm_fourcc( create_info->imageFormat, TRUE ))
-                          ? 3 /* DXGI_ALPHA_MODE_IGNORE */ : 0 /* DXGI_ALPHA_MODE_UNSPECIFIED */;
+                          ? HWND_DMABUF_ALPHA_MODE_IGNORE : HWND_DMABUF_ALPHA_MODE_UNSPECIFIED;
     managed->extents = create_info->imageExtent;
     managed->usage = usage;
     managed->next_release_token = 0;
@@ -3099,7 +3127,8 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
 
     for (i = 0; i < count; i++)
     {
-        if ((res = managed_create_image( device, managed, modifiers, modifier_count, &managed->images[i] )))
+        if ((res = managed_create_image( device, managed, modifiers, wire_modifiers,
+                                         modifier_count, &managed->images[i] )))
         {
             WARN( "failed to create managed image %u, res %d, falling back to host swapchain\n", i, res );
             managed->image_count = i;

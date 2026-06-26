@@ -104,6 +104,7 @@ struct window
     struct object   *dmabuf_channel_consumer; /* consumer end of the frame socket */
     unsigned int     dmabuf_pending_count;    /* swapchain creation in progress */
     unsigned int     dmabuf_producer_count;   /* active users of the frame socket */
+    unsigned int     dmabuf_exclusive_count;  /* producer count from exclusive opens */
 };
 
 static void window_dump( struct object *obj, int verbose );
@@ -696,6 +697,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->dmabuf_channel_consumer = NULL;
     win->dmabuf_pending_count = 0;
     win->dmabuf_producer_count = 0;
+    win->dmabuf_exclusive_count = 0;
     win->window_rect = win->visible_rect = win->surface_rect = win->client_rect = empty_rect;
     list_init( &win->children );
     list_init( &win->unlinked );
@@ -1313,6 +1315,7 @@ static void hwnd_dmabuf_release_server_channel( struct window *win )
         release_object( win->dmabuf_channel_consumer );
         win->dmabuf_channel_consumer = NULL;
     }
+    win->dmabuf_exclusive_count = 0;
 }
 
 /* Pending producers are also listed so parents do not snapshot their GDI host
@@ -3108,51 +3111,115 @@ static struct object *hwnd_dmabuf_wrap_fd( int unix_fd )
     return obj;
 }
 
-/* Hand the producer its end of the frame socket, minted once and retained. A
- * resize (new swapchain) re-grants the same socket so the consumer keeps reading. */
-DECL_HANDLER(hwnd_dmabuf_get_channel)
+static int hwnd_dmabuf_create_server_channel( struct window *win )
 {
-    struct window *win = get_window( req->hwnd );
     int fds[2];
-    int created = 0;
 
-    reply->status = HWND_DMABUF_INVALID_ARGS;
-    reply->channel_handle = 0;
-    if (!win) return;
+    if (win->dmabuf_channel_producer) return 1;
 
-    if (!win->dmabuf_channel_producer)
+    if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
+        return 0;
+
     {
         struct object *producer_end, *consumer_end;
 
-        if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
-        {
-            reply->status = HWND_DMABUF_NOT_FOUND;
-            return;
-        }
         producer_end = hwnd_dmabuf_wrap_fd( fds[0] );
         consumer_end = hwnd_dmabuf_wrap_fd( fds[1] );
         if (!producer_end || !consumer_end)
         {
             if (producer_end) release_object( producer_end );
             if (consumer_end) release_object( consumer_end );
-            return;
+            return 0;
         }
         win->dmabuf_channel_producer = producer_end;
         win->dmabuf_channel_consumer = consumer_end;
-        created = 1;
     }
 
-    reply->channel_handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
-                                                          GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
-    if (!reply->channel_handle)
+    return 1;
+}
+
+static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *handle )
+{
+    *handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
+                                            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
+    return *handle != 0;
+}
+
+static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive )
+{
+    win->dmabuf_producer_count++;
+    if (exclusive)
+        win->dmabuf_exclusive_count++;
+    if (win->dmabuf_pending_count)
+        win->dmabuf_pending_count--;
+}
+
+/* Hand the producer its end of the frame socket, minted once and retained. A
+ * resize (new swapchain) re-grants the same socket so the consumer keeps reading. */
+DECL_HANDLER(hwnd_dmabuf_get_channel)
+{
+    struct window *win = get_window( req->hwnd );
+    int had_channel;
+
+    reply->status = HWND_DMABUF_INVALID_ARGS;
+    reply->channel_handle = 0;
+    if (!win) return;
+
+    if (win->dmabuf_exclusive_count)
     {
-        if (created && !win->dmabuf_producer_count && !win->dmabuf_pending_count)
+        reply->status = HWND_DMABUF_BUSY;
+        return;
+    }
+
+    had_channel = win->dmabuf_channel_producer != NULL;
+    if (!hwnd_dmabuf_create_server_channel( win ))
+    {
+        reply->status = HWND_DMABUF_NOT_FOUND;
+        return;
+    }
+
+    if (!hwnd_dmabuf_alloc_producer_handle( win, &reply->channel_handle ))
+    {
+        if (!had_channel && !win->dmabuf_producer_count && !win->dmabuf_pending_count)
             hwnd_dmabuf_release_server_channel( win );
         return;
     }
-    win->dmabuf_producer_count++;
-    if (win->dmabuf_pending_count)
-        win->dmabuf_pending_count--;
+    hwnd_dmabuf_commit_producer_open( win, 0 );
+    reply->status = HWND_DMABUF_OK;
+}
+
+/* GL capture owns the channel exclusively. Other users keep the shared request
+ * above so resize handoff can reuse an existing producer socket. */
+DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive)
+{
+    struct window *win = get_window( req->hwnd );
+    int had_channel;
+
+    reply->status = HWND_DMABUF_INVALID_ARGS;
+    reply->channel_handle = 0;
+    if (!win) return;
+
+    if (win->dmabuf_producer_count || win->dmabuf_pending_count)
+    {
+        reply->status = HWND_DMABUF_BUSY;
+        return;
+    }
+
+    had_channel = win->dmabuf_channel_producer != NULL;
+    if (!hwnd_dmabuf_create_server_channel( win ))
+    {
+        reply->status = HWND_DMABUF_NOT_FOUND;
+        return;
+    }
+
+    if (!hwnd_dmabuf_alloc_producer_handle( win, &reply->channel_handle ))
+    {
+        if (!had_channel && !win->dmabuf_producer_count && !win->dmabuf_pending_count)
+            hwnd_dmabuf_release_server_channel( win );
+        return;
+    }
+
+    hwnd_dmabuf_commit_producer_open( win, 1 );
     reply->status = HWND_DMABUF_OK;
 }
 
@@ -3192,6 +3259,8 @@ DECL_HANDLER(hwnd_dmabuf_release_channel)
 
     if (win->dmabuf_producer_count)
         win->dmabuf_producer_count--;
+    if (win->dmabuf_exclusive_count)
+        win->dmabuf_exclusive_count--;
     if (!win->dmabuf_producer_count && !win->dmabuf_pending_count)
         hwnd_dmabuf_release_server_channel( win );
     reply->status = HWND_DMABUF_OK;
