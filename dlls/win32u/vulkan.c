@@ -3013,6 +3013,41 @@ static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat 
     return TRUE;
 }
 
+static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFormat format,
+                                              VkImageUsageFlags usage,
+                                              const hwnd_dmabuf_format_modifier_t *caps_mods,
+                                              UINT caps_count, unsigned int fourcc,
+                                              uint64_t *out_mods, uint64_t *out_wire_mods,
+                                              uint32_t max_out )
+{
+    UINT i;
+    uint32_t out_count = 0;
+
+    for (i = 0; i < caps_count && out_count < max_out; i++)
+    {
+        uint64_t wire_modifier = caps_mods[i].modifier;
+        uint64_t modifier = wire_modifier;
+
+        if (caps_mods[i].fourcc != fourcc) continue;
+        /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
+        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
+            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
+        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+        /* dedupe */
+        {
+            uint32_t j;
+            BOOL dup = FALSE;
+            for (j = 0; j < out_count; j++) if (out_mods[j] == modifier) { dup = TRUE; break; }
+            if (dup) continue;
+        }
+        out_mods[out_count] = modifier;
+        out_wire_mods[out_count] = wire_modifier;
+        out_count++;
+    }
+
+    return out_count;
+}
+
 /* Build the candidate modifier list = caps modifiers (matching fourcc) that the
  * host can also export as a single-plane dmabuf. out_mods is what Vulkan gets,
  * out_wire_mods is what the consumer must see. Returns the count placed in
@@ -3024,7 +3059,7 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
     hwnd_dmabuf_format_modifier_t *caps_mods;
     hwnd_dmabuf_host_caps_t caps = {0};
     unsigned int fourcc_first, fourcc_second;
-    UINT caps_count = 0, i;
+    UINT caps_count = 0;
     uint32_t out_count = 0;
 
     /* The fourcc must match compositeAlpha: opaque swapchains use the X-variant
@@ -3054,33 +3089,17 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
     }
 
     *fourcc_out = 0;
-    for (i = 0; i < caps_count && !*fourcc_out; i++)
-        if (fourcc_first && caps_mods[i].fourcc == fourcc_first) *fourcc_out = fourcc_first;
-    if (!*fourcc_out)
-        for (i = 0; i < caps_count && !*fourcc_out; i++)
-            if (fourcc_second && caps_mods[i].fourcc == fourcc_second) *fourcc_out = fourcc_second;
-    if (!*fourcc_out) { free( caps_mods ); return 0; }
-
-    for (i = 0; i < caps_count && out_count < max_out; i++)
+    if (fourcc_first)
     {
-        uint64_t wire_modifier = caps_mods[i].modifier;
-        uint64_t modifier = wire_modifier;
-
-        if (caps_mods[i].fourcc != *fourcc_out) continue;
-        /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
-        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
-            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
-        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
-        /* dedupe */
-        {
-            uint32_t j;
-            BOOL dup = FALSE;
-            for (j = 0; j < out_count; j++) if (out_mods[j] == modifier) { dup = TRUE; break; }
-            if (dup) continue;
-        }
-        out_mods[out_count] = modifier;
-        out_wire_mods[out_count] = wire_modifier;
-        out_count++;
+        out_count = vk_collect_managed_modifiers( device, format, usage, caps_mods, caps_count,
+                                                  fourcc_first, out_mods, out_wire_mods, max_out );
+        if (out_count) *fourcc_out = fourcc_first;
+    }
+    if (!out_count && fourcc_second)
+    {
+        out_count = vk_collect_managed_modifiers( device, format, usage, caps_mods, caps_count,
+                                                  fourcc_second, out_mods, out_wire_mods, max_out );
+        if (out_count) *fourcc_out = fourcc_second;
     }
 
     free( caps_mods );
