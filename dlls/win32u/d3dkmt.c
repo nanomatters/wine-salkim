@@ -1941,6 +1941,62 @@ static void get_resource_global_keyed_mutex( struct d3dkmt_dxgi_desc *desc, D3DK
     }
 }
 
+static void d3dkmt_resource_desc_from_runtime_data( void *runtime_data, UINT runtime_size, struct d3dkmt_resource_desc *desc )
+{
+    const struct d3dkmt_dxgi_desc *dxgi = runtime_data;
+
+    memset( desc, 0, sizeof(*desc) );
+    desc->type = D3DKMT_RESOURCE_DESC_UNKNOWN;
+
+    if (!runtime_data || runtime_size < sizeof(*dxgi)) return;
+
+    desc->width = dxgi->width;
+    desc->height = dxgi->height;
+    desc->format = dxgi->format;
+    desc->keyed_mutex = dxgi->keyed_mutex;
+    desc->nt_shared = dxgi->nt_shared;
+
+    if (dxgi->size == sizeof(struct d3dkmt_d3d9_desc) && runtime_size >= sizeof(struct d3dkmt_d3d9_desc))
+    {
+        const struct d3dkmt_d3d9_desc *d3d9 = runtime_data;
+
+        if (d3d9->type == D3DRTYPE_TEXTURE)
+        {
+            desc->type = D3DKMT_RESOURCE_DESC_TEXTURE_2D;
+            desc->width = d3d9->texture.width;
+            desc->height = d3d9->texture.height;
+            desc->mip_levels = d3d9->texture.levels;
+            desc->array_size = 1;
+            desc->sample_count = 1;
+        }
+        else if (d3d9->type == D3DRTYPE_SURFACE)
+        {
+            desc->type = D3DKMT_RESOURCE_DESC_TEXTURE_2D;
+            desc->width = d3d9->surface.width;
+            desc->height = d3d9->surface.height;
+            desc->mip_levels = 1;
+            desc->array_size = 1;
+            desc->sample_count = 1;
+        }
+    }
+    else if (dxgi->size == sizeof(struct d3dkmt_d3d11_desc) && runtime_size >= sizeof(struct d3dkmt_d3d11_desc))
+    {
+        const struct d3dkmt_d3d11_desc *d3d11 = runtime_data;
+
+        if (d3d11->dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        {
+            desc->type = D3DKMT_RESOURCE_DESC_TEXTURE_2D;
+            desc->width = d3d11->d3d11_2d.Width;
+            desc->height = d3d11->d3d11_2d.Height;
+            desc->format = d3d11->d3d11_2d.Format;
+            desc->mip_levels = d3d11->d3d11_2d.MipLevels;
+            desc->array_size = d3d11->d3d11_2d.ArraySize;
+            desc->sample_count = d3d11->d3d11_2d.SampleDesc.Count;
+            desc->sample_quality = d3d11->d3d11_2d.SampleDesc.Quality;
+        }
+    }
+}
+
 /* get a locally opened D3DKMT object host-specific fd */
 int d3dkmt_object_get_fd( D3DKMT_HANDLE local )
 {
@@ -1987,7 +2043,8 @@ failed:
 }
 
 /* open a D3DKMT global or shared resource */
-D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local )
+D3DKMT_HANDLE d3dkmt_open_resource_with_desc( D3DKMT_HANDLE global, HANDLE shared,
+        D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc )
 {
     struct d3dkmt_object *allocation = NULL, *mutex = NULL, *sync = NULL;
     UINT runtime_size, mutex_size = 0, sync_size = 0;
@@ -1997,6 +2054,9 @@ D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_
     NTSTATUS status;
 
     TRACE( "global %#x, shared %p\n", global, shared );
+
+    *mutex_local = *sync_local = 0;
+    if (desc) memset( desc, 0, sizeof(*desc) );
 
     if ((status = d3dkmt_object_query( D3DKMT_RESOURCE, global, shared, &runtime_size ))) goto failed;
     if (runtime_size && !(runtime_data = malloc( runtime_size ))) goto failed;
@@ -2011,7 +2071,11 @@ D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_
     resource->allocation = allocation->local;
 
     if (!runtime_data || runtime_size <= sizeof(struct d3dkmt_dxgi_desc)) WARN( "Unsupported runtime data size %#x\n", runtime_size );
-    else get_resource_global_keyed_mutex( runtime_data, &mutex_global, &sync_global );
+    else
+    {
+        if (desc) d3dkmt_resource_desc_from_runtime_data( runtime_data, runtime_size, desc );
+        get_resource_global_keyed_mutex( runtime_data, &mutex_global, &sync_global );
+    }
 
     if (!d3dkmt_object_open( mutex, mutex_global, shared, NULL, &mutex_size ) &&
         !d3dkmt_object_open( sync, sync_global, shared, NULL, &sync_size ))
@@ -2037,6 +2101,22 @@ failed:
     if (sync) d3dkmt_object_free( sync );
     free( runtime_data );
     return 0;
+}
+
+D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local )
+{
+    return d3dkmt_open_resource_with_desc( global, shared, mutex_local, sync_local, NULL );
+}
+
+D3DKMT_HANDLE d3dkmt_open_shared_resource_with_desc( HANDLE shared, D3DKMT_HANDLE *mutex_local,
+        D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc )
+{
+    D3DKMT_HANDLE global = PtrToUlong( shared );
+
+    if (is_d3dkmt_global( global ))
+        return d3dkmt_open_resource_with_desc( global, NULL, mutex_local, sync_local, desc );
+
+    return d3dkmt_open_resource_with_desc( 0, shared, mutex_local, sync_local, desc );
 }
 
 /* destroy a locally opened D3DKMT resource */

@@ -46,6 +46,29 @@ int hwnd_dmabuf_open_channel( HWND hwnd )
     return fd;
 }
 
+/* Open an exclusive producer channel for cross-module GL publishers. */
+int hwnd_dmabuf_open_channel_exclusive( HWND hwnd )
+{
+    HANDLE handle = 0;
+    int fd = -1;
+
+    if (wine_hwnd_dmabuf_get_channel_exclusive( hwnd, &handle ) != HWND_DMABUF_OK || !handle)
+        return -1;
+    if (wine_server_handle_to_fd( handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL ))
+    {
+        fd = -1;
+        wine_hwnd_dmabuf_release_channel( hwnd );
+    }
+    NtClose( handle );
+    return fd;
+}
+
+void hwnd_dmabuf_close_channel( HWND hwnd, int channel_fd )
+{
+    if (channel_fd >= 0) close( channel_fd );
+    wine_hwnd_dmabuf_release_channel( hwnd );
+}
+
 unsigned int hwnd_dmabuf_release_channel( HWND hwnd )
 {
     return wine_hwnd_dmabuf_release_channel( hwnd );
@@ -79,4 +102,74 @@ int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd )
     while (n < 0 && errno == EINTR);
     if (dmabuf_fd >= 0) close( dmabuf_fd );
     return n == sizeof(hwnd_dmabuf_frame_desc_t) ? 0 : n < 0 ? errno : EMSGSIZE;
+}
+
+static int hwnd_dmabuf_channel_result_from_errno( int err )
+{
+    switch (err)
+    {
+        case EPIPE:
+        case ECONNRESET:
+        case ENOTCONN:
+        case ECONNABORTED:
+#ifdef ESHUTDOWN
+        case ESHUTDOWN:
+#endif
+        case EBADF:
+            return HWND_DMABUF_CHANNEL_CLOSED;
+        default:
+            return HWND_DMABUF_CHANNEL_ERROR;
+    }
+}
+
+int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
+{
+    int send_fd, ret;
+
+    if (dmabuf_fd < 0) return HWND_DMABUF_CHANNEL_ERROR;
+    if ((send_fd = dup( dmabuf_fd )) < 0)
+        return hwnd_dmabuf_channel_result_from_errno( errno );
+
+    ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd );
+    if (!ret) hwnd_dmabuf_post_wake( hwnd );
+    return ret ? hwnd_dmabuf_channel_result_from_errno( ret ) : HWND_DMABUF_CHANNEL_OK;
+}
+
+int hwnd_dmabuf_channel_recv_release( int channel_fd, void *release )
+{
+    ssize_t n;
+
+    do n = recv( channel_fd, release, sizeof(hwnd_dmabuf_release_t), MSG_DONTWAIT );
+    while (n < 0 && errno == EINTR);
+
+    if (n == sizeof(hwnd_dmabuf_release_t)) return HWND_DMABUF_CHANNEL_OK;
+#if EAGAIN == EWOULDBLOCK
+    if (n < 0 && errno == EAGAIN) return HWND_DMABUF_CHANNEL_EMPTY;
+#else
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return HWND_DMABUF_CHANNEL_EMPTY;
+#endif
+    if (!n) return HWND_DMABUF_CHANNEL_CLOSED;
+    return n < 0 ? hwnd_dmabuf_channel_result_from_errno( errno ) : HWND_DMABUF_CHANNEL_ERROR;
+}
+
+int WINAPI NtUserHwndDmaBufOpenProducer( HWND hwnd )
+{
+    return hwnd_dmabuf_open_channel_exclusive( hwnd );
+}
+
+void WINAPI NtUserHwndDmaBufCloseProducer( HWND hwnd, int channel_fd )
+{
+    hwnd_dmabuf_close_channel( hwnd, channel_fd );
+}
+
+int WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
+{
+    if (!desc) return HWND_DMABUF_CHANNEL_ERROR;
+    return hwnd_dmabuf_channel_publish( hwnd, channel_fd, desc, dmabuf_fd );
+}
+
+int WINAPI NtUserHwndDmaBufDrainRelease( int channel_fd, void *release )
+{
+    if (!release) return HWND_DMABUF_CHANNEL_ERROR;
+    return hwnd_dmabuf_channel_recv_release( channel_fd, release );
 }
