@@ -3283,6 +3283,52 @@ NTSTATUS WINAPI wow64_NtUserHiliteMenuItem( UINT *args )
     return NtUserHiliteMenuItem( hwnd, handle, item, hilite );
 }
 
+NTSTATUS WINAPI wow64_NtUserHwndDmaBufCloseProducer( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    int channel_fd = get_ulong( &args );
+
+    NtUserHwndDmaBufCloseProducer( hwnd, channel_fd );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS WINAPI wow64_NtUserHwndDmaBufDrainRelease( UINT *args )
+{
+    int channel_fd = get_ulong( &args );
+    void *release = get_ptr( &args );
+
+    return NtUserHwndDmaBufDrainRelease( channel_fd, release );
+}
+
+NTSTATUS WINAPI wow64_NtUserHwndDmaBufGetCaps( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    void *caps = get_ptr( &args );
+    void *format_modifiers = get_ptr( &args );
+    UINT max_format_modifiers = get_ulong( &args );
+    UINT *format_modifier_count = get_ptr( &args );
+
+    return NtUserHwndDmaBufGetCaps( hwnd, caps, format_modifiers,
+            max_format_modifiers, format_modifier_count );
+}
+
+NTSTATUS WINAPI wow64_NtUserHwndDmaBufOpenProducer( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+
+    return NtUserHwndDmaBufOpenProducer( hwnd );
+}
+
+NTSTATUS WINAPI wow64_NtUserHwndDmaBufPublish( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    int channel_fd = get_ulong( &args );
+    const void *desc = get_ptr( &args );
+    int dmabuf_fd = get_ulong( &args );
+
+    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd );
+}
+
 NTSTATUS WINAPI wow64_NtUserInitializeClientPfnArrays( UINT *args )
 {
     const ntuser_client_func_ptr *procsA = get_ptr( &args );

@@ -235,6 +235,8 @@ struct wayland_hwnd_dmabuf_surface
     struct wl_list buffers;
     UINT frame_seq;
     BOOL current_committed;
+    BOOL logged_first_attach;
+    BOOL logged_first_import;
     BOOL seen;
     BOOL direct;
     BOOL linked;
@@ -2310,7 +2312,7 @@ static void wayland_hwnd_dmabuf_surface_set_opaque(struct wayland_hwnd_dmabuf_su
 {
     struct wl_region *region = NULL;
 
-    if (surface->current && surface->current->alpha_mode == DXGI_ALPHA_MODE_IGNORE &&
+    if (surface->current && surface->current->alpha_mode == HWND_DMABUF_ALPHA_MODE_IGNORE &&
         (region = wl_compositor_create_region(process_wayland.wl_compositor)))
     {
         wl_region_add(region, 0, 0, width, height);
@@ -2564,6 +2566,11 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
     zwp_linux_buffer_params_v1_destroy(params);
     if (!buffer->wl_buffer)
     {
+        WARN("hwnd=%p failed to create dmabuf buffer size=%ux%u fourcc=%#x "
+             "modifier=0x%08x%08x stride=%u alpha=%u\n",
+             surface->hwnd, desc->width, desc->height, desc->fourcc,
+             (unsigned int)(desc->modifier >> 32), (unsigned int)desc->modifier,
+             desc->stride, desc->alpha_mode);
         free(buffer);
         return NULL;
     }
@@ -2606,6 +2613,13 @@ static void wayland_hwnd_dmabuf_attach_current(struct wayland_hwnd_dmabuf_surfac
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
 
     if (!buffer) return;
+    if (!surface->logged_first_attach)
+    {
+        TRACE("hwnd=%p attaching dmabuf slot=%u size=%dx%d fourcc=%#x alpha=%u\n",
+              surface->hwnd, buffer->image_id, buffer->width, buffer->height,
+              buffer->fourcc, buffer->alpha_mode);
+        surface->logged_first_attach = TRUE;
+    }
     buffer->release_flags = HWND_DMABUF_RELEASE_PRESENTED;
     wl_surface_attach(surface->wl_surface, buffer->wl_buffer, 0, 0);
     wl_surface_damage_buffer(surface->wl_surface, 0, 0, buffer->width, buffer->height);
@@ -2663,11 +2677,7 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_cache_slot(
     }
 
     if (buffer)
-    {
-        TRACE("hwnd=%p cache-hit slot=%u gen=%u frame_seq=%u\n",
-              surface->hwnd, desc->image_id, desc->ring_generation, desc->frame_seq);
         return buffer;
-    }
     if (fd < 0)
     {
         TRACE("hwnd=%p cache-miss-no-fd slot=%u (awaiting fd resend)\n",
@@ -2701,6 +2711,12 @@ static void wayland_hwnd_dmabuf_retire_frame(struct wayland_hwnd_dmabuf_surface 
                                      flags, desc->image_id, desc->ring_generation);
 }
 
+static BOOL wayland_hwnd_dmabuf_desc_is_valid(const hwnd_dmabuf_frame_desc_t *desc)
+{
+    return desc->version == HWND_DMABUF_DESC_VERSION_V1 && desc->width && desc->height &&
+           desc->stride && desc->fourcc && desc->release_token;
+}
+
 /* Drain the channel, importing every fd-bearing slot so none is lost, then show the newest
  * frame. Stable-slot producers send a slot's fd once and fd-less references after. The fd
  * is dup'd + passed via SCM_RIGHTS once per slot, not once per frame. created_buffer reports
@@ -2725,12 +2741,22 @@ retry:
 
     while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc, &fd)) > 0)
     {
-        if (desc.version != HWND_DMABUF_DESC_VERSION_V1 || !desc.width || !desc.height ||
-            !desc.stride || !desc.fourcc || !desc.release_token ||
-            !wayland_dmabuf_format_supported(desc.fourcc, desc.modifier))
+        BOOL desc_valid = wayland_hwnd_dmabuf_desc_is_valid(&desc);
+        BOOL format_supported = desc_valid &&
+                wayland_dmabuf_format_supported(desc.fourcc, desc.modifier);
+
+        if (!desc_valid || !format_supported)
         {
-            WARN("hwnd=%p import rejected info_seq=%u desc_seq=%u fourcc=%#x\n",
-                 surface->hwnd, info->frame_seq, desc.frame_seq, desc.fourcc);
+            WARN("hwnd=%p import rejected info_seq=%u desc_seq=%u version=%u "
+                 "size=%ux%u stride=%u offset=%u fourcc=%#x (%c%c%c%c) "
+                 "modifier=0x%08x%08x token=0x%08x%08x supported=%u\n",
+                 surface->hwnd, info->frame_seq, desc.frame_seq, desc.version,
+                 desc.width, desc.height, desc.stride, desc.offset, desc.fourcc,
+                 desc.fourcc & 0xff, (desc.fourcc >> 8) & 0xff,
+                 (desc.fourcc >> 16) & 0xff, (desc.fourcc >> 24) & 0xff,
+                 (unsigned int)(desc.modifier >> 32), (unsigned int)desc.modifier,
+                 (unsigned int)(desc.release_token >> 32),
+                 (unsigned int)desc.release_token, format_supported);
             if (fd >= 0) close(fd);
             if (desc.release_token)
                 wayland_hwnd_dmabuf_send_release(surface, desc.producer_unique_id, desc.release_token,
@@ -2761,7 +2787,19 @@ retry:
     if (pdesc.flags & HWND_DMABUF_FLAG_STABLE_SLOT)
         buffer = wayland_hwnd_dmabuf_cache_slot(surface, &pdesc, pfd, created_buffer);
     else if ((buffer = wayland_hwnd_dmabuf_create_buffer(surface, &pdesc, pfd, FALSE)))
+    {
         *created_buffer = TRUE;
+        if (!surface->logged_first_import)
+        {
+            TRACE("hwnd=%p imported dmabuf seq=%u slot=%u size=%ux%u "
+                  "fourcc=%#x modifier=0x%08x%08x alpha=%u flags=%#x\n",
+                  surface->hwnd, pdesc.frame_seq, pdesc.image_id,
+                  pdesc.width, pdesc.height, pdesc.fourcc,
+                  (unsigned int)(pdesc.modifier >> 32),
+                  (unsigned int)pdesc.modifier, pdesc.alpha_mode, pdesc.flags);
+            surface->logged_first_import = TRUE;
+        }
+    }
 
     if (pfd >= 0) close(pfd);
 
@@ -2960,7 +2998,7 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
     if (!direct->current) return TRUE;
 
 commit_current:
-    if (direct->current->alpha_mode != DXGI_ALPHA_MODE_IGNORE)
+    if (direct->current->alpha_mode != HWND_DMABUF_ALPHA_MODE_IGNORE)
     {
         wayland_hwnd_dmabuf_drop_current_frame(direct, HWND_DMABUF_RELEASE_DROPPED);
         wayland_surface_clear_direct_dmabuf(surface, data);
@@ -3008,9 +3046,10 @@ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface)
 {
     struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
 
-    if (surface->direct_dmabuf_surface) return TRUE;
+    if (surface->direct_dmabuf_surface && surface->direct_dmabuf_surface->current_committed)
+        return TRUE;
     wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
-        if (dmabuf_surface->current)
+        if (dmabuf_surface->current_committed)
             return TRUE;
     return FALSE;
 }
@@ -3115,8 +3154,6 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         if (status != HWND_DMABUF_OK) count = 0;
     }
 
-    TRACE("hwnd=%p listed total=%u count=%u\n", surface->hwnd, total, count);
-
     data = wayland_win_data_get_nolock(surface->hwnd);
     if (wayland_surface_update_direct_dmabuf(surface, data, frames, count, now))
     {
@@ -3140,9 +3177,6 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     {
         HWND hwnd = (HWND)(UINT_PTR)frames[i].hwnd;
         BOOL created_buffer, attached_frame;
-
-        TRACE("hwnd=%p child=%p frame_seq=%u opened=%u\n",
-              surface->hwnd, hwnd, frames[i].frame_seq, frames[i].opened);
 
         if (!frames[i].opened)
         {
