@@ -266,6 +266,7 @@ struct wayland_dmabuf_feedback
     struct wl_list pending_formats;
     uint32_t tranche_index;
     uint32_t tranche_flags;
+    BOOL valid;
 };
 
 struct wayland
