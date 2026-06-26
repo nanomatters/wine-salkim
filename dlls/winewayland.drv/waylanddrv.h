@@ -171,6 +171,34 @@ struct wayland_data_device
     pthread_mutex_t mutex;
 };
 
+struct wayland_dmabuf_format
+{
+    struct wl_list link;
+    uint32_t format;
+    uint32_t tranche_index;
+    uint32_t tranche_flags;
+    uint64_t modifier;
+};
+
+#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+
+struct wayland_dmabuf_feedback_format
+{
+    uint32_t format;
+    uint32_t padding;
+    uint64_t modifier;
+};
+
+struct wayland_dmabuf_feedback
+{
+    struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1;
+    struct wayland_dmabuf_feedback_format *format_table;
+    size_t format_table_count;
+    struct wl_list pending_formats;
+    uint32_t tranche_index;
+    uint32_t tranche_flags;
+};
+
 struct wayland
 {
     BOOL initialized;
@@ -184,7 +212,9 @@ struct wayland
     struct wp_viewporter *wp_viewporter;
     struct wl_subcompositor *wl_subcompositor;
     struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+    struct wayland_dmabuf_feedback dmabuf_default_feedback;
     struct wl_list dmabuf_formats;
+    pthread_mutex_t dmabuf_mutex;
     struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
     struct zwlr_layer_shell_v1 *zwlr_layer_shell_v1;
@@ -224,15 +254,6 @@ struct wayland_output_state
     int logical_x, logical_y;
     int logical_w, logical_h;
 };
-
-struct wayland_dmabuf_format
-{
-    struct wl_list link;
-    uint32_t format;
-    uint64_t modifier;
-};
-
-#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
 
 struct wayland_output
 {

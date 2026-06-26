@@ -123,16 +123,21 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
         if (presentable_locally) return HWND_DMABUF_NOT_FOUND;
     }
 
-    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link) count++;
+    pthread_mutex_lock(&process_wayland.dmabuf_mutex);
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+        count++;
 
     memset(caps, 0, sizeof(*caps));
     wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
     {
         if (copied >= max_format_modifiers) break;
         format_modifiers[copied].fourcc = entry->format;
+        format_modifiers[copied].tranche_index = entry->tranche_index;
+        format_modifiers[copied].tranche_flags = entry->tranche_flags;
         format_modifiers[copied].modifier = entry->modifier;
         copied++;
     }
+    pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
 
     caps->format_modifier_count = copied;
     *format_modifier_count = count;
