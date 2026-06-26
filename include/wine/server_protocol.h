@@ -6412,6 +6412,20 @@ struct hwnd_dmabuf_get_channel_reply
 
 
 
+struct hwnd_dmabuf_get_channel_exclusive_request
+{
+    struct request_header __header;
+    user_handle_t  hwnd;
+};
+struct hwnd_dmabuf_get_channel_exclusive_reply
+{
+    struct reply_header __header;
+    unsigned int   status;
+    obj_handle_t   channel_handle;
+};
+
+
+
 struct hwnd_dmabuf_claim_channel_request
 {
     struct request_header __header;
@@ -6756,6 +6770,7 @@ enum request
     REQ_hwnd_list_dmabuf_frames,
     REQ_hwnd_dmabuf_set_pending,
     REQ_hwnd_dmabuf_get_channel,
+    REQ_hwnd_dmabuf_get_channel_exclusive,
     REQ_hwnd_dmabuf_claim_channel,
     REQ_hwnd_dmabuf_release_channel,
     REQ_NB_REQUESTS
@@ -7080,6 +7095,7 @@ union generic_request
     struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
     struct hwnd_dmabuf_set_pending_request hwnd_dmabuf_set_pending_request;
     struct hwnd_dmabuf_get_channel_request hwnd_dmabuf_get_channel_request;
+    struct hwnd_dmabuf_get_channel_exclusive_request hwnd_dmabuf_get_channel_exclusive_request;
     struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
     struct hwnd_dmabuf_release_channel_request hwnd_dmabuf_release_channel_request;
 };
@@ -7402,10 +7418,11 @@ union generic_reply
     struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
     struct hwnd_dmabuf_set_pending_reply hwnd_dmabuf_set_pending_reply;
     struct hwnd_dmabuf_get_channel_reply hwnd_dmabuf_get_channel_reply;
+    struct hwnd_dmabuf_get_channel_exclusive_reply hwnd_dmabuf_get_channel_exclusive_reply;
     struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 932
+#define SERVER_PROTOCOL_VERSION 933
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -34,6 +34,8 @@
 #include "win32u_private.h"
 #include "ntuser_private.h"
 
+#include <dxgi.h>
+
 #include "wine/opengl_driver.h"
 
 #include "dibdrv/dibdrv.h"
@@ -1533,6 +1535,11 @@ static BOOL init_egl_platform( struct egl_platform *egl, const struct opengl_fun
 
     egl->has_EGL_EXT_present_opaque = has_extension( extensions, "EGL_EXT_present_opaque" );
     egl->has_EGL_EXT_pixel_format_float = has_extension( extensions, "EGL_EXT_pixel_format_float" );
+    egl->has_EGL_KHR_image_base = has_extension( extensions, "EGL_KHR_image_base" );
+    egl->has_EGL_KHR_gl_renderbuffer_image = has_extension( extensions, "EGL_KHR_gl_renderbuffer_image" );
+    egl->has_EGL_KHR_gl_texture_2D_image = has_extension( extensions, "EGL_KHR_gl_texture_2D_image" );
+    egl->has_EGL_KHR_image = has_extension( extensions, "EGL_KHR_image" );
+    egl->has_EGL_MESA_image_dma_buf_export = has_extension( extensions, "EGL_MESA_image_dma_buf_export" );
     return TRUE;
 }
 
@@ -3314,6 +3321,565 @@ void win32u_glImportSemaphoreWin32NameEXT( GLuint semaphore, GLenum type, const 
     }
 }
 
+#ifndef WGL_ACCESS_READ_ONLY_NV
+#define WGL_ACCESS_READ_ONLY_NV             0x0000
+#define WGL_ACCESS_READ_WRITE_NV            0x0001
+#define WGL_ACCESS_WRITE_DISCARD_NV         0x0002
+#endif
+
+struct wgl_dx_share_handle
+{
+    struct list entry;
+    void *dx_object;
+    HANDLE share_handle;
+};
+
+struct wgl_dx_object
+{
+    struct list entry;
+    HANDLE handle;
+    void *dx_object;
+    GLuint gl_name;
+    GLenum gl_type;
+    GLenum access;
+    BOOL locked;
+    GLuint memory;
+    UINT width;
+    UINT height;
+};
+
+struct wgl_dx_gl_format
+{
+    GLenum internal_format;
+    UINT bytes_per_pixel;
+    BOOL bgra_swizzle;
+};
+
+struct wgl_dx_device
+{
+    struct list entry;
+    HANDLE handle;
+    void *dx_device;
+    struct list objects;
+};
+
+static pthread_mutex_t wgl_dx_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct list wgl_dx_devices = LIST_INIT( wgl_dx_devices );
+static struct list wgl_dx_share_handles = LIST_INIT( wgl_dx_share_handles );
+static UINT_PTR wgl_dx_next_handle = 1;
+static BOOL wgl_dx_supported;
+
+static HANDLE wgl_dx_alloc_handle(void)
+{
+    return (HANDLE)(UINT_PTR)wgl_dx_next_handle++;
+}
+
+static BOOL wgl_dx_valid_access( GLenum access )
+{
+    return access == WGL_ACCESS_READ_ONLY_NV || access == WGL_ACCESS_READ_WRITE_NV ||
+           access == WGL_ACCESS_WRITE_DISCARD_NV;
+}
+
+static struct wgl_dx_device *wgl_dx_get_device_locked( HANDLE handle )
+{
+    struct wgl_dx_device *device;
+
+    LIST_FOR_EACH_ENTRY( device, &wgl_dx_devices, struct wgl_dx_device, entry )
+    {
+        if (device->handle == handle) return device;
+    }
+
+    return NULL;
+}
+
+static struct wgl_dx_object *wgl_dx_get_object_locked( struct wgl_dx_device *device, HANDLE handle )
+{
+    struct wgl_dx_object *object;
+
+    LIST_FOR_EACH_ENTRY( object, &device->objects, struct wgl_dx_object, entry )
+    {
+        if (object->handle == handle) return object;
+    }
+
+    return NULL;
+}
+
+static struct wgl_dx_share_handle *wgl_dx_get_share_handle_locked( void *dx_object )
+{
+    struct wgl_dx_share_handle *share;
+
+    LIST_FOR_EACH_ENTRY( share, &wgl_dx_share_handles, struct wgl_dx_share_handle, entry )
+    {
+        if (share->dx_object == dx_object) return share;
+    }
+
+    return NULL;
+}
+
+static void wgl_dx_remove_share_handle_locked( void *dx_object, HANDLE share_handle )
+{
+    struct wgl_dx_share_handle *share;
+
+    if ((share = wgl_dx_get_share_handle_locked( dx_object )) && share->share_handle == share_handle)
+    {
+        list_remove( &share->entry );
+        free( share );
+    }
+}
+
+static void wgl_dx_drain_gl_errors(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < 16 && display_funcs.p_glGetError() != GL_NO_ERROR; ++i) {}
+}
+
+static BOOL wgl_dx_get_gl_format( UINT format, struct wgl_dx_gl_format *gl_format )
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        gl_format->internal_format = GL_RGBA8;
+        gl_format->bytes_per_pixel = 4;
+        gl_format->bgra_swizzle = FALSE;
+        return TRUE;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        gl_format->internal_format = GL_RGBA8;
+        gl_format->bytes_per_pixel = 4;
+        gl_format->bgra_swizzle = TRUE;
+        return TRUE;
+    default:
+        WARN( "Unsupported DXGI format %#x\n", format );
+        return FALSE;
+    }
+}
+
+static BOOL wgl_dx_validate_resource_desc( const struct d3dkmt_resource_desc *desc, GLenum gl_type,
+                                           struct wgl_dx_gl_format *gl_format, GLuint64 *size )
+{
+    if (gl_type != GL_TEXTURE_2D)
+    {
+        WARN( "Unsupported GL object type %#x\n", gl_type );
+        return FALSE;
+    }
+    if (desc->type != D3DKMT_RESOURCE_DESC_TEXTURE_2D)
+    {
+        WARN( "Unsupported D3DKMT resource type %#x\n", desc->type );
+        return FALSE;
+    }
+    if (!desc->width || !desc->height)
+    {
+        WARN( "Invalid resource dimensions %ux%u\n", desc->width, desc->height );
+        return FALSE;
+    }
+    if (desc->mip_levels != 1 || desc->array_size != 1 || desc->sample_count != 1)
+    {
+        WARN( "Unsupported resource shape mips %u array %u samples %u\n",
+              desc->mip_levels, desc->array_size, desc->sample_count );
+        return FALSE;
+    }
+    if (!wgl_dx_get_gl_format( desc->format, gl_format )) return FALSE;
+
+    *size = (GLuint64)desc->width * desc->height * gl_format->bytes_per_pixel;
+    return TRUE;
+}
+
+static GLuint64 wgl_dx_get_fd_size( int fd, GLuint64 min_size )
+{
+    off_t end;
+
+    if ((end = lseek( fd, 0, SEEK_END )) > 0)
+    {
+        lseek( fd, 0, SEEK_SET );
+        if ((GLuint64)end >= min_size) return end;
+
+        WARN( "Shared resource fd size %s is smaller than minimum image size %s\n",
+              wine_dbgstr_longlong( (ULONGLONG)end ), wine_dbgstr_longlong( min_size ) );
+        return 0;
+    }
+
+    WARN( "Failed to query shared resource fd size, using minimum image size %s\n",
+          wine_dbgstr_longlong( min_size ) );
+    return min_size;
+}
+
+static void wgl_dx_apply_bgra_swizzle(void)
+{
+    static const GLint swizzle[] = {GL_BLUE, GL_GREEN, GL_RED, GL_ALPHA};
+
+    display_funcs.p_glTexParameteriv( GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle );
+}
+
+static void wgl_dx_delete_object( struct wgl_dx_object *object )
+{
+    if (object->memory && display_funcs.p_glDeleteMemoryObjectsEXT)
+    {
+        if (NtCurrentTeb()->glContext) display_funcs.p_glDeleteMemoryObjectsEXT( 1, &object->memory );
+        else WARN( "Skipping WGL/DX memory object delete without a current GL context\n" );
+    }
+    free( object );
+}
+
+static BOOL wgl_dx_import_texture( HANDLE share_handle, GLuint gl_name, GLenum gl_type, struct wgl_dx_object *object )
+{
+    D3DKMT_HANDLE local = 0, mutex = 0, sync = 0;
+    struct d3dkmt_resource_desc desc;
+    struct wgl_dx_gl_format gl_format;
+    GLenum err;
+    GLuint64 size;
+    GLuint memory = 0;
+    GLint previous = 0;
+    int fd;
+
+    local = d3dkmt_open_shared_resource_with_desc( share_handle, &mutex, &sync, &desc );
+    if (mutex) d3dkmt_destroy_mutex( mutex );
+    if (sync) d3dkmt_destroy_sync( sync );
+    if (!local)
+    {
+        WARN( "Failed to open shared D3DKMT resource for handle %p\n", share_handle );
+        return FALSE;
+    }
+
+    if (!wgl_dx_validate_resource_desc( &desc, gl_type, &gl_format, &size ))
+    {
+        d3dkmt_destroy_resource( local );
+        return FALSE;
+    }
+
+    fd = d3dkmt_object_get_fd( local );
+    d3dkmt_destroy_resource( local );
+    if (fd < 0)
+    {
+        WARN( "Failed to obtain shared resource fd\n" );
+        return FALSE;
+    }
+    if (!(size = wgl_dx_get_fd_size( fd, size )))
+    {
+        close( fd );
+        return FALSE;
+    }
+
+    wgl_dx_drain_gl_errors();
+    display_funcs.p_glCreateMemoryObjectsEXT( 1, &memory );
+    if ((err = display_funcs.p_glGetError()) || !memory)
+    {
+        WARN( "glCreateMemoryObjectsEXT failed with %#x\n", err );
+        if (memory) display_funcs.p_glDeleteMemoryObjectsEXT( 1, &memory );
+        close( fd );
+        return FALSE;
+    }
+
+    display_funcs.p_glImportMemoryFdEXT( memory, size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd );
+    if ((err = display_funcs.p_glGetError()))
+    {
+        WARN( "glImportMemoryFdEXT failed with %#x\n", err );
+        close( fd );
+        display_funcs.p_glDeleteMemoryObjectsEXT( 1, &memory );
+        return FALSE;
+    }
+
+    display_funcs.p_glGetIntegerv( GL_TEXTURE_BINDING_2D, &previous );
+    display_funcs.p_glBindTexture( GL_TEXTURE_2D, gl_name );
+    if (gl_format.bgra_swizzle)
+    {
+        wgl_dx_apply_bgra_swizzle();
+        err = display_funcs.p_glGetError();
+    }
+    else err = GL_NO_ERROR;
+    if (!err)
+    {
+        display_funcs.p_glTexStorageMem2DEXT( GL_TEXTURE_2D, 1, gl_format.internal_format, desc.width, desc.height, memory, 0 );
+        err = display_funcs.p_glGetError();
+    }
+    display_funcs.p_glBindTexture( GL_TEXTURE_2D, previous );
+    if (err)
+    {
+        WARN( "Failed to initialize WGL/DX texture storage with %#x\n", err );
+        display_funcs.p_glDeleteMemoryObjectsEXT( 1, &memory );
+        return FALSE;
+    }
+
+    object->memory = memory;
+    object->width = desc.width;
+    object->height = desc.height;
+    return TRUE;
+}
+
+static BOOL wgl_dx_functions_supported(void)
+{
+    return display_funcs.p_glBindTexture && display_funcs.p_glCreateMemoryObjectsEXT &&
+           display_funcs.p_glDeleteMemoryObjectsEXT && display_funcs.p_glFinish &&
+           display_funcs.p_glGetError && display_funcs.p_glGetIntegerv &&
+           display_funcs.p_glImportMemoryFdEXT && display_funcs.p_glTexParameteriv &&
+           display_funcs.p_glTexStorageMem2DEXT;
+}
+
+static HANDLE win32u_wglDXOpenDeviceNV( void *dx_device )
+{
+    struct wgl_dx_device *device;
+
+    TRACE( "dx_device %p\n", dx_device );
+
+    if (!wgl_dx_supported || !dx_device) return NULL;
+    if (!(device = calloc( 1, sizeof(*device) ))) return NULL;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    device->handle = wgl_dx_alloc_handle();
+    device->dx_device = dx_device;
+    list_init( &device->objects );
+    list_add_tail( &wgl_dx_devices, &device->entry );
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    return device->handle;
+}
+
+static BOOL win32u_wglDXCloseDeviceNV( HANDLE handle )
+{
+    struct wgl_dx_object *object, *next;
+    struct list objects = LIST_INIT( objects );
+    struct wgl_dx_device *device;
+
+    TRACE( "handle %p\n", handle );
+
+    if (!wgl_dx_supported || !handle) return FALSE;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if (!(device = wgl_dx_get_device_locked( handle )))
+    {
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        return FALSE;
+    }
+    list_remove( &device->entry );
+    list_move_tail( &objects, &device->objects );
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    LIST_FOR_EACH_ENTRY_SAFE( object, next, &objects, struct wgl_dx_object, entry )
+    {
+        list_remove( &object->entry );
+        wgl_dx_delete_object( object );
+    }
+    free( device );
+    return TRUE;
+}
+
+static HANDLE win32u_wglDXRegisterObjectNV( HANDLE device_handle, void *dx_object,
+                                            GLuint name, GLenum type, GLenum access )
+{
+    struct wgl_dx_share_handle *share;
+    struct wgl_dx_device *device;
+    struct wgl_dx_object *object;
+    HANDLE share_handle;
+    BOOL remove_share_handle = FALSE;
+
+    TRACE( "device %p, dx_object %p, name %u, type %#x, access %#x\n",
+           device_handle, dx_object, name, type, access );
+
+    if (!wgl_dx_supported || !device_handle || !dx_object || !name || !wgl_dx_valid_access( access ))
+        return NULL;
+    if (!NtCurrentTeb()->glContext)
+    {
+        WARN( "No current GL context for WGL/DX registration\n" );
+        return NULL;
+    }
+    if (!(object = calloc( 1, sizeof(*object) ))) return NULL;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if (!(device = wgl_dx_get_device_locked( device_handle )))
+    {
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        free( object );
+        return NULL;
+    }
+    if ((share = wgl_dx_get_share_handle_locked( dx_object )))
+    {
+        share_handle = share->share_handle;
+        remove_share_handle = TRUE;
+    }
+    else share_handle = dx_object;
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    if (!wgl_dx_import_texture( share_handle, name, type, object ))
+    {
+        free( object );
+        return NULL;
+    }
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if (!(device = wgl_dx_get_device_locked( device_handle )))
+    {
+        if (remove_share_handle) wgl_dx_remove_share_handle_locked( dx_object, share_handle );
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        wgl_dx_delete_object( object );
+        return NULL;
+    }
+    object->handle = wgl_dx_alloc_handle();
+    object->dx_object = dx_object;
+    object->gl_name = name;
+    object->gl_type = type;
+    object->access = access;
+    list_add_tail( &device->objects, &object->entry );
+    if (remove_share_handle) wgl_dx_remove_share_handle_locked( dx_object, share_handle );
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    return object->handle;
+}
+
+static BOOL win32u_wglDXUnregisterObjectNV( HANDLE device_handle, HANDLE object_handle )
+{
+    struct wgl_dx_device *device;
+    struct wgl_dx_object *object;
+
+    TRACE( "device %p, object %p\n", device_handle, object_handle );
+
+    if (!wgl_dx_supported || !device_handle || !object_handle) return FALSE;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if (!(device = wgl_dx_get_device_locked( device_handle )) ||
+        !(object = wgl_dx_get_object_locked( device, object_handle )) || object->locked)
+    {
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        return FALSE;
+    }
+    list_remove( &object->entry );
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    wgl_dx_delete_object( object );
+    return TRUE;
+}
+
+static BOOL win32u_wglDXObjectAccessNV( HANDLE object_handle, GLenum access )
+{
+    struct wgl_dx_device *device;
+    struct wgl_dx_object *object;
+
+    TRACE( "object %p, access %#x\n", object_handle, access );
+
+    if (!wgl_dx_supported || !object_handle || !wgl_dx_valid_access( access )) return FALSE;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    LIST_FOR_EACH_ENTRY( device, &wgl_dx_devices, struct wgl_dx_device, entry )
+    {
+        if ((object = wgl_dx_get_object_locked( device, object_handle )))
+        {
+            if (object->locked)
+            {
+                pthread_mutex_unlock( &wgl_dx_mutex );
+                return FALSE;
+            }
+            object->access = access;
+            pthread_mutex_unlock( &wgl_dx_mutex );
+            return TRUE;
+        }
+    }
+    pthread_mutex_unlock( &wgl_dx_mutex );
+    return FALSE;
+}
+
+static BOOL win32u_wglDXLockObjectsNV( HANDLE device_handle, GLint count, HANDLE *handles )
+{
+    struct wgl_dx_device *device;
+    struct wgl_dx_object *object;
+    GLint i;
+
+    TRACE( "device %p, count %d, handles %p\n", device_handle, count, handles );
+
+    if (!wgl_dx_supported || !NtCurrentTeb()->glContext ||
+        !device_handle || count < 0 || (count && !handles))
+        return FALSE;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if (!(device = wgl_dx_get_device_locked( device_handle )))
+    {
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        return FALSE;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        if (!(object = wgl_dx_get_object_locked( device, handles[i] )) || object->locked)
+        {
+            pthread_mutex_unlock( &wgl_dx_mutex );
+            return FALSE;
+        }
+    }
+    for (i = 0; i < count; ++i)
+    {
+        object = wgl_dx_get_object_locked( device, handles[i] );
+        object->locked = TRUE;
+    }
+    pthread_mutex_unlock( &wgl_dx_mutex );
+    return TRUE;
+}
+
+static BOOL win32u_wglDXUnlockObjectsNV( HANDLE device_handle, GLint count, HANDLE *handles )
+{
+    struct wgl_dx_device *device;
+    struct wgl_dx_object *object;
+    GLint i;
+
+    TRACE( "device %p, count %d, handles %p\n", device_handle, count, handles );
+
+    if (!wgl_dx_supported || !NtCurrentTeb()->glContext ||
+        !device_handle || count < 0 || (count && !handles))
+        return FALSE;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if (!(device = wgl_dx_get_device_locked( device_handle )))
+    {
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        return FALSE;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        if (!(object = wgl_dx_get_object_locked( device, handles[i] )) || !object->locked)
+        {
+            pthread_mutex_unlock( &wgl_dx_mutex );
+            return FALSE;
+        }
+    }
+    display_funcs.p_glFinish();
+    for (i = 0; i < count; ++i)
+    {
+        object = wgl_dx_get_object_locked( device, handles[i] );
+        object->locked = FALSE;
+    }
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    return TRUE;
+}
+
+static BOOL win32u_wglDXSetResourceShareHandleNV( void *dx_object, HANDLE share_handle )
+{
+    struct wgl_dx_share_handle *existing, *share;
+
+    TRACE( "dx_object %p, share_handle %p\n", dx_object, share_handle );
+
+    if (!wgl_dx_supported || !dx_object || !share_handle) return FALSE;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if ((share = wgl_dx_get_share_handle_locked( dx_object )))
+    {
+        share->share_handle = share_handle;
+        pthread_mutex_unlock( &wgl_dx_mutex );
+        return TRUE;
+    }
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    if (!(share = calloc( 1, sizeof(*share) ))) return FALSE;
+    share->dx_object = dx_object;
+    share->share_handle = share_handle;
+
+    pthread_mutex_lock( &wgl_dx_mutex );
+    if ((existing = wgl_dx_get_share_handle_locked( dx_object )))
+    {
+        free( share );
+        existing->share_handle = share_handle;
+    }
+    else list_add_tail( &wgl_dx_share_handles, &share->entry );
+    pthread_mutex_unlock( &wgl_dx_mutex );
+
+    return TRUE;
+}
+
 static void display_funcs_init(void)
 {
     struct egl_platform *egl;
@@ -3394,6 +3960,8 @@ static void display_funcs_init(void)
     strcpy( wgl_extensions, driver_funcs->p_init_wgl_extensions( &display_funcs ) );
     display_funcs.p_wglGetPixelFormat = win32u_wglGetPixelFormat;
     display_funcs.p_wglSetPixelFormat = win32u_wglSetPixelFormat;
+    display_funcs.p_wglWineDmaBufExportSupportedWINE = driver_funcs->p_get_proc_address( "wglWineDmaBufExportSupportedWINE" );
+    display_funcs.p_wglWineExportDmaBufWINE = driver_funcs->p_get_proc_address( "wglWineExportDmaBufWINE" );
 
     display_funcs.p_wglCreateContext = (void *)1; /* never called */
     display_funcs.p_wglDeleteContext = (void *)1; /* never called */
@@ -3455,6 +4023,32 @@ static void display_funcs_init(void)
     register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_EXT_swap_control_tear" );
     display_funcs.p_wglSwapIntervalEXT = win32u_wglSwapIntervalEXT;
     display_funcs.p_wglGetSwapIntervalEXT = win32u_wglGetSwapIntervalEXT;
+
+    wgl_dx_supported = wgl_dx_functions_supported();
+    if (wgl_dx_supported)
+    {
+        display_funcs.p_wglDXOpenDeviceNV             = win32u_wglDXOpenDeviceNV;
+        display_funcs.p_wglDXCloseDeviceNV            = win32u_wglDXCloseDeviceNV;
+        display_funcs.p_wglDXRegisterObjectNV         = win32u_wglDXRegisterObjectNV;
+        display_funcs.p_wglDXUnregisterObjectNV       = win32u_wglDXUnregisterObjectNV;
+        display_funcs.p_wglDXLockObjectsNV            = win32u_wglDXLockObjectsNV;
+        display_funcs.p_wglDXUnlockObjectsNV          = win32u_wglDXUnlockObjectsNV;
+        display_funcs.p_wglDXObjectAccessNV           = win32u_wglDXObjectAccessNV;
+        display_funcs.p_wglDXSetResourceShareHandleNV = win32u_wglDXSetResourceShareHandleNV;
+        register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_NV_DX_interop" );
+        register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_NV_DX_interop2" );
+    }
+    else
+    {
+        display_funcs.p_wglDXOpenDeviceNV = NULL;
+        display_funcs.p_wglDXCloseDeviceNV = NULL;
+        display_funcs.p_wglDXRegisterObjectNV = NULL;
+        display_funcs.p_wglDXUnregisterObjectNV = NULL;
+        display_funcs.p_wglDXLockObjectsNV = NULL;
+        display_funcs.p_wglDXUnlockObjectsNV = NULL;
+        display_funcs.p_wglDXObjectAccessNV = NULL;
+        display_funcs.p_wglDXSetResourceShareHandleNV = NULL;
+    }
 
     if (display_funcs.p_glImportMemoryFdEXT)
     {
