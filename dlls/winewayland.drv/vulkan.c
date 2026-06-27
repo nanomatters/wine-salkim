@@ -158,14 +158,18 @@ static VkResult wayland_vulkan_surface_configure(VkColorSpaceKHR *colorspace,
 
         if (!wp_image_description_v1) goto err;
     }
-    else if (process_wayland.supports_win_pq &&
-             old == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+    else if (old == VK_COLOR_SPACE_HDR10_ST2084_EXT)
     {
-        *colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
-        wp_image_description_v1 =
-            wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
+        static BOOL warned;
 
-        if (!wp_image_description_v1) goto err;
+        wp_image_description_v1 = wayland_color_manager_create_windows_bt2100();
+        if (wp_image_description_v1)
+            *colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+        else if (!warned)
+        {
+            warned = TRUE;
+            TRACE("No safe Windows BT.2100 path for HDR10 ST2084 colorspace.\n");
+        }
     }
 
     TRACE("mapping colorspace %u => %u\n", old, *colorspace);

@@ -64,6 +64,7 @@ static const char devpropkey_device_ispresentA[] = "Properties\\{540B947E-8B40-4
 static const char devpropkey_monitor_gpu_luidA[] = "Properties\\{CA085853-16CE-48AA-B114-DE9C72334223}\\0001";
 static const char devpropkey_monitor_output_idA[] = "Properties\\{CA085853-16CE-48AA-B114-DE9C72334223}\\0002";
 static const char wine_devpropkey_monitor_rcworkA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0004";
+static const char wine_devpropkey_monitor_hdr_supportedA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0005";
 static const char wine_devpropkey_monitor_hdr_enabledA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0006";
 
 static const WCHAR linkedW[] = {'L','i','n','k','e','d',0};
@@ -156,6 +157,7 @@ struct monitor
     RECT rc_work;
     BOOL is_clone;
     struct edid_monitor_info edid_info;
+    BOOL hdr_supported;
     BOOL hdr_enabled;
 };
 
@@ -829,6 +831,14 @@ static BOOL read_monitor_from_registry( struct monitor *monitor )
         return FALSE;
     }
     monitor->hdr_enabled = *(const BOOL *)value->Data;
+
+    /* WINE_DEVPROPKEY_MONITOR_HDR_SUPPORTED */
+    size = query_reg_subkey_value( hkey, wine_devpropkey_monitor_hdr_supportedA,
+                                   value, sizeof(buffer) );
+    if (size == sizeof(monitor->hdr_supported))
+        monitor->hdr_supported = *(const BOOL *)value->Data;
+    else
+        monitor->hdr_supported = monitor->hdr_enabled;
 
     NtClose( hkey );
     return TRUE;
@@ -2064,6 +2074,14 @@ static BOOL write_monitor_to_registry( struct monitor *monitor, const BYTE *edid
         NtClose( subkey );
     }
 
+    /* WINE_DEVPROPKEY_MONITOR_HDR_SUPPORTED */
+    if ((subkey = reg_create_ascii_key( hkey, wine_devpropkey_monitor_hdr_supportedA, 0, NULL )))
+    {
+        set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_BOOLEAN,
+                       &monitor->hdr_supported, sizeof(monitor->hdr_supported) );
+        NtClose( subkey );
+    }
+
     NtClose( hkey );
 
 
@@ -2093,6 +2111,7 @@ static void add_monitor( const struct gdi_monitor *gdi_monitor, void *param )
     monitor->id = source->monitor_count;
     monitor->output_id = ctx->monitor_count;
     monitor->rc_work = gdi_monitor->rc_work;
+    monitor->hdr_supported = gdi_monitor->hdr_supported;
     monitor->hdr_enabled = gdi_monitor->hdr_enabled;
 
     TRACE( "%u %s %s\n", monitor->id, wine_dbgstr_rect(&gdi_monitor->rc_monitor), wine_dbgstr_rect(&gdi_monitor->rc_work) );
@@ -8260,18 +8279,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
 
-            if (monitor->hdr_enabled)
-            {
-                color_info->advancedColorSupported = 1;
-                color_info->advancedColorEnabled = 1;
-                color_info->bitsPerColorChannel = 10;
-            }
-            else
-            {
-                color_info->advancedColorSupported = 0;
-                color_info->advancedColorEnabled = 0;
-                color_info->bitsPerColorChannel = 8;
-            }
+            color_info->advancedColorSupported = monitor->hdr_supported;
+            color_info->advancedColorEnabled = monitor->hdr_enabled;
+            color_info->bitsPerColorChannel = monitor->hdr_enabled ? 10 : 8;
             color_info->wideColorEnforced = 0;
             color_info->advancedColorForceDisabled = 0;
             color_info->colorEncoding = DISPLAYCONFIG_COLOR_ENCODING_RGB;

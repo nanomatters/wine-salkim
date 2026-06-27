@@ -313,9 +313,13 @@ struct wayland
     /* Protects the output_list and the wayland_output.current states. */
     pthread_mutex_t output_mutex;
     LONG input_serial;
+    BOOL supports_parametric;
     BOOL supports_pq;
     BOOL supports_scrgb;
-    BOOL supports_win_pq;
+    BOOL supports_windows_bt2100;
+    BOOL supports_set_primaries;
+    BOOL supports_set_luminances;
+    BOOL supports_bt2020_primaries;
     BOOL supports_extended_volume;
 };
 
@@ -569,7 +573,16 @@ void wayland_output_destroy(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
 void wayland_output_use_image_description(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect);
+BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);
+BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len);
+UINT wayland_generic_output_get_edid_override(const char *output_name, unsigned char **edid);
+UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned char **edid);
+UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
+                                     BOOL hdr_supported, unsigned char **edid);
 void wayland_color_manager_init(void);
+BOOL wayland_color_manager_can_present_bt2100(void);
+BOOL wayland_color_manager_may_support_hdr(void);
+struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void);
 
 /**********************************************************************
  *          Wayland surface
