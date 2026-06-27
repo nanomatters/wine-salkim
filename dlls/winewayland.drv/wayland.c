@@ -53,9 +53,13 @@ struct wayland process_wayland =
     .output_list = {&process_wayland.output_list, &process_wayland.output_list},
     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
     .supports_extended_volume = FALSE,
+    .supports_parametric = FALSE,
     .supports_pq = FALSE,
     .supports_scrgb = FALSE,
-    .supports_win_pq = FALSE
+    .supports_windows_bt2100 = FALSE,
+    .supports_set_primaries = FALSE,
+    .supports_set_luminances = FALSE,
+    .supports_bt2020_primaries = FALSE
 };
 
 /**********************************************************************
