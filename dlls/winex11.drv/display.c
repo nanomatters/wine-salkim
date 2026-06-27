@@ -529,6 +529,7 @@ UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manage
             /* Initialize monitors */
             for (monitor = 0; monitor < monitor_count; monitor++)
             {
+                monitors[monitor].hdr_supported = hdr_enabled;
                 monitors[monitor].hdr_enabled = hdr_enabled;
                 device_manager->add_monitor( &monitors[monitor], param );
             }
