@@ -114,10 +114,18 @@ static void wayland_color_manager_handle_supported_feature(void *data,
 
     TRACE("feature %u\n", feature);
 
-    if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB)
+    if (feature == WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC)
+        process_wayland.supports_parametric = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES)
+        process_wayland.supports_set_primaries = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES)
+        process_wayland.supports_set_luminances = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB)
         process_wayland.supports_win_scrgb = TRUE;
     else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100)
-        process_wayland.supports_win_pq = TRUE;
+        process_wayland.supports_windows_bt2100 = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_EXTENDED_TARGET_VOLUME)
+        process_wayland.supports_extended_volume = TRUE;
 
     pthread_mutex_unlock(&process_wayland.output_mutex);
 }
@@ -125,11 +133,27 @@ static void wayland_color_manager_handle_supported_feature(void *data,
 static void wayland_color_manager_handle_supported_named_tf(void *data,
     struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t tf)
 {
+    pthread_mutex_lock(&process_wayland.output_mutex);
+
+    TRACE("named tf %u\n", tf);
+
+    if (tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ)
+        process_wayland.supports_pq = TRUE;
+
+    pthread_mutex_unlock(&process_wayland.output_mutex);
 }
 
 static void wayland_color_manager_handle_supported_primaries(void *data,
     struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t primaries)
 {
+    pthread_mutex_lock(&process_wayland.output_mutex);
+
+    TRACE("primaries %u\n", primaries);
+
+    if (primaries == WP_COLOR_MANAGER_V1_PRIMARIES_BT2020)
+        process_wayland.supports_bt2020_primaries = TRUE;
+
+    pthread_mutex_unlock(&process_wayland.output_mutex);
 }
 
 static void wayland_color_manager_handle_done(void *data,
@@ -736,8 +760,8 @@ BOOL wayland_process_init(void)
     if (!process_wayland.xdg_activation_v1)
         ERR("Wayland compositor doesn't support xdg_activation_v1! (Window Activation will not be supported)\n");
 
-    if (!process_wayland.supports_win_pq)
-        ERR("Wayland compositor doesn't expose windows_bt2100 image description (HDR may look broken)!\n");
+    if (!wayland_color_manager_can_present_bt2100())
+        ERR("Wayland compositor cannot present Windows BT.2100 (HDR may look broken)!\n");
 
     if (!process_wayland.supports_win_scrgb)
         ERR("Wayland compositor doesn't expose windows_scrgb image description (HDR may look broken)!\n");

@@ -10,6 +10,7 @@ SOURCES = \
 	content-type-v1.xml \
 	cursor-shape-v1.xml \
 	display.c \
+	generic_output_device.c \
 	linux-dmabuf-unstable-v1.xml \
 	dllmain.c \
 	fractional-scale-v1.xml \

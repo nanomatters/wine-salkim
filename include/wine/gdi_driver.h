@@ -345,6 +345,7 @@ struct gdi_monitor
     RECT rc_work;         /* RcWork in MONITORINFO struct */
     unsigned char *edid;  /* Extended Device Identification Data */
     UINT edid_len;
+    BOOL hdr_supported;
     BOOL hdr_enabled;
 };
 
