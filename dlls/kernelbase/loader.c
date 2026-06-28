@@ -623,17 +623,18 @@ BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
     ret = GetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", envW, sizeof(envW));
     if ( !ret || ret >= ARRAY_SIZE(envW) ) return FALSE;
 
-    if ( wcsstr( envW, L"fsr3" ) )
+    if ( wcsstr( envW, L"ffx3" ) )
     {
-        /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR3 upgrade */
+        /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR3 SDK upgrade */
         if (wcsstr( name, L"amd_fidelityfx_vk.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_vk.dll" );
         if (wcsstr( name, L"amd_fidelityfx_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_dx12.dll" );
     }
-    if ( wcsstr( envW, L"fsr4" ) )
+    if ( wcsstr( envW, L"ffx4" ) )
     {
-        /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 upgrade */
-        /* Using strict comparison here instead of string search to not override loads with absolute paths (optiscaler) */
-        if (!wcscmp( name, L"amdxcffx64.dll" )) wcscpy( override, L"c:\\windows\\system32\\amdxcffx64.dll" );
+        /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR4 SDK upgrade */
+        if (wcsstr( name, L"amd_fidelityfx_loader_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_loader_dx12.dll" );
+        if (wcsstr( name, L"amd_fidelityfx_upscaler_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_upscaler_dx12.dll" );
+        if (wcsstr( name, L"amd_fidelityfx_framegeneration_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_framegeneration_dx12.dll" );
     }
     if ( wcsstr( envW, L"dlss" ) )
     {
@@ -650,6 +651,12 @@ BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
         if (wcsstr( name, L"libxess_dx11.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxess_dx11.dll" );
         if (wcsstr( name, L"libxell.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxell.dll" );
         if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxess_fg.dll" );
+    }
+    if ( wcsstr( envW, L"fsr4" ) )
+    {
+        /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 driver upgrade */
+        /* Using strict comparison here instead of string search to not override loads with absolute paths (optiscaler) */
+        if (!wcscmp( name, L"amdxcffx64.dll" )) wcscpy( override, L"c:\\windows\\system32\\amdxcffx64.dll" );
     }
 
     return override[0] ? TRUE : FALSE;
