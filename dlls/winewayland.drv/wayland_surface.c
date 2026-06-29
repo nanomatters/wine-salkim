@@ -3305,10 +3305,14 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
     }
-    /* If this is the initial configure, and we have a compatible requested
-     * config, use that, in order to draw windows that don't go through the
-     * message loop (e.g., some splash screens). */
-    else if (!surface->current.serial && surface->requested.serial &&
+    /* Initial configure, or a fullscreen/maximized transition: ack from the
+     * requested state so a dmabuf-only toplevel finalizes without the win32
+     * resize round-trip. */
+    else if (surface->requested.serial &&
+             (!surface->current.serial ||
+              (surface->requested.state &
+               (WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
+                WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))) &&
              wayland_surface_config_is_compatible(&surface->requested,
                                                   width, height,
                                                   window->state))
@@ -3316,6 +3320,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
         if (surface->requested.serial != surface->current.serial)
             xdg_surface_ack_configure(surface->xdg_surface, surface->requested.serial);
         surface->current = surface->requested;
+        memset(&surface->processing, 0, sizeof(surface->processing));
         memset(&surface->requested, 0, sizeof(surface->requested));
         /* decoration changes must go through the message loop */
         surface->requested.decor = surface->current.decor;
