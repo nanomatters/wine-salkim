@@ -506,6 +506,7 @@ struct wayland_win_data;
 struct wayland_surface
 {
     HWND hwnd;
+    unsigned int serial;
 
     struct wl_surface *wl_surface;
     struct wp_viewport *wp_viewport;
@@ -537,6 +538,7 @@ struct wayland_surface
         {
             struct wl_subsurface *wl_subsurface;
             HWND toplevel_hwnd;
+            unsigned int parent_serial;
         };
         struct
         {

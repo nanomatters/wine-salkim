@@ -40,6 +40,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
+static LONG wayland_surface_serial_counter;
+
 static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
                                                 struct wayland_win_data *data);
 static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
@@ -1198,6 +1200,7 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
     TRACE("surface=%p\n", surface);
 
     surface->hwnd = hwnd;
+    surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
     wl_list_init(&surface->hwnd_dmabuf_surfaces);
     wl_list_init(&surface->child_overlays);
     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
@@ -1470,7 +1473,13 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent)
 {
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE);
-    if (surface->wl_subsurface && surface->toplevel_hwnd == parent->hwnd) return;
+    if (surface->wl_subsurface && surface->toplevel_hwnd == parent->hwnd)
+    {
+        if (surface->parent_serial == parent->serial) return;
+
+        TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
+              surface->hwnd, parent->hwnd, surface->parent_serial, parent->serial);
+    }
 
     wayland_surface_clear_role(surface);
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
@@ -1485,6 +1494,9 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
     wayland_surface_init_fractional_scale(surface, parent->window.scale);
     wayland_surface_sync_alpha(surface);
     surface->toplevel_hwnd = parent->hwnd;
+    surface->parent_serial = parent->serial;
+
+    /* Present contents independently of the parent surface. */
     wl_subsurface_set_desync(surface->wl_subsurface);
     wl_display_flush(process_wayland.wl_display);
     return;
@@ -1877,6 +1889,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
         }
 
         surface->toplevel_hwnd = 0;
+        surface->parent_serial = 0;
         break;
     }
 
@@ -3323,6 +3336,15 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
     if (!(toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) ||
         !(toplevel_surface = toplevel_data->wayland_surface))
         return;
+
+    if (surface->parent_serial != toplevel_surface->serial)
+    {
+        TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
+              surface->hwnd, toplevel_surface->hwnd, surface->parent_serial,
+              toplevel_surface->serial);
+        wayland_surface_make_subsurface(surface, toplevel_surface);
+        return;
+    }
 
     point.x = surface->window.rect.left - toplevel_surface->window.rect.left;
     point.y = surface->window.rect.top - toplevel_surface->window.rect.top;
