@@ -1638,6 +1638,24 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
     return TRUE;
 }
 
+BOOL set_window_surface_clip( HWND hwnd )
+{
+    WND *win = get_win_ptr( hwnd );
+    BOOL changed = FALSE;
+
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+    {
+        NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
+        return FALSE;
+    }
+
+    if (!win->clip_from_parent) changed = win->clip_from_parent = TRUE;
+    release_win_ptr( win );
+
+    if (changed) update_window_state( hwnd );
+    return TRUE;
+}
+
 int get_window_pixel_format( HWND hwnd )
 {
     WND *win = get_win_ptr( hwnd );
@@ -2393,6 +2411,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         if (new_surface) req->paint_flags |= SET_WINPOS_PAINT_SURFACE;
         if (is_layered) req->paint_flags |= SET_WINPOS_LAYERED_WINDOW;
         else if (win->clip_clients) req->paint_flags |= SET_WINPOS_PIXEL_FORMAT;
+        if (win->clip_from_parent) req->paint_flags |= SET_WINPOS_CLIP_CLIENT;
 
         if ((ret = !wine_server_call( req )))
         {

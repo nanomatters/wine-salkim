@@ -49,6 +49,7 @@
 
 #include "x11drv.h"
 #include "wingdi.h"
+#include "ntuser.h"
 #include "winuser.h"
 
 #include "wine/debug.h"
@@ -56,6 +57,14 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(systray);
+
+static void mark_direct_draw_child( HWND hwnd, HWND top )
+{
+    if (!hwnd || hwnd == top) return;
+
+    /* The owner process latches the flag, so repeated posts from foreign drawing processes are harmless. */
+    NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
+}
 
 #define _NET_WM_MOVERESIZE_SIZE_TOPLEFT      0
 #define _NET_WM_MOVERESIZE_SIZE_TOP          1
@@ -3466,6 +3475,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     {
         escape.drawable = X11DRV_get_whole_window( top );
         escape.visual = default_visual; /* FIXME: use the right visual for other process window */
+        if (escape.drawable) mark_direct_draw_child( hwnd, top );
     }
 
     if (!escape.drawable) return; /* don't create a GC for foreign windows */

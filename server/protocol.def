@@ -2893,6 +2893,7 @@ enum message_type
 #define SET_WINPOS_PAINT_SURFACE    0x01  /* window has a paintable surface */
 #define SET_WINPOS_PIXEL_FORMAT     0x02  /* window has a custom pixel format */
 #define SET_WINPOS_LAYERED_WINDOW   0x04  /* window is drawn with UpdateLayeredWindow */
+#define SET_WINPOS_CLIP_CLIENT      0x08  /* window client is clipped out of parent surfaces */
 
 /* Get the window and client rectangles of a window */
 @REQ(get_window_rectangles)
