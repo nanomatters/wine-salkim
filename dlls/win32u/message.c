@@ -2278,6 +2278,9 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case WM_WINE_SETPIXELFORMAT:
         set_window_pixel_format( hwnd, wparam, lparam );
         return 0;
+    case WM_WINE_SETWINDOWSURFACECLIP:
+        set_window_surface_clip( hwnd );
+        return 0;
     case WM_WINE_TRACKMOUSEEVENT:
     {
         TRACKMOUSEEVENT info;
