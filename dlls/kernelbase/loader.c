@@ -652,12 +652,6 @@ BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
         if (wcsstr( name, L"libxell.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxell.dll" );
         if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxess_fg.dll" );
     }
-    if ( wcsstr( envW, L"fsr4" ) )
-    {
-        /* HACK: override amdxcffx64.dll path to a non-standard location for FSR4 driver upgrade */
-        /* Using strict comparison here instead of string search to not override loads with absolute paths (optiscaler) */
-        if (!wcscmp( name, L"amdxcffx64.dll" )) wcscpy( override, L"c:\\windows\\system32\\amdxcffx64.dll" );
-    }
 
     return override[0] ? TRUE : FALSE;
 }
