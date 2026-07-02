@@ -276,6 +276,22 @@ static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surfac
            (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
 }
 
+static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
+{
+    if (!(style & WS_POPUP)) return FALSE;
+    if ((style & WS_CAPTION) == WS_CAPTION) return FALSE;
+    if (style & WS_SYSMENU) return FALSE;
+    if (exstyle & WS_EX_APPWINDOW) return FALSE;
+    return TRUE;
+}
+
+static BOOL should_defer_ownerless_menu_popup(DWORD style, DWORD exstyle, BOOL fullscreen)
+{
+    if (!(exstyle & WS_EX_TOOLWINDOW)) return FALSE;
+    if (fullscreen) return FALSE;
+    return is_menu_popup_candidate_style(style, exstyle);
+}
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
                                                     struct wayland_surface *owner_surface,
@@ -314,6 +330,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (use_layer_shell && !IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_LAYER;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    else if (should_defer_ownerless_menu_popup(style, exstyle, data->is_fullscreen)) role = WAYLAND_SURFACE_ROLE_NONE;
     else if (!IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     else role = WAYLAND_SURFACE_ROLE_NONE;
 
@@ -371,7 +388,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     switch (role)
     {
     case WAYLAND_SURFACE_ROLE_NONE:
-        wayland_surface_clear_role(surface);
+        if (surface->role) wayland_surface_clear_role(surface);
         break;
     case WAYLAND_SURFACE_ROLE_POPUP:
         wayland_surface_make_popup(surface, owner_surface, &data->rects.window);
@@ -712,40 +729,53 @@ static BOOL has_parent_cycle(HWND hwnd, struct wayland_surface *parent)
     return has_parent_cycle(hwnd, grandparent);
 }
 
-/* An owned, caption-less, sysmenu-less popup is a menu. Force it unmanaged so it
- * becomes an xdg_popup, not a compositor-centered toplevel. */
-BOOL wayland_is_menu_popup(HWND hwnd)
+/* Caption-less, sysmenu-less popups are menu-like transient windows. When they
+ * have an owner, force them unmanaged so they become xdg_popups, not
+ * compositor-positioned toplevels. */
+BOOL wayland_is_menu_popup_candidate(HWND hwnd)
 {
     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    DWORD exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
 
-    if (!(style & WS_POPUP)) return FALSE;
-    if ((style & WS_CAPTION) == WS_CAPTION) return FALSE;
-    if (style & WS_SYSMENU) return FALSE;
-    if (NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW) return FALSE;
-    /* must be owned so there is an owner toplevel/popup to anchor against */
-    if (NtUserGetAncestor(hwnd, GA_ROOTOWNER) == hwnd) return FALSE;
-    return TRUE;
+    return is_menu_popup_candidate_style(style, exstyle);
+}
+
+static HWND get_menu_popup_owner(HWND hwnd, HWND owner_hint)
+{
+    HWND owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
+
+    if (!owner) owner = owner_hint;
+    if (!owner || owner == hwnd || owner == NtUserGetDesktopWindow() ||
+        !NtUserIsWindow(owner))
+        return NULL;
+
+    owner = NtUserGetAncestor(owner, GA_ROOT);
+    if (!owner || owner == hwnd || owner == NtUserGetDesktopWindow() ||
+        !NtUserIsWindow(owner))
+        return NULL;
+
+    return owner;
+}
+
+BOOL wayland_is_menu_popup(HWND hwnd)
+{
+    if (!wayland_is_menu_popup_candidate(hwnd)) return FALSE;
+    return !!get_menu_popup_owner(hwnd, NULL);
 }
 
 static BOOL is_layer_shell_menu_popup(HWND hwnd)
 {
-    DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-
-    if (!(style & WS_POPUP)) return FALSE;
-    if ((style & WS_CAPTION) == WS_CAPTION) return FALSE;
-    if (style & WS_SYSMENU) return FALSE;
-    if (NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW) return FALSE;
-    return wayland_is_popup_menu_class(hwnd);
+    return wayland_is_menu_popup_candidate(hwnd) && wayland_is_popup_menu_class(hwnd);
 }
 
-static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+static BOOL is_window_managed(HWND hwnd, HWND menu_popup_owner, UINT swp_flags, BOOL fullscreen)
 {
     DWORD style, ex_style;
 
     /* child windows are not managed */
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
-    if (wayland_is_menu_popup(hwnd)) return FALSE;
+    if (wayland_is_menu_popup_candidate(hwnd) && menu_popup_owner) return FALSE;
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
     if (hwnd == get_active_window()) return TRUE;
@@ -810,7 +840,7 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL;
+    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL, menu_popup_owner = NULL;
     /* GA_ROOT host of any GDI child overlays, resolved independently below. */
     HWND overlay_toplevel = toplevel;
     struct child_overlay_snapshot *snapshot = NULL;
@@ -824,7 +854,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* Get the managed state with win_data unlocked, as is_window_managed
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
-    managed = is_window_managed(hwnd, swp_flags, fullscreen);
+    menu_popup_owner = wayland_is_menu_popup_candidate(hwnd) ? get_menu_popup_owner(hwnd, owner_hint) : NULL;
+    managed = is_window_managed(hwnd, menu_popup_owner, swp_flags, fullscreen);
     if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
     {
         managed = FALSE;
@@ -834,13 +865,14 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     else if (!managed && surface)
     {
         toplevel = NULL;
-        owner = owner_hint;
+        owner = menu_popup_owner ? menu_popup_owner : owner_hint;
         use_layer_shell = owner && process_wayland.zwlr_layer_shell_v1 &&
                           is_layer_shell_menu_popup(hwnd);
     }
 
-    TRACE("hwnd %p toplevel %p owner %p new_rects %s after %p flags %08x\n", hwnd, toplevel, owner,
-          debugstr_window_rects(new_rects), insert_after, swp_flags);
+    TRACE("hwnd %p toplevel %p owner %p owner_hint %p menu_owner %p new_rects %s after %p flags %08x\n",
+          hwnd, toplevel, owner, owner_hint, menu_popup_owner, debugstr_window_rects(new_rects),
+          insert_after, swp_flags);
 
     /* A child moved, restacked or changed visibility. Snapshot the toplevel's
      * overlay stack outside win_data_mutex so overlays track the window tree
