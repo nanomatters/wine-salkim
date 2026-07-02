@@ -1656,7 +1656,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
     if (!surface->xdg_popup) goto err;
     xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
 
-    if (wayland_is_menu_popup(surface->hwnd))
+    if (wayland_is_menu_popup_candidate(surface->hwnd))
         grab_serial = popup_grab_serial_for_owner(owner);
     if (grab_serial)
     {

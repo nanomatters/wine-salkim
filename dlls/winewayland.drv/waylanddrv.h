@@ -662,6 +662,7 @@ void wayland_surface_activate(struct wayland_surface *surface, BOOL serial);
 void wayland_surface_shortcut_control(struct wayland_surface *surface, BOOL inhibit);
 void wayland_surface_sync_alpha(struct wayland_surface *surface);
 BOOL wayland_is_popup_menu_class(HWND hwnd);
+BOOL wayland_is_menu_popup_candidate(HWND hwnd);
 BOOL wayland_is_menu_popup(HWND hwnd);
 BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
 void wayland_set_layer_menu_hwnd(HWND hwnd);
