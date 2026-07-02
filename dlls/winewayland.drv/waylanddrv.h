@@ -493,6 +493,7 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface,
 void wayland_surface_sync_alpha(struct wayland_surface *surface);
 unsigned long long wayland_time_ms(void);
 BOOL wayland_is_popup_menu_class(HWND hwnd);
+BOOL wayland_is_menu_popup_candidate(HWND hwnd);
 BOOL wayland_is_menu_popup(HWND hwnd);
 BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
 void wayland_set_layer_menu_hwnd(HWND hwnd);
