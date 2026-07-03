@@ -450,6 +450,7 @@ struct wayland_client_surface
     BOOL hwnd_dmabuf_producer;
     RECT rect;
     struct wl_surface *wl_surface;
+    const struct wl_surface *toplevel_wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
     struct wp_viewport *wp_viewport;
@@ -458,33 +459,6 @@ struct wayland_client_surface
     BOOL has_alpha;
     BOOL has_presented;
     struct wayland_visual_constraint_trace visual_constraint_trace;
-};
-
-/* A GDI child window shown on its own wl_subsurface above a client surface. Its
- * toplevel's GDI window-surface is hidden behind that client. */
-struct wayland_child_overlay
-{
-    struct wl_list link;
-    HWND hwnd;                          /* the child window */
-    struct wl_surface *wl_surface;
-    struct wl_subsurface *wl_subsurface;
-    struct wp_viewport *wp_viewport;
-    RECT rect;                          /* last rect, toplevel-window-relative */
-};
-
-/* Child window geometry captured via NtUser outside win_data_mutex. Querying
- * win32u under the mutex can deadlock against threads holding win32u state and
- * waiting for it. */
-struct child_overlay_snapshot
-{
-    unsigned int producer_count; /* dmabuf producers visible while capturing */
-    unsigned int count;
-    struct child_overlay_snapshot_entry
-    {
-        HWND hwnd;
-        RECT rect;          /* child rect in screen coords */
-        int rx, ry, rw, rh; /* visible part, toplevel-window-relative */
-    } entries[];
 };
 
 struct wayland_shm_buffer
@@ -553,15 +527,12 @@ struct wayland_surface
     BOOL resizing;
     enum wayland_surface_ensure_type ensured_contents;
     struct wl_list hwnd_dmabuf_surfaces;
-    struct wl_list child_overlays; /* GDI child windows shown above a client surface */
     struct wayland_hwnd_dmabuf_surface *direct_dmabuf_surface;
-    /* Existing overlays were captured before any dmabuf producer was visible;
-     * refresh them once when the producer first wakes this toplevel. */
-    BOOL child_overlays_need_dmabuf_refresh;
-    /* Top of the dmabuf subsurface chain as last stacked. Overlays anchor above it,
-     * keeping the [base, client, dmabufs, overlays] order stable whichever chain
-     * restacks last. Validated against the live list before use, never freed. */
-    struct wl_surface *dmabuf_top;
+    /* Bottom of the below-main dmabuf subsurface chain. Client subsurfaces
+     * anchor below this so children stay above their parent's client content. */
+    struct wl_surface *dmabuf_bottom;
+    BOOL transparent_carrier_attached;
+    int transparent_carrier_width, transparent_carrier_height;
     HRGN child_region;
     BOOL shaped;
     BOOL occlusion_clipped;
@@ -634,12 +605,6 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
-struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
-void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
-                                          struct wayland_shm_buffer *shm_buffer,
-                                          const struct child_overlay_snapshot *snapshot);
-void wayland_surface_clear_child_overlays(struct wayland_surface *surface);
-void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND child);
 void wayland_surface_coords_from_window(struct wayland_surface *surface,
                                         int window_x, int window_y,
                                         int *surface_x, int *surface_y);
@@ -736,9 +701,7 @@ void wayland_win_data_release(struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
-                                 const struct child_overlay_snapshot *overlay_snapshot);
-BOOL window_surface_needs_child_overlays(HWND hwnd);
+BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
 void wayland_window_init(void);
