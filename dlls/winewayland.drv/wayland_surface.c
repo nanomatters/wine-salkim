@@ -186,9 +186,8 @@ static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
     if (wayland_surface_try_direct_dmabuf(hwnd)) return;
 
     /* Inline exposes preserve the initial-configure path for windows that draw
-     * without pumping messages. Child-overlay windows must defer to avoid the
-     * event thread taking the surface lock before win_data_mutex. */
-    if (allow_inline && !window_surface_needs_child_overlays(hwnd))
+     * without pumping messages. */
+    if (allow_inline)
     {
         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
         return;
@@ -773,6 +772,7 @@ static void wayland_surface_clear_child_surfaces(struct wayland_surface *surface
         wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
 
     surface->dmabuf_top = NULL;
+    surface->dmabuf_bottom = NULL;
 }
 
 /* Clear cached input state when the wl_surface is destroyed. Role changes are
@@ -900,6 +900,27 @@ static struct wl_surface *wayland_surface_overlay_anchor(struct wayland_surface 
     }
 
     return above;
+}
+
+static struct wl_surface *wayland_surface_dmabuf_stack_bottom(struct wayland_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+
+    if (!surface->dmabuf_bottom) return NULL;
+
+    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+        if (dmabuf_surface->wl_surface == surface->dmabuf_bottom && dmabuf_surface->current)
+            return surface->dmabuf_bottom;
+
+    surface->dmabuf_bottom = NULL;
+    return NULL;
+}
+
+static struct wl_surface *wayland_surface_client_stack_anchor(struct wayland_surface *surface)
+{
+    struct wl_surface *bottom = wayland_surface_dmabuf_stack_bottom(surface);
+
+    return bottom ? bottom : surface->wl_surface;
 }
 
 /* True if child or a descendant is a dmabuf producer of toplevel. That subtree
@@ -2046,7 +2067,8 @@ static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,
     if (client->wl_subsurface)
     {
         wl_subsurface_set_position(client->wl_subsurface, x, y);
-        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
+        wl_subsurface_place_below(client->wl_subsurface,
+                                  wayland_surface_client_stack_anchor(surface));
     }
 
     if (width != 0 && height != 0)
@@ -2394,10 +2416,10 @@ static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface 
 
 static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabuf_surface *surface,
                                                        const struct wayland_hwnd_dmabuf_geometry *geometry,
-                                                       struct wl_surface *above)
+                                                       struct wl_surface *sibling)
 {
     wl_subsurface_set_position(surface->wl_subsurface, geometry->x, geometry->y);
-    wl_subsurface_place_above(surface->wl_subsurface, above);
+    wl_subsurface_place_below(surface->wl_subsurface, sibling);
     wp_viewport_set_source(surface->wp_viewport,
                            wl_fixed_from_double(geometry->source_x),
                            wl_fixed_from_double(geometry->source_y),
@@ -2410,14 +2432,14 @@ static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabu
 static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent,
                                                   struct wayland_hwnd_dmabuf_surface *surface,
                                                   const hwnd_dmabuf_frame_info_t *info,
-                                                  struct wl_surface *above)
+                                                  struct wl_surface *sibling)
 {
     struct wayland_hwnd_dmabuf_geometry geometry;
 
     if (!wayland_hwnd_dmabuf_surface_compute_geometry(parent, surface, info, &geometry))
         return FALSE;
 
-    wayland_hwnd_dmabuf_surface_apply_geometry(surface, &geometry, above);
+    wayland_hwnd_dmabuf_surface_apply_geometry(surface, &geometry, sibling);
     return TRUE;
 }
 
@@ -2878,6 +2900,7 @@ static void wayland_surface_clear_dmabuf_children(struct wayland_surface *surfac
     wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
         wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
     surface->dmabuf_top = NULL;
+    surface->dmabuf_bottom = NULL;
 }
 
 static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface,
@@ -3053,7 +3076,7 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *next;
     enum hwnd_dmabuf_status status;
     struct wayland_win_data *data;
-    struct wl_surface *above;
+    struct wl_surface *sibling, *bottom = NULL;
     unsigned long long now = wayland_time_ms();
     BOOL any_new = FALSE;
 
@@ -3091,19 +3114,10 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         return;
     }
 
-    /* Anchor the dmabuf chain above the client subsurface, not the main surface.
-     * Both used to place_above() main. Whichever committed last won the top,
-     * a per-frame z-order race (the flicker). A fixed sibling anchor makes
-     * [main, client, dmabuf...] resolve the same regardless. (win_data_mutex held.) */
-    above = surface->wl_surface;
-    if (data &&
-        data->client_surface && data->client_surface->wl_subsurface &&
-        data->client_surface->toplevel == surface->hwnd)
-        above = data->client_surface->wl_surface;
-    /* Server child lists are returned in z-order from top to bottom, while
-     * Wayland subsurface stacking needs to be applied from bottom to top when
-     * chaining place_above() calls. */
-    for (i = count; i-- > 0; )
+    /* Self-presenting children are stacked below the GDI surface; server order
+     * is top-to-bottom, matching place_below chaining. */
+    sibling = surface->wl_surface;
+    for (i = 0; i < count; i++)
     {
         HWND hwnd = (HWND)(UINT_PTR)frames[i].hwnd;
         BOOL created_buffer, attached_frame;
@@ -3115,10 +3129,10 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                 dmabuf_surface->seen = TRUE;
                 dmabuf_surface->last_seen_ms = now;
                 if (dmabuf_surface->current &&
-                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
+                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], sibling))
                 {
                     wl_surface_commit(dmabuf_surface->wl_surface);
-                    above = dmabuf_surface->wl_surface;
+                    bottom = sibling = dmabuf_surface->wl_surface;
                     any_new = TRUE;
                 }
             }
@@ -3143,7 +3157,7 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         if (attached_frame) any_new = TRUE;
         if (!dmabuf_surface->current) continue;
         if (attached_frame) wayland_hwnd_dmabuf_attach_current(dmabuf_surface);
-        if (!wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
+        if (!wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], sibling))
         {
             TRACE("hwnd=%p child=%p configure failed frame_seq=%u\n",
                   surface->hwnd, hwnd, frames[i].frame_seq);
@@ -3165,13 +3179,12 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
             InterlockedIncrement(&dmabuf_surface->current->ref);
             dmabuf_surface->current_committed = TRUE;
         }
-        above = dmabuf_surface->wl_surface;
+        bottom = sibling = dmabuf_surface->wl_surface;
     }
 
-    /* record the chain top for the GDI overlay anchor, see wayland_surface_overlay_anchor */
-    surface->dmabuf_top = above;
+    surface->dmabuf_bottom = bottom;
 
-    /* A child absent from the descendant list: hide its stale overlay at once so the
+    /* A child absent from the descendant list: hide its stale dmabuf subsurface at once so the
      * content behind it (e.g. the client surface) is not occluded. Keep the dmabuf
      * cache for a grace window so a brief gap does not force a re-import. Reap the
      * cache only once the grace expires. */
@@ -3191,6 +3204,11 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
             any_new = TRUE;
         }
     }
+
+    if (any_new && data && data->client_surface && data->client_surface->wl_subsurface &&
+        data->client_surface->toplevel == surface->hwnd)
+        wl_subsurface_place_below(data->client_surface->wl_subsurface,
+                                  wayland_surface_client_stack_anchor(surface));
 
     /* Commit and arm the next vsync only when something changed. An idle window costs nothing. */
     /* Commit the parent to apply subsurface stacking. No frame callback: import is
@@ -3690,6 +3708,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     {
         if (client->wl_subsurface)
         {
+            if (client->toplevel)
+                NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, FALSE, 0);
             wl_subsurface_destroy(client->wl_subsurface);
             client->wl_subsurface = NULL;
         }
@@ -3722,10 +3742,13 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         }
         /* Present contents independently of the parent surface. */
         wl_subsurface_set_desync(client->wl_subsurface);
+        wl_subsurface_place_below(client->wl_subsurface,
+                                  wayland_surface_client_stack_anchor(surface));
 
         client->toplevel = toplevel;
         client->toplevel_wl_surface = surface->wl_surface;
         SetRect(&client->rect, 0, 0, -1, -1);
+        NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, TRUE, 0);
     }
 
     if (hwnd == toplevel)

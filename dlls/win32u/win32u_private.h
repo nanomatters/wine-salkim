@@ -321,7 +321,7 @@ extern BOOL is_window_unicode( HWND hwnd );
 extern BOOL is_window_visible( HWND hwnd );
 extern BOOL is_zoomed( HWND hwnd );
 extern BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal );
-extern BOOL set_window_surface_clip( HWND hwnd );
+extern BOOL set_window_surface_clip( HWND hwnd, BOOL enable );
 extern int get_window_pixel_format( HWND hwnd );
 extern DWORD get_window_long( HWND hwnd, INT offset );
 extern ULONG_PTR get_window_long_ptr( HWND hwnd, INT offset, BOOL ansi );

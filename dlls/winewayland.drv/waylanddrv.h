@@ -421,6 +421,9 @@ struct wayland_surface
      * keeping the [base, client, dmabufs, overlays] order stable whichever chain
      * restacks last. Validated against the live list before use, never freed. */
     struct wl_surface *dmabuf_top;
+    /* Bottom of the below-main dmabuf subsurface chain. Client subsurfaces
+     * anchor below this so children stay above their parent's client content. */
+    struct wl_surface *dmabuf_bottom;
     HRGN child_region;
     BOOL shaped;
     BOOL occlusion_clipped;
@@ -565,9 +568,7 @@ void wayland_win_data_release(struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
-                                 const struct child_overlay_snapshot *overlay_snapshot);
-BOOL window_surface_needs_child_overlays(HWND hwnd);
+BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
 

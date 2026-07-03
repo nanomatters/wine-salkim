@@ -54,7 +54,7 @@ static pthread_mutex_t win_data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
 static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd);
 static BOOL window_surface_has_requested_configure(HWND hwnd);
-static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd);
+static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd);
 
 static const WCHAR layer_menu_hwnd_prop[] =
     {'_','_','w','i','n','e','_','w','a','y','l','a','n','d','_','l','a','y','e','r','_','m','e','n','u',0};
@@ -700,17 +700,11 @@ static BOOL is_window_managed(HWND hwnd, HWND menu_popup_owner, UINT swp_flags, 
  */
 void WAYLAND_DestroyWindow(HWND hwnd)
 {
-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-    struct wayland_win_data *data, *toplevel_data;
+    struct wayland_win_data *data;
 
     TRACE("%p\n", hwnd);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
-    /* drop this child's overlay (if any) from its toplevel */
-    if (toplevel && toplevel != hwnd &&
-        (toplevel_data = wayland_win_data_get_nolock(toplevel)) &&
-        toplevel_data->wayland_surface)
-        wayland_surface_remove_child_overlay(toplevel_data->wayland_surface, hwnd);
     wayland_win_data_destroy(data);
 }
 
@@ -737,11 +731,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL, menu_popup_owner = NULL;
-    HWND overlay_toplevel = toplevel;
-    struct child_overlay_snapshot *snapshot = NULL;
-    struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL, *overlay_surface;
+    struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
     struct wayland_client_surface *client;
-    struct wayland_win_data *data, *toplevel_data, *owner_data, *overlay_data;
+    struct wayland_win_data *data, *toplevel_data, *owner_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL use_layer_shell = FALSE;
@@ -767,17 +759,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                           is_layer_shell_menu_popup(hwnd);
     }
 
-    /* Snapshot child geometry without win_data_mutex. NtUser queries while
-     * holding it can deadlock with a thread waiting for the same window. */
-    if (overlay_toplevel && overlay_toplevel != hwnd &&
-        window_surface_needs_child_overlays(overlay_toplevel))
-        snapshot = child_overlays_snapshot(overlay_toplevel);
-
-    if (!(data = wayland_win_data_get(hwnd)))
-    {
-        free(snapshot);
-        return;
-    }
+    if (!(data = wayland_win_data_get(hwnd))) return;
     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
     owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
@@ -801,17 +783,6 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         owner_surface = NULL;
         owner_data = NULL;
     }
-
-    if (owner_surface) use_layer_shell = FALSE;
-
-    if (snapshot && overlay_toplevel && overlay_toplevel != hwnd &&
-        (overlay_data = wayland_win_data_get_nolock(overlay_toplevel)) &&
-        (overlay_surface = overlay_data->wayland_surface))
-    {
-        wayland_surface_apply_child_overlays(overlay_surface, NULL, snapshot);
-        wl_surface_commit(overlay_surface->wl_surface);
-    }
-    free(snapshot);
 
     data->rects = *new_rects;
     data->is_fullscreen = fullscreen;
@@ -1074,7 +1045,7 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_WAYLAND_DMABUF_FRAME:
     {
-        struct child_overlay_snapshot *snapshot = NULL;
+        BOOL had_dmabuf_content;
 
         if (window_surface_has_requested_configure(hwnd))
             wayland_configure_window(hwnd);
@@ -1082,29 +1053,11 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
 
         /* A producer published a frame for a descendant of this toplevel.
-         * Import it in the process that owns the toplevel's wayland surface.
-         * If GDI child overlays were captured before the producer existed,
-         * refresh them once with a producer-aware snapshot so stale host
-         * overlays do not stay stacked above the live dmabuf. */
-        if (window_surface_needs_dmabuf_overlay_refresh(hwnd))
-            snapshot = child_overlays_snapshot(hwnd);
+         * Import it in the process that owns the toplevel's Wayland surface. */
+        had_dmabuf_content = window_surface_has_hwnd_dmabuf_content(hwnd);
         ensure_window_surface_contents(hwnd);
-        if (snapshot)
-        {
-            struct wayland_win_data *data;
-
-            if ((data = wayland_win_data_get(hwnd)))
-            {
-                if (data->wayland_surface)
-                {
-                    wayland_surface_apply_child_overlays(data->wayland_surface, NULL, snapshot);
-                    wl_surface_commit(data->wayland_surface->wl_surface);
-                    wl_display_flush(process_wayland.wl_display);
-                }
-                wayland_win_data_release(data);
-            }
-            free(snapshot);
-        }
+        if (had_dmabuf_content != window_surface_has_hwnd_dmabuf_content(hwnd))
+            NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
         return 0;
     }
     case WM_WAYLAND_EXPOSE:
@@ -1334,23 +1287,6 @@ static BOOL window_client_surface_pending_first_frame(struct wayland_win_data *d
     return data->client_surface && !data->client_surface->has_presented;
 }
 
-/* Whether the flush path should snapshot child geometry for overlays before
- * taking win_data_mutex in set_window_surface_contents. Overlays exist only
- * while an attached client surface occludes the whole GDI buffer. Dmabuf
- * children do NOT count: they cover only their own rects, the base stays
- * visible and a copy overlay would occlude their content (Steam black window). */
-BOOL window_surface_needs_child_overlays(HWND hwnd)
-{
-    struct wayland_win_data *data;
-    BOOL ret;
-
-    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
-    ret = window_client_surface_attached(data);
-    wayland_win_data_release(data);
-
-    return ret;
-}
-
 static BOOL window_surface_has_requested_configure(HWND hwnd)
 {
     struct wayland_win_data *data;
@@ -1388,20 +1324,19 @@ static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd)
     return ret;
 }
 
-static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd)
+static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)
 {
     struct wayland_win_data *data;
-    BOOL ret;
+    BOOL ret = FALSE;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
-    ret = data->wayland_surface && data->wayland_surface->child_overlays_need_dmabuf_refresh;
+    ret = data->wayland_surface && wayland_surface_has_hwnd_dmabuf_content(data->wayland_surface);
     wayland_win_data_release(data);
 
     return ret;
 }
 
-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
-                                 const struct child_overlay_snapshot *overlay_snapshot)
+BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
@@ -1422,10 +1357,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 
             wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
-            if (window_client_surface_attached(data))
-                wayland_surface_apply_child_overlays(wayland_surface, shm_buffer, overlay_snapshot);
-            else if (!wl_list_empty(&wayland_surface->child_overlays))
-                wayland_surface_clear_child_overlays(wayland_surface);
             wl_surface_commit(wayland_surface->wl_surface);
             wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
             committed = TRUE;

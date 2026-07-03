@@ -1633,18 +1633,22 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
     return TRUE;
 }
 
-BOOL set_window_surface_clip( HWND hwnd )
+BOOL set_window_surface_clip( HWND hwnd, BOOL enable )
 {
     WND *win = get_win_ptr( hwnd );
     BOOL changed = FALSE;
 
     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
     {
-        NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
+        NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, enable, 0 );
         return FALSE;
     }
 
-    if (!win->clip_from_parent) changed = win->clip_from_parent = TRUE;
+    if (win->clip_from_parent != enable)
+    {
+        win->clip_from_parent = enable;
+        changed = TRUE;
+    }
     release_win_ptr( win );
 
     if (changed) update_window_state( hwnd );
