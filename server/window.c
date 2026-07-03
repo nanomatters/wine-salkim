@@ -259,6 +259,18 @@ static inline void update_clip_client_flags( struct window *win )
         win->paint_flags |= PAINT_CLIP_CLIENT_CHILD;
 }
 
+static inline int window_has_self_presenting_content( struct window *win )
+{
+    return (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) ||
+           win->dmabuf_pending_count || win->dmabuf_producer_count;
+}
+
+static inline int window_has_punch_through_content( struct window *win )
+{
+    return window_has_self_presenting_content( win ) ||
+           (win->paint_flags & PAINT_CLIP_CLIENT_CHILD);
+}
+
 static struct rectangle monitors_get_union_rect( struct winstation *winstation, int is_raw )
 {
     struct monitor_info *monitor, *end;
@@ -450,7 +462,7 @@ static int set_parent_window( struct window *win, struct window *parent )
         if (parent->thread && parent->thread != win->thread && !is_desktop_window(parent))
             attach_thread_input( win->thread, parent->thread );
 
-        if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT | PAINT_CLIP_CLIENT_CHILD))
+        if (window_has_punch_through_content( win ))
             update_clip_client_flags( win );
     }
     else  /* move it to parent unlinked list */
@@ -1435,80 +1447,114 @@ error:
 }
 
 
-/* clip all children that draw outside of the parent surface out of the visible region */
-static struct region *clip_client_children( struct window *parent, struct region *parent_clip,
-                                            struct region *region, int offset_x, int offset_y )
+static int is_self_presenting_window( struct window *win )
+{
+    return window_has_self_presenting_content( win );
+}
+
+static int set_window_rect_region( struct region *region, struct window *win,
+                                   const struct rectangle *rect, struct region *clip,
+                                   int offset_x, int offset_y )
+{
+    set_region_rect( region, rect );
+    if (win->win_region && !intersect_window_region( region, win )) return 0;
+    offset_region( region, offset_x, offset_y );
+    return intersect_region( region, region, clip ) != NULL;
+}
+
+static int add_window_coverage( struct window *win, struct region *clip,
+                                struct region *covered, struct region *visible,
+                                int offset_x, int offset_y )
+{
+    if (!set_window_rect_region( visible, win, &win->visible_rect, clip, offset_x, offset_y ))
+        return 0;
+    if (!subtract_region( visible, visible, covered )) return 0;
+    return union_region( covered, covered, visible ) != NULL;
+}
+
+/* Walk the child tree in top-to-bottom z-order. 'covered' tracks pixels already
+ * claimed by higher windows; 'holes' tracks pixels where the topmost window is
+ * self-presenting and must show through the parent surface. */
+static int collect_punch_through_holes( struct window *win, struct region *parent_clip,
+                                        struct region *holes, struct region *covered,
+                                        int offset_x, int offset_y )
 {
     struct window *ptr;
-    struct region *clip = create_empty_region();
+    struct region *client_clip = NULL, *visible = NULL, *tmp = NULL;
+    int ret = 0;
 
-    if (!clip) return NULL;
+    if (!(client_clip = create_empty_region())) return 0;
+    if (!(visible = create_empty_region())) goto done;
+    if (!(tmp = create_empty_region())) goto done;
 
-    LIST_FOR_EACH_ENTRY_REV( ptr, &parent->children, struct window, entry )
+    if (!set_window_rect_region( client_clip, win, &win->client_rect, parent_clip, offset_x, offset_y ))
+        goto done;
+
+    LIST_FOR_EACH_ENTRY( ptr, &win->children, struct window, entry )
     {
         if (!(ptr->style & WS_VISIBLE)) continue;
         if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
 
-        /* add the visible rect */
-        set_region_rect( clip, &ptr->visible_rect );
-        if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
-        offset_region( clip, offset_x, offset_y );
-        if (!intersect_region( clip, clip, parent_clip )) break;
-        if (!union_region( region, region, clip )) break;
-        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT | PAINT_CLIP_CLIENT_CHILD))) continue;
-
-        /* subtract the client rect if it draws outside of the parent surface */
-        set_region_rect( clip, &ptr->client_rect );
-        if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
-        offset_region( clip, offset_x, offset_y );
-        if (!intersect_region( clip, clip, parent_clip )) break;
-        if ((ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) &&
-            !subtract_region( region, region, clip ))
-            break;
-
-        if (!clip_client_children( ptr, clip, region, offset_x + ptr->client_rect.left,
-                                   offset_y + ptr->client_rect.top ))
-            break;
+        if (window_has_punch_through_content( ptr ))
+        {
+            if (!collect_punch_through_holes( ptr, client_clip, holes, covered,
+                                              offset_x + win->client_rect.left,
+                                              offset_y + win->client_rect.top ))
+                goto done;
+        }
+        else if (!add_window_coverage( ptr, client_clip, covered, visible,
+                                       offset_x + win->client_rect.left,
+                                       offset_y + win->client_rect.top ))
+            goto done;
     }
-    free_region( clip );
-    return region;
+
+    if (is_self_presenting_window( win ))
+    {
+        if (!subtract_region( tmp, client_clip, covered )) goto done;
+        if (!union_region( holes, holes, tmp )) goto done;
+    }
+
+    if (!add_window_coverage( win, parent_clip, covered, visible, offset_x, offset_y )) goto done;
+
+    ret = 1;
+
+done:
+    if (tmp) free_region( tmp );
+    if (visible) free_region( visible );
+    free_region( client_clip );
+    return ret;
 }
 
 
 /* compute the visible surface region of a window, in parent coordinates */
 static struct region *get_surface_region( struct window *win )
 {
-    struct region *region, *clip;
-    int offset_x, offset_y;
+    struct region *region, *clip = NULL, *holes = NULL, *covered = NULL;
 
     /* create a region relative to the window itself */
 
     if (!(region = create_empty_region())) return NULL;
     if (!(clip = create_empty_region())) goto error;
+    if (!(holes = create_empty_region())) goto error;
+    if (!(covered = create_empty_region())) goto error;
+
     set_region_rect( region, &win->visible_rect );
     if (win->win_region && !intersect_window_region( region, win )) goto error;
-    set_region_rect( clip, &win->client_rect );
+
+    set_region_rect( clip, &win->visible_rect );
     if (win->win_region && !intersect_window_region( clip, win )) goto error;
 
-    if ((win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) &&
-        !subtract_region( region, region, clip ))
-        goto error;
+    if (!collect_punch_through_holes( win, clip, holes, covered, 0, 0 )) goto error;
+    if (!subtract_region( region, region, holes )) goto error;
 
-    /* clip children */
-
-    if (!is_desktop_window(win))
-    {
-        offset_x = win->client_rect.left;
-        offset_y = win->client_rect.top;
-    }
-    else offset_x = offset_y = 0;
-
-    if (!clip_client_children( win, clip, region, offset_x, offset_y )) goto error;
-
+    free_region( covered );
+    free_region( holes );
     free_region( clip );
     return region;
 
 error:
+    if (covered) free_region( covered );
+    if (holes) free_region( holes );
     if (clip) free_region( clip );
     free_region( region );
     return NULL;
@@ -3094,7 +3140,10 @@ DECL_HANDLER(hwnd_dmabuf_set_pending)
     if (!win) return;
 
     if (req->pending)
+    {
+        if (!window_has_self_presenting_content( win )) update_clip_client_flags( win );
         win->dmabuf_pending_count++;
+    }
     else if (win->dmabuf_pending_count)
         win->dmabuf_pending_count--;
     if (!win->dmabuf_pending_count && !win->dmabuf_producer_count)
@@ -3151,6 +3200,7 @@ static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *
 
 static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive )
 {
+    if (!window_has_self_presenting_content( win )) update_clip_client_flags( win );
     win->dmabuf_producer_count++;
     if (exclusive)
         win->dmabuf_exclusive_count++;

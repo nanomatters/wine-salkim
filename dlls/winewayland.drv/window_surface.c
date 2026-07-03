@@ -467,7 +467,6 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
-    struct child_overlay_snapshot *overlay_snapshot = NULL;
     BOOL flushed = FALSE;
     HRGN surface_damage_region = NULL;
     HRGN copy_from_window_region;
@@ -543,16 +542,10 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     if (shape_changed) wayland_window_surface_sync_regions(window_surface);
 
-    /* snapshot child geometry before set_window_surface_contents locks win_data_mutex */
-    if (window_surface_needs_child_overlays(window_surface->hwnd))
-        overlay_snapshot = child_overlays_snapshot(window_surface->hwnd);
-
-    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region,
-                                          overlay_snapshot);
+    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
     wl_display_flush(process_wayland.wl_display);
 
 done:
-    free(overlay_snapshot);
     if (surface_damage_region) NtGdiDeleteObjectApp(surface_damage_region);
     return flushed;
 }
