@@ -24,12 +24,16 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
+#include "win32u_private.h"
 #include "wine/opengl_driver.h"
+#include "wine/hwnd_dmabuf.h"
 #include "wine/server.h"
 #include "wine/debug.h"
 
@@ -52,6 +56,437 @@ static struct list dce_list = LIST_INIT(dce_list);
 
 static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define FOREIGN_GDI_RING_SIZE 3
+
+struct foreign_gdi_slot
+{
+    HANDLE section;
+    void *bits;
+    int fd;
+    UINT64 release_token;
+    unsigned int image_id;
+    BOOL busy;
+};
+
+struct foreign_gdi_surface
+{
+    struct window_surface header;
+    struct list entry;
+    HWND hwnd;
+    int channel_fd;
+    UINT64 producer_unique_id;
+    UINT64 next_release_token;
+    unsigned int frame_seq;
+    unsigned int ring_generation;
+    int width, height, stride, size;
+    BOOL lost, slots_created, linked;
+    struct foreign_gdi_slot slots[FOREIGN_GDI_RING_SIZE];
+};
+
+static struct list foreign_gdi_surfaces = LIST_INIT( foreign_gdi_surfaces );
+static pthread_mutex_t foreign_gdi_lock = PTHREAD_MUTEX_INITIALIZER;
+static LONGLONG volatile foreign_gdi_next_producer_id;
+
+static struct foreign_gdi_surface *foreign_gdi_surface_from_window_surface( struct window_surface *surface )
+{
+    return CONTAINING_RECORD( surface, struct foreign_gdi_surface, header );
+}
+
+static void foreign_gdi_slot_destroy( struct foreign_gdi_slot *slot )
+{
+    if (slot->fd >= 0) close( slot->fd );
+    if (slot->bits) NtUnmapViewOfSection( GetCurrentProcess(), slot->bits );
+    if (slot->section) NtClose( slot->section );
+    memset( slot, 0, sizeof(*slot) );
+    slot->fd = -1;
+}
+
+static BOOL foreign_gdi_slot_create( struct foreign_gdi_slot *slot, unsigned int image_id, int size )
+{
+    LARGE_INTEGER section_size;
+    SIZE_T view_size = 0;
+    NTSTATUS status;
+
+    memset( slot, 0, sizeof(*slot) );
+    slot->fd = -1;
+    slot->image_id = image_id;
+
+    section_size.QuadPart = size;
+    status = NtCreateSection( &slot->section, GENERIC_READ | SECTION_MAP_READ | SECTION_MAP_WRITE,
+                              NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0 );
+    if (status)
+    {
+        WARN( "failed to create foreign GDI shm section status %#lx\n", status );
+        return FALSE;
+    }
+
+    status = NtMapViewOfSection( slot->section, GetCurrentProcess(), &slot->bits, 0, 0, NULL,
+                                 &view_size, ViewUnmap, 0, PAGE_READWRITE );
+    if (status)
+    {
+        WARN( "failed to map foreign GDI shm section status %#lx\n", status );
+        foreign_gdi_slot_destroy( slot );
+        return FALSE;
+    }
+
+    status = wine_server_handle_to_fd( slot->section, FILE_READ_DATA, &slot->fd, NULL );
+    if (status)
+    {
+        WARN( "failed to export foreign GDI shm section status %#lx\n", status );
+        foreign_gdi_slot_destroy( slot );
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL foreign_gdi_surface_ensure_slots( struct foreign_gdi_surface *surface )
+{
+    unsigned int i;
+
+    if (surface->slots_created) return TRUE;
+
+    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
+        if (!foreign_gdi_slot_create( &surface->slots[i], i, surface->size ))
+        {
+            while (i--) foreign_gdi_slot_destroy( &surface->slots[i] );
+            return FALSE;
+        }
+
+    surface->slots_created = TRUE;
+    TRACE( "foreign_gdi hwnd=%p allocated %u shm slots size=%d\n",
+           surface->hwnd, FOREIGN_GDI_RING_SIZE, surface->size );
+    return TRUE;
+}
+
+static void foreign_gdi_surface_close_channel( struct foreign_gdi_surface *surface )
+{
+    if (surface->channel_fd >= 0)
+    {
+        hwnd_dmabuf_close_channel( surface->hwnd, surface->channel_fd );
+        surface->channel_fd = -1;
+    }
+}
+
+static BOOL foreign_gdi_surface_ensure_channel( struct foreign_gdi_surface *surface )
+{
+    LONGLONG producer_id;
+
+    if (surface->lost) return FALSE;
+    if (surface->channel_fd >= 0) return TRUE;
+
+    if ((surface->channel_fd = hwnd_dmabuf_open_channel( surface->hwnd )) < 0)
+    {
+        surface->lost = TRUE;
+        TRACE( "foreign_gdi hwnd=%p failed to open producer channel\n", surface->hwnd );
+        return FALSE;
+    }
+
+    producer_id = InterlockedIncrement64( &foreign_gdi_next_producer_id );
+    if (!producer_id) producer_id = InterlockedIncrement64( &foreign_gdi_next_producer_id );
+    surface->producer_unique_id = producer_id;
+    surface->ring_generation++;
+    if (!surface->ring_generation) surface->ring_generation++;
+    TRACE( "foreign_gdi hwnd=%p opened producer channel fd=%d producer=%s generation=%u\n",
+           surface->hwnd, surface->channel_fd, wine_dbgstr_longlong(surface->producer_unique_id),
+           surface->ring_generation );
+    return TRUE;
+}
+
+static void foreign_gdi_surface_drain_releases( struct foreign_gdi_surface *surface )
+{
+    hwnd_dmabuf_release_t rel;
+    int ret;
+
+    if (surface->channel_fd < 0) return;
+    while ((ret = hwnd_dmabuf_channel_recv_release( surface->channel_fd, &rel )) == HWND_DMABUF_CHANNEL_OK)
+    {
+        struct foreign_gdi_slot *slot;
+
+        if (rel.producer_unique_id != surface->producer_unique_id) continue;
+        if (rel.ring_generation != surface->ring_generation) continue;
+        if (rel.image_id >= FOREIGN_GDI_RING_SIZE) continue;
+
+        slot = &surface->slots[rel.image_id];
+        if (!slot->release_token || slot->release_token != rel.release_token) continue;
+
+        slot->busy = FALSE;
+        slot->release_token = 0;
+        TRACE( "foreign_gdi hwnd=%p released slot=%u flags=%#x\n",
+               surface->hwnd, rel.image_id, rel.flags );
+    }
+
+    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
+    {
+        surface->lost = TRUE;
+        foreign_gdi_surface_close_channel( surface );
+    }
+}
+
+static struct foreign_gdi_slot *foreign_gdi_surface_get_free_slot( struct foreign_gdi_surface *surface )
+{
+    unsigned int i;
+
+    foreign_gdi_surface_drain_releases( surface );
+    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
+        if (!surface->slots[i].busy)
+            return &surface->slots[i];
+    return NULL;
+}
+
+static void foreign_gdi_copy_frame( struct foreign_gdi_surface *surface, struct foreign_gdi_slot *slot,
+                                    const BITMAPINFO *color_info, const void *color_bits )
+{
+    int height = abs( color_info->bmiHeader.biHeight );
+    int src_stride = color_info->bmiHeader.biSizeImage / max( 1, height );
+    int copy_stride = min( src_stride, surface->stride );
+    const char *src = color_bits;
+    char *dst = slot->bits;
+    int y, rows = min( height, surface->height );
+
+    for (y = 0; y < rows; y++)
+        memcpy( dst + y * surface->stride, src + y * src_stride, copy_stride );
+}
+
+static UINT64 foreign_gdi_surface_next_release_token( struct foreign_gdi_surface *surface )
+{
+    UINT64 token = ++surface->next_release_token;
+
+    if (!token) token = ++surface->next_release_token;
+    return token;
+}
+
+static void foreign_gdi_fill_dirty_rect( hwnd_dmabuf_frame_desc_t *desc, const RECT *dirty )
+{
+    RECT rect = *dirty;
+
+    rect.left = max( 0, min( rect.left, (LONG)desc->width ) );
+    rect.top = max( 0, min( rect.top, (LONG)desc->height ) );
+    rect.right = max( rect.left, min( rect.right, (LONG)desc->width ) );
+    rect.bottom = max( rect.top, min( rect.bottom, (LONG)desc->height ) );
+
+    desc->dirty_count = 1;
+    desc->dirty_rects[0][0] = min( rect.left, 0xffff );
+    desc->dirty_rects[0][1] = min( rect.top, 0xffff );
+    desc->dirty_rects[0][2] = min( rect.right, 0xffff );
+    desc->dirty_rects[0][3] = min( rect.bottom, 0xffff );
+}
+
+static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                                       const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                       const BITMAPINFO *shape_info, const void *shape_bits )
+{
+    struct foreign_gdi_surface *surface = foreign_gdi_surface_from_window_surface( window_surface );
+    struct foreign_gdi_slot *slot;
+    hwnd_dmabuf_frame_desc_t desc;
+    int ret;
+
+    if (surface->lost) return TRUE;
+    if (!foreign_gdi_surface_ensure_slots( surface )) return FALSE;
+    if (!foreign_gdi_surface_ensure_channel( surface )) return TRUE;
+    if (!(slot = foreign_gdi_surface_get_free_slot( surface )))
+    {
+        TRACE( "foreign_gdi hwnd=%p no free shm slot, keeping dirty=%s\n",
+               surface->hwnd, wine_dbgstr_rect(dirty) );
+        return FALSE;
+    }
+
+    foreign_gdi_copy_frame( surface, slot, color_info, color_bits );
+
+    memset( &desc, 0, sizeof(desc) );
+    desc.version = HWND_DMABUF_DESC_VERSION_V1;
+    desc.flags = HWND_DMABUF_FLAG_SHM | HWND_DMABUF_FLAG_STABLE_SLOT;
+    desc.width = surface->width;
+    desc.height = surface->height;
+    desc.fourcc = HWND_DMABUF_SHM_FORMAT_XRGB8888;
+    desc.stride = surface->stride;
+    desc.frame_seq = ++surface->frame_seq;
+    desc.ring_generation = surface->ring_generation;
+    desc.image_id = slot->image_id;
+    desc.modifier = HWND_DMABUF_MOD_LINEAR;
+    desc.producer_unique_id = surface->producer_unique_id;
+    desc.release_token = foreign_gdi_surface_next_release_token( surface );
+    desc.alpha_mode = HWND_DMABUF_ALPHA_MODE_IGNORE;
+    desc.plane_count = 1;
+    desc.plane_offsets[0] = 0;
+    desc.plane_strides[0] = surface->stride;
+    foreign_gdi_fill_dirty_rect( &desc, dirty );
+
+    slot->busy = TRUE;
+    slot->release_token = desc.release_token;
+    ret = hwnd_dmabuf_channel_publish( surface->hwnd, surface->channel_fd, &desc, slot->fd );
+    if (ret == HWND_DMABUF_CHANNEL_OK)
+    {
+        TRACE( "foreign_gdi hwnd=%p published shm slot=%u seq=%u size=%ux%u dirty=%s token=%s\n",
+               surface->hwnd, slot->image_id, desc.frame_seq, desc.width, desc.height,
+               wine_dbgstr_rect(dirty), wine_dbgstr_longlong(desc.release_token) );
+        return TRUE;
+    }
+
+    slot->busy = FALSE;
+    slot->release_token = 0;
+    WARN( "foreign_gdi hwnd=%p failed to publish shm slot=%u ret=%d\n",
+          surface->hwnd, slot->image_id, ret );
+    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
+    {
+        surface->lost = TRUE;
+        foreign_gdi_surface_close_channel( surface );
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void foreign_gdi_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
+{
+}
+
+static void foreign_gdi_surface_destroy( struct window_surface *window_surface )
+{
+    struct foreign_gdi_surface *surface = foreign_gdi_surface_from_window_surface( window_surface );
+    unsigned int i;
+
+    pthread_mutex_lock( &foreign_gdi_lock );
+    if (surface->linked)
+    {
+        list_remove( &surface->entry );
+        surface->linked = FALSE;
+    }
+    pthread_mutex_unlock( &foreign_gdi_lock );
+
+    foreign_gdi_surface_close_channel( surface );
+    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
+        foreign_gdi_slot_destroy( &surface->slots[i] );
+}
+
+static const struct window_surface_funcs foreign_gdi_surface_funcs =
+{
+    foreign_gdi_surface_set_clip,
+    foreign_gdi_surface_flush,
+    foreign_gdi_surface_destroy
+};
+
+static struct foreign_gdi_surface *foreign_gdi_surface_create( HWND hwnd, int width, int height )
+{
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    struct foreign_gdi_surface *surface;
+    struct window_surface *window_surface;
+    RECT rect = {0, 0, width, height};
+    unsigned int i;
+
+    if (width <= 0 || height <= 0) return NULL;
+    if (width > INT_MAX / 4) return NULL;
+    if (height > INT_MAX / (width * 4)) return NULL;
+
+    memset( info, 0, sizeof(*info) );
+    info->bmiHeader.biSize = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth = width;
+    info->bmiHeader.biHeight = -height;
+    info->bmiHeader.biPlanes = 1;
+    info->bmiHeader.biBitCount = 32;
+    info->bmiHeader.biCompression = BI_RGB;
+    info->bmiHeader.biSizeImage = get_dib_image_size( info );
+
+    if (!(window_surface = window_surface_create( sizeof(*surface), &foreign_gdi_surface_funcs,
+                                                  hwnd, &rect, info, 0 )))
+        return NULL;
+
+    surface = foreign_gdi_surface_from_window_surface( window_surface );
+    surface->hwnd = hwnd;
+    surface->channel_fd = -1;
+    surface->width = width;
+    surface->height = height;
+    surface->stride = width * 4;
+    surface->size = surface->stride * height;
+    surface->ring_generation = 1;
+    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
+        surface->slots[i].fd = -1;
+
+    TRACE( "foreign_gdi hwnd=%p created producer surface %p size=%dx%d\n",
+           hwnd, surface, width, height );
+    return surface;
+}
+
+static struct window_surface *foreign_gdi_surface_get( HWND hwnd, const RECT *win_rect )
+{
+    struct foreign_gdi_surface *surface, *old = NULL, *created;
+    int width = win_rect->right - win_rect->left;
+    int height = win_rect->bottom - win_rect->top;
+
+    if (width <= 0 || height <= 0) return NULL;
+
+    pthread_mutex_lock( &foreign_gdi_lock );
+    LIST_FOR_EACH_ENTRY( surface, &foreign_gdi_surfaces, struct foreign_gdi_surface, entry )
+    {
+        if (surface->hwnd != hwnd) continue;
+        if (surface->width == width && surface->height == height && !surface->lost)
+        {
+            window_surface_add_ref( &surface->header );
+            pthread_mutex_unlock( &foreign_gdi_lock );
+            return &surface->header;
+        }
+        list_remove( &surface->entry );
+        surface->linked = FALSE;
+        old = surface;
+        break;
+    }
+    pthread_mutex_unlock( &foreign_gdi_lock );
+
+    if (old)
+    {
+        window_surface_lock( &old->header );
+        old->lost = TRUE;
+        foreign_gdi_surface_close_channel( old );
+        window_surface_unlock( &old->header );
+        register_window_surface( &old->header, NULL );
+        window_surface_release( &old->header );
+    }
+
+    if (!(created = foreign_gdi_surface_create( hwnd, width, height ))) return NULL;
+
+    pthread_mutex_lock( &foreign_gdi_lock );
+    LIST_FOR_EACH_ENTRY( surface, &foreign_gdi_surfaces, struct foreign_gdi_surface, entry )
+    {
+        if (surface->hwnd != hwnd) continue;
+        if (surface->width == width && surface->height == height && !surface->lost)
+        {
+            window_surface_add_ref( &surface->header );
+            pthread_mutex_unlock( &foreign_gdi_lock );
+            window_surface_release( &created->header );
+            return &surface->header;
+        }
+    }
+    list_add_tail( &foreign_gdi_surfaces, &created->entry );
+    created->linked = TRUE;
+    window_surface_add_ref( &created->header );
+    pthread_mutex_unlock( &foreign_gdi_lock );
+
+    register_window_surface( NULL, &created->header );
+    return &created->header;
+}
+
+static void foreign_gdi_surface_flush_hwnd( HWND hwnd )
+{
+    struct foreign_gdi_surface *surface;
+    struct window_surface *window_surface = NULL;
+
+    pthread_mutex_lock( &foreign_gdi_lock );
+    LIST_FOR_EACH_ENTRY( surface, &foreign_gdi_surfaces, struct foreign_gdi_surface, entry )
+    {
+        if (surface->hwnd != hwnd) continue;
+        window_surface = &surface->header;
+        window_surface_add_ref( window_surface );
+        break;
+    }
+    pthread_mutex_unlock( &foreign_gdi_lock );
+
+    if (window_surface)
+    {
+        window_surface_flush( window_surface );
+        window_surface_release( window_surface );
+    }
+}
 
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
@@ -858,6 +1293,7 @@ static void update_visible_region( struct dce *dce )
     UINT raw_dpi;
     DWORD layered_flags;
     WND *win;
+    BOOL foreign = dce->hwnd && !is_current_process_window( dce->hwnd );
 
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
@@ -920,8 +1356,20 @@ static void update_visible_region( struct dce *dce )
     }
     else
     {
+        struct window_surface *foreign_surface = NULL;
         RECT window_rect, toplevel_rect;
         UINT dpi;
+
+        if (foreign && user_driver->pUseForeignGdiBridge())
+            foreign_surface = foreign_gdi_surface_get( dce->hwnd, &win_rect );
+
+        if (foreign_surface)
+        {
+            user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &win_rect, flags );
+            set_visible_region( dce->hdc, vis_rgn, &win_rect, &win_rect, foreign_surface, 0, 0 );
+            window_surface_release( foreign_surface );
+            return;
+        }
 
         get_win_monitor_dpi( top_win, &raw_dpi );
         dpi = get_dpi_for_window( top_win );
@@ -1459,7 +1907,10 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 INT WINAPI NtUserReleaseDC( HWND hwnd, HDC hdc )
 {
     if (hwnd && !is_current_process_window( hwnd ))
+    {
+        foreign_gdi_surface_flush_hwnd( hwnd );
         user_driver->pProcessEvents( 0 );
+    }
 
     return release_dc( hwnd, hdc, FALSE );
 }

@@ -33,6 +33,11 @@
 
 char *process_name = NULL;
 
+static BOOL WAYLAND_UseForeignGdiBridge(void)
+{
+    return TRUE;
+}
+
 static const struct user_driver_funcs waylanddrv_funcs =
 {
     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
@@ -57,6 +62,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
     .pWindowPosChanged = WAYLAND_WindowPosChanged,
     .pWindowPosChanging = WAYLAND_WindowPosChanging,
     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
+    .pUseForeignGdiBridge = WAYLAND_UseForeignGdiBridge,
     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
     .pGetWindowStateUpdates = WAYLAND_GetWindowStateUpdates,
     .pGetWindowMaxTrackSize = WAYLAND_GetWindowMaxTrackSize,

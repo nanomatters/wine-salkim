@@ -12,6 +12,12 @@
 #define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
 #define HWND_DMABUF_ALPHA_MODE_IGNORE          3
 
+/* DRM fourcc values carried in hwnd_dmabuf_frame_desc_t.fourcc when
+ * HWND_DMABUF_FLAG_SHM is set. Consumers translate them to native shm
+ * protocol formats where needed. */
+#define HWND_DMABUF_SHM_FORMAT_XRGB8888        0x34325258 /* 'XR24' */
+#define HWND_DMABUF_SHM_FORMAT_ARGB8888        0x34325241 /* 'AR24' */
+
 enum hwnd_dmabuf_channel_result
 {
     HWND_DMABUF_CHANNEL_OK = 0,
