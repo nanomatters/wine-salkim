@@ -301,6 +301,8 @@ enum hwnd_dmabuf_status
  * then may the consumer cache and reuse the wl_buffer per slot. Producers that
  * re-export a fresh dmabuf each publish (e.g. the wined3d GL path) must NOT set it. */
 #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
+/* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
+#define HWND_DMABUF_FLAG_SHM              0x00000002
 
 typedef struct
 {
