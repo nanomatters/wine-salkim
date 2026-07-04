@@ -3239,37 +3239,69 @@ static BOOL lock_display_devices( BOOL force )
     UINT64 serial;
     UINT status;
     WCHAR name[MAX_PATH];
+    BOOL requested_force = force, probed_gpus = FALSE;
     BOOL ret = TRUE;
 
     init_display_driver(); /* make sure to load the driver before anything else */
 
     if (user_driver->pHasWindowManager( "steamcompmgr" )) emulate_modeset = FALSE;
 
-    pthread_mutex_lock( &display_lock );
-
-    serial = get_monitor_update_serial();
-    if (!force && monitor_update_serial >= serial) return TRUE;
-
-    /* services do not have any adapters, only a virtual monitor */
-    if (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL )
-        && !wcscmp( name, wine_service_station_name ))
+    for (;;)
     {
-        clear_display_devices();
-        list_add_tail( &monitors, &virtual_monitor.entry );
-        set_winstation_monitors( TRUE );
-        return TRUE;
-    }
+        force = requested_force;
 
-    if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
-    if (force)
-    {
+        pthread_mutex_lock( &display_lock );
+
+        serial = get_monitor_update_serial();
+        if (!force && monitor_update_serial >= serial)
+        {
+            if (probed_gpus)
+            {
+                free_gpu_infos( &ctx.vulkan_gpus );
+                free_gpu_infos( &ctx.opengl_gpus );
+            }
+            return TRUE;
+        }
+
+        /* services do not have any adapters, only a virtual monitor */
+        if (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL )
+            && !wcscmp( name, wine_service_station_name ))
+        {
+            if (probed_gpus)
+            {
+                free_gpu_infos( &ctx.vulkan_gpus );
+                free_gpu_infos( &ctx.opengl_gpus );
+            }
+            clear_display_devices();
+            list_add_tail( &monitors, &virtual_monitor.entry );
+            set_winstation_monitors( TRUE );
+            return TRUE;
+        }
+
+        if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
+
+        if (!force || probed_gpus) break;
+
+        /* GPU probing initializes host graphics loaders and can re-enter user callbacks. */
+        pthread_mutex_unlock( &display_lock );
+
         if (!get_vulkan_gpus( &ctx.vulkan_gpus )) WARN( "Failed to find any Vulkan GPU\n" );
         if (!get_opengl_gpus( &ctx.opengl_gpus )) WARN( "Failed to find any OpenGL GPU\n" );
+        probed_gpus = TRUE;
+    }
+
+    if (force)
+    {
         if (!(status = update_display_devices( &ctx ))) commit_display_devices( &ctx );
         else WARN( "Failed to update display devices, status %#x\n", status );
         release_display_manager_ctx( &ctx );
 
         ret = update_display_cache_from_registry( serial );
+    }
+    else if (probed_gpus)
+    {
+        free_gpu_infos( &ctx.vulkan_gpus );
+        free_gpu_infos( &ctx.opengl_gpus );
     }
 
     if (!ret)
