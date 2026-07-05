@@ -605,6 +605,7 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
 void wayland_surface_coords_from_window(struct wayland_surface *surface,
                                         int window_x, int window_y,
                                         int *surface_x, int *surface_y);

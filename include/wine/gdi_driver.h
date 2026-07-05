@@ -312,6 +312,8 @@ struct window_surface
     UINT                               alpha_bits;   /* layered window global alpha bits, invalid if -1 */
     UINT                               alpha_mask;   /* layered window per-pixel alpha mask, invalid if 0 */
     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
+    HRGN                               gdi_over_producer_region; /* GDI pixels that must appear over child producers */
+    HRGN                               gdi_over_paint_region; /* actual GDI paints to carry over child producers */
     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
     /* driver-specific fields here */
@@ -325,8 +327,10 @@ W32KAPI void window_surface_lock( struct window_surface *surface );
 W32KAPI void window_surface_unlock( struct window_surface *surface );
 W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
 W32KAPI void window_surface_flush( struct window_surface *surface );
+W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect );
 W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
 W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );
+W32KAPI void window_surface_set_gdi_over_producer_region( struct window_surface *surface, HRGN region );
 W32KAPI struct window_surface *window_surface_get( HWND hwnd );
 
 /* display manager interface, used to initialize display device registry data */

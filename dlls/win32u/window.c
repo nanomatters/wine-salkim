@@ -1974,7 +1974,14 @@ static BOOL get_window_info( HWND hwnd, WINDOWINFO *info )
     return TRUE;
 }
 
-static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *visible )
+enum window_region_type
+{
+    WINDOW_REGION_SHAPE,
+    WINDOW_REGION_SURFACE,
+    WINDOW_REGION_GDI_OVER_PRODUCER,
+};
+
+static NTSTATUS get_window_region( HWND hwnd, enum window_region_type type, HRGN *region, RECT *visible )
 {
     NTSTATUS status;
     RGNDATA *data;
@@ -1988,7 +1995,7 @@ static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *
         SERVER_START_REQ( get_window_region )
         {
             req->window = wine_server_user_handle( hwnd );
-            req->surface = surface;
+            req->surface = type;
             wine_server_set_reply( req, data->Buffer, size );
             if (!(status = wine_server_call( req )))
             {
@@ -2025,7 +2032,7 @@ static void update_surface_region( HWND hwnd )
     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
     if (!win->surface) goto done;
 
-    if (get_window_region( hwnd, FALSE, &shape, &visible )) goto done;
+    if (get_window_region( hwnd, WINDOW_REGION_SHAPE, &shape, &visible )) goto done;
     if (shape)
     {
         region = NtGdiCreateRectRgn( 0, 0, visible.right - visible.left, visible.bottom - visible.top );
@@ -2035,7 +2042,7 @@ static void update_surface_region( HWND hwnd )
     }
     window_surface_set_shape( win->surface, shape );
 
-    if (get_window_region( hwnd, TRUE, &region, &visible )) goto done;
+    if (get_window_region( hwnd, WINDOW_REGION_SURFACE, &region, &visible )) goto done;
     if (!region) window_surface_set_clip( win->surface, shape );
     else
     {
@@ -2044,6 +2051,16 @@ static void update_surface_region( HWND hwnd )
         window_surface_set_clip( win->surface, region );
         NtGdiDeleteObjectApp( region );
     }
+
+    if (get_window_region( hwnd, WINDOW_REGION_GDI_OVER_PRODUCER, &region, &visible )) goto done;
+    if (region)
+    {
+        NtGdiOffsetRgn( region, -visible.left, -visible.top );
+        if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
+        window_surface_set_gdi_over_producer_region( win->surface, region );
+        NtGdiDeleteObjectApp( region );
+    }
+    else window_surface_set_gdi_over_producer_region( win->surface, 0 );
 
 done:
     if (shape) NtGdiDeleteObjectApp( shape );
