@@ -291,6 +291,15 @@ static BOOL rect_contains_context_pos( const RECT *rect, POINT pos )
            rect->top <= pos.y && pos.y <= rect->bottom;
 }
 
+static BOOL rect_matches_context_anchor( const RECT *rect, POINT pos )
+{
+    RECT anchor_rect = *rect;
+
+    InflateRect( &anchor_rect, get_system_metrics( SM_CXDRAG ),
+                 get_system_metrics( SM_CYDRAG ) );
+    return rect_contains_context_pos( &anchor_rect, pos );
+}
+
 static POINT map_context_pos_raw_to_thread_dpi( POINT pos )
 {
     RECT rect = {pos.x, pos.y, pos.x, pos.y};
@@ -305,8 +314,8 @@ static BOOL rect_matches_context_pos( const RECT *rect, POINT pos )
 {
     POINT mapped = map_context_pos_raw_to_thread_dpi( pos );
 
-    return rect_contains_context_pos( rect, pos ) ||
-           ((mapped.x != pos.x || mapped.y != pos.y) && rect_contains_context_pos( rect, mapped ));
+    return rect_matches_context_anchor( rect, pos ) ||
+           ((mapped.x != pos.x || mapped.y != pos.y) && rect_matches_context_anchor( rect, mapped ));
 }
 
 /* Convert an HICON to a 32bpp ARGB buffer in network byte order, as the
