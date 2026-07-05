@@ -198,22 +198,26 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
     if (!process_wayland.zwp_linux_dmabuf_v1)
         return HWND_DMABUF_NOT_FOUND;
 
-    /* Only cross-process windows need the bridge. A top-level with a local
-     * wayland surface presents directly through Vulkan WSI. Do not advertise
-     * caps. Otherwise DXVK routes same-process windows (games) onto
-     * the dmabuf path and loses FIFO vsync pacing. */
+    /* Most local top-levels should present directly through Vulkan WSI. If the
+     * top-level's client content cannot be represented as a rectangular Wayland
+     * surface, route it through the managed producer path where Wine can apply
+     * the Win32 visible region. */
     {
         HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
         struct wayland_win_data *toplevel_data;
         BOOL toplevel_presentable_locally = FALSE;
+        BOOL toplevel_unmaskable = FALSE;
 
         if (toplevel && (toplevel_data = wayland_win_data_get(toplevel)))
         {
-            toplevel_presentable_locally = toplevel_data->wayland_surface != NULL;
+            struct wayland_surface *surface = toplevel_data->wayland_surface;
+
+            toplevel_presentable_locally = surface != NULL;
+            toplevel_unmaskable = surface && wayland_surface_client_is_unmaskable(surface);
             wayland_win_data_release(toplevel_data);
         }
 
-        if (toplevel_presentable_locally)
+        if (toplevel_presentable_locally && !toplevel_unmaskable)
         {
             TRACE("hwnd %p toplevel %p has a local wayland surface; direct present, no dmabuf bridge\n",
                   hwnd, toplevel);
