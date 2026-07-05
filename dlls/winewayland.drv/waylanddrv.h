@@ -483,6 +483,7 @@ void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
                                           const struct child_overlay_snapshot *snapshot);
 void wayland_surface_clear_child_overlays(struct wayland_surface *surface);
 void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND child);
+void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
 void wayland_surface_coords_from_window(struct wayland_surface *surface,
                                         int window_x, int window_y,
                                         int *surface_x, int *surface_y);

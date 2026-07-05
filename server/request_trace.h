@@ -3593,6 +3593,7 @@ static void dump_hwnd_dmabuf_set_pending_reply( const struct hwnd_dmabuf_set_pen
 static void dump_hwnd_dmabuf_get_channel_request( const struct hwnd_dmabuf_get_channel_request *req )
 {
     fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", flags=%08x", req->flags );
 }
 
 static void dump_hwnd_dmabuf_get_channel_reply( const struct hwnd_dmabuf_get_channel_reply *req )
@@ -3615,6 +3616,7 @@ static void dump_hwnd_dmabuf_get_channel_exclusive_reply( const struct hwnd_dmab
 static void dump_hwnd_dmabuf_claim_channel_request( const struct hwnd_dmabuf_claim_channel_request *req )
 {
     fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", flags=%08x", req->flags );
 }
 
 static void dump_hwnd_dmabuf_claim_channel_reply( const struct hwnd_dmabuf_claim_channel_reply *req )
@@ -3626,6 +3628,7 @@ static void dump_hwnd_dmabuf_claim_channel_reply( const struct hwnd_dmabuf_claim
 static void dump_hwnd_dmabuf_release_channel_request( const struct hwnd_dmabuf_release_channel_request *req )
 {
     fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", flags=%08x", req->flags );
 }
 
 static void dump_hwnd_dmabuf_release_channel_reply( const struct hwnd_dmabuf_release_channel_reply *req )

@@ -287,6 +287,13 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
 /* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
 #define HWND_DMABUF_FLAG_SHM              0x00000002
+/* Frame is a GDI overlay carried above normal self-presenting producers. */
+#define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
+
+#define HWND_DMABUF_FRAME_OPENED          0x00000001
+#define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
+
+#define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
 
 typedef struct
 {
@@ -6383,6 +6390,8 @@ struct hwnd_dmabuf_get_channel_request
 {
     struct request_header __header;
     user_handle_t  hwnd;
+    unsigned int   flags;
+    char __pad_20[4];
 };
 struct hwnd_dmabuf_get_channel_reply
 {
@@ -6411,6 +6420,8 @@ struct hwnd_dmabuf_claim_channel_request
 {
     struct request_header __header;
     user_handle_t  hwnd;
+    unsigned int   flags;
+    char __pad_20[4];
 };
 struct hwnd_dmabuf_claim_channel_reply
 {
@@ -6425,6 +6436,8 @@ struct hwnd_dmabuf_release_channel_request
 {
     struct request_header __header;
     user_handle_t  hwnd;
+    unsigned int   flags;
+    char __pad_20[4];
 };
 struct hwnd_dmabuf_release_channel_reply
 {
@@ -7398,6 +7411,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 932
+#define SERVER_PROTOCOL_VERSION 933
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

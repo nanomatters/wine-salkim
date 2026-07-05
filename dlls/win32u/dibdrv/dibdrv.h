@@ -99,6 +99,7 @@ typedef struct dibdrv_physdev
 
     HRGN clip;
     RECT *bounds;
+    struct window_surface *gdi_over_surface;
     struct cached_font *font;
 
     /* pen */

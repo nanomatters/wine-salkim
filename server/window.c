@@ -102,8 +102,11 @@ struct window
     window_shm_t    *shared;          /* window in session shared memory */
     struct object   *dmabuf_channel_producer; /* producer end of the frame socket */
     struct object   *dmabuf_channel_consumer; /* consumer end of the frame socket */
+    struct object   *gdi_overlay_channel_producer; /* GDI overlay producer socket */
+    struct object   *gdi_overlay_channel_consumer; /* GDI overlay consumer socket */
     unsigned int     dmabuf_pending_count;    /* swapchain creation in progress */
     unsigned int     dmabuf_producer_count;   /* active users of the frame socket */
+    unsigned int     gdi_overlay_producer_count; /* active GDI overlay producers */
     unsigned int     dmabuf_exclusive_count;  /* producer count from exclusive opens */
 };
 
@@ -180,6 +183,8 @@ static void window_destroy( struct object *obj )
 
     if (win->dmabuf_channel_producer) release_object( win->dmabuf_channel_producer );
     if (win->dmabuf_channel_consumer) release_object( win->dmabuf_channel_consumer );
+    if (win->gdi_overlay_channel_producer) release_object( win->gdi_overlay_channel_producer );
+    if (win->gdi_overlay_channel_consumer) release_object( win->gdi_overlay_channel_consumer );
 
     if (win->parent)
     {
@@ -709,8 +714,11 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->shared         = NULL;
     win->dmabuf_channel_producer = NULL;
     win->dmabuf_channel_consumer = NULL;
+    win->gdi_overlay_channel_producer = NULL;
+    win->gdi_overlay_channel_consumer = NULL;
     win->dmabuf_pending_count = 0;
     win->dmabuf_producer_count = 0;
+    win->gdi_overlay_producer_count = 0;
     win->dmabuf_exclusive_count = 0;
     win->window_rect = win->visible_rect = win->surface_rect = win->client_rect = empty_rect;
     list_init( &win->children );
@@ -1314,7 +1322,8 @@ static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct wind
     info->style = win->style;
     info->ex_style = win->ex_style;
     info->dpi = get_window_dpi( win );
-    info->opened = win->dmabuf_producer_count != 0;
+    if (win->dmabuf_producer_count) info->opened |= HWND_DMABUF_FRAME_OPENED;
+    if (win->gdi_overlay_producer_count) info->opened |= HWND_DMABUF_FRAME_GDI_OVERLAY;
 }
 
 static void hwnd_dmabuf_release_server_channel( struct window *win )
@@ -1332,11 +1341,25 @@ static void hwnd_dmabuf_release_server_channel( struct window *win )
     win->dmabuf_exclusive_count = 0;
 }
 
+static void hwnd_dmabuf_release_gdi_overlay_server_channel( struct window *win )
+{
+    if (win->gdi_overlay_channel_producer)
+    {
+        release_object( win->gdi_overlay_channel_producer );
+        win->gdi_overlay_channel_producer = NULL;
+    }
+    if (win->gdi_overlay_channel_consumer)
+    {
+        release_object( win->gdi_overlay_channel_consumer );
+        win->gdi_overlay_channel_consumer = NULL;
+    }
+}
+
 /* Pending producers are also listed so parents do not snapshot their GDI host
  * while the producer is still allocating its first exportable images. */
 static int hwnd_dmabuf_is_listed( struct window *win )
 {
-    return win->dmabuf_producer_count || win->dmabuf_pending_count;
+    return win->dmabuf_producer_count || win->dmabuf_pending_count || win->gdi_overlay_producer_count;
 }
 
 static unsigned int hwnd_dmabuf_count_frames( struct window *win )
@@ -1477,6 +1500,7 @@ static int add_window_coverage( struct window *win, struct region *clip,
  * self-presenting and must show through the parent surface. */
 static int collect_punch_through_holes( struct window *win, struct region *parent_clip,
                                         struct region *holes, struct region *covered,
+                                        struct region *transparent_above, struct region *gdi_over,
                                         int offset_x, int offset_y )
 {
     struct window *ptr;
@@ -1493,11 +1517,24 @@ static int collect_punch_through_holes( struct window *win, struct region *paren
     LIST_FOR_EACH_ENTRY( ptr, &win->children, struct window, entry )
     {
         if (!(ptr->style & WS_VISIBLE)) continue;
-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+        if (ptr->ex_style & WS_EX_TRANSPARENT)
+        {
+            /* WS_EX_TRANSPARENT affects sibling paint ordering, not whether
+             * the window may draw pixels. Track these pixels separately so
+             * punch-through can preserve them above lower producer holes. */
+            if (transparent_above && !window_has_self_presenting_content( ptr ) &&
+                set_window_rect_region( visible, ptr, &ptr->visible_rect, client_clip,
+                                        offset_x + win->client_rect.left,
+                                        offset_y + win->client_rect.top ) &&
+                !union_region( transparent_above, transparent_above, visible ))
+                goto done;
+            continue;
+        }
 
         if (window_has_punch_through_content( ptr ))
         {
             if (!collect_punch_through_holes( ptr, client_clip, holes, covered,
+                                              transparent_above, gdi_over,
                                               offset_x + win->client_rect.left,
                                               offset_y + win->client_rect.top ))
                 goto done;
@@ -1512,6 +1549,11 @@ static int collect_punch_through_holes( struct window *win, struct region *paren
     {
         if (!subtract_region( tmp, client_clip, covered )) goto done;
         if (!union_region( holes, holes, tmp )) goto done;
+        if (transparent_above && gdi_over)
+        {
+            if (!intersect_region( tmp, tmp, transparent_above )) goto done;
+            if (!union_region( gdi_over, gdi_over, tmp )) goto done;
+        }
     }
 
     if (!add_window_coverage( win, parent_clip, covered, visible, offset_x, offset_y )) goto done;
@@ -1544,7 +1586,7 @@ static struct region *get_surface_region( struct window *win )
     set_region_rect( clip, &win->visible_rect );
     if (win->win_region && !intersect_window_region( clip, win )) goto error;
 
-    if (!collect_punch_through_holes( win, clip, holes, covered, 0, 0 )) goto error;
+    if (!collect_punch_through_holes( win, clip, holes, covered, NULL, NULL, 0, 0 )) goto error;
     if (!subtract_region( region, region, holes )) goto error;
 
     free_region( covered );
@@ -1553,6 +1595,39 @@ static struct region *get_surface_region( struct window *win )
     return region;
 
 error:
+    if (covered) free_region( covered );
+    if (holes) free_region( holes );
+    if (clip) free_region( clip );
+    free_region( region );
+    return NULL;
+}
+
+
+/* compute the GDI pixels that must be carried above self-presenting children */
+static struct region *get_gdi_over_producer_region( struct window *win )
+{
+    struct region *region, *clip = NULL, *holes = NULL, *covered = NULL, *transparent_above = NULL;
+
+    if (!(region = create_empty_region())) return NULL;
+    if (!(clip = create_empty_region())) goto error;
+    if (!(holes = create_empty_region())) goto error;
+    if (!(covered = create_empty_region())) goto error;
+    if (!(transparent_above = create_empty_region())) goto error;
+
+    set_region_rect( clip, &win->visible_rect );
+    if (win->win_region && !intersect_window_region( clip, win )) goto error;
+
+    if (!collect_punch_through_holes( win, clip, holes, covered, transparent_above, region, 0, 0 ))
+        goto error;
+
+    free_region( transparent_above );
+    free_region( covered );
+    free_region( holes );
+    free_region( clip );
+    return region;
+
+error:
+    if (transparent_above) free_region( transparent_above );
     if (covered) free_region( covered );
     if (holes) free_region( holes );
     if (clip) free_region( clip );
@@ -3045,6 +3120,12 @@ DECL_HANDLER(get_visible_region)
 /* get the window regions */
 DECL_HANDLER(get_window_region)
 {
+    enum
+    {
+        WINDOW_REGION_SHAPE,
+        WINDOW_REGION_SURFACE,
+        WINDOW_REGION_GDI_OVER_PRODUCER
+    };
     struct rectangle *data;
     struct region *region;
     struct window *win = get_window( req->window );
@@ -3052,11 +3133,16 @@ DECL_HANDLER(get_window_region)
     if (!win) return;
 
     reply->visible_rect = win->visible_rect;
-    if (req->surface)
+    if (req->surface == WINDOW_REGION_SURFACE || req->surface == WINDOW_REGION_GDI_OVER_PRODUCER)
     {
         if (!is_visible( win )) return;
 
-        if ((region = get_surface_region( win )))
+        if (req->surface == WINDOW_REGION_GDI_OVER_PRODUCER)
+            region = get_gdi_over_producer_region( win );
+        else
+            region = get_surface_region( win );
+
+        if (region)
         {
             struct rectangle *data = get_region_data_and_free( region, get_reply_max_size(), &reply->total_size );
             if (data) set_reply_data_ptr( data, reply->total_size );
@@ -3191,9 +3277,43 @@ static int hwnd_dmabuf_create_server_channel( struct window *win )
     return 1;
 }
 
+static int hwnd_dmabuf_create_gdi_overlay_server_channel( struct window *win )
+{
+    int fds[2];
+
+    if (win->gdi_overlay_channel_producer) return 1;
+
+    if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
+        return 0;
+
+    {
+        struct object *producer_end, *consumer_end;
+
+        producer_end = hwnd_dmabuf_wrap_fd( fds[0] );
+        consumer_end = hwnd_dmabuf_wrap_fd( fds[1] );
+        if (!producer_end || !consumer_end)
+        {
+            if (producer_end) release_object( producer_end );
+            if (consumer_end) release_object( consumer_end );
+            return 0;
+        }
+        win->gdi_overlay_channel_producer = producer_end;
+        win->gdi_overlay_channel_consumer = consumer_end;
+    }
+
+    return 1;
+}
+
 static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *handle )
 {
     *handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
+                                            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
+    return *handle != 0;
+}
+
+static int hwnd_dmabuf_alloc_gdi_overlay_producer_handle( struct window *win, obj_handle_t *handle )
+{
+    *handle = alloc_handle_no_access_check( current->process, win->gdi_overlay_channel_producer,
                                             GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
     return *handle != 0;
 }
@@ -3208,6 +3328,11 @@ static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive 
         win->dmabuf_pending_count--;
 }
 
+static void hwnd_dmabuf_commit_gdi_overlay_producer_open( struct window *win )
+{
+    win->gdi_overlay_producer_count++;
+}
+
 /* Hand the producer its end of the frame socket, minted once and retained. A
  * resize (new swapchain) re-grants the same socket so the consumer keeps reading. */
 DECL_HANDLER(hwnd_dmabuf_get_channel)
@@ -3218,6 +3343,38 @@ DECL_HANDLER(hwnd_dmabuf_get_channel)
     reply->status = HWND_DMABUF_INVALID_ARGS;
     reply->channel_handle = 0;
     if (!win) return;
+
+    if (req->flags & HWND_DMABUF_CHANNEL_GDI_OVERLAY)
+    {
+        if (win->dmabuf_producer_count || win->dmabuf_pending_count)
+        {
+            reply->status = HWND_DMABUF_BUSY;
+            return;
+        }
+
+        had_channel = win->gdi_overlay_channel_producer != NULL;
+        if (!hwnd_dmabuf_create_gdi_overlay_server_channel( win ))
+        {
+            reply->status = HWND_DMABUF_NOT_FOUND;
+            return;
+        }
+
+        if (!hwnd_dmabuf_alloc_gdi_overlay_producer_handle( win, &reply->channel_handle ))
+        {
+            if (!had_channel && !win->gdi_overlay_producer_count)
+                hwnd_dmabuf_release_gdi_overlay_server_channel( win );
+            return;
+        }
+        hwnd_dmabuf_commit_gdi_overlay_producer_open( win );
+        reply->status = HWND_DMABUF_OK;
+        return;
+    }
+
+    if (win->gdi_overlay_producer_count)
+    {
+        reply->status = HWND_DMABUF_BUSY;
+        return;
+    }
 
     if (win->dmabuf_exclusive_count)
     {
@@ -3253,7 +3410,8 @@ DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive)
     reply->channel_handle = 0;
     if (!win) return;
 
-    if (win->dmabuf_producer_count || win->dmabuf_pending_count)
+    if (win->dmabuf_producer_count || win->dmabuf_pending_count ||
+        win->gdi_overlay_producer_count)
     {
         reply->status = HWND_DMABUF_BUSY;
         return;
@@ -3285,6 +3443,26 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
     reply->status = HWND_DMABUF_NOT_FOUND;
     reply->channel_handle = 0;
     if (!win) return;
+    if (req->flags & HWND_DMABUF_CHANNEL_GDI_OVERLAY)
+    {
+        if (!win->gdi_overlay_producer_count || !win->gdi_overlay_channel_consumer)
+        {
+            reply->status = HWND_DMABUF_NO_FRAME;
+            return;
+        }
+
+        reply->channel_handle = alloc_handle_no_access_check( current->process,
+                                                              win->gdi_overlay_channel_consumer,
+                                                              GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
+        if (!reply->channel_handle)
+        {
+            reply->status = HWND_DMABUF_INVALID_ARGS;
+            return;
+        }
+        reply->status = HWND_DMABUF_OK;
+        return;
+    }
+
     if (!win->dmabuf_producer_count || !win->dmabuf_channel_consumer)
     {
         reply->status = HWND_DMABUF_NO_FRAME;
@@ -3310,6 +3488,16 @@ DECL_HANDLER(hwnd_dmabuf_release_channel)
 
     reply->status = HWND_DMABUF_INVALID_ARGS;
     if (!win) return;
+
+    if (req->flags & HWND_DMABUF_CHANNEL_GDI_OVERLAY)
+    {
+        if (win->gdi_overlay_producer_count)
+            win->gdi_overlay_producer_count--;
+        if (!win->gdi_overlay_producer_count)
+            hwnd_dmabuf_release_gdi_overlay_server_channel( win );
+        reply->status = HWND_DMABUF_OK;
+        return;
+    }
 
     if (win->dmabuf_producer_count)
         win->dmabuf_producer_count--;
