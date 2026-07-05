@@ -56,6 +56,8 @@ static void *client_objects[MAX_USER_HANDLES];
 static volatile unsigned int startup_info_flags;
 static unsigned int startup_show_window;
 
+static HWND window_from_point_excluding_root( HWND hwnd, POINT pt );
+
 static unsigned int set_startup_info_flags( unsigned int mask, unsigned int flags )
 {
     unsigned int prev, new;
@@ -2560,6 +2562,14 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         /* fallback to any window that is right below our top left corner */
         if (!owner_hint) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
         if (owner_hint) owner_hint = NtUserGetAncestor(owner_hint, GA_ROOT);
+        if (!owner_hint || owner_hint == hwnd || owner_hint == NtUserGetDesktopWindow())
+        {
+            POINT pt = { new_rects->window.left, new_rects->window.top };
+
+            if (new_rects->window.right - new_rects->window.left > 1) pt.x++;
+            if (new_rects->window.bottom - new_rects->window.top > 1) pt.y++;
+            owner_hint = window_from_point_excluding_root( hwnd, pt );
+        }
 
         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
                                         get_driver_window_surface( new_surface, raw_dpi ) );
@@ -2927,6 +2937,30 @@ static HWND *list_children_from_point( HWND hwnd, POINT pt, UINT dpi )
         size = count + 1;  /* restart with a large enough buffer */
     }
     return NULL;
+}
+
+static HWND window_from_point_excluding_root( HWND hwnd, POINT pt )
+{
+    HWND hwnd_root = NtUserGetAncestor( hwnd, GA_ROOT );
+    HWND desktop = NtUserGetDesktopWindow();
+    UINT dpi, raw_dpi;
+    HWND *list, ret = 0;
+    int i;
+
+    if (!(dpi = get_thread_dpi())) dpi = get_win_monitor_dpi( desktop, &raw_dpi );
+    if (!(list = list_children_from_point( desktop, pt, dpi ))) return 0;
+
+    for (i = 0; list[i]; i++)
+    {
+        HWND root = NtUserGetAncestor( list[i], GA_ROOT );
+
+        if (!root || root == desktop || root == hwnd_root) continue;
+        ret = root;
+        break;
+    }
+
+    free( list );
+    return ret;
 }
 
 /***********************************************************************
