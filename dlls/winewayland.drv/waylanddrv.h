@@ -418,7 +418,7 @@ enum wayland_child_visibility
     WAYLAND_CHILD_VISIBILITY_UNMASKABLE,
 };
 
-struct wayland_visual_constraint_trace
+struct wayland_visual_constraint
 {
     BOOL valid;
     enum wayland_child_visibility visibility;
@@ -458,7 +458,7 @@ struct wayland_client_surface
     /* if true then the client surface has an alpha channel controlling transparency */
     BOOL has_alpha;
     BOOL has_presented;
-    struct wayland_visual_constraint_trace visual_constraint_trace;
+    struct wayland_visual_constraint visual_constraint;
 };
 
 struct wayland_shm_buffer
@@ -601,6 +601,7 @@ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
 BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
