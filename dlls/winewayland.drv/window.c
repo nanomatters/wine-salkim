@@ -1617,6 +1617,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             wayland_surface->transparent_carrier_attached = FALSE;
             wl_surface_commit(wayland_surface->wl_surface);
             wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
+            wayland_surface_update_hwnd_dmabufs(wayland_surface);
             committed = TRUE;
         }
         else

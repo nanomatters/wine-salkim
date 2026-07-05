@@ -109,6 +109,31 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, H
     SERVER_START_REQ( hwnd_dmabuf_get_channel )
     {
         req->hwnd = wine_server_user_handle( hwnd );
+        req->flags = 0;
+        if (!wine_server_call_err( req ))
+        {
+            status = reply->status;
+            if (status == HWND_DMABUF_OK)
+                *channel_handle = wine_server_ptr_handle( reply->channel_handle );
+        }
+    }
+    SERVER_END_REQ;
+
+    return status;
+}
+
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_gdi_overlay_channel( HWND hwnd,
+                                                                                HANDLE *channel_handle )
+{
+    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+
+    if (!channel_handle) return status;
+    *channel_handle = 0;
+
+    SERVER_START_REQ( hwnd_dmabuf_get_channel )
+    {
+        req->hwnd = wine_server_user_handle( hwnd );
+        req->flags = HWND_DMABUF_CHANNEL_GDI_OVERLAY;
         if (!wine_server_call_err( req ))
         {
             status = reply->status;
@@ -154,6 +179,31 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd,
     SERVER_START_REQ( hwnd_dmabuf_claim_channel )
     {
         req->hwnd = wine_server_user_handle( hwnd );
+        req->flags = 0;
+        if (!wine_server_call_err( req ))
+        {
+            status = reply->status;
+            if (status == HWND_DMABUF_OK)
+                *channel_handle = wine_server_ptr_handle( reply->channel_handle );
+        }
+    }
+    SERVER_END_REQ;
+
+    return status;
+}
+
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_gdi_overlay_channel( HWND hwnd,
+                                                                                  HANDLE *channel_handle )
+{
+    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+
+    if (!channel_handle) return status;
+    *channel_handle = 0;
+
+    SERVER_START_REQ( hwnd_dmabuf_claim_channel )
+    {
+        req->hwnd = wine_server_user_handle( hwnd );
+        req->flags = HWND_DMABUF_CHANNEL_GDI_OVERLAY;
         if (!wine_server_call_err( req ))
         {
             status = reply->status;
@@ -173,6 +223,23 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_channel( HWND hwn
     SERVER_START_REQ( hwnd_dmabuf_release_channel )
     {
         req->hwnd = wine_server_user_handle( hwnd );
+        req->flags = 0;
+        if (!wine_server_call_err( req ))
+            status = reply->status;
+    }
+    SERVER_END_REQ;
+
+    return status;
+}
+
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_gdi_overlay_channel( HWND hwnd )
+{
+    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+
+    SERVER_START_REQ( hwnd_dmabuf_release_channel )
+    {
+        req->hwnd = wine_server_user_handle( hwnd );
+        req->flags = HWND_DMABUF_CHANNEL_GDI_OVERLAY;
         if (!wine_server_call_err( req ))
             status = reply->status;
     }
