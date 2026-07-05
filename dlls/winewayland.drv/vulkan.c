@@ -106,8 +106,6 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
     hwnd_dmabuf_format_modifier_t *format_modifiers = format_modifiers_ptr;
     struct wayland_dmabuf_format *entry;
     UINT count = 0, copied = 0;
-    HWND toplevel;
-    struct wayland_win_data *data;
 
     if (format_modifier_count) *format_modifier_count = 0;
     if (!caps || !format_modifier_count || (max_format_modifiers && !format_modifiers))
@@ -115,12 +113,31 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
     if (!process_wayland.zwp_linux_dmabuf_v1)
         return HWND_DMABUF_NOT_FOUND;
 
-    toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-    if (toplevel && (data = wayland_win_data_get(toplevel)))
+    /* Most local top-levels should present directly through Vulkan WSI. If the
+     * top-level's client content cannot be represented as a rectangular Wayland
+     * surface, route it through the managed producer path where Wine can apply
+     * the Win32 visible region. */
     {
-        BOOL presentable_locally = data->wayland_surface != NULL;
-        wayland_win_data_release(data);
-        if (presentable_locally) return HWND_DMABUF_NOT_FOUND;
+        HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+        struct wayland_win_data *toplevel_data;
+        BOOL toplevel_presentable_locally = FALSE;
+        BOOL toplevel_unmaskable = FALSE;
+
+        if (toplevel && (toplevel_data = wayland_win_data_get(toplevel)))
+        {
+            struct wayland_surface *surface = toplevel_data->wayland_surface;
+
+            toplevel_presentable_locally = surface != NULL;
+            toplevel_unmaskable = surface && wayland_surface_client_is_unmaskable(surface);
+            wayland_win_data_release(toplevel_data);
+        }
+
+        if (toplevel_presentable_locally && !toplevel_unmaskable)
+        {
+            TRACE("hwnd %p toplevel %p has a local wayland surface; direct present, no dmabuf bridge\n",
+                  hwnd, toplevel);
+            return HWND_DMABUF_NOT_FOUND;
+        }
     }
 
     pthread_mutex_lock(&process_wayland.dmabuf_mutex);
