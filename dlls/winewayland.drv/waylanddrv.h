@@ -424,6 +424,8 @@ struct wayland_surface
     /* Bottom of the below-main dmabuf subsurface chain. Client subsurfaces
      * anchor below this so children stay above their parent's client content. */
     struct wl_surface *dmabuf_bottom;
+    BOOL transparent_carrier_attached;
+    int transparent_carrier_width, transparent_carrier_height;
     HRGN child_region;
     BOOL shaped;
     BOOL occlusion_clipped;
@@ -476,6 +478,7 @@ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface);
+BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
