@@ -51,6 +51,10 @@ struct dce
 };
 
 static struct list dce_list = LIST_INIT(dce_list);
+static pthread_key_t background_erase_key;
+static pthread_once_t background_erase_once = PTHREAD_ONCE_INIT;
+static pthread_key_t copy_bits_key;
+static pthread_once_t copy_bits_once = PTHREAD_ONCE_INIT;
 
 #define DCE_CACHE_SIZE 64
 
@@ -87,6 +91,40 @@ struct foreign_gdi_surface
 static struct list foreign_gdi_surfaces = LIST_INIT( foreign_gdi_surfaces );
 static pthread_mutex_t foreign_gdi_lock = PTHREAD_MUTEX_INITIALIZER;
 static LONGLONG volatile foreign_gdi_next_producer_id;
+
+static void init_background_erase_key(void)
+{
+    pthread_key_create( &background_erase_key, NULL );
+}
+
+static UINT get_background_erase_depth(void)
+{
+    pthread_once( &background_erase_once, init_background_erase_key );
+    return (UINT)(ULONG_PTR)pthread_getspecific( background_erase_key );
+}
+
+static void set_background_erase_depth( UINT depth )
+{
+    pthread_once( &background_erase_once, init_background_erase_key );
+    pthread_setspecific( background_erase_key, (void *)(ULONG_PTR)depth );
+}
+
+static void init_copy_bits_key(void)
+{
+    pthread_key_create( &copy_bits_key, NULL );
+}
+
+static UINT get_copy_bits_depth(void)
+{
+    pthread_once( &copy_bits_once, init_copy_bits_key );
+    return (UINT)(ULONG_PTR)pthread_getspecific( copy_bits_key );
+}
+
+static void set_copy_bits_depth( UINT depth )
+{
+    pthread_once( &copy_bits_once, init_copy_bits_key );
+    pthread_setspecific( copy_bits_key, (void *)(ULONG_PTR)depth );
+}
 
 static struct foreign_gdi_surface *foreign_gdi_surface_from_window_surface( struct window_surface *surface )
 {
@@ -629,6 +667,7 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
     NtGdiDeleteObjectApp( hdc_src );
 
     window_surface_lock( surface->target_surface );
+    window_surface_add_app_paint_rect( surface->target_surface, &dst );
     add_bounds_rect( &surface->target_surface->bounds, &dst );
     window_surface_unlock( surface->target_surface );
 
@@ -1004,6 +1043,7 @@ W32KAPI void window_surface_release( struct window_surface *surface )
     {
         if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
+        if (surface->app_painted_region) NtGdiDeleteObjectApp( surface->app_painted_region );
         if (surface->gdi_over_producer_region) NtGdiDeleteObjectApp( surface->gdi_over_producer_region );
         if (surface->gdi_over_paint_region) NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
@@ -1104,12 +1144,51 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     window_surface_unlock( surface );
 }
 
+W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface, const RECT *rect )
+{
+    HRGN rect_region, surface_region;
+
+    if (surface == &dummy_surface || IsRectEmpty( rect )) return;
+    if (surface->app_painted_full) return;
+    if (rect->left <= surface->rect.left && rect->top <= surface->rect.top &&
+        rect->right >= surface->rect.right && rect->bottom >= surface->rect.bottom)
+    {
+        if (surface->app_painted_region)
+        {
+            NtGdiDeleteObjectApp( surface->app_painted_region );
+            surface->app_painted_region = 0;
+        }
+        surface->app_painted_full = TRUE;
+        return;
+    }
+    if (!(rect_region = NtGdiCreateRectRgn( rect->left, rect->top, rect->right, rect->bottom ))) return;
+    if (!surface->app_painted_region)
+        surface->app_painted_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+    if (surface->app_painted_region)
+    {
+        NtGdiCombineRgn( surface->app_painted_region, surface->app_painted_region, rect_region, RGN_OR );
+        if ((surface_region = NtGdiCreateRectRgn( surface->rect.left, surface->rect.top,
+                                                  surface->rect.right, surface->rect.bottom )))
+        {
+            if (NtGdiEqualRgn( surface->app_painted_region, surface_region ))
+            {
+                NtGdiDeleteObjectApp( surface->app_painted_region );
+                surface->app_painted_region = 0;
+                surface->app_painted_full = TRUE;
+            }
+            NtGdiDeleteObjectApp( surface_region );
+        }
+    }
+    NtGdiDeleteObjectApp( rect_region );
+}
+
 W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect )
 {
-    HRGN rect_region, clipped_region;
+    HRGN rect_region, clipped_region, producer_region = 0, synthetic_region = 0, combined_region = 0;
     int type;
 
-    if (!surface->gdi_over_producer_region || IsRectEmpty( rect )) return;
+    if (IsRectEmpty( rect )) return;
+    if (get_background_erase_depth() || get_copy_bits_depth()) return;
     if (!(rect_region = NtGdiCreateRectRgn( rect->left, rect->top, rect->right, rect->bottom ))) return;
     if (!(clipped_region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
     {
@@ -1117,7 +1196,53 @@ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surf
         return;
     }
 
-    type = NtGdiCombineRgn( clipped_region, rect_region, surface->gdi_over_producer_region, RGN_AND );
+    if (surface->clip_region && !surface->alpha_mask && surface->color_key == CLR_INVALID &&
+        surface->alpha_bits == -1 &&
+        (!surface->shape_region || !NtGdiEqualRgn( surface->clip_region, surface->shape_region )))
+    {
+        HRGN surface_region;
+
+        if ((surface_region = NtGdiCreateRectRgn( surface->rect.left, surface->rect.top,
+                                                  surface->rect.right, surface->rect.bottom )))
+        {
+            int producer_type;
+
+            synthetic_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+            if (synthetic_region)
+            {
+                producer_type = NtGdiCombineRgn( synthetic_region, surface_region,
+                                                 surface->clip_region, RGN_DIFF );
+                if (producer_type == ERROR || producer_type == NULLREGION)
+                {
+                    NtGdiDeleteObjectApp( synthetic_region );
+                    synthetic_region = 0;
+                }
+            }
+            NtGdiDeleteObjectApp( surface_region );
+        }
+    }
+
+    if (surface->gdi_over_producer_region && synthetic_region)
+    {
+        combined_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+        if (combined_region &&
+            NtGdiCombineRgn( combined_region, surface->gdi_over_producer_region,
+                             synthetic_region, RGN_OR ) != ERROR)
+            producer_region = combined_region;
+        else producer_region = surface->gdi_over_producer_region;
+    }
+    else producer_region = surface->gdi_over_producer_region ? surface->gdi_over_producer_region : synthetic_region;
+
+    if (!producer_region)
+    {
+        if (synthetic_region) NtGdiDeleteObjectApp( synthetic_region );
+        if (combined_region) NtGdiDeleteObjectApp( combined_region );
+        NtGdiDeleteObjectApp( clipped_region );
+        NtGdiDeleteObjectApp( rect_region );
+        return;
+    }
+
+    type = NtGdiCombineRgn( clipped_region, rect_region, producer_region, RGN_AND );
     if (type != ERROR && type != NULLREGION)
     {
         if (!surface->gdi_over_paint_region)
@@ -1127,6 +1252,8 @@ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surf
                              clipped_region, RGN_OR );
     }
 
+    if (combined_region) NtGdiDeleteObjectApp( combined_region );
+    if (synthetic_region) NtGdiDeleteObjectApp( synthetic_region );
     NtGdiDeleteObjectApp( clipped_region );
     NtGdiDeleteObjectApp( rect_region );
 }
@@ -1436,7 +1563,8 @@ static void update_visible_region( struct dce *dce )
 
     if (surface)
     {
-        BOOL gdi_over_source = !foreign && (dce->hwnd != top_win) &&
+        BOOL gdi_over_source = !foreign &&
+            (dce->hwnd != top_win) &&
             (get_window_long( dce->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) &&
             !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT));
 
@@ -2229,7 +2357,11 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
                 /* don't erase if the clip box is empty */
                 if (type != NULLREGION)
                 {
+                    UINT erase_depth = get_background_erase_depth();
+
+                    set_background_erase_depth( erase_depth + 1 );
                     need_erase = !send_message_timeout( hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0, SMTO_ABORTIFHUNG, 1000, FALSE );
+                    set_background_erase_depth( erase_depth );
                     if (need_erase && RtlGetLastWin32Error() == ERROR_TIMEOUT) ERR( "timeout.\n" );
                 }
             }
@@ -2257,13 +2389,16 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
         UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
         HRGN rgn = get_update_region( hwnd, &flags, NULL );
         HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+        UINT copy_bits_depth = get_copy_bits_depth();
 
         TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
         OffsetRect( &src, -rects->window.left, -rects->window.top );
         OffsetRect( &dst, -rects->window.left, -rects->window.top );
 
+        set_copy_bits_depth( copy_bits_depth + 1 );
         NtGdiStretchBlt( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
                          hdc, src.left, src.top, src.right - src.left, src.bottom - src.top, SRCCOPY, 0 );
+        set_copy_bits_depth( copy_bits_depth );
         NtUserReleaseDC( hwnd, hdc );
     }
 }
@@ -2286,6 +2421,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
 
     RECT dst = valid_rects[0];
     RECT src = valid_rects[1];
+    UINT copy_bits_depth = get_copy_bits_depth();
 
     TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
@@ -2293,10 +2429,12 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
 
     window_surface_lock( old_surface );
     bits = window_surface_get_color( old_surface, info );
+    set_copy_bits_depth( copy_bits_depth + 1 );
     NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
                                     src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
                                     0, old_surface->rect.bottom - old_surface->rect.top,
                                     bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+    set_copy_bits_depth( copy_bits_depth );
     window_surface_unlock( old_surface );
     NtUserReleaseDC( hwnd, hdc );
 }
