@@ -308,6 +308,8 @@ struct window_surface
     RECT                               bounds;       /* dirty area rectangle */
     HRGN                               clip_region;  /* visible region of the surface, fully visible if 0 */
     DWORD                              draw_start_ticks; /* start ticks of fresh draw */
+    HRGN                               app_painted_region; /* app-originated pixels in surface coordinates */
+    BOOL                               app_painted_full; /* app-originated pixels cover the whole surface */
     COLORREF                           color_key;    /* layered window surface color key, invalid if CLR_INVALID */
     UINT                               alpha_bits;   /* layered window global alpha bits, invalid if -1 */
     UINT                               alpha_mask;   /* layered window per-pixel alpha mask, invalid if 0 */
@@ -327,6 +329,7 @@ W32KAPI void window_surface_lock( struct window_surface *surface );
 W32KAPI void window_surface_unlock( struct window_surface *surface );
 W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
 W32KAPI void window_surface_flush( struct window_surface *surface );
+W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface, const RECT *rect );
 W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect );
 W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
 W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );

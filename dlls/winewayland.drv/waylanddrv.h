@@ -604,6 +604,7 @@ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface);
+BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);

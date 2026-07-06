@@ -2879,7 +2879,11 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         ret = NtGdiAlphaBlend( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                                hdc_src, src_rect.left, src_rect.top, src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
                                *(DWORD *)&src_blend, 0 );
-        if (ret) add_bounds_rect( &surface->bounds, &rect );
+        if (ret)
+        {
+            window_surface_add_app_paint_rect( surface, &rect );
+            add_bounds_rect( &surface->bounds, &rect );
+        }
 
         NtGdiDeleteObjectApp( hdc );
         window_surface_unlock( surface );

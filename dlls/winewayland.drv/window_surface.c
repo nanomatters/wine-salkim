@@ -143,7 +143,7 @@ static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slo
                              NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);
     if (status)
     {
-        WARN("failed to create GDI overlay shm section status %#lx\n", status);
+        WARN("failed to create GDI overlay shm section status %#x\n", status);
         return FALSE;
     }
 
@@ -151,7 +151,7 @@ static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slo
                                 &view_size, ViewUnmap, 0, PAGE_READWRITE);
     if (status)
     {
-        WARN("failed to map GDI overlay shm section status %#lx\n", status);
+        WARN("failed to map GDI overlay shm section status %#x\n", status);
         wayland_gdi_overlay_slot_destroy(slot);
         return FALSE;
     }
@@ -159,7 +159,7 @@ static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slo
     status = wine_server_handle_to_fd(slot->section, FILE_READ_DATA, &slot->fd, NULL);
     if (status)
     {
-        WARN("failed to export GDI overlay shm section status %#lx\n", status);
+        WARN("failed to export GDI overlay shm section status %#x\n", status);
         wayland_gdi_overlay_slot_destroy(slot);
         return FALSE;
     }
@@ -1010,6 +1010,46 @@ static void wayland_shm_buffer_clear_outside_clip(struct wayland_shm_buffer *buf
     NtGdiDeleteObjectApp(dirty_region);
 }
 
+static HRGN create_occluded_region(const RECT *surface_rect, HRGN clip_region)
+{
+    HRGN surface_region, occluded_region;
+    int type;
+
+    if (!clip_region) return 0;
+    if (!(surface_region = NtGdiCreateRectRgn(surface_rect->left, surface_rect->top,
+                                              surface_rect->right, surface_rect->bottom)))
+        return 0;
+    if (!(occluded_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+    {
+        NtGdiDeleteObjectApp(surface_region);
+        return 0;
+    }
+
+    type = NtGdiCombineRgn(occluded_region, surface_region, clip_region, RGN_DIFF);
+    NtGdiDeleteObjectApp(surface_region);
+    if (type == ERROR || type == NULLREGION)
+    {
+        NtGdiDeleteObjectApp(occluded_region);
+        return 0;
+    }
+    return occluded_region;
+}
+
+static HRGN union_regions(HRGN a, HRGN b)
+{
+    HRGN region;
+
+    if (!a) return b;
+    if (!b) return a;
+    if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0))) return a;
+    if (NtGdiCombineRgn(region, a, b, RGN_OR) == ERROR)
+    {
+        NtGdiDeleteObjectApp(region);
+        return a;
+    }
+    return region;
+}
+
 /**********************************************************************
  *          wayland_shm_buffer_copy_data
  */
@@ -1070,12 +1110,23 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 {
     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
-    struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
+    struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer = NULL;
     BOOL flushed = FALSE;
     BOOL overlay_flushed;
     HRGN surface_damage_region = NULL;
-    HRGN copy_from_window_region;
+    HRGN occluded_region = NULL;
+    HRGN merged_gdi_over_region = NULL;
+    HRGN gdi_over_region, gdi_over_paint_region;
+    HRGN copy_from_window_region = NULL;
     uint32_t buffer_format;
+
+    if (!window_surface->app_painted_full && !window_surface->app_painted_region)
+    {
+        if (shape_changed) wayland_window_surface_sync_regions(window_surface);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL);
+        wl_display_flush(process_wayland.wl_display);
+        goto done;
+    }
 
     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
                                                rect->left + dirty->right, rect->top + dirty->bottom);
@@ -1084,6 +1135,17 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         ERR("failed to create surface damage region\n");
         goto done;
     }
+    if (window_surface->app_painted_full)
+        copy_from_window_region = surface_damage_region;
+    else if (!(copy_from_window_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+    {
+        ERR("failed to create copy_from_window region\n");
+        goto done;
+    }
+    if (!window_surface->app_painted_full &&
+        NtGdiCombineRgn(copy_from_window_region, surface_damage_region,
+                        window_surface->app_painted_region, RGN_AND) == ERROR)
+        goto done;
 
     buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered) ?
                     WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
@@ -1119,30 +1181,42 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
                 goto done;
             }
             NtGdiCombineRgn(copy_from_latest_region, shm_buffer->damage_region,
-                            surface_damage_region, RGN_DIFF);
+                            copy_from_window_region, RGN_DIFF);
             wayland_shm_buffer_copy(latest_buffer,
                                     shm_buffer, copy_from_latest_region);
             NtGdiDeleteObjectApp(copy_from_latest_region);
         }
-        /* ... and use the window_surface as the source of pixel data contained
-         * in the flush bounds. */
-        copy_from_window_region = surface_damage_region;
         wayland_shm_buffer_unref(latest_buffer);
     }
     else
     {
+        HRGN clear_region;
+
         TRACE("latest_window_buffer=NULL\n");
-        /* If we don't have a latest buffer, use the window_surface as
-         * the source of all pixel data. */
-        copy_from_window_region = shm_buffer->damage_region;
+
+        if ((clear_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+        {
+            NtGdiCombineRgn(clear_region, surface_damage_region, copy_from_window_region, RGN_DIFF);
+            clear_pixel_region(shm_buffer, clear_region);
+            NtGdiDeleteObjectApp(clear_region);
+        }
     }
 
     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
                                  (shape_bits || wws->occlusion_clipped) && !wws->layered);
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
+
+    gdi_over_region = window_surface->gdi_over_producer_region;
+    gdi_over_paint_region = window_surface->gdi_over_paint_region;
+    if (wws->occlusion_clipped && !wws->layered)
+    {
+        occluded_region = create_occluded_region(&surface_rect, window_surface->clip_region);
+        merged_gdi_over_region = union_regions(window_surface->gdi_over_producer_region, occluded_region);
+        gdi_over_region = merged_gdi_over_region;
+    }
+
     overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
-                                                 window_surface->gdi_over_producer_region,
-                                                 window_surface->gdi_over_paint_region);
+                                                 gdi_over_region, gdi_over_paint_region);
     if (wws->occlusion_clipped)
         wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
 
@@ -1158,6 +1232,12 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     wl_display_flush(process_wayland.wl_display);
 
 done:
+    if (merged_gdi_over_region && merged_gdi_over_region != window_surface->gdi_over_producer_region &&
+        merged_gdi_over_region != occluded_region)
+        NtGdiDeleteObjectApp(merged_gdi_over_region);
+    if (occluded_region) NtGdiDeleteObjectApp(occluded_region);
+    if (copy_from_window_region && copy_from_window_region != surface_damage_region)
+        NtGdiDeleteObjectApp(copy_from_window_region);
     if (surface_damage_region) NtGdiDeleteObjectApp(surface_damage_region);
     return flushed;
 }

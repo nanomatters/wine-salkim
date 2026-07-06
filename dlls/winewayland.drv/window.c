@@ -1589,14 +1589,18 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                 wayland_surface_sync_alpha(wayland_surface);
             }
 
-            wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
-            wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
-            wayland_surface->transparent_carrier_attached = FALSE;
-            wl_surface_commit(wayland_surface->wl_surface);
-            wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
-            wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
-            wayland_surface_update_hwnd_dmabufs(wayland_surface);
-            committed = TRUE;
+            if (shm_buffer)
+            {
+                wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
+                wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+                wayland_surface->transparent_carrier_attached = FALSE;
+                wl_surface_commit(wayland_surface->wl_surface);
+                wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
+                wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
+                wayland_surface_update_hwnd_dmabufs(wayland_surface);
+                committed = TRUE;
+            }
+            else committed = wayland_surface_attach_transparent_carrier(wayland_surface);
         }
         else
         {
@@ -1606,7 +1610,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 
     /* An attached client stays attached on GDI commits. Detaching would flash
      * the empty GDI buffer. Lifecycle callbacks clear dead client surfaces. */
-    if (committed && data->client_surface && !window_client_surface_attached(data) &&
+    if (committed && shm_buffer && data->client_surface && !window_client_surface_attached(data) &&
         !window_client_surface_pending_first_frame(data))
         wayland_client_surface_attach(data->client_surface, NULL);
 
@@ -1615,7 +1619,12 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
      * it's irrelevant if it was actually committed or not. */
     if (data->window_contents)
         wayland_shm_buffer_unref(data->window_contents);
-    wayland_shm_buffer_ref((data->window_contents = shm_buffer));
+    data->window_contents = NULL;
+    if (shm_buffer)
+    {
+        wayland_shm_buffer_ref(shm_buffer);
+        data->window_contents = shm_buffer;
+    }
 
     wayland_win_data_release(data);
 

@@ -1881,7 +1881,6 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
         return res;
     }
     add_window_client_surface( surface->hwnd, surface->client );
-    set_window_pixel_format( surface->hwnd, -1, TRUE );
 
     vulkan_object_init( &surface->obj.obj, host_surface );
     surface->obj.instance = instance;
@@ -3897,6 +3896,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                 swapchain->extents = managed->extents;
                 swapchain->managed = managed;
                 instance->p_insert_object( instance, &swapchain->obj.obj );
+                set_window_pixel_format( surface->hwnd, -1, TRUE );
 
                 *ret = swapchain->obj.client.swapchain;
                 TRACE( "hwnd %p -> wine-managed swapchain %p (cross-process dmabuf producer)\n",
@@ -3944,6 +3944,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         WARN( "Enabled fullscreen hack on swapchain %p, scaling from %s -> %s\n", swapchain,
               debugstr_vkextent2d(&swapchain->extents), debugstr_vkextent2d(&swapchain->host_extents) );
     }
+
+    set_window_pixel_format( surface->hwnd, -1, TRUE );
 
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
