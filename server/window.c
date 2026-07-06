@@ -467,8 +467,7 @@ static int set_parent_window( struct window *win, struct window *parent )
         if (parent->thread && parent->thread != win->thread && !is_desktop_window(parent))
             attach_thread_input( win->thread, parent->thread );
 
-        if (window_has_punch_through_content( win ))
-            update_clip_client_flags( win );
+        if (window_has_punch_through_content( win )) update_clip_client_flags( win );
     }
     else  /* move it to parent unlinked list */
     {

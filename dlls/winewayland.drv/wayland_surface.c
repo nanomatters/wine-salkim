@@ -1494,7 +1494,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
     if (!surface->xdg_popup) goto err;
     xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
 
-    if (wayland_is_menu_popup(surface->hwnd))
+    if (wayland_is_popup_menu_class(surface->hwnd))
         grab_serial = popup_grab_serial_for_owner(owner);
     if (grab_serial)
     {
@@ -2994,7 +2994,7 @@ static const struct wl_buffer_listener transparent_carrier_buffer_listener =
     transparent_carrier_buffer_release
 };
 
-static BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
+BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
 {
     struct wayland_shm_buffer *shm_buffer;
     int width, height;
@@ -4018,9 +4018,9 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
         return;
     }
 
+    surface->has_presented = TRUE;
     set_client_surface(hwnd, surface);
     ensure_window_surface_contents(toplevel);
-    surface->has_presented = TRUE;
 }
 
 static const struct client_surface_funcs wayland_client_surface_funcs =
@@ -4110,7 +4110,7 @@ static BOOL wayland_surface_has_live_role(struct wayland_surface *surface)
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
 {
     struct wayland_win_data *toplevel_data;
-    struct wayland_surface *surface;
+    struct wayland_surface *surface = NULL;
     HWND hwnd = client->client.hwnd;
     RECT client_rect, dst;
     struct wayland_child_visibility_info visibility;
@@ -4119,8 +4119,6 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     {
         if (client->wl_subsurface)
         {
-            if (client->toplevel)
-                NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, FALSE, 0);
             wl_subsurface_destroy(client->wl_subsurface);
             client->wl_subsurface = NULL;
             client->toplevel_wl_surface = NULL;
@@ -4168,7 +4166,6 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         client->toplevel = toplevel;
         client->toplevel_wl_surface = surface->wl_surface;
         SetRect(&client->rect, 0, 0, -1, -1);
-        NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, TRUE, 0);
 
         TRACE("Created subsurface for toplevel=%p\n", toplevel);
     }
