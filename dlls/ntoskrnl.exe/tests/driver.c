@@ -580,6 +580,7 @@ static void test_current_thread(BOOL is_system)
     ok(PsGetThreadProcessId((PETHREAD)KeGetCurrentThread()) == PsGetCurrentProcessId(), "process IDs don't match\n");
 
     thread = PsGetCurrentThread();
+    ok(IoThreadToProcess(thread) == current, "thread process does not match current process\n");
     ret = wait_single( thread, 0 );
     ok(ret == STATUS_TIMEOUT, "got %#lx\n", ret);
 
