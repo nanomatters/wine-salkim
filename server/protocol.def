@@ -2911,6 +2911,7 @@ enum message_type
 @REPLY
     struct rectangle window;      /* window rectangle */
     struct rectangle client;      /* client rectangle */
+    unsigned int     style;       /* window style */
 @END
 enum coords_relative
 {
