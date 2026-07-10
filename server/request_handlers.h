@@ -163,6 +163,7 @@ DECL_HANDLER(get_window_parents);
 DECL_HANDLER(get_window_list);
 DECL_HANDLER(get_class_windows);
 DECL_HANDLER(get_window_children_from_point);
+DECL_HANDLER(get_window_from_point);
 DECL_HANDLER(get_window_tree);
 DECL_HANDLER(set_window_pos);
 DECL_HANDLER(get_window_rectangles);
@@ -485,6 +486,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_window_list,
     (req_handler)req_get_class_windows,
     (req_handler)req_get_window_children_from_point,
+    (req_handler)req_get_window_from_point,
     (req_handler)req_get_window_tree,
     (req_handler)req_set_window_pos,
     (req_handler)req_get_window_rectangles,
@@ -1595,6 +1597,14 @@ C_ASSERT( offsetof(struct get_window_children_from_point_request, dpi) == 24 );
 C_ASSERT( sizeof(struct get_window_children_from_point_request) == 32 );
 C_ASSERT( offsetof(struct get_window_children_from_point_reply, count) == 8 );
 C_ASSERT( sizeof(struct get_window_children_from_point_reply) == 16 );
+C_ASSERT( offsetof(struct get_window_from_point_request, parent) == 12 );
+C_ASSERT( offsetof(struct get_window_from_point_request, x) == 16 );
+C_ASSERT( offsetof(struct get_window_from_point_request, y) == 20 );
+C_ASSERT( offsetof(struct get_window_from_point_request, dpi) == 24 );
+C_ASSERT( sizeof(struct get_window_from_point_request) == 32 );
+C_ASSERT( offsetof(struct get_window_from_point_reply, handle) == 8 );
+C_ASSERT( offsetof(struct get_window_from_point_reply, style) == 12 );
+C_ASSERT( sizeof(struct get_window_from_point_reply) == 16 );
 C_ASSERT( offsetof(struct get_window_tree_request, handle) == 12 );
 C_ASSERT( sizeof(struct get_window_tree_request) == 16 );
 C_ASSERT( offsetof(struct get_window_tree_reply, parent) == 8 );

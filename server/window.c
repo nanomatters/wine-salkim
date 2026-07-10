@@ -1137,6 +1137,30 @@ static int all_windows_from_point( struct window *top, int x, int y, unsigned in
     return 1;
 }
 
+/* return the first window containing point (in absolute coords) */
+static struct window *first_window_from_point( struct window *top, int x, int y, unsigned int dpi )
+{
+    if (!is_desktop_window( top ) && !is_desktop_window( top->parent ))
+    {
+        screen_to_client( top->parent, &x, &y, dpi );
+        dpi = get_window_dpi( top->parent );
+    }
+
+    if (!is_point_in_window( top, &x, &y, dpi )) return NULL;
+
+    if (!(top->style & (WS_MINIMIZE|WS_DISABLED)) && point_in_rect( &top->client_rect, x, y ))
+    {
+        if (!is_desktop_window(top))
+        {
+            x -= top->client_rect.left;
+            y -= top->client_rect.top;
+        }
+        return child_window_from_point( top, x, y );
+    }
+
+    return top;
+}
+
 
 /* return the thread owning a window */
 struct thread *get_window_thread( user_handle_t handle )
@@ -2847,6 +2871,18 @@ DECL_HANDLER(get_window_children_from_point)
     len = min( get_reply_max_size(), array.count * sizeof(user_handle_t) );
     if (len) set_reply_data_ptr( array.handles, len );
     else free( array.handles );
+}
+
+/* get the first window that contains a given point */
+DECL_HANDLER(get_window_from_point)
+{
+    struct window *win, *parent = get_window( req->parent );
+
+    if (!parent) return;
+    if (!(win = first_window_from_point( parent, req->x, req->y, req->dpi ))) return;
+
+    reply->handle = win->handle;
+    reply->style = win->style;
 }
 
 
