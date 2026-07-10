@@ -32,6 +32,7 @@ struct inputpane
     LONG ref;
 
     HWND tabtip_hwnd;
+    BOOL tabtip_hwnd_checked;
 };
 
 static inline struct inputpane *impl_from_IInputPane( IInputPane *iface )
@@ -158,15 +159,26 @@ static const struct IInputPaneVtbl inputpane_vtbl =
 DEFINE_IINSPECTABLE( inputpane2, IInputPane2, struct inputpane, IInputPane_iface );
 
 #define WM_TABTIP_OSK_TOGGLE (WM_USER + 1)
+static BOOL inputpane_post_tabtip_message( struct inputpane *impl, WPARAM show )
+{
+    if (!impl->tabtip_hwnd_checked)
+    {
+        impl->tabtip_hwnd = FindWindowW( L"IPTip_Main_Window", L"Input" );
+        impl->tabtip_hwnd_checked = TRUE;
+    }
+
+    return impl->tabtip_hwnd && PostMessageW( impl->tabtip_hwnd, WM_TABTIP_OSK_TOGGLE, show, 0 );
+}
+
 static HRESULT WINAPI inputpane2_TryShow( IInputPane2 *iface, boolean *result )
 {
     struct inputpane *impl = impl_from_IInputPane2( iface );
 
     FIXME( "iface %p, result %p stub!\n", iface, result );
 
-    *result = FALSE;
+    if (!result) return E_POINTER;
 
-    PostMessageW(impl->tabtip_hwnd, WM_TABTIP_OSK_TOGGLE, TRUE, 0);
+    *result = inputpane_post_tabtip_message( impl, TRUE );
 
     return S_OK;
 }
@@ -177,7 +189,9 @@ static HRESULT WINAPI inputpane2_TryHide( IInputPane2 *iface, boolean *result )
 
     FIXME( "iface %p, result %p stub!\n", iface, result );
 
-    PostMessageW(impl->tabtip_hwnd, WM_TABTIP_OSK_TOGGLE, FALSE, 0);
+    if (!result) return E_POINTER;
+
+    *result = inputpane_post_tabtip_message( impl, FALSE );
 
     return S_OK;
 }
@@ -298,8 +312,6 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     impl->IInputPane_iface.lpVtbl = &inputpane_vtbl;
     impl->IInputPane2_iface.lpVtbl = &inputpane2_vtbl;
     impl->ref = 1;
-
-    impl->tabtip_hwnd = FindWindowW(L"IPTip_Main_Window", L"Input");
 
     *instance = (IInspectable *)&impl->IInputPane_iface;
     return S_OK;

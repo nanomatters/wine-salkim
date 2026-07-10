@@ -1225,6 +1225,17 @@ static HANDLE start_tabtip_process(void)
     return pi.hProcess;
 }
 
+static BOOL use_tabtip(void)
+{
+    WCHAR value[2];
+    DWORD ret;
+
+    ret = GetEnvironmentVariableW( L"PROTON_USE_TABTIP", value, ARRAY_SIZE(value) );
+    if (!ret || (ret < ARRAY_SIZE(value) && !wcscmp( value, L"0" ))) return FALSE;
+
+    return TRUE;
+}
+
 static void start_xalia_process(void)
 {
     PROCESS_INFORMATION pi;
@@ -1409,8 +1420,7 @@ void manage_desktop( WCHAR *arg )
     /* run the desktop message loop */
     if (hwnd)
     {
-        /* FIXME: hack, run tabtip.exe on startup. */
-        tabtip = start_tabtip_process();
+        if (use_tabtip()) tabtip = start_tabtip_process();
 
         start_xalia_process();
 
