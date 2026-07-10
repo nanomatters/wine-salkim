@@ -3814,6 +3814,23 @@ struct get_window_children_from_point_reply
 };
 
 
+struct get_window_from_point_request
+{
+    struct request_header __header;
+    user_handle_t  parent;
+    int            x;
+    int            y;
+    int            dpi;
+    char __pad_28[4];
+};
+struct get_window_from_point_reply
+{
+    struct reply_header __header;
+    user_handle_t  handle;
+    unsigned int   style;
+};
+
+
 
 struct get_window_tree_request
 {
@@ -6629,6 +6646,7 @@ enum request
     REQ_get_window_list,
     REQ_get_class_windows,
     REQ_get_window_children_from_point,
+    REQ_get_window_from_point,
     REQ_get_window_tree,
     REQ_set_window_pos,
     REQ_get_window_rectangles,
@@ -6954,6 +6972,7 @@ union generic_request
     struct get_window_list_request get_window_list_request;
     struct get_class_windows_request get_class_windows_request;
     struct get_window_children_from_point_request get_window_children_from_point_request;
+    struct get_window_from_point_request get_window_from_point_request;
     struct get_window_tree_request get_window_tree_request;
     struct set_window_pos_request set_window_pos_request;
     struct get_window_rectangles_request get_window_rectangles_request;
@@ -7277,6 +7296,7 @@ union generic_reply
     struct get_window_list_reply get_window_list_reply;
     struct get_class_windows_reply get_class_windows_reply;
     struct get_window_children_from_point_reply get_window_children_from_point_reply;
+    struct get_window_from_point_reply get_window_from_point_reply;
     struct get_window_tree_reply get_window_tree_reply;
     struct set_window_pos_reply set_window_pos_reply;
     struct get_window_rectangles_reply get_window_rectangles_reply;
@@ -7441,6 +7461,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 935
+#define SERVER_PROTOCOL_VERSION 936
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
