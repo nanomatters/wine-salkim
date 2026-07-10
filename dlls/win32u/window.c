@@ -2849,6 +2849,27 @@ static HWND *list_children_from_point( HWND hwnd, POINT pt, UINT dpi )
     return NULL;
 }
 
+static HWND first_window_from_point( HWND hwnd, POINT pt, UINT dpi, DWORD *style )
+{
+    HWND ret = 0;
+
+    SERVER_START_REQ( get_window_from_point )
+    {
+        req->parent = wine_server_user_handle( hwnd );
+        req->x = pt.x;
+        req->y = pt.y;
+        req->dpi = dpi;
+        if (!wine_server_call( req ))
+        {
+            ret = wine_server_ptr_handle( reply->handle );
+            *style = reply->style;
+        }
+    }
+    SERVER_END_REQ;
+
+    return ret;
+}
+
 static HWND window_from_point_excluding_root( HWND hwnd, POINT pt )
 {
     HWND hwnd_root = NtUserGetAncestor( hwnd, GA_ROOT );
@@ -2889,6 +2910,16 @@ HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest )
     if (!(dpi = get_thread_dpi())) dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
 
     *hittest = HTNOWHERE;
+
+    if (!send_nchittest)
+    {
+        DWORD style;
+
+        if (!(ret = first_window_from_point( hwnd, pt, dpi, &style ))) return 0;
+        *hittest = (style & WS_DISABLED) ? HTERROR : HTCLIENT;
+        TRACE( "scope %p (%d,%d) returning %p\n", hwnd, pt.x, pt.y, ret );
+        return ret;
+    }
 
     if (!(list = list_children_from_point( hwnd, pt, dpi ))) return 0;
 

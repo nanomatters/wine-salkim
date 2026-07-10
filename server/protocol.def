@@ -2868,6 +2868,17 @@ enum message_type
     VARARG(children,user_handles); /* children handles */
 @END
 
+/* Get the first window that contains a given point */
+@REQ(get_window_from_point)
+    user_handle_t  parent;        /* parent window */
+    int            x;             /* point in parent coordinates */
+    int            y;
+    int            dpi;           /* dpi for the point coordinates */
+@REPLY
+    user_handle_t  handle;        /* window handle */
+    unsigned int   style;         /* window style */
+@END
+
 
 /* Get window tree information from a window handle */
 @REQ(get_window_tree)
