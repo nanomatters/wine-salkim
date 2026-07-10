@@ -1691,21 +1691,25 @@ static struct timer *set_timer( struct msg_queue *queue, unsigned int rate )
 }
 
 /* change the input key state for a given key */
-static void set_input_key_state( volatile unsigned char *keystate, unsigned char key, unsigned char down )
+static int set_input_key_state( volatile unsigned char *keystate, unsigned char key, unsigned char down )
 {
+    unsigned char old = keystate[key];
+
     if (down)
     {
         if (!(keystate[key] & 0x80)) keystate[key] ^= 0x01;
         keystate[key] |= down;
     }
     else keystate[key] &= ~0x80;
+    return old != keystate[key];
 }
 
 /* update the input key state for a keyboard message */
-static void update_key_state( volatile unsigned char *keystate, unsigned int msg,
-                              lparam_t wparam, int desktop )
+static int update_key_state( volatile unsigned char *keystate, unsigned int msg,
+                             lparam_t wparam, int desktop )
 {
     unsigned char key, down = 0, down_val = desktop ? 0xc0 : 0x80;
+    int changed = 0;
 
     switch (msg)
     {
@@ -1713,26 +1717,26 @@ static void update_key_state( volatile unsigned char *keystate, unsigned int msg
         down = down_val;
         /* fall through */
     case WM_LBUTTONUP:
-        set_input_key_state( keystate, VK_LBUTTON, down );
+        changed |= set_input_key_state( keystate, VK_LBUTTON, down );
         break;
     case WM_MBUTTONDOWN:
         down = down_val;
         /* fall through */
     case WM_MBUTTONUP:
-        set_input_key_state( keystate, VK_MBUTTON, down );
+        changed |= set_input_key_state( keystate, VK_MBUTTON, down );
         break;
     case WM_RBUTTONDOWN:
         down = down_val;
         /* fall through */
     case WM_RBUTTONUP:
-        set_input_key_state( keystate, VK_RBUTTON, down );
+        changed |= set_input_key_state( keystate, VK_RBUTTON, down );
         break;
     case WM_XBUTTONDOWN:
         down = down_val;
         /* fall through */
     case WM_XBUTTONUP:
-        if (wparam >> 16 == XBUTTON1) set_input_key_state( keystate, VK_XBUTTON1, down );
-        else if (wparam >> 16 == XBUTTON2) set_input_key_state( keystate, VK_XBUTTON2, down );
+        if (wparam >> 16 == XBUTTON1) changed |= set_input_key_state( keystate, VK_XBUTTON1, down );
+        else if (wparam >> 16 == XBUTTON2) changed |= set_input_key_state( keystate, VK_XBUTTON2, down );
         break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
@@ -1741,27 +1745,28 @@ static void update_key_state( volatile unsigned char *keystate, unsigned int msg
     case WM_KEYUP:
     case WM_SYSKEYUP:
         key = (unsigned char)wparam;
-        set_input_key_state( keystate, key, down );
+        changed |= set_input_key_state( keystate, key, down );
         switch(key)
         {
         case VK_LCONTROL:
         case VK_RCONTROL:
             down = (keystate[VK_LCONTROL] | keystate[VK_RCONTROL]) & 0x80;
-            set_input_key_state( keystate, VK_CONTROL, down );
+            changed |= set_input_key_state( keystate, VK_CONTROL, down );
             break;
         case VK_LMENU:
         case VK_RMENU:
             down = (keystate[VK_LMENU] | keystate[VK_RMENU]) & 0x80;
-            set_input_key_state( keystate, VK_MENU, down );
+            changed |= set_input_key_state( keystate, VK_MENU, down );
             break;
         case VK_LSHIFT:
         case VK_RSHIFT:
             down = (keystate[VK_LSHIFT] | keystate[VK_RSHIFT]) & 0x80;
-            set_input_key_state( keystate, VK_SHIFT, down );
+            changed |= set_input_key_state( keystate, VK_SHIFT, down );
             break;
         }
         break;
     }
+    return changed;
 }
 
 static void update_thread_input_key_state( struct thread_input *input, unsigned int msg, lparam_t wparam )
@@ -1778,8 +1783,7 @@ static void update_desktop_key_state( struct desktop *desktop, unsigned int msg,
 {
     SHARED_WRITE_BEGIN( desktop->shared, desktop_shm_t )
     {
-        update_key_state( shared->keystate, msg, wparam, 1 );
-        ++shared->keystate_serial;
+        if (update_key_state( shared->keystate, msg, wparam, 1 )) ++shared->keystate_serial;
     }
     SHARED_WRITE_END;
 }
