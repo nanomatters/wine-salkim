@@ -135,12 +135,20 @@ struct instance
 {
     struct vulkan_instance obj;
     BOOL enable_win32_surface;
+    BOOL nvidia_wayland_wsi;
 
     struct list utils_messengers;
     struct list report_callbacks;
 
     struct rb_tree objects;
     pthread_rwlock_t objects_lock;
+};
+
+struct nvidia_wayland_host_instance
+{
+    struct list entry;
+    PFN_vkDestroyInstance p_vkDestroyInstance;
+    VkInstance host_instance;
 };
 
 static struct instance *instance_from_handle( VkInstance handle )
@@ -257,6 +265,12 @@ static const char *debugstr_vkextent2d( const VkExtent2D *ext )
 
 /* Serializes the producer's cross-thread queue submits and device idles. */
 static pthread_mutex_t producer_device_lock = PTHREAD_MUTEX_INITIALIZER;
+/* NVIDIA tears down process-global Wayland WSI state from vkDestroyInstance()
+ * while other instances can still present. Keep affected host instances alive
+ * until no NVIDIA Wayland instance remains. Churn against one persistent
+ * instance accumulates deferred host instances until process teardown. */
+static struct list delayed_nvidia_wayland_host_instances = LIST_INIT( delayed_nvidia_wayland_host_instances );
+static unsigned int nvidia_wayland_instance_count;
 static LONGLONG managed_next_producer_id;
 
 struct wine_managed_image
@@ -783,6 +797,86 @@ failed:
     return res;
 }
 
+static BOOL instance_has_nvidia_wayland_wsi( struct instance *instance )
+{
+    static const UINT nvidia_vendor_id = 0x10de;
+    VkPhysicalDeviceProperties properties;
+    unsigned int i;
+
+    if (!instance->obj.extensions.has_VK_KHR_wayland_surface) return FALSE;
+
+    for (i = 0; i < instance->obj.physical_device_count; i++)
+    {
+        struct vulkan_physical_device *physical_device = &instance->obj.physical_devices[i];
+
+        instance->obj.p_vkGetPhysicalDeviceProperties( physical_device->host.physical_device, &properties );
+        if (properties.vendorID == nvidia_vendor_id) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void register_nvidia_wayland_instance( struct instance *instance )
+{
+    if (!instance_has_nvidia_wayland_wsi( instance )) return;
+
+    pthread_mutex_lock( &producer_device_lock );
+    instance->nvidia_wayland_wsi = TRUE;
+    nvidia_wayland_instance_count++;
+    pthread_mutex_unlock( &producer_device_lock );
+}
+
+static void destroy_delayed_nvidia_wayland_host_instances( void )
+{
+    struct nvidia_wayland_host_instance *host, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( host, next, &delayed_nvidia_wayland_host_instances,
+                              struct nvidia_wayland_host_instance, entry )
+    {
+        list_remove( &host->entry );
+        host->p_vkDestroyInstance( host->host_instance, NULL );
+        free( host );
+    }
+}
+
+static void destroy_host_instance( struct instance *instance )
+{
+    PFN_vkDestroyInstance p_vkDestroyInstance = instance->obj.p_vkDestroyInstance;
+    VkInstance host_instance = instance->obj.host.instance;
+    struct nvidia_wayland_host_instance *queued;
+
+    if (!instance->nvidia_wayland_wsi)
+    {
+        p_vkDestroyInstance( host_instance, NULL );
+        return;
+    }
+
+    pthread_mutex_lock( &producer_device_lock );
+
+    if (nvidia_wayland_instance_count) nvidia_wayland_instance_count--;
+    if (nvidia_wayland_instance_count)
+    {
+        if ((queued = malloc( sizeof(*queued) )))
+        {
+            queued->p_vkDestroyInstance = p_vkDestroyInstance;
+            queued->host_instance = host_instance;
+            list_add_tail( &delayed_nvidia_wayland_host_instances, &queued->entry );
+        }
+        else
+        {
+            ERR( "Failed to allocate delayed NVIDIA Wayland VkInstance destroy, leaking host instance %p.\n",
+                 host_instance );
+        }
+    }
+    else
+    {
+        p_vkDestroyInstance( host_instance, NULL );
+        destroy_delayed_nvidia_wayland_host_instances();
+    }
+
+    pthread_mutex_unlock( &producer_device_lock );
+}
+
 static BOOL add_instance_extension( const char *extension, size_t len, struct vulkan_instance_extensions *extensions )
 {
 #define USE_VK_EXT(x) \
@@ -859,6 +953,7 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
      * object, which means we need to wrap the host physical devices and present those to the application.
      */
     if ((res = init_physical_devices( &instance->obj, physical_devices ))) goto failed;
+    register_nvidia_wayland_instance( instance );
 
     TRACE( "Created instance %p, host_instance %p.\n", instance, instance->obj.host.instance );
     for (i = 0; i < instance->obj.physical_device_count; i++)
@@ -887,7 +982,7 @@ static void win32u_vkDestroyInstance( VkInstance client_instance, const VkAlloca
 
     if (!instance) return;
 
-    instance->obj.p_vkDestroyInstance( instance->obj.host.instance, NULL /* allocator */ );
+    destroy_host_instance( instance );
     for (int i = 0; i < instance->obj.physical_device_count; i++)
         vulkan_instance_remove_object( &instance->obj, &instance->obj.physical_devices[i].obj );
     vulkan_instance_remove_object( &instance->obj, &instance->obj.obj );
