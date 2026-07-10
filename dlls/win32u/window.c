@@ -3158,28 +3158,31 @@ BOOL WINAPI NtUserGetWindowPlacement( HWND hwnd, WINDOWPLACEMENT *placement )
     }
     if (win == WND_OTHER_PROCESS)
     {
-        RECT normal_position;
-        DWORD style;
+        BOOL ret = FALSE;
 
-        if (!get_window_rect( hwnd, &normal_position, get_thread_dpi() ))
-            return FALSE;
-
-        FIXME("not fully supported on other process window %p.\n", hwnd);
-
-        placement->length  = sizeof(*placement);
-        style = get_window_long( hwnd, GWL_STYLE );
-        if (style & WS_MINIMIZE)
-            placement->showCmd = SW_SHOWMINIMIZED;
-        else
-            placement->showCmd = (style & WS_MAXIMIZE) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
-        /* provide some dummy information */
-        placement->flags = 0;
-        placement->ptMinPosition.x = -1;
-        placement->ptMinPosition.y = -1;
-        placement->ptMaxPosition.x = -1;
-        placement->ptMaxPosition.y = -1;
-        placement->rcNormalPosition = normal_position;
-        return TRUE;
+        SERVER_START_REQ( get_window_rectangles )
+        {
+            req->handle = wine_server_user_handle( hwnd );
+            req->relative = COORDS_SCREEN;
+            req->dpi = get_thread_dpi();
+            if ((ret = !wine_server_call_err( req )))
+            {
+                placement->length  = sizeof(*placement);
+                if (reply->style & WS_MINIMIZE)
+                    placement->showCmd = SW_SHOWMINIMIZED;
+                else
+                    placement->showCmd = (reply->style & WS_MAXIMIZE) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+                /* provide some dummy information */
+                placement->flags = 0;
+                placement->ptMinPosition.x = -1;
+                placement->ptMinPosition.y = -1;
+                placement->ptMaxPosition.x = -1;
+                placement->ptMaxPosition.y = -1;
+                placement->rcNormalPosition = wine_server_get_rect( reply->window );
+            }
+        }
+        SERVER_END_REQ;
+        return ret;
     }
 
     /* update the placement according to the current style */

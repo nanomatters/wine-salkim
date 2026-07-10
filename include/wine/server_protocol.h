@@ -3874,6 +3874,8 @@ struct get_window_rectangles_reply
     struct reply_header __header;
     struct rectangle window;
     struct rectangle client;
+    unsigned int     style;
+    char __pad_44[4];
 };
 enum coords_relative
 {
@@ -7440,6 +7442,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 934
+#define SERVER_PROTOCOL_VERSION 935
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
