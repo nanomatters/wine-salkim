@@ -1865,6 +1865,20 @@ static void dump_get_window_children_from_point_reply( const struct get_window_c
     dump_varargs_user_handles( ", children=", cur_size );
 }
 
+static void dump_get_window_from_point_request( const struct get_window_from_point_request *req )
+{
+    fprintf( stderr, " parent=%08x", req->parent );
+    fprintf( stderr, ", x=%d", req->x );
+    fprintf( stderr, ", y=%d", req->y );
+    fprintf( stderr, ", dpi=%d", req->dpi );
+}
+
+static void dump_get_window_from_point_reply( const struct get_window_from_point_reply *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", style=%08x", req->style );
+}
+
 static void dump_get_window_tree_request( const struct get_window_tree_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -3814,6 +3828,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_window_list_request,
     (dump_func)dump_get_class_windows_request,
     (dump_func)dump_get_window_children_from_point_request,
+    (dump_func)dump_get_window_from_point_request,
     (dump_func)dump_get_window_tree_request,
     (dump_func)dump_set_window_pos_request,
     (dump_func)dump_get_window_rectangles_request,
@@ -4136,6 +4151,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_window_list_reply,
     (dump_func)dump_get_class_windows_reply,
     (dump_func)dump_get_window_children_from_point_reply,
+    (dump_func)dump_get_window_from_point_reply,
     (dump_func)dump_get_window_tree_reply,
     (dump_func)dump_set_window_pos_reply,
     (dump_func)dump_get_window_rectangles_reply,
@@ -4458,6 +4474,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_window_list",
     "get_class_windows",
     "get_window_children_from_point",
+    "get_window_from_point",
     "get_window_tree",
     "set_window_pos",
     "get_window_rectangles",
