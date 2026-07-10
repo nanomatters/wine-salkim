@@ -2984,6 +2984,7 @@ DECL_HANDLER(get_window_rectangles)
 
     reply->window  = win->window_rect;
     reply->client  = win->client_rect;
+    reply->style   = win->style;
 
     switch (req->relative)
     {

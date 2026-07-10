@@ -1911,6 +1911,7 @@ static void dump_get_window_rectangles_reply( const struct get_window_rectangles
 {
     dump_rectangle( " window=", &req->window );
     dump_rectangle( ", client=", &req->client );
+    fprintf( stderr, ", style=%08x", req->style );
 }
 
 static void dump_get_window_text_request( const struct get_window_text_request *req )
