@@ -820,7 +820,6 @@ static void wayland_window_surface_set_clip(struct window_surface *window_surfac
                                             const RECT *rects, UINT count)
 {
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
-    struct wayland_win_data *data;
     BOOL occlusion_clipped;
 
     TRACE("hwnd=%p rects=%p count=%u\n", window_surface->hwnd, rects, count);
@@ -835,13 +834,8 @@ static void wayland_window_surface_set_clip(struct window_surface *window_surfac
     }
     wws->occlusion_clipped = occlusion_clipped;
 
-    if (!(data = wayland_win_data_get(window_surface->hwnd)))
-        return;
-
-    if (data->wayland_surface)
-        wayland_surface_sync_window_regions(data->wayland_surface, window_surface);
-
-    wayland_win_data_release(data);
+    if (window_surface->hwnd)
+        NtUserPostMessage(window_surface->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
 }
 
 /**********************************************************************
