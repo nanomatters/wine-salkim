@@ -1244,6 +1244,8 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* the same applies here */
         else if (!wp && focused == hwnd)
         {
+            if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE)
+                NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
             NtUserSetForegroundWindowInternal(hwnd);
             /* remember where to hand foreground back when an ownerless layer
              * menu is dismissed so dismissal does not strand the process. */
