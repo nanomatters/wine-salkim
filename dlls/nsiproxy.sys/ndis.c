@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <errno.h>
 
 #ifdef HAVE_NET_IF_H
 #include <net/if.h>
@@ -330,9 +331,16 @@ static struct if_entry *add_entry( UINT index, const char *name )
 
 static unsigned int update_if_table( void )
 {
-    struct if_nameindex *indices = if_nameindex(), *entry;
+    struct if_nameindex *indices, *entry;
     unsigned int append_count = 0;
     struct if_entry *if_entry;
+
+    indices = if_nameindex();
+    if (!indices)
+    {
+        ERR( "if_nameindex failed, errno %d.\n", errno );
+        return 0;
+    }
 
     for (entry = indices; entry->if_index; entry++)
     {
