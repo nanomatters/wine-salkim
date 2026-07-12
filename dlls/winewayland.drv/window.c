@@ -233,10 +233,33 @@ static BOOL rect_intersects_virtual_screen(const RECT *rect)
     return intersect_rect(&intersect, rect, &virtual_rect);
 }
 
-static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface, DWORD style)
+static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface,
+                                                  DWORD style)
 {
     if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
-    return style & WS_MINIMIZE;
+    if (!(style & WS_MINIMIZE)) return FALSE;
+
+    return !surface->current.caps ||
+           (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
+}
+
+static BOOL window_or_root_minimized(HWND hwnd)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+
+    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) return TRUE;
+    return root && root != hwnd && (NtUserGetWindowLongW(root, GWL_STYLE) & WS_MINIMIZE);
+}
+
+static void detach_client_surfaces_for_toplevel(HWND toplevel)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->client_surface && data->client_surface->toplevel == toplevel)
+            wayland_client_surface_attach(data->client_surface, NULL);
+    }
 }
 
 static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
@@ -331,10 +354,13 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     if (client)
     {
-        if (role != WAYLAND_SURFACE_ROLE_NONE) wayland_client_surface_attach(client, data->hwnd);
+        if (role != WAYLAND_SURFACE_ROLE_NONE && !window_or_root_minimized(data->hwnd))
+            wayland_client_surface_attach(client, data->hwnd);
         else wayland_client_surface_attach(client, NULL);
     }
     wayland_win_data_get_config(data, &surface->window);
+    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
+        detach_client_surfaces_for_toplevel(data->hwnd);
     wayland_surface_sync_window_regions(surface, window_surface);
 
     /* Size/position changes affect the effective pointer constraint, so update
@@ -792,7 +818,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if ((client = data->client_surface))
         {
-            if (toplevel && NtUserIsWindowVisible(hwnd))
+            if (toplevel && NtUserIsWindowVisible(hwnd) && !window_or_root_minimized(hwnd))
                 wayland_client_surface_attach(client, toplevel);
             else
                 wayland_client_surface_attach(client, NULL);
@@ -1256,7 +1282,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
         return;
     }
 
-    visible = NtUserIsWindowVisible(hwnd);
+    visible = NtUserIsWindowVisible(hwnd) && !window_or_root_minimized(hwnd);
 
     if (new_client && new_client != data->client_surface && data->client_surface &&
         data->client_surface->has_presented && !new_client->has_presented)
@@ -1356,6 +1382,13 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 
     if ((wayland_surface = data->wayland_surface))
     {
+        if (wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            wayland_surface->window.minimized)
+        {
+            wayland_win_data_release(data);
+            return TRUE;
+        }
+
         if (wayland_surface_reconfigure(wayland_surface))
         {
             /* sync the alpha multiplier if it has changed due to SLWA/ULW */
