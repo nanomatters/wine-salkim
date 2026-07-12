@@ -949,7 +949,10 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
          * foreground window when both the old and new foreground windows
          * are in the same non-current thread. */
         if (surface->window.minimized)
+        {
             NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+        }
         else if (surface->window.managed || wayland_is_layer_menu_hwnd(hwnd))
             NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
     }
