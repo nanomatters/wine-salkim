@@ -1067,8 +1067,47 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         wayland_configure_window(hwnd);
         return 0;
     case WM_WAYLAND_SET_FOREGROUND:
-        NtUserSetForegroundWindowInternal(hwnd);
+    {
+        BOOL layer_menu;
+        HWND focused, restore;
+        pthread_mutex_lock(&process_wayland.keyboard.mutex);
+        focused = process_wayland.keyboard.focused_hwnd;
+        pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+        layer_menu = wayland_is_layer_menu_hwnd(hwnd);
+        /* Layer menu cancellation is explicit. Other focus-loss messages must
+         * match a compositor keyboard leave. */
+        if (wp && layer_menu && wayland_is_popup_menu_class(hwnd))
+        {
+            if (NtUserGetForegroundWindow() == hwnd)
+            {
+                restore = (HWND)lp;
+                if (!restore || !NtUserIsWindow(restore)) restore = NtUserGetDesktopWindow();
+                NtUserSetForegroundWindowInternal(restore);
+            }
+            if (NtUserEndMenu()) wayland_clear_layer_menu_hwnd(hwnd);
+        }
+        else if (wp && NtUserGetForegroundWindow() == hwnd && (focused != hwnd || layer_menu))
+        {
+            restore = (HWND)lp;
+            if (!restore || !NtUserIsWindow(restore)) restore = NtUserGetDesktopWindow();
+            if (NtUserSetForegroundWindowInternal(restore) && layer_menu)
+                wayland_clear_layer_menu_hwnd(hwnd);
+        }
+        /* the same applies here */
+        else if (!wp && focused == hwnd)
+        {
+            if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE)
+                NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+            NtUserSetForegroundWindowInternal(hwnd);
+            /* remember where to hand foreground back when an ownerless layer
+             * menu is dismissed so dismissal does not strand the process. */
+            if (!wayland_is_layer_menu_hwnd(hwnd)) layer_menu_restore_fg = hwnd;
+        }
+        else
+            WARN("focused %p hwnd %p, Ignoring stale %s message\n",
+                 focused, hwnd, wp ? "focus loss" : "focus gain");
         return 0;
+    }
     case WM_WAYLAND_DMABUF_FRAME:
     {
         BOOL had_dmabuf_content;
