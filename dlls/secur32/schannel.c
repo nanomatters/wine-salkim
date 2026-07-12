@@ -918,7 +918,7 @@ static SECURITY_STATUS establish_context(
                 return SEC_E_INCOMPLETE_MESSAGE;
             }
 
-            if (!is_dtls_context(ctx) && !is_tls_record_header(ptr))
+            if (!is_dtls_context(ctx) && buffer->cbBuffer >= ctx->header_size && !is_tls_record_header(ptr))
             {
                 WARN("Invalid TLS record header: %02x %02x %02x %02x %02x.\n",
                      ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
