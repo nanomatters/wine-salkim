@@ -920,6 +920,8 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
                                   struct wl_array *keys)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    struct wayland_surface *surface;
+    struct wayland_win_data *data;
     HWND hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
@@ -937,8 +939,25 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
 
     NtUserPostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
     NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
-    if (wayland_is_layer_menu_hwnd(hwnd))
-        NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+
+    if ((surface = data->wayland_surface))
+    {
+        /* TODO: Drop the internal message and call NtUserSetForegroundWindow
+         * directly once it's updated to not explicitly deactivate the old
+         * foreground window when both the old and new foreground windows
+         * are in the same non-current thread. */
+        if (surface->window.minimized)
+        {
+            NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+        }
+        else if (surface->window.managed || wayland_is_layer_menu_hwnd(hwnd))
+            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+    }
+
+    wayland_win_data_release(data);
 }
 
 static BOOL wayland_disable_focus_loss(void)

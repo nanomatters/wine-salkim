@@ -3182,6 +3182,13 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
     {
         struct wayland_surface *surface = data->wayland_surface;
 
+        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            surface->window.minimized)
+        {
+            wayland_win_data_release(data);
+            return FALSE;
+        }
+
         had_direct = surface && surface->direct_dmabuf_surface;
         may_try = surface && (had_direct ||
                               (wayland_surface_is_toplevel(surface) &&
@@ -3243,6 +3250,8 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     /* Producer children are composited for primary surfaces. */
     if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface) &&
         !wayland_surface_is_layer(surface))
+        return;
+    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
         return;
 
     /* Import is driven by producer wakes (WM_WAYLAND_DMABUF_FRAME) at the producer's
@@ -3927,7 +3936,12 @@ static void wayland_client_surface_detach(struct client_surface *client)
 
 static BOOL is_client_visible(HWND hwnd)
 {
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
     RECT dummy;
+
+    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) return FALSE;
+    if (root && root != hwnd && (NtUserGetWindowLongW(root, GWL_STYLE) & WS_MINIMIZE))
+        return FALSE;
     return NtUserIsWindowVisible(hwnd) || NtUserGetPresentRect(hwnd, &dummy, -1);
 }
 
@@ -4190,6 +4204,11 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     {
         if (toplevel_data) wayland_win_data_release(toplevel_data);
         return wayland_client_surface_attach(client, NULL);
+    }
+    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
+    {
+        wayland_client_surface_attach(client, NULL);
+        return;
     }
 
     if (client->toplevel != toplevel ||
