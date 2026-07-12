@@ -1243,7 +1243,7 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
     {
         struct sockaddr_un sun = { 0 };
         WCHAR *sun_pathW;
-        memcpy(&sun, addr, len);
+        memcpy(&sun, addr, min( (size_t)len, sizeof(sun) ));
         if (strlen( sun.sun_path ))
         {
             sun_pathW = strdupAtoW( sun.sun_path );
