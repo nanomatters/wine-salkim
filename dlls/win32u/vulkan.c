@@ -2979,6 +2979,8 @@ static VkResult win32u_vkSetLatencySleepModeNV(VkDevice device, VkSwapchainKHR s
 
     vk_device->low_latency_enabled = pSleepModeInfo->lowLatencyMode;
 
+    if (vk_swapchain->managed) return VK_SUCCESS;
+
     sleep_mode_info_host.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
     sleep_mode_info_host.pNext = NULL;
     sleep_mode_info_host.lowLatencyMode = pSleepModeInfo->lowLatencyMode;
@@ -2986,6 +2988,57 @@ static VkResult win32u_vkSetLatencySleepModeNV(VkDevice device, VkSwapchainKHR s
     sleep_mode_info_host.minimumIntervalUs = pSleepModeInfo->minimumIntervalUs;
 
     return vk_device->p_vkSetLatencySleepModeNV(vk_device->host.device, vk_swapchain->obj.host.swapchain, &sleep_mode_info_host);
+}
+
+static VkResult win32u_vkLatencySleepNV(VkDevice device, VkSwapchainKHR swapchain, const VkLatencySleepInfoNV *pSleepInfo)
+{
+    struct vulkan_device *vk_device = vulkan_device_from_handle(device);
+    struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
+    VkLatencySleepInfoNV sleep_info_host = *pSleepInfo;
+    struct vulkan_semaphore *semaphore;
+
+    if (!vk_swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+
+    if (vk_swapchain->managed) return VK_SUCCESS;
+
+    semaphore = sleep_info_host.signalSemaphore ? vulkan_semaphore_from_handle(sleep_info_host.signalSemaphore) : NULL;
+    sleep_info_host.signalSemaphore = semaphore ? semaphore->host.semaphore : 0;
+
+    return vk_device->p_vkLatencySleepNV(vk_device->host.device, vk_swapchain->obj.host.swapchain, &sleep_info_host);
+}
+
+static void win32u_vkSetLatencyMarkerNV(VkDevice device, VkSwapchainKHR swapchain,
+                                        const VkSetLatencyMarkerInfoNV *pLatencyMarkerInfo)
+{
+    struct vulkan_device *vk_device = vulkan_device_from_handle(device);
+    struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
+
+    if (!vk_swapchain) return;
+
+    if (vk_swapchain->managed) return;
+
+    vk_device->p_vkSetLatencyMarkerNV(vk_device->host.device, vk_swapchain->obj.host.swapchain, pLatencyMarkerInfo);
+}
+
+static void win32u_vkGetLatencyTimingsNV(VkDevice device, VkSwapchainKHR swapchain,
+                                         VkGetLatencyMarkerInfoNV *pLatencyMarkerInfo)
+{
+    struct vulkan_device *vk_device = vulkan_device_from_handle(device);
+    struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
+
+    if (!vk_swapchain)
+    {
+        pLatencyMarkerInfo->timingCount = 0;
+        return;
+    }
+
+    if (vk_swapchain->managed)
+    {
+        pLatencyMarkerInfo->timingCount = 0;
+        return;
+    }
+
+    vk_device->p_vkGetLatencyTimingsNV(vk_device->host.device, vk_swapchain->obj.host.swapchain, pLatencyMarkerInfo);
 }
 
 static BOOL surface_get_fshack_dpi( struct surface *surface )
@@ -4280,6 +4333,44 @@ static VkResult managed_swapchain_get_status( struct swapchain *swapchain, UINT6
     return res;
 }
 
+static VkResult win32u_vkSetSwapchainPresentTimingQueueSizeEXT( VkDevice client_device,
+                                                                VkSwapchainKHR client_swapchain, uint32_t size )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+
+    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+
+    if (swapchain->managed) return managed_swapchain_get_status( swapchain, NULL );
+
+    return device->p_vkSetSwapchainPresentTimingQueueSizeEXT( device->host.device,
+                                                              swapchain->obj.host.swapchain, size );
+}
+
+static VkResult win32u_vkGetSwapchainTimingPropertiesEXT( VkDevice client_device, VkSwapchainKHR client_swapchain,
+                                                          VkSwapchainTimingPropertiesEXT *properties,
+                                                          uint64_t *counter )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+    VkResult res;
+
+    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+
+    if (swapchain->managed)
+    {
+        res = managed_swapchain_get_status( swapchain, NULL );
+        if (res < VK_SUCCESS) return res;
+        properties->refreshDuration = 0;
+        properties->refreshInterval = 0;
+        if (counter) *counter = 0;
+        return VK_SUCCESS;
+    }
+
+    return device->p_vkGetSwapchainTimingPropertiesEXT( device->host.device, swapchain->obj.host.swapchain,
+                                                        properties, counter );
+}
+
 static VkResult win32u_vkGetPastPresentationTimingEXT( VkDevice client_device,
                                                        const VkPastPresentationTimingInfoEXT *info,
                                                        VkPastPresentationTimingPropertiesEXT *properties )
@@ -4305,6 +4396,106 @@ static VkResult win32u_vkGetPastPresentationTimingEXT( VkDevice client_device,
 
     info_host.swapchain = swapchain->obj.host.swapchain;
     return device->p_vkGetPastPresentationTimingEXT( device->host.device, &info_host, properties );
+}
+
+static VkResult managed_release_swapchain_images( struct swapchain *swapchain,
+                                                  const VkReleaseSwapchainImagesInfoKHR *info )
+{
+    struct wine_managed_swapchain *managed = swapchain->managed;
+    VkResult res = VK_SUCCESS;
+
+    pthread_mutex_lock( &producer_device_lock );
+    pthread_mutex_lock( &managed->lock );
+    managed_drain_releases( managed );
+    if (managed->lost) res = VK_ERROR_OUT_OF_DATE_KHR;
+    else
+    {
+        for (uint32_t i = 0; i < info->imageIndexCount; i++)
+        {
+            uint32_t image_index = info->pImageIndices[i];
+            if (image_index >= managed->image_count)
+            {
+                res = VK_ERROR_OUT_OF_DATE_KHR;
+                break;
+            }
+            managed->images[image_index].acquired = FALSE;
+        }
+    }
+    pthread_mutex_unlock( &managed->lock );
+    pthread_mutex_unlock( &producer_device_lock );
+    return res;
+}
+
+static VkResult win32u_vkReleaseSwapchainImagesKHR( VkDevice client_device,
+                                                    const VkReleaseSwapchainImagesInfoKHR *release_info )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    struct swapchain *swapchain = swapchain_from_handle( release_info->swapchain );
+    VkReleaseSwapchainImagesInfoKHR release_info_host = *release_info;
+
+    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+
+    if (swapchain->managed) return managed_release_swapchain_images( swapchain, release_info );
+
+    release_info_host.swapchain = swapchain->obj.host.swapchain;
+    return device->p_vkReleaseSwapchainImagesKHR( device->host.device, &release_info_host );
+}
+
+static VkResult win32u_vkReleaseSwapchainImagesEXT( VkDevice client_device,
+                                                    const VkReleaseSwapchainImagesInfoKHR *release_info )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    struct swapchain *swapchain = swapchain_from_handle( release_info->swapchain );
+    VkReleaseSwapchainImagesInfoKHR release_info_host = *release_info;
+
+    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+
+    if (swapchain->managed) return managed_release_swapchain_images( swapchain, release_info );
+
+    release_info_host.swapchain = swapchain->obj.host.swapchain;
+    return device->p_vkReleaseSwapchainImagesEXT( device->host.device, &release_info_host );
+}
+
+static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapchain_count,
+                                        const VkSwapchainKHR *client_swapchains,
+                                        const VkHdrMetadataEXT *metadata )
+{
+    VkSwapchainKHR stack_swapchains[16], *host_swapchains = stack_swapchains;
+    VkHdrMetadataEXT stack_metadata[16], *host_metadata = stack_metadata;
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    uint32_t host_count = 0;
+
+    if (swapchain_count > ARRAY_SIZE(stack_swapchains))
+    {
+        host_swapchains = malloc( swapchain_count * sizeof(*host_swapchains) );
+        host_metadata = malloc( swapchain_count * sizeof(*host_metadata) );
+        if (!host_swapchains || !host_metadata)
+        {
+            WARN( "failed to allocate HDR metadata arrays\n" );
+            free( host_swapchains );
+            free( host_metadata );
+            return;
+        }
+    }
+
+    for (uint32_t i = 0; i < swapchain_count; i++)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        if (!swapchain) continue;
+        if (swapchain->managed) continue;
+        host_swapchains[host_count] = swapchain->obj.host.swapchain;
+        host_metadata[host_count] = metadata[i];
+        host_count++;
+    }
+
+    if (host_count)
+        device->p_vkSetHdrMetadataEXT( device->host.device, host_count, host_swapchains, host_metadata );
+
+    if (host_swapchains != stack_swapchains)
+    {
+        free( host_swapchains );
+        free( host_metadata );
+    }
 }
 
 static VkCommandBuffer create_hack_cmd( struct vulkan_queue *queue, struct swapchain *swapchain, uint32_t queue_idx )
@@ -5809,14 +6000,22 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkGetPhysicalDeviceSurfaceFormatsKHR = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR,
     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR,
     .p_vkGetPastPresentationTimingEXT = win32u_vkGetPastPresentationTimingEXT,
+    .p_vkGetLatencyTimingsNV = win32u_vkGetLatencyTimingsNV,
     .p_vkGetSemaphoreWin32HandleKHR = win32u_vkGetSemaphoreWin32HandleKHR,
+    .p_vkGetSwapchainTimingPropertiesEXT = win32u_vkGetSwapchainTimingPropertiesEXT,
     .p_vkGetSwapchainImagesKHR = win32u_vkGetSwapchainImagesKHR,
     .p_vkImportFenceWin32HandleKHR = win32u_vkImportFenceWin32HandleKHR,
     .p_vkImportSemaphoreWin32HandleKHR = win32u_vkImportSemaphoreWin32HandleKHR,
+    .p_vkLatencySleepNV = win32u_vkLatencySleepNV,
     .p_vkMapMemory = win32u_vkMapMemory,
     .p_vkMapMemory2KHR = win32u_vkMapMemory2KHR,
     .p_vkQueuePresentKHR = win32u_vkQueuePresentKHR,
+    .p_vkReleaseSwapchainImagesEXT = win32u_vkReleaseSwapchainImagesEXT,
+    .p_vkReleaseSwapchainImagesKHR = win32u_vkReleaseSwapchainImagesKHR,
+    .p_vkSetHdrMetadataEXT = win32u_vkSetHdrMetadataEXT,
+    .p_vkSetLatencyMarkerNV = win32u_vkSetLatencyMarkerNV,
     .p_vkSetLatencySleepModeNV = win32u_vkSetLatencySleepModeNV,
+    .p_vkSetSwapchainPresentTimingQueueSizeEXT = win32u_vkSetSwapchainPresentTimingQueueSizeEXT,
     .p_vkQueueSubmit = win32u_vkQueueSubmit,
     .p_vkQueueSubmit2 = win32u_vkQueueSubmit2,
     .p_vkQueueSubmit2KHR = win32u_vkQueueSubmit2KHR,
