@@ -372,6 +372,10 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     HDC draw_hdc = teb->glReserved1[0], read_hdc = teb->glReserved1[1];
     struct context *old_ctx = get_current_context( teb, NULL, NULL );
     const struct opengl_funcs *old_funcs = teb->glTable;
+    static const WCHAR staticW[] = {'s','t','a','t','i','c',0};
+    UNICODE_STRING static_us = RTL_CONSTANT_STRING( staticW );
+    HDC hdc = NULL;
+    HWND hwnd;
 
     if (dst == old_ctx)
     {
@@ -383,7 +387,17 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     if (src->used == -1) FIXME( "Unsupported attributes on context %p/%p\n", src_handle, src );
     if (src != dst && dst->used == -1) FIXME( "Unsupported attributes on context %p/%p\n", dst_handle, dst );
 
-    funcs->p_wglMakeCurrent( dst->hdc, &dst->base );
+    if (!(hwnd = NtUserCreateWindowEx( 0, &static_us, NULL, &static_us, WS_POPUP, 0, 0, 0, 0,
+                                       NULL, NULL, NULL, NULL, 0, NULL, NULL, FALSE )) ||
+        !(hdc = NtUserGetWindowDC( hwnd )) || !funcs->p_wglSetPixelFormat( hdc, dst->base.format, NULL ))
+    {
+        WARN( "Failed to create dummy window to update context attributes\n" );
+        if (hdc) NtUserReleaseDC( hwnd, hdc );
+        if (hwnd) NtUserDestroyWindow( hwnd );
+        return FALSE;
+    }
+
+    funcs->p_wglMakeCurrent( hdc, &dst->base );
 
     dst->has_been_current = src->has_been_current;
     if (mask & GL_COLOR_BUFFER_BIT)
@@ -441,6 +455,9 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     if (!old_ctx) funcs->p_wglMakeCurrent( NULL, NULL );
     else if (!old_funcs->p_wglMakeContextCurrentARB) old_funcs->p_wglMakeCurrent( draw_hdc, &old_ctx->base );
     else old_funcs->p_wglMakeContextCurrentARB( draw_hdc, read_hdc, &old_ctx->base );
+
+    NtUserReleaseDC( hwnd, hdc );
+    NtUserDestroyWindow( hwnd );
 
     return dst->used != -1 && src->used != -1;
 }
