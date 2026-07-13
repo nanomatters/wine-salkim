@@ -366,15 +366,16 @@ void set_context_attribute( TEB *teb, GLenum name, const void *value, size_t siz
     }
 }
 
+static BOOL create_context_dc( const struct opengl_funcs *funcs, int format, HWND *hwnd, HDC *hdc );
+static void destroy_context_dc( HWND hwnd, HDC hdc );
+
 static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs, HGLRC dst_handle, struct context *dst,
                                      HGLRC src_handle, struct context *src, GLbitfield mask )
 {
     HDC draw_hdc = teb->glReserved1[0], read_hdc = teb->glReserved1[1];
     struct context *old_ctx = get_current_context( teb, NULL, NULL );
     const struct opengl_funcs *old_funcs = teb->glTable;
-    static const WCHAR staticW[] = {'s','t','a','t','i','c',0};
-    UNICODE_STRING static_us = RTL_CONSTANT_STRING( staticW );
-    HDC hdc = NULL;
+    HDC hdc;
     HWND hwnd;
 
     if (dst == old_ctx)
@@ -387,15 +388,8 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     if (src->used == -1) FIXME( "Unsupported attributes on context %p/%p\n", src_handle, src );
     if (src != dst && dst->used == -1) FIXME( "Unsupported attributes on context %p/%p\n", dst_handle, dst );
 
-    if (!(hwnd = NtUserCreateWindowEx( 0, &static_us, NULL, &static_us, WS_POPUP, 0, 0, 0, 0,
-                                       NULL, NULL, NULL, NULL, 0, NULL, NULL, FALSE )) ||
-        !(hdc = NtUserGetWindowDC( hwnd )) || !funcs->p_wglSetPixelFormat( hdc, dst->base.format, NULL ))
-    {
-        WARN( "Failed to create dummy window to update context attributes\n" );
-        if (hdc) NtUserReleaseDC( hwnd, hdc );
-        if (hwnd) NtUserDestroyWindow( hwnd );
+    if (!create_context_dc( funcs, dst->base.format, &hwnd, &hdc ))
         return FALSE;
-    }
 
     funcs->p_wglMakeCurrent( hdc, &dst->base );
 
@@ -456,8 +450,7 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     else if (!old_funcs->p_wglMakeContextCurrentARB) old_funcs->p_wglMakeCurrent( draw_hdc, &old_ctx->base );
     else old_funcs->p_wglMakeContextCurrentARB( draw_hdc, read_hdc, &old_ctx->base );
 
-    NtUserReleaseDC( hwnd, hdc );
-    NtUserDestroyWindow( hwnd );
+    destroy_context_dc( hwnd, hdc );
 
     return dst->used != -1 && src->used != -1;
 }
@@ -505,6 +498,35 @@ static void release_buffers( const struct opengl_funcs *funcs, struct buffers *b
     free( buffers );
 }
 
+static BOOL create_context_dc( const struct opengl_funcs *funcs, int format, HWND *hwnd, HDC *hdc )
+{
+    static const WCHAR staticW[] = {'s','t','a','t','i','c',0};
+    UNICODE_STRING static_us = RTL_CONSTANT_STRING( staticW );
+
+    *hwnd = NULL;
+    *hdc = NULL;
+
+    if (!(*hwnd = NtUserCreateWindowEx( 0, &static_us, NULL, &static_us, WS_POPUP, 0, 0, 0, 0,
+                                        NULL, NULL, NULL, NULL, 0, NULL, NULL, FALSE )) ||
+        !(*hdc = NtUserGetWindowDC( *hwnd )) || !funcs->p_wglSetPixelFormat( *hdc, format, NULL ))
+    {
+        WARN( "Failed to create dummy window for OpenGL context\n" );
+        if (*hdc) NtUserReleaseDC( *hwnd, *hdc );
+        if (*hwnd) NtUserDestroyWindow( *hwnd );
+        *hwnd = NULL;
+        *hdc = NULL;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void destroy_context_dc( HWND hwnd, HDC hdc )
+{
+    NtUserReleaseDC( hwnd, hdc );
+    NtUserDestroyWindow( hwnd );
+}
+
 static struct context *opengl_context_from_handle( TEB *teb, HGLRC handle, const struct opengl_funcs **funcs );
 
 /* update handle context if it has been re-shared with another one */
@@ -512,16 +534,24 @@ static void update_handle_context( TEB *teb, HGLRC handle, struct wgl_handle *pt
 {
     struct context *ctx = context_from_wgl_context( ptr->u.context ), *shared;
     const struct opengl_funcs *funcs = ptr->funcs, *share_funcs;
+    HDC hdc;
+    HWND hwnd;
 
     if (ctx->tid) return; /* currently in use */
     if (ctx->share == (HGLRC)-1) return; /* not re-shared */
 
     shared = ctx->share ? opengl_context_from_handle( teb, ctx->share, &share_funcs ) : NULL;
-    if (!funcs->p_wgl_context_reset( &ctx->base, ctx->hdc, shared ? &shared->base : NULL, ctx->attribs ))
+    if (!create_context_dc( funcs, ctx->base.format, &hwnd, &hdc ))
+        return;
+
+    if (!funcs->p_wgl_context_reset( &ctx->base, hdc, shared ? &shared->base : NULL, ctx->attribs ))
     {
         WARN( "Failed to re-create context for wglShareLists\n" );
+        destroy_context_dc( hwnd, hdc );
         return;
     }
+    destroy_context_dc( hwnd, hdc );
+
     if (shared && shared->buffers)
     {
         release_buffers( funcs, ctx->buffers );
