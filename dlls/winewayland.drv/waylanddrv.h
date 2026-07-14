@@ -470,6 +470,8 @@ struct wayland_surface
 
     struct wl_surface *wl_surface;
     struct wp_viewport *wp_viewport;
+    struct wp_viewport *configured_wp_viewport;
+    int viewport_dest_width, viewport_dest_height;
     struct wp_fractional_scale_v1 *wp_fractional_scale_v1;
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
     struct zwp_keyboard_shortcuts_inhibitor_v1* zwp_keyboard_shortcuts_inhibitor_v1;

@@ -1082,6 +1082,7 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     {
         wp_viewport_destroy(surface->wp_viewport);
         surface->wp_viewport = NULL;
+        surface->configured_wp_viewport = NULL;
     }
 
     if (surface->wl_surface)
@@ -2016,12 +2017,26 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
                                              int width, int height)
 {
-    TRACE("hwnd=%p size=%dx%d\n", surface->hwnd, width, height);
+    int dest_width = width, dest_height = height;
 
-    if (width > 0 && height > 0)
-        wp_viewport_set_destination(surface->wp_viewport, width, height);
+    if (width <= 0 || height <= 0)
+        dest_width = dest_height = -1;
+
+    if (surface->configured_wp_viewport == surface->wp_viewport &&
+        surface->viewport_dest_width == dest_width &&
+        surface->viewport_dest_height == dest_height)
+        return;
+
+    TRACE("hwnd=%p size=%dx%d\n", surface->hwnd, dest_width, dest_height);
+
+    if (dest_width > 0 && dest_height > 0)
+        wp_viewport_set_destination(surface->wp_viewport, dest_width, dest_height);
     else
         wp_viewport_set_destination(surface->wp_viewport, -1, -1);
+
+    surface->configured_wp_viewport = surface->wp_viewport;
+    surface->viewport_dest_width = dest_width;
+    surface->viewport_dest_height = dest_height;
 }
 
 /**********************************************************************
