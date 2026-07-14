@@ -2313,6 +2313,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     UINT virtual_count, modes_count = host_modes_count;
     const DEVMODEW *modes = host_modes;
     struct source *source;
+    BOOL virtual_modelist = FALSE;
 
     TRACE( "current %s, host_modes_count %u, host_modes %p, param %p\n", debugstr_devmodew( current ),
            host_modes_count, host_modes, param );
@@ -2327,6 +2328,9 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     }
     else if (emulate_modelist)
     {
+        virtual_modelist = TRUE;
+        /* Keep the real host mode as physical. Current may be replaced below
+         * by a game requested virtual mode. */
         physical = *current;
         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
         {
@@ -2343,7 +2347,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
         }
     }
 
-    physical = modes_count == 1 ? *modes : *current;
+    if (!virtual_modelist) physical = modes_count == 1 ? *modes : *current;
     if (ctx->is_primary) ctx->primary = *current;
 
     detached.dmPelsWidth = 0;
@@ -2352,8 +2356,12 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
 
     if (modes_count > 1 || current == &detached)
     {
-        reg_delete_value( source->key, physicalW );
-        if (!emulate_modelist) virtual_modes = NULL;
+        if (virtual_modelist && current != &detached)
+            write_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &physical );
+        else
+            reg_delete_value( source->key, physicalW );
+
+        if (!virtual_modelist) virtual_modes = NULL;
     }
     else
     {
