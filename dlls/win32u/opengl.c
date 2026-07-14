@@ -1938,8 +1938,11 @@ static void set_window_opengl_drawable( HWND hwnd, struct opengl_drawable *new_d
     if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
     {
         struct opengl_drawable **ptr = current ? &win->current_drawable : &win->unused_drawable;
-        old_drawable = *ptr;
-        if ((*ptr = new_drawable)) opengl_drawable_add_ref( new_drawable );
+        if (*ptr != new_drawable)
+        {
+            old_drawable = *ptr;
+            if ((*ptr = new_drawable)) opengl_drawable_add_ref( new_drawable );
+        }
         release_win_ptr( win );
     }
 
@@ -2300,12 +2303,30 @@ static struct opengl_drawable *get_updated_drawable( HDC hdc, int format, struct
     return get_window_unused_drawable( hwnd, format );
 }
 
+static BOOL context_drawable_is_current( struct opengl_drawable *drawable )
+{
+    HWND hwnd;
+
+    if (!drawable || !drawable->client) return FALSE;
+    if (!(hwnd = drawable->client->hwnd)) return FALSE;
+    return is_client_surface_window( drawable->client, hwnd ) && !needs_framebuffer_update( hwnd, drawable );
+}
+
+static BOOL context_drawables_are_current( struct wgl_context *context )
+{
+    if (!context_drawable_is_current( context->draw )) return FALSE;
+    return context->read == context->draw || context_drawable_is_current( context->read );
+}
+
 static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, HDC read_hdc )
 {
     struct opengl_drawable *new_draw, *new_read, *old_draw = NULL, *old_read = NULL, *draw, *read;
     static pthread_mutex_t reserved_tx_mutex = PTHREAD_MUTEX_INITIALIZER;
     struct wgl_context *previous = NtCurrentTeb()->glContext;
     BOOL ret = FALSE, draw_updated, read_updated;
+
+    if (!draw_hdc && !read_hdc && previous == context && context_drawables_are_current( context ))
+        return TRUE;
 
     if (!(new_draw = get_updated_drawable( draw_hdc, context->format, context->draw, &draw_updated ))) return FALSE;
     read_updated = draw_updated;
