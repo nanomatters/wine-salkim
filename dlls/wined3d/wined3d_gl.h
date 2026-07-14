@@ -1184,8 +1184,10 @@ struct wined3d_gl_hwnd_dmabuf_ring
     uint64_t present_count;
     uint64_t next_release_token;
     volatile LONG support;
+    HWND caps_hwnd;
     HWND channel_hwnd;
     int channel_fd;
+    bool hwnd_has_caps;
     uint64_t producer_unique_id;
     bool logged_implicit_modifier;
     bool logged_opaque_fourcc;
