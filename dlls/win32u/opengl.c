@@ -2310,6 +2310,20 @@ static BOOL context_drawables_are_current( struct wgl_context *context )
     return context->read == context->draw || context_drawable_is_current( context->read );
 }
 
+static BOOL context_drawable_has_pending_update( struct opengl_drawable *drawable )
+{
+    return drawable && drawable->client && InterlockedCompareExchange( &drawable->client->updated, 0, 0 );
+}
+
+static BOOL context_flush_is_noop( struct wgl_context *context, void (*flush)(void), UINT flags )
+{
+    if (flush || flags) return FALSE;
+    if (NtCurrentTeb()->glContext != context) return FALSE;
+    if (!context_drawables_are_current( context )) return FALSE;
+    if (context_drawable_has_pending_update( context->draw )) return FALSE;
+    return context->read == context->draw || !context_drawable_has_pending_update( context->read );
+}
+
 static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, HDC read_hdc )
 {
     struct opengl_drawable *new_draw, *new_read, *old_draw = NULL, *old_read = NULL, *draw, *read;
@@ -3000,6 +3014,10 @@ static BOOL win32u_wgl_context_flush( struct wgl_context *context, void (*flush)
     int interval;
 
     if (!draw->client) return flush_memory_pbuffer( flush );
+
+    /* No-op flushes cannot present. Real swaps apply interval changes. */
+    if (context_flush_is_noop( context, flush, flags )) return TRUE;
+
     interval = get_window_swap_interval( draw->client->hwnd );
     if (flags & GL_FLUSH_FORCE_SWAP) interval = 0;
 
