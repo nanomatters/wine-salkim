@@ -1865,6 +1865,20 @@ static void dump_get_window_children_from_point_reply( const struct get_window_c
     dump_varargs_user_handles( ", children=", cur_size );
 }
 
+static void dump_get_window_from_point_request( const struct get_window_from_point_request *req )
+{
+    fprintf( stderr, " parent=%08x", req->parent );
+    fprintf( stderr, ", x=%d", req->x );
+    fprintf( stderr, ", y=%d", req->y );
+    fprintf( stderr, ", dpi=%d", req->dpi );
+}
+
+static void dump_get_window_from_point_reply( const struct get_window_from_point_reply *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", style=%08x", req->style );
+}
+
 static void dump_get_window_tree_request( const struct get_window_tree_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -1912,6 +1926,7 @@ static void dump_get_window_rectangles_reply( const struct get_window_rectangles
 {
     dump_rectangle( " window=", &req->window );
     dump_rectangle( ", client=", &req->client );
+    fprintf( stderr, ", style=%08x", req->style );
 }
 
 static void dump_get_window_text_request( const struct get_window_text_request *req )
@@ -3584,6 +3599,75 @@ static void dump_fsync_free_shm_idx_request( const struct fsync_free_shm_idx_req
     fprintf( stderr, " shm_idx=%08x", req->shm_idx );
 }
 
+static void dump_hwnd_list_dmabuf_frames_request( const struct hwnd_list_dmabuf_frames_request *req )
+{
+    fprintf( stderr, " host_hwnd=%08x", req->host_hwnd );
+}
+
+static void dump_hwnd_list_dmabuf_frames_reply( const struct hwnd_list_dmabuf_frames_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+    fprintf( stderr, ", count=%08x", req->count );
+    dump_varargs_bytes( ", frames=", cur_size );
+}
+
+static void dump_hwnd_dmabuf_set_pending_request( const struct hwnd_dmabuf_set_pending_request *req )
+{
+    fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", pending=%08x", req->pending );
+}
+
+static void dump_hwnd_dmabuf_set_pending_reply( const struct hwnd_dmabuf_set_pending_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+}
+
+static void dump_hwnd_dmabuf_get_channel_request( const struct hwnd_dmabuf_get_channel_request *req )
+{
+    fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", flags=%08x", req->flags );
+}
+
+static void dump_hwnd_dmabuf_get_channel_reply( const struct hwnd_dmabuf_get_channel_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+    fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
+}
+
+static void dump_hwnd_dmabuf_get_channel_exclusive_request( const struct hwnd_dmabuf_get_channel_exclusive_request *req )
+{
+    fprintf( stderr, " hwnd=%08x", req->hwnd );
+}
+
+static void dump_hwnd_dmabuf_get_channel_exclusive_reply( const struct hwnd_dmabuf_get_channel_exclusive_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+    fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
+}
+
+static void dump_hwnd_dmabuf_claim_channel_request( const struct hwnd_dmabuf_claim_channel_request *req )
+{
+    fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", flags=%08x", req->flags );
+}
+
+static void dump_hwnd_dmabuf_claim_channel_reply( const struct hwnd_dmabuf_claim_channel_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+    fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
+}
+
+static void dump_hwnd_dmabuf_release_channel_request( const struct hwnd_dmabuf_release_channel_request *req )
+{
+    fprintf( stderr, " hwnd=%08x", req->hwnd );
+    fprintf( stderr, ", flags=%08x", req->flags );
+}
+
+static void dump_hwnd_dmabuf_release_channel_reply( const struct hwnd_dmabuf_release_channel_reply *req )
+{
+    fprintf( stderr, " status=%08x", req->status );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3744,6 +3828,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_window_list_request,
     (dump_func)dump_get_class_windows_request,
     (dump_func)dump_get_window_children_from_point_request,
+    (dump_func)dump_get_window_from_point_request,
     (dump_func)dump_get_window_tree_request,
     (dump_func)dump_set_window_pos_request,
     (dump_func)dump_get_window_rectangles_request,
@@ -3900,6 +3985,12 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_fsync_free_shm_idx_request,
+    (dump_func)dump_hwnd_list_dmabuf_frames_request,
+    (dump_func)dump_hwnd_dmabuf_set_pending_request,
+    (dump_func)dump_hwnd_dmabuf_get_channel_request,
+    (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_request,
+    (dump_func)dump_hwnd_dmabuf_claim_channel_request,
+    (dump_func)dump_hwnd_dmabuf_release_channel_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4060,6 +4151,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_window_list_reply,
     (dump_func)dump_get_class_windows_reply,
     (dump_func)dump_get_window_children_from_point_reply,
+    (dump_func)dump_get_window_from_point_reply,
     (dump_func)dump_get_window_tree_reply,
     (dump_func)dump_set_window_pos_reply,
     (dump_func)dump_get_window_rectangles_reply,
@@ -4216,6 +4308,12 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     NULL,
+    (dump_func)dump_hwnd_list_dmabuf_frames_reply,
+    (dump_func)dump_hwnd_dmabuf_set_pending_reply,
+    (dump_func)dump_hwnd_dmabuf_get_channel_reply,
+    (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_reply,
+    (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
+    (dump_func)dump_hwnd_dmabuf_release_channel_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4376,6 +4474,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_window_list",
     "get_class_windows",
     "get_window_children_from_point",
+    "get_window_from_point",
     "get_window_tree",
     "set_window_pos",
     "get_window_rectangles",
@@ -4532,6 +4631,12 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "fsync_free_shm_idx",
+    "hwnd_list_dmabuf_frames",
+    "hwnd_dmabuf_set_pending",
+    "hwnd_dmabuf_get_channel",
+    "hwnd_dmabuf_get_channel_exclusive",
+    "hwnd_dmabuf_claim_channel",
+    "hwnd_dmabuf_release_channel",
 };
 
 static const struct

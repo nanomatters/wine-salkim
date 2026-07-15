@@ -948,9 +948,7 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
          * directly once it's updated to not explicitly deactivate the old
          * foreground window when both the old and new foreground windows
          * are in the same non-current thread. */
-        if (surface->window.minimized)
-            NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
-        else if (surface->window.managed)
+        if (surface->window.minimized || surface->window.managed || wayland_is_layer_menu_hwnd(hwnd))
             NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
     }
 
@@ -977,7 +975,7 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
-    HWND hwnd;
+    HWND foreground, hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
 
@@ -997,11 +995,17 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
      * and for any key repetition to stop. */
     release_all_keys(hwnd);
 
-    if (hwnd == NtUserGetForegroundWindow())
+    foreground = NtUserGetForegroundWindow();
+    if (wayland_is_layer_menu_hwnd(hwnd))
+        wayland_cancel_layer_menu(hwnd);
+    else if (hwnd == foreground || wayland_is_menu_popup(hwnd))
     {
         if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
             send_message(hwnd, WM_CANCELMODE, 0, 0);
+    }
 
+    if (hwnd == foreground)
+    {
         if (!(data = wayland_win_data_get(hwnd))) return;
 
         if ((surface = data->wayland_surface))
@@ -1108,6 +1112,9 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
     if (!(hwnd = wayland_keyboard_get_focused_hwnd())) return;
 
     TRACE_(key)("serial=%u hwnd=%p key=%d scan=%#x state=%#x\n", serial, hwnd, key, scan, state);
+
+    if (key == KEY_ESC && state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        wayland_cancel_layer_menu_if_needed(NULL);
 
     /* NOTE: Windows normally sends VK_CONTROL + VK_MENU only if the layout has KLLF_ALTGR */
     if (key == KEY_RIGHTALT) send_right_control(hwnd, state);

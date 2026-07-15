@@ -163,6 +163,7 @@ DECL_HANDLER(get_window_parents);
 DECL_HANDLER(get_window_list);
 DECL_HANDLER(get_class_windows);
 DECL_HANDLER(get_window_children_from_point);
+DECL_HANDLER(get_window_from_point);
 DECL_HANDLER(get_window_tree);
 DECL_HANDLER(set_window_pos);
 DECL_HANDLER(get_window_rectangles);
@@ -319,6 +320,12 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(fsync_free_shm_idx);
+DECL_HANDLER(hwnd_list_dmabuf_frames);
+DECL_HANDLER(hwnd_dmabuf_set_pending);
+DECL_HANDLER(hwnd_dmabuf_get_channel);
+DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
+DECL_HANDLER(hwnd_dmabuf_claim_channel);
+DECL_HANDLER(hwnd_dmabuf_release_channel);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -479,6 +486,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_window_list,
     (req_handler)req_get_class_windows,
     (req_handler)req_get_window_children_from_point,
+    (req_handler)req_get_window_from_point,
     (req_handler)req_get_window_tree,
     (req_handler)req_set_window_pos,
     (req_handler)req_get_window_rectangles,
@@ -635,6 +643,12 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_fsync_free_shm_idx,
+    (req_handler)req_hwnd_list_dmabuf_frames,
+    (req_handler)req_hwnd_dmabuf_set_pending,
+    (req_handler)req_hwnd_dmabuf_get_channel,
+    (req_handler)req_hwnd_dmabuf_get_channel_exclusive,
+    (req_handler)req_hwnd_dmabuf_claim_channel,
+    (req_handler)req_hwnd_dmabuf_release_channel,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -1583,6 +1597,14 @@ C_ASSERT( offsetof(struct get_window_children_from_point_request, dpi) == 24 );
 C_ASSERT( sizeof(struct get_window_children_from_point_request) == 32 );
 C_ASSERT( offsetof(struct get_window_children_from_point_reply, count) == 8 );
 C_ASSERT( sizeof(struct get_window_children_from_point_reply) == 16 );
+C_ASSERT( offsetof(struct get_window_from_point_request, parent) == 12 );
+C_ASSERT( offsetof(struct get_window_from_point_request, x) == 16 );
+C_ASSERT( offsetof(struct get_window_from_point_request, y) == 20 );
+C_ASSERT( offsetof(struct get_window_from_point_request, dpi) == 24 );
+C_ASSERT( sizeof(struct get_window_from_point_request) == 32 );
+C_ASSERT( offsetof(struct get_window_from_point_reply, handle) == 8 );
+C_ASSERT( offsetof(struct get_window_from_point_reply, style) == 12 );
+C_ASSERT( sizeof(struct get_window_from_point_reply) == 16 );
 C_ASSERT( offsetof(struct get_window_tree_request, handle) == 12 );
 C_ASSERT( sizeof(struct get_window_tree_request) == 16 );
 C_ASSERT( offsetof(struct get_window_tree_reply, parent) == 8 );
@@ -1612,7 +1634,8 @@ C_ASSERT( offsetof(struct get_window_rectangles_request, dpi) == 20 );
 C_ASSERT( sizeof(struct get_window_rectangles_request) == 24 );
 C_ASSERT( offsetof(struct get_window_rectangles_reply, window) == 8 );
 C_ASSERT( offsetof(struct get_window_rectangles_reply, client) == 24 );
-C_ASSERT( sizeof(struct get_window_rectangles_reply) == 40 );
+C_ASSERT( offsetof(struct get_window_rectangles_reply, style) == 40 );
+C_ASSERT( sizeof(struct get_window_rectangles_reply) == 48 );
 C_ASSERT( offsetof(struct get_window_text_request, handle) == 12 );
 C_ASSERT( sizeof(struct get_window_text_request) == 16 );
 C_ASSERT( offsetof(struct get_window_text_reply, length) == 8 );
@@ -2423,3 +2446,35 @@ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
 C_ASSERT( offsetof(struct fsync_free_shm_idx_request, shm_idx) == 12 );
 C_ASSERT( sizeof(struct fsync_free_shm_idx_request) == 16 );
 C_ASSERT( sizeof(struct fsync_free_shm_idx_reply) == 8 );
+C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_request, host_hwnd) == 12 );
+C_ASSERT( sizeof(struct hwnd_list_dmabuf_frames_request) == 16 );
+C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_reply, count) == 12 );
+C_ASSERT( sizeof(struct hwnd_list_dmabuf_frames_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_set_pending_request, hwnd) == 12 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_set_pending_request, pending) == 16 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_set_pending_request) == 24 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_set_pending_reply, status) == 8 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_set_pending_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_request, hwnd) == 12 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_request, flags) == 16 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_request) == 24 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, channel_handle) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_request, hwnd) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_request) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, channel_handle) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, hwnd) == 12 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, flags) == 16 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_request) == 24 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, status) == 8 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, channel_handle) == 12 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_reply) == 16 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_request, hwnd) == 12 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_request, flags) == 16 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_request) == 24 );
+C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_reply, status) == 8 );
+C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_reply) == 16 );

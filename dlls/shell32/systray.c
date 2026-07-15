@@ -29,10 +29,56 @@
 #include "winuser.h"
 #include "shellapi.h"
 #include "shell32_main.h"
+#include "ntuser.h"
 
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(systray);
+
+/* Pump the in-process StatusNotifierItem D-Bus connection. A win32 thread so
+ * dispatch can post window messages to the icon owner. Exits when the
+ * connection drops or all icons are gone. */
+static LONG sni_pump_started;
+
+static DWORD WINAPI sni_dbus_thread( void *arg )
+{
+    for (;;)
+    {
+        NtUserMessageCall( 0, WINE_SYSTRAY_DBUS_RUN, 0, 0, NULL, NtUserSystemTrayCall, FALSE );
+        /* pump returned. Clear the latch so a racing NIM_ADD can take ownership. */
+        InterlockedExchange( &sni_pump_started, 0 );
+        /* Re-check AFTER clearing the latch: if an icon was added or queued during
+         * teardown, re-claim the latch and run again rather than strand it. If
+         * another thread already took the latch it owns the pump now. */
+        if (!NtUserMessageCall( 0, WINE_SYSTRAY_DBUS_HAS_ICONS, 0, 0, NULL, NtUserSystemTrayCall, FALSE ))
+            break;
+        if (InterlockedExchange( &sni_pump_started, 1 )) break;
+    }
+    return 0;
+}
+
+/* Try the StatusNotifierItem (D-Bus) tray from the app's own process. Keeps
+ * icon handles valid and lets the app render its own Win32 menu. Returns -1
+ * when no SNI host is available. The caller falls back to the explorer systray. */
+static LRESULT notify_icon_sni( DWORD dwMessage, NOTIFYICONDATAW *nid )
+{
+    LRESULT ret;
+
+    ret = NtUserMessageCall( nid->hWnd, WINE_SYSTRAY_NOTIFY_ICON_SNI, dwMessage, 0,
+                             nid, NtUserSystemTrayCall, FALSE );
+    /* Start the pump when SNI has anything to service or reap and none runs.
+     * A failed NIM_ADD returns -1 but still queues its icon for reaping. The
+     * NIM_ADD case is therefore checked even on failure. */
+    if ((ret != -1 || dwMessage == NIM_ADD) &&
+        NtUserMessageCall( 0, WINE_SYSTRAY_DBUS_HAS_ICONS, 0, 0, NULL, NtUserSystemTrayCall, FALSE ) &&
+        !InterlockedExchange( &sni_pump_started, 1 ))
+    {
+        HANDLE thread = CreateThread( NULL, 0, sni_dbus_thread, NULL, 0, NULL );
+        if (thread) CloseHandle( thread );
+        else InterlockedExchange( &sni_pump_started, 0 );
+    }
+    return ret;
+}
 
 struct notify_data_icon
 {
@@ -202,6 +248,16 @@ BOOL WINAPI Shell_NotifyIconW(DWORD dwMessage, PNOTIFYICONDATAW nid)
         CopyMemory(&newNid, nid, NOTIFYICONDATAW_V1_SIZE);
         newNid.cbSize = NOTIFYICONDATAW_V1_SIZE;
         return Shell_NotifyIconW(dwMessage, &newNid);
+    }
+
+    /* in-process StatusNotifierItem (D-Bus) tray, when a host is available */
+    {
+        LRESULT sni_ret = notify_icon_sni( dwMessage, nid );
+        if (sni_ret != -1)
+        {
+            SetLastError( sni_ret ? ERROR_SUCCESS : ERROR_GEN_FAILURE );
+            return sni_ret;
+        }
     }
 
     tray = FindWindowExW(0, NULL, L"Shell_TrayWnd", NULL);

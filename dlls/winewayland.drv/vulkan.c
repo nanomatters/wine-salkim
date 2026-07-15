@@ -26,6 +26,7 @@
 
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -33,6 +34,7 @@
 #include "wine/debug.h"
 
 #include "wine/vulkan.h"
+#include "wine/hwnd_dmabuf.h"
 #include "wine/vulkan_driver.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
@@ -156,14 +158,18 @@ static VkResult wayland_vulkan_surface_configure(VkColorSpaceKHR *colorspace,
 
         if (!wp_image_description_v1) goto err;
     }
-    else if (process_wayland.supports_win_pq &&
-             old == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+    else if (old == VK_COLOR_SPACE_HDR10_ST2084_EXT)
     {
-        *colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
-        wp_image_description_v1 =
-            wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
+        static BOOL warned;
 
-        if (!wp_image_description_v1) goto err;
+        wp_image_description_v1 = wayland_color_manager_create_windows_bt2100();
+        if (wp_image_description_v1)
+            *colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+        else if (!warned)
+        {
+            warned = TRUE;
+            TRACE("No safe Windows BT.2100 path for HDR10 ST2084 colorspace.\n");
+        }
     }
 
     TRACE("mapping colorspace %u => %u\n", old, *colorspace);
@@ -178,9 +184,73 @@ err:
     return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
+static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void *format_modifiers_ptr,
+                                                UINT max_format_modifiers, UINT *format_modifier_count)
+{
+    hwnd_dmabuf_host_caps_t *caps = caps_ptr;
+    hwnd_dmabuf_format_modifier_t *format_modifiers = format_modifiers_ptr;
+    struct wayland_dmabuf_format *entry;
+    UINT count = 0, copied = 0;
+
+    if (format_modifier_count) *format_modifier_count = 0;
+    if (!caps || !format_modifier_count || (max_format_modifiers && !format_modifiers))
+        return HWND_DMABUF_INVALID_ARGS;
+    if (!process_wayland.zwp_linux_dmabuf_v1)
+        return HWND_DMABUF_NOT_FOUND;
+
+    /* Most local top-levels should present directly through Vulkan WSI. If the
+     * top-level's client content cannot be represented as a rectangular Wayland
+     * surface, route it through the managed producer path where Wine can apply
+     * the Win32 visible region. */
+    {
+        HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+        struct wayland_win_data *toplevel_data;
+        BOOL toplevel_presentable_locally = FALSE;
+        BOOL toplevel_unmaskable = FALSE;
+
+        if (toplevel && (toplevel_data = wayland_win_data_get(toplevel)))
+        {
+            struct wayland_surface *surface = toplevel_data->wayland_surface;
+
+            toplevel_presentable_locally = surface != NULL;
+            toplevel_unmaskable = surface && wayland_surface_client_is_unmaskable(surface);
+            wayland_win_data_release(toplevel_data);
+        }
+
+        if (toplevel_presentable_locally && !toplevel_unmaskable)
+        {
+            TRACE("hwnd %p toplevel %p has a local wayland surface; direct present, no dmabuf bridge\n",
+                  hwnd, toplevel);
+            return HWND_DMABUF_NOT_FOUND;
+        }
+    }
+
+    pthread_mutex_lock(&process_wayland.dmabuf_mutex);
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+        count++;
+
+    memset(caps, 0, sizeof(*caps));
+    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+    {
+        if (copied >= max_format_modifiers)
+            break;
+        format_modifiers[copied].fourcc = entry->format;
+        format_modifiers[copied].tranche_index = entry->tranche_index;
+        format_modifiers[copied].tranche_flags = entry->tranche_flags;
+        format_modifiers[copied].modifier = entry->modifier;
+        copied++;
+    }
+    pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
+
+    caps->format_modifier_count = copied;
+    *format_modifier_count = count;
+    return HWND_DMABUF_OK;
+}
+
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = wayland_vulkan_surface_create,
+    .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_vulkan_surface_configure = wayland_vulkan_surface_configure,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
     .p_map_instance_extensions = wayland_map_instance_extensions,

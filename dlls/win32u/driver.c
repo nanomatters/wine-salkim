@@ -888,6 +888,11 @@ static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp
     return FALSE;
 }
 
+static BOOL nulldrv_GetWindowMaxTrackSize( HWND hwnd, SIZE *size )
+{
+    return FALSE;
+}
+
 static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
 {
     return FALSE;
@@ -901,6 +906,11 @@ static void nulldrv_MoveWindowBits( HWND hwnd, const struct window_rects *old_re
 static void nulldrv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                       const struct window_rects *new_rects, struct window_surface *surface )
 {
+}
+
+static BOOL nulldrv_UseForeignGdiBridge(void)
+{
+    return FALSE;
 }
 
 static BOOL nulldrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, UINT flags )
@@ -1258,6 +1268,11 @@ static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *openg
     return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
 }
 
+static BOOL loaderdrv_UseForeignGdiBridge(void)
+{
+    return load_driver()->pUseForeignGdiBridge();
+}
+
 static const struct user_driver_funcs lazy_load_driver =
 {
     { NULL },
@@ -1323,9 +1338,11 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_WindowPosChanging,
     nulldrv_GetWindowStyleMasks,
     nulldrv_GetWindowStateUpdates,
+    nulldrv_GetWindowMaxTrackSize,
     nulldrv_CreateWindowSurface,
     nulldrv_MoveWindowBits,
     nulldrv_WindowPosChanged,
+    loaderdrv_UseForeignGdiBridge,
     /* system parameters */
     nulldrv_SystemParametersInfo,
     /* wintab support */
@@ -1424,9 +1441,11 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(WindowPosChanging);
     SET_USER_FUNC(GetWindowStyleMasks);
     SET_USER_FUNC(GetWindowStateUpdates);
+    SET_USER_FUNC(GetWindowMaxTrackSize);
     SET_USER_FUNC(CreateWindowSurface);
     SET_USER_FUNC(MoveWindowBits);
     SET_USER_FUNC(WindowPosChanged);
+    SET_USER_FUNC(UseForeignGdiBridge);
     SET_USER_FUNC(SystemParametersInfo);
     SET_USER_FUNC(WintabProc);
     SET_USER_FUNC(VulkanInit);

@@ -136,6 +136,7 @@ static void wayland_output_mode_free_rb(struct rb_entry *entry, void *ctx)
 
 static void wayland_output_done(struct wayland_output *output)
 {
+    static BOOL warned_no_bt2100;
     struct wayland_output_mode *mode;
 
     /* Update current state from pending state. */
@@ -218,13 +219,17 @@ static void wayland_output_done(struct wayland_output *output)
 
     output->current.supports_hdr = FALSE;
 
-    if (process_wayland.supports_extended_volume &&
-        process_wayland.supports_pq &&
-        process_wayland.supports_scrgb)
+    if (wayland_color_manager_may_support_hdr())
     {
-        if (!process_wayland.supports_win_pq)
-            ERR("Compositor doesn't supports windows_bt2100, HDR10 ST2084 may look broken\n");
         output->current.supports_hdr = (output->current.max_target_lum > output->current.ref_lum);
+        if (output->current.supports_hdr && !wayland_color_manager_can_present_bt2100())
+        {
+            if (!warned_no_bt2100)
+            {
+                warned_no_bt2100 = TRUE;
+                WARN("Compositor cannot present Windows BT.2100, HDR10 ST2084 may look broken\n");
+            }
+        }
     }
 
     output->pending_flags = 0;
@@ -739,6 +744,71 @@ static void wayland_color_manager_handle_supported_intent(void *data,
 {
 }
 
+BOOL wayland_color_manager_may_support_hdr(void)
+{
+    return process_wayland.supports_extended_volume &&
+           process_wayland.supports_pq &&
+           process_wayland.supports_scrgb;
+}
+
+BOOL wayland_color_manager_can_present_bt2100(void)
+{
+    if (!process_wayland.wp_color_manager_v1)
+        return FALSE;
+
+    if (process_wayland.supports_windows_bt2100)
+        return TRUE;
+
+    return process_wayland.supports_parametric &&
+           process_wayland.supports_pq &&
+           (process_wayland.supports_bt2020_primaries ||
+            process_wayland.supports_set_primaries);
+}
+
+struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void)
+{
+    struct wp_image_description_creator_params_v1 *params;
+    struct wp_image_description_v1 *desc;
+
+    if (!process_wayland.wp_color_manager_v1)
+        return NULL;
+
+    if (process_wayland.supports_windows_bt2100)
+        return wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
+
+    if (!wayland_color_manager_can_present_bt2100())
+        return NULL;
+
+    params = wp_color_manager_v1_create_parametric_creator(process_wayland.wp_color_manager_v1);
+    if (!params)
+        return NULL;
+
+    wp_image_description_creator_params_v1_set_tf_named(params,
+            WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+
+    if (process_wayland.supports_bt2020_primaries)
+    {
+        wp_image_description_creator_params_v1_set_primaries_named(params,
+                WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+    }
+    else
+    {
+        wp_image_description_creator_params_v1_set_primaries(params,
+                708000, 292000, 170000, 797000,
+                131000, 46000, 312700, 329000);
+    }
+
+    if (process_wayland.supports_set_luminances &&
+        process_wayland.supports_extended_volume)
+        wp_image_description_creator_params_v1_set_luminances(params, 0, 10000, 203);
+
+    desc = wp_image_description_creator_params_v1_create(params);
+    if (desc)
+        TRACE("Using parametric Windows BT.2100 image description.\n");
+
+    return desc;
+}
+
 static void wayland_color_manager_handle_supported_feature(void *data,
     struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t feature)
 {
@@ -746,10 +816,16 @@ static void wayland_color_manager_handle_supported_feature(void *data,
 
     TRACE("feature %u\n", feature);
 
-    if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB)
+    if (feature == WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC)
+        process_wayland.supports_parametric = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES)
+        process_wayland.supports_set_primaries = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES)
+        process_wayland.supports_set_luminances = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB)
         process_wayland.supports_scrgb = TRUE;
     else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100)
-        process_wayland.supports_win_pq = TRUE;
+        process_wayland.supports_windows_bt2100 = TRUE;
     else if (feature == WP_COLOR_MANAGER_V1_FEATURE_EXTENDED_TARGET_VOLUME)
         process_wayland.supports_extended_volume = TRUE;
 
@@ -772,6 +848,14 @@ static void wayland_color_manager_handle_supported_named_tf(void *data,
 static void wayland_color_manager_handle_supported_primaries(void *data,
     struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t primaries)
 {
+    pthread_mutex_lock(&process_wayland.output_mutex);
+
+    TRACE("primaries %u\n", primaries);
+
+    if (primaries == WP_COLOR_MANAGER_V1_PRIMARIES_BT2020)
+        process_wayland.supports_bt2020_primaries = TRUE;
+
+    pthread_mutex_unlock(&process_wayland.output_mutex);
 }
 
 static void wayland_color_manager_handle_done(void *data,

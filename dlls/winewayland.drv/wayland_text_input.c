@@ -259,19 +259,18 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
     int cursor_x, cursor_y, cursor_width, cursor_height;
     TRACE("hwnd %p, rect %s.\n", hwnd, wine_dbgstr_rect(&rect));
 
+    /* win_data_mutex before text_input->mutex, matching text_input_enter.
+     * The reverse order deadlocks against the event thread. */
+    if (!(data = wayland_win_data_get(hwnd)))
+        return FALSE;
+
     pthread_mutex_lock(&text_input->mutex);
 
     if (!text_input->zwp_text_input_v3 || !text_input->enabled || hwnd != text_input->focused_hwnd)
         goto err;
 
-    if (!(data = wayland_win_data_get(hwnd)))
-        goto err;
-
     if (!(surface = data->wayland_surface) || !data->num_ime_children)
-    {
-        wayland_win_data_release(data);
         goto err;
-    }
 
     wayland_surface_coords_from_window(surface,
             rect.left - surface->window.rect.left,
@@ -281,17 +280,18 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
             rect.right - rect.left,
             rect.bottom - rect.top,
             &cursor_width, &cursor_height);
-    wayland_win_data_release(data);
 
     zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3,
             cursor_x, cursor_y, cursor_width, cursor_height);
     zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
 
     pthread_mutex_unlock(&text_input->mutex);
+    wayland_win_data_release(data);
     return TRUE;
 
 err:
     pthread_mutex_unlock(&text_input->mutex);
+    wayland_win_data_release(data);
     return FALSE;
 }
 
@@ -304,19 +304,21 @@ BOOL WAYLAND_SetIMEEnabled(HWND hwnd, BOOL enabled)
     toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     TRACE("hwnd %p, toplevel hwnd %p, enabled %u.\n", hwnd, toplevel, enabled);
 
-    pthread_mutex_lock(&text_input->mutex);
-
-    if (!text_input->zwp_text_input_v3)
-        goto err;
-
+    /* win_data_mutex before text_input->mutex, matching text_input_enter.
+     * The reverse order deadlocks against the event thread. */
     if (!(hwnd_data = wayland_win_data_get(hwnd)))
-        goto err;
+        return FALSE;
 
     if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)))
     {
         wayland_win_data_release(hwnd_data);
-        goto err;
+        return FALSE;
     }
+
+    pthread_mutex_lock(&text_input->mutex);
+
+    if (!text_input->zwp_text_input_v3)
+        goto err;
 
     if (!hwnd_data->ime_enabled && enabled) toplevel_data->num_ime_children++;
     else if (hwnd_data->ime_enabled && !enabled) toplevel_data->num_ime_children--;
@@ -328,11 +330,12 @@ BOOL WAYLAND_SetIMEEnabled(HWND hwnd, BOOL enabled)
         else wayland_text_input_ime_disable(text_input);
     }
 
-    wayland_win_data_release(hwnd_data);
     pthread_mutex_unlock(&text_input->mutex);
+    wayland_win_data_release(hwnd_data);
     return TRUE;
 
 err:
     pthread_mutex_unlock(&text_input->mutex);
+    wayland_win_data_release(hwnd_data);
     return FALSE;
 }

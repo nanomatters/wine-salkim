@@ -316,7 +316,11 @@ void add_clipped_bounds( dibdrv_physdev *dev, const RECT *rect, HRGN clip )
 
     if (IsRectEmpty( &rc )) return;
     OffsetRect( &rc, dev->dib.rect.left, dev->dib.rect.top );
+    /* Erase and CopyBits still prove the surface has app-visible pixels.
+     * GDI-over-producer tracking filters those paths separately. */
+    if (dev->window_surface) window_surface_add_app_paint_rect( dev->window_surface, &rc );
     add_bounds_rect( dev->bounds, &rc );
+    if (dev->gdi_over_surface) window_surface_add_gdi_over_paint_rect( dev->gdi_over_surface, &rc );
 }
 
 /**********************************************************************
@@ -557,7 +561,7 @@ static void unlock_windrv_bits( struct gdi_image_bits *bits )
     unlock_surface( bits->param );
 }
 
-void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
+void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi_over_source )
 {
     PHYSDEV windev;
     struct windrv_physdev *physdev;
@@ -600,6 +604,8 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
         dibdrv->dib.rect = dc->attr->vis_rect;
         OffsetRect( &dibdrv->dib.rect, -dc->device_rect.left, -dc->device_rect.top );
         dibdrv->bounds = &surface->bounds;
+        dibdrv->window_surface = surface != &dummy_surface ? surface : NULL;
+        dibdrv->gdi_over_surface = (gdi_over_source && surface != &dummy_surface) ? surface : NULL;
         DC_InitDC( dc );
     }
     else if (windev)

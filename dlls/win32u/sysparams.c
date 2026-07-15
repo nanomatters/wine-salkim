@@ -64,6 +64,7 @@ static const char devpropkey_device_ispresentA[] = "Properties\\{540B947E-8B40-4
 static const char devpropkey_monitor_gpu_luidA[] = "Properties\\{CA085853-16CE-48AA-B114-DE9C72334223}\\0001";
 static const char devpropkey_monitor_output_idA[] = "Properties\\{CA085853-16CE-48AA-B114-DE9C72334223}\\0002";
 static const char wine_devpropkey_monitor_rcworkA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0004";
+static const char wine_devpropkey_monitor_hdr_supportedA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0005";
 static const char wine_devpropkey_monitor_hdr_enabledA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0006";
 
 static const WCHAR linkedW[] = {'L','i','n','k','e','d',0};
@@ -156,6 +157,7 @@ struct monitor
     RECT rc_work;
     BOOL is_clone;
     struct edid_monitor_info edid_info;
+    BOOL hdr_supported;
     BOOL hdr_enabled;
 };
 
@@ -829,6 +831,14 @@ static BOOL read_monitor_from_registry( struct monitor *monitor )
         return FALSE;
     }
     monitor->hdr_enabled = *(const BOOL *)value->Data;
+
+    /* WINE_DEVPROPKEY_MONITOR_HDR_SUPPORTED */
+    size = query_reg_subkey_value( hkey, wine_devpropkey_monitor_hdr_supportedA,
+                                   value, sizeof(buffer) );
+    if (size == sizeof(monitor->hdr_supported))
+        monitor->hdr_supported = *(const BOOL *)value->Data;
+    else
+        monitor->hdr_supported = monitor->hdr_enabled;
 
     NtClose( hkey );
     return TRUE;
@@ -2080,6 +2090,14 @@ static BOOL write_monitor_to_registry( struct monitor *monitor, const BYTE *edid
         NtClose( subkey );
     }
 
+    /* WINE_DEVPROPKEY_MONITOR_HDR_SUPPORTED */
+    if ((subkey = reg_create_ascii_key( hkey, wine_devpropkey_monitor_hdr_supportedA, 0, NULL )))
+    {
+        set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_BOOLEAN,
+                       &monitor->hdr_supported, sizeof(monitor->hdr_supported) );
+        NtClose( subkey );
+    }
+
     NtClose( hkey );
 
 
@@ -2109,6 +2127,7 @@ static void add_monitor( const struct gdi_monitor *gdi_monitor, void *param )
     monitor->id = source->monitor_count;
     monitor->output_id = ctx->monitor_count;
     monitor->rc_work = gdi_monitor->rc_work;
+    monitor->hdr_supported = gdi_monitor->hdr_supported;
     monitor->hdr_enabled = gdi_monitor->hdr_enabled;
 
     TRACE( "%u %s %s\n", monitor->id, wine_dbgstr_rect(&gdi_monitor->rc_monitor), wine_dbgstr_rect(&gdi_monitor->rc_work) );
@@ -2496,6 +2515,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     UINT virtual_count, modes_count = host_modes_count;
     const DEVMODEW *modes = host_modes;
     struct source *source;
+    BOOL virtual_modelist = FALSE;
 
     TRACE( "current %s, host_modes_count %u, host_modes %p, param %p\n", debugstr_devmodew( current ),
            host_modes_count, host_modes, param );
@@ -2510,6 +2530,9 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     }
     else if (emulate_modelist)
     {
+        virtual_modelist = TRUE;
+        /* Keep the real host mode as physical. Current may be replaced below
+         * by a game requested virtual mode. */
         physical = *current;
         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
         {
@@ -2526,7 +2549,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
         }
     }
 
-    physical = modes_count == 1 ? *modes : *current;
+    if (!virtual_modelist) physical = modes_count == 1 ? *modes : *current;
     if (ctx->is_primary) ctx->primary = *current;
 
     detached.dmPelsWidth = 0;
@@ -2535,8 +2558,12 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
 
     if (modes_count > 1 || current == &detached)
     {
-        reg_delete_value( source->key, physicalW );
-        if (!emulate_modelist) virtual_modes = NULL;
+        if (virtual_modelist && current != &detached)
+            write_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &physical );
+        else
+            reg_delete_value( source->key, physicalW );
+
+        if (!virtual_modelist) virtual_modes = NULL;
     }
     else
     {
@@ -3220,37 +3247,69 @@ static BOOL lock_display_devices( BOOL force )
     UINT64 serial;
     UINT status;
     WCHAR name[MAX_PATH];
+    BOOL requested_force = force, probed_gpus = FALSE;
     BOOL ret = TRUE;
 
     init_display_driver(); /* make sure to load the driver before anything else */
 
     if (user_driver->pHasWindowManager( "steamcompmgr" )) emulate_modeset = FALSE;
 
-    pthread_mutex_lock( &display_lock );
-
-    serial = get_monitor_update_serial();
-    if (!force && monitor_update_serial >= serial) return TRUE;
-
-    /* services do not have any adapters, only a virtual monitor */
-    if (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL )
-        && !wcscmp( name, wine_service_station_name ))
+    for (;;)
     {
-        clear_display_devices();
-        list_add_tail( &monitors, &virtual_monitor.entry );
-        set_winstation_monitors( TRUE );
-        return TRUE;
-    }
+        force = requested_force;
 
-    if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
-    if (force)
-    {
+        pthread_mutex_lock( &display_lock );
+
+        serial = get_monitor_update_serial();
+        if (!force && monitor_update_serial >= serial)
+        {
+            if (probed_gpus)
+            {
+                free_gpu_infos( &ctx.vulkan_gpus );
+                free_gpu_infos( &ctx.opengl_gpus );
+            }
+            return TRUE;
+        }
+
+        /* services do not have any adapters, only a virtual monitor */
+        if (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL )
+            && !wcscmp( name, wine_service_station_name ))
+        {
+            if (probed_gpus)
+            {
+                free_gpu_infos( &ctx.vulkan_gpus );
+                free_gpu_infos( &ctx.opengl_gpus );
+            }
+            clear_display_devices();
+            list_add_tail( &monitors, &virtual_monitor.entry );
+            set_winstation_monitors( TRUE );
+            return TRUE;
+        }
+
+        if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
+
+        if (!force || probed_gpus) break;
+
+        /* GPU probing initializes host graphics loaders and can re-enter user callbacks. */
+        pthread_mutex_unlock( &display_lock );
+
         if (!get_vulkan_gpus( &ctx.vulkan_gpus )) WARN( "Failed to find any Vulkan GPU\n" );
         if (!get_opengl_gpus( &ctx.opengl_gpus )) WARN( "Failed to find any OpenGL GPU\n" );
+        probed_gpus = TRUE;
+    }
+
+    if (force)
+    {
         if (!(status = update_display_devices( &ctx ))) commit_display_devices( &ctx );
         else WARN( "Failed to update display devices, status %#x\n", status );
         release_display_manager_ctx( &ctx );
 
         ret = update_display_cache_from_registry( serial );
+    }
+    else if (probed_gpus)
+    {
+        free_gpu_infos( &ctx.vulkan_gpus );
+        free_gpu_infos( &ctx.opengl_gpus );
     }
 
     if (!ret)
@@ -8276,18 +8335,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
 
-            if (monitor->hdr_enabled)
-            {
-                color_info->advancedColorSupported = 1;
-                color_info->advancedColorEnabled = 1;
-                color_info->bitsPerColorChannel = 10;
-            }
-            else
-            {
-                color_info->advancedColorSupported = 0;
-                color_info->advancedColorEnabled = 0;
-                color_info->bitsPerColorChannel = 8;
-            }
+            color_info->advancedColorSupported = monitor->hdr_supported;
+            color_info->advancedColorEnabled = monitor->hdr_enabled;
+            color_info->bitsPerColorChannel = monitor->hdr_enabled ? 10 : 8;
             color_info->wideColorEnforced = 0;
             color_info->advancedColorForceDisabled = 0;
             color_info->colorEncoding = DISPLAYCONFIG_COLOR_ENCODING_RGB;
