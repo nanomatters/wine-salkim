@@ -275,8 +275,10 @@ static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
     return TRUE;
 }
 
-static BOOL should_defer_ownerless_menu_popup(DWORD style, DWORD exstyle, BOOL fullscreen)
+static BOOL should_defer_unanchored_menu_popup(DWORD style, DWORD exstyle,
+                                               BOOL fullscreen, BOOL has_owner)
 {
+    if (!has_owner) return FALSE;
     if (!(exstyle & WS_EX_TOOLWINDOW)) return FALSE;
     if (fullscreen) return FALSE;
     return is_menu_popup_candidate_style(style, exstyle);
@@ -287,7 +289,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                                                     struct wayland_surface *owner_surface,
                                                     BOOL use_layer_shell,
                                                     struct window_surface *window_surface,
-                                                    UINT swp_flags)
+                                                    UINT swp_flags,
+                                                    BOOL has_menu_popup_owner)
 {
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *surface = data->wayland_surface;
@@ -326,7 +329,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (use_layer_shell && !IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_LAYER;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
-    else if (should_defer_ownerless_menu_popup(style, exstyle, data->is_fullscreen)) role = WAYLAND_SURFACE_ROLE_NONE;
+    else if (should_defer_unanchored_menu_popup(style, exstyle, data->is_fullscreen,
+                                                has_menu_popup_owner))
+        role = WAYLAND_SURFACE_ROLE_NONE;
     else if (!IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     else role = WAYLAND_SURFACE_ROLE_NONE;
 
@@ -852,7 +857,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         }
     }
     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
-                                                     use_layer_shell, surface, swp_flags))
+                                                     use_layer_shell, surface, swp_flags,
+                                                     menu_popup_owner != NULL))
     {
         wayland_win_data_update_wayland_state(data);
     }
