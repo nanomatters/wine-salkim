@@ -1213,7 +1213,10 @@ BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size)
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
 
-    if (data->wayland_surface)
+    /* The cached Wayland config is refreshed from WindowPosChanged, but this
+     * query runs during calc_winpos. Recheck the live style so a borderless
+     * fullscreen transition cannot be clamped by stale configure bounds. */
+    if ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_THICKFRAME) && data->wayland_surface)
         ret = wayland_surface_get_max_track_size(data->wayland_surface, size);
 
     wayland_win_data_release(data);
