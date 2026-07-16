@@ -1659,6 +1659,13 @@ static struct xdg_positioner *create_xdg_positioner(RECT rect)
     xdg_positioner_set_anchor_rect(xdg_positioner, 0, 0, 1, 1);
     xdg_positioner_set_anchor(xdg_positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
     xdg_positioner_set_gravity(xdg_positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    xdg_positioner_set_constraint_adjustment(xdg_positioner,
+                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y |
+                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X |
+                                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y);
     xdg_positioner_set_offset(xdg_positioner, rect.left, rect.top);
     xdg_positioner_set_size(xdg_positioner, width, height);
 
