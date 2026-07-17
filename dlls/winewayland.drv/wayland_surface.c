@@ -910,11 +910,12 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
  *
  * Reconfigures the subsurface covering the client area.
  */
-static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,
                                                struct wayland_client_surface *client,
                                                const RECT *client_rect)
 {
     struct wayland_window_config *window = &surface->window;
+    RECT rect;
     int client_x, client_y, x, y;
     int client_width, client_height, width, height;
 
@@ -929,7 +930,11 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
     wayland_surface_coords_from_window(surface, client_width, client_height,
                                        &width, &height);
 
+    SetRect(&rect, x, y, x + width, y + height);
+    if (EqualRect(&client->rect, &rect)) return FALSE;
+
     TRACE("hwnd=%p subsurface=%d,%d+%dx%d\n", surface->hwnd, x, y, width, height);
+    client->rect = rect;
 
     if (client->wl_subsurface)
     {
@@ -941,6 +946,8 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
         wp_viewport_set_destination(client->wp_viewport, width, height);
     else /* We can't have a 0x0 destination, use 1x1 instead. */
         wp_viewport_set_destination(client->wp_viewport, 1, 1);
+
+    return TRUE;
 }
 
 /**********************************************************************
@@ -1440,6 +1447,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         }
 
         client->toplevel = 0;
+        client->toplevel_wl_surface = NULL;
         return;
     }
 
@@ -1449,7 +1457,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         return;
     }
 
-    if (client->toplevel != toplevel)
+    if (client->toplevel_wl_surface != surface->wl_surface)
     {
         wayland_client_surface_attach(client, NULL);
 
@@ -1466,14 +1474,18 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         wl_subsurface_set_desync(client->wl_subsurface);
 
         client->toplevel = toplevel;
+        client->toplevel_wl_surface = surface->wl_surface;
+        SetRect(&client->rect, 0, 0, -1, -1);
     }
 
     NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
 
-    wayland_surface_reconfigure_client(surface, client, &client_rect);
-    /* Commit to apply subsurface positioning. */
-    wl_surface_commit(surface->wl_surface);
+    if (wayland_surface_reconfigure_client(surface, client, &client_rect))
+    {
+        /* Commit to apply subsurface positioning. */
+        wl_surface_commit(surface->wl_surface);
+    }
 }
 
 static void dummy_buffer_release(void *data, struct wl_buffer *buffer)

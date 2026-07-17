@@ -250,8 +250,10 @@ struct wayland_client_surface
     struct client_surface client;
     HWND toplevel;
     struct wl_surface *wl_surface;
+    const struct wl_surface *toplevel_wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
+    RECT rect;
 };
 
 struct wayland_shm_buffer
