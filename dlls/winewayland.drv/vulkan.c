@@ -179,6 +179,13 @@ err:
     return colorspace;
 }
 
+static void wayland_vulkan_surface_set_alpha(VkCompositeAlphaFlagBitsKHR alpha_bits,
+                                             struct client_surface *client)
+{
+    /* Wayland does not support inherited alpha. */
+    wayland_client_surface_set_alpha(client, !(alpha_bits & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR));
+}
+
 static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void *format_modifiers_ptr,
                                                 UINT max_format_modifiers, UINT *format_modifier_count)
 {
@@ -246,6 +253,7 @@ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = wayland_vulkan_surface_create,
     .p_vulkan_map_colorspace = wayland_vulkan_map_colorspace,
+    .p_vulkan_surface_set_alpha = wayland_vulkan_surface_set_alpha,
     .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
     .p_map_instance_extensions = wayland_map_instance_extensions,
