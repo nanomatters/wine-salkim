@@ -94,7 +94,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 48
+#define WINE_VULKAN_DRIVER_VERSION 49
 
 struct vulkan_object
 {
@@ -380,6 +380,7 @@ struct vulkan_driver_funcs
 {
     VkResult (*p_vulkan_surface_create)(HWND, BOOL, const struct vulkan_instance *, VkSurfaceKHR *, struct client_surface **);
     VkColorSpaceKHR (*p_vulkan_map_colorspace)( VkColorSpaceKHR, struct client_surface * );
+    void (*p_vulkan_surface_set_alpha)( VkCompositeAlphaFlagBitsKHR, struct client_surface * );
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
     UINT (*p_vulkan_get_hwnd_dmabuf_caps)( HWND, void *, void *, UINT, UINT * );
     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );
