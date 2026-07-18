@@ -2134,6 +2134,8 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
 
     /* Keep input state across role churn; it follows wl_surface enter/leave. */
     wayland_surface_clear_child_surfaces(surface);
+    surface->transparent_carrier_attached = FALSE;
+    surface->transparent_carrier_width = surface->transparent_carrier_height = 0;
 
     /* some objects are shared between several roles */
 
@@ -3563,6 +3565,7 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
     wl_surface_set_opaque_region(surface->wl_surface, NULL);
     wayland_surface_attach_shm(surface, data->window_contents,
                                data->window_contents->damage_region);
+    surface->transparent_carrier_attached = FALSE;
     wl_surface_commit(surface->wl_surface);
     wayland_hwnd_dmabuf_surface_destroy(direct);
     return TRUE;
@@ -3994,6 +3997,9 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
             any_new = TRUE;
         }
     }
+
+    if (data && !data->window_contents && wayland_surface_has_hwnd_dmabuf_content(surface))
+        wayland_surface_attach_transparent_carrier(surface);
 
     if (any_new && data && data->client_surface && data->client_surface->wl_subsurface &&
         data->client_surface->toplevel == surface->hwnd)
@@ -4627,6 +4633,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         /* Commit to apply subsurface positioning. */
         wl_surface_commit(surface->wl_surface);
     }
+    if (!toplevel_data->window_contents)
+        wayland_surface_attach_transparent_carrier(surface);
 }
 
 /**********************************************************************
