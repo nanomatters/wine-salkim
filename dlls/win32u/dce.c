@@ -155,7 +155,7 @@ static BOOL foreign_gdi_slot_create( struct foreign_gdi_slot *slot, unsigned int
                               NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0 );
     if (status)
     {
-        WARN( "failed to create foreign GDI shm section status %#lx\n", status );
+        WARN( "failed to create foreign GDI shm section status %#lx\n", (unsigned long)status );
         return FALSE;
     }
 
@@ -163,7 +163,7 @@ static BOOL foreign_gdi_slot_create( struct foreign_gdi_slot *slot, unsigned int
                                  &view_size, ViewUnmap, 0, PAGE_READWRITE );
     if (status)
     {
-        WARN( "failed to map foreign GDI shm section status %#lx\n", status );
+        WARN( "failed to map foreign GDI shm section status %#lx\n", (unsigned long)status );
         foreign_gdi_slot_destroy( slot );
         return FALSE;
     }
@@ -171,7 +171,7 @@ static BOOL foreign_gdi_slot_create( struct foreign_gdi_slot *slot, unsigned int
     status = wine_server_handle_to_fd( slot->section, FILE_READ_DATA, &slot->fd, NULL );
     if (status)
     {
-        WARN( "failed to export foreign GDI shm section status %#lx\n", status );
+        WARN( "failed to export foreign GDI shm section status %#lx\n", (unsigned long)status );
         foreign_gdi_slot_destroy( slot );
         return FALSE;
     }

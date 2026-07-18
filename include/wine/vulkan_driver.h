@@ -94,7 +94,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 48
+#define WINE_VULKAN_DRIVER_VERSION 49
 
 struct vulkan_object
 {
@@ -222,6 +222,7 @@ struct vulkan_device
     uint64_t queue_count;
     struct vulkan_queue *queues;
     VkQueueFamilyProperties *queue_props;
+    BOOL low_latency_enabled;
 };
 
 static inline struct vulkan_device *vulkan_device_from_handle( VkDevice handle )
@@ -369,6 +370,8 @@ struct vulkan_funcs
     PFN_vkQueueSubmit2KHR p_vkQueueSubmit2KHR;
     PFN_vkUnmapMemory p_vkUnmapMemory;
     PFN_vkUnmapMemory2KHR p_vkUnmapMemory2KHR;
+    PFN_vkWaitForPresentKHR p_vkWaitForPresentKHR;
+    PFN_vkWaitForPresent2KHR p_vkWaitForPresent2KHR;
 };
 
 /* interface between win32u and the user drivers */

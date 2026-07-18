@@ -191,6 +191,8 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
 
     TRACE("window=%s style=%#x\n", wine_dbgstr_rect(&conf->rect), style);
 
+    conf->minimized = style & WS_MINIMIZE;
+
     /* The fullscreen state is implied by the window position and style. */
     if (wayland_win_data_is_fullscreen(data, style))
     {
@@ -243,8 +245,7 @@ static BOOL should_keep_toplevel_mapped(struct wayland_surface *surface,
      * windows map through the normal path. */
     if (!(style & WS_MINIMIZE)) return !(style & WS_VISIBLE);
 
-    return !surface->current.caps ||
-           (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
+    return TRUE;
 }
 
 static BOOL window_or_root_minimized(HWND hwnd)

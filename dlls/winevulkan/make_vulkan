@@ -247,6 +247,8 @@ USER_DRIVER_FUNCS = {
     "vkSetSwapchainPresentTimingQueueSizeEXT",
     "vkUnmapMemory",
     "vkUnmapMemory2KHR",
+    "vkWaitForPresentKHR",
+    "vkWaitForPresent2KHR",
 }
 
 # functions for which the unix thunk is manually implemented
