@@ -2078,10 +2078,14 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
     }
-    /* If this is the initial configure, and we have a compatible requested
-     * config, use that, in order to draw windows that don't go through the
-     * message loop (e.g., some splash screens). */
-    else if (!surface->current.serial && surface->requested.serial &&
+    /* Use a compatible requested config for the initial configure and for
+     * fullscreen or maximized transitions, which can complete without a
+     * Win32 resize round trip. */
+    else if (surface->requested.serial &&
+             (!surface->current.serial ||
+              (surface->requested.state &
+               (WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
+                WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))) &&
              wayland_surface_config_is_compatible(&surface->requested,
                                                   width, height,
                                                   window->state))
