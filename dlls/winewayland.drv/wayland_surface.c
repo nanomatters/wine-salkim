@@ -1835,9 +1835,11 @@ static struct wl_output *layer_surface_get_output(const RECT *rect, RECT *monito
     HMONITOR monitor;
 
     if (monitor_rect) SetRectEmpty(monitor_rect);
-    pthread_mutex_lock(&process_wayland.output_mutex);
-    if ((output = wayland_output_for_rect(rect))) wl_output = output->wl_output;
-    pthread_mutex_unlock(&process_wayland.output_mutex);
+    if ((output = wayland_output_for_rect(rect)))
+    {
+        wl_output = output->wl_output;
+        wayland_output_release(output);
+    }
 
     mi.cbSize = sizeof(mi);
     if (wl_output && monitor_rect && (monitor = NtUserMonitorFromRect(rect, 0)) &&
