@@ -297,7 +297,7 @@ static struct desktop *create_desktop( const struct unicode_str *name, unsigned 
             desktop->taskman_window = NULL;
             desktop->global_hooks = NULL;
             desktop->close_timeout = NULL;
-            desktop->close_timeout_val = 0;
+            desktop->close_timeout_val = -TICKS_PER_SEC;
             desktop->foreground_input = NULL;
             desktop->foreground_pid = 0;
             desktop->users = 0;
