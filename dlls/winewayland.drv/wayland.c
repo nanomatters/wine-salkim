@@ -348,9 +348,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     }
     else if (strcmp(interface, "xdg_wm_base") == 0)
     {
-        /* Bind version 2 so that compositors (e.g., sway) can properly send tiled
-         * states, instead of falling back to (ab)using the maximized state. */
-        /* version 3 is required for xdg_popup::reposition */
+        /* Version 3 is required for xdg_popup.reposition. */
         if (version < 3)
         {
             ERR("xdg_wm_base version 3 or higher is required!\n");
@@ -358,7 +356,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         }
         process_wayland.xdg_wm_base =
             wl_registry_bind(registry, id, &xdg_wm_base_interface,
-                             version < 2 ? version : 2);
+                             version < 4 ? version : 4);
         xdg_wm_base_add_listener(process_wayland.xdg_wm_base, &xdg_wm_base_listener, NULL);
     }
     else if (strcmp(interface, "wl_shm") == 0)
