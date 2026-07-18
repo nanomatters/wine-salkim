@@ -883,6 +883,8 @@ void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
 
     TRACE("hwnd=%p previous=%p\n", hwnd, previous);
 
+    if (hwnd == previous) return;
+
     if ((data = wayland_win_data_get(hwnd)))
     {
         if (data->wayland_surface)
