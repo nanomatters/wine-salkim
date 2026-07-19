@@ -804,7 +804,7 @@ static void wined3d_gl_hwnd_dmabuf_clear_busy(struct wined3d_gl_hwnd_dmabuf_imag
 }
 
 static void wined3d_gl_hwnd_dmabuf_release_token(struct wined3d_gl_hwnd_dmabuf_ring *ring,
-        UINT64 release_token, UINT release_flags)
+        UINT64 release_token, UINT release_flags, UINT ring_generation)
 {
     unsigned int i;
 
@@ -816,6 +816,9 @@ static void wined3d_gl_hwnd_dmabuf_release_token(struct wined3d_gl_hwnd_dmabuf_r
             continue;
 
         wined3d_gl_hwnd_dmabuf_clear_busy(image);
+        /* A stale cache confirmation must not suppress the next slot fd. */
+        image->consumer_cached = ring_generation == ring->ring_generation &&
+                (release_flags & HWND_DMABUF_RELEASE_CACHED);
         if (release_flags & (HWND_DMABUF_RELEASE_FAILED | HWND_DMABUF_RELEASE_ORPHANED))
             image->valid = false;
         return;
@@ -839,6 +842,7 @@ static unsigned int wined3d_gl_hwnd_dmabuf_reclaim_channel_slots(
 
         wined3d_gl_hwnd_dmabuf_clear_busy(image);
         image->valid = false;
+        image->consumer_cached = false;
         ++count;
     }
 
@@ -889,7 +893,8 @@ static void wined3d_gl_hwnd_dmabuf_drain_channel(struct wined3d_gl_hwnd_dmabuf_r
         {
             if (release.producer_unique_id != ring->producer_unique_id)
                 continue;
-            wined3d_gl_hwnd_dmabuf_release_token(ring, release.release_token, release.flags);
+            wined3d_gl_hwnd_dmabuf_release_token(ring, release.release_token, release.flags,
+                    release.ring_generation);
             continue;
         }
         if (ret == HWND_DMABUF_CHANNEL_EMPTY)
@@ -907,6 +912,7 @@ static BOOL wined3d_gl_hwnd_dmabuf_ensure_channel(struct wined3d_swapchain_gl *s
     struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
     HWND hwnd = swapchain_gl->s.win_handle;
     LONGLONG producer_id;
+    unsigned int i;
     int channel_fd;
 
     if (!hwnd || hwnd == GetDesktopWindow())
@@ -939,6 +945,8 @@ static BOOL wined3d_gl_hwnd_dmabuf_ensure_channel(struct wined3d_swapchain_gl *s
     ring->channel_fd = channel_fd;
     ring->channel_hwnd = hwnd;
     ring->producer_unique_id = producer_id;
+    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+        ring->images[i].consumer_cached = false;
     ring->p_wglWineHwndDmaBufCloseProducerWINE = gl_info->p_wglWineHwndDmaBufCloseProducerWINE;
     ring->p_wglWineHwndDmaBufPublishWINE = gl_info->p_wglWineHwndDmaBufPublishWINE;
     ring->p_wglWineHwndDmaBufDrainReleaseWINE = gl_info->p_wglWineHwndDmaBufDrainReleaseWINE;
@@ -953,6 +961,8 @@ static void wined3d_gl_hwnd_dmabuf_desc_from_image(const struct wined3d_gl_hwnd_
 {
     memset(desc, 0, sizeof(*desc));
     desc->version = HWND_DMABUF_DESC_VERSION_V1;
+    desc->flags = HWND_DMABUF_FLAG_STABLE_SLOT;
+    desc->ring_generation = ring->ring_generation;
     desc->width = image->width;
     desc->height = image->height;
     desc->fourcc = image->dmabuf_desc.fourcc;
@@ -980,8 +990,9 @@ static void wined3d_gl_hwnd_dmabuf_publish_channel(struct wined3d_gl_hwnd_dmabuf
 
     wined3d_gl_hwnd_dmabuf_desc_from_image(ring, image, &desc);
     image->busy_producer_unique_id = ring->producer_unique_id;
+    /* The consumer needs the fd until it confirms the slot is cached. */
     ret = ring->p_wglWineHwndDmaBufPublishWINE(ring->channel_hwnd, ring->channel_fd,
-            &desc, image->dmabuf_fd);
+            &desc, image->consumer_cached ? -1 : image->dmabuf_fd);
     if (!ret)
         return;
 
@@ -1012,6 +1023,7 @@ static void wined3d_gl_hwnd_dmabuf_destroy_image(struct wined3d_gl_hwnd_dmabuf_r
         struct wined3d_gl_hwnd_dmabuf_image *image, struct wined3d_context_gl *context_gl)
 {
     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    unsigned int i;
 
     wined3d_gl_hwnd_dmabuf_close_fd(ring, &image->dmabuf_fd);
 
@@ -1040,6 +1052,11 @@ static void wined3d_gl_hwnd_dmabuf_destroy_image(struct wined3d_gl_hwnd_dmabuf_r
     image->present_count = 0;
     image->release_token = 0;
     memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
+
+    /* Recreating a slot invalidates all cached imports from this ring. */
+    if (!++ring->ring_generation) ++ring->ring_generation;
+    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+        ring->images[i].consumer_cached = false;
 }
 
 static void wined3d_gl_hwnd_dmabuf_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
@@ -1197,28 +1214,31 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
     gl_info->fbo_ops.glBlitFramebuffer(src_rect.left, src_rect.top, src_rect.right, src_rect.bottom,
             0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    /* SYNC_NONE consumers need the copy complete before fd export. */
+    /* SYNC_NONE consumers need the copy complete before the frame publishes. */
     gl_info->gl_ops.gl.p_glFinish();
     checkGLcall("copy HWND dmabuf image");
 
-    memset(&dmabuf_desc, 0, sizeof(dmabuf_desc));
-    if (!gl_info->p_wglWineExportDmaBufWINE(image->texture, GL_TEXTURE_2D,
-            &dmabuf_desc, &dmabuf_fd) || dmabuf_fd < 0)
+    /* Export each texture once and retain its fd for the slot's lifetime. */
+    if (image->dmabuf_fd < 0)
     {
-        wined3d_gl_hwnd_dmabuf_close_fd(ring, &dmabuf_fd);
-        wined3d_gl_hwnd_dmabuf_close_fd(ring, &image->dmabuf_fd);
-        memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
-        image->present_count = 0;
-        image->release_token = 0;
-        image->valid = false;
-        wined3d_gl_hwnd_dmabuf_clear_busy(image);
-        return;
-    }
-    wined3d_gl_hwnd_dmabuf_negotiate_desc(ring, &dmabuf_desc);
+        memset(&dmabuf_desc, 0, sizeof(dmabuf_desc));
+        if (!gl_info->p_wglWineExportDmaBufWINE(image->texture, GL_TEXTURE_2D,
+                &dmabuf_desc, &dmabuf_fd) || dmabuf_fd < 0)
+        {
+            wined3d_gl_hwnd_dmabuf_close_fd(ring, &dmabuf_fd);
+            memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
+            image->present_count = 0;
+            image->release_token = 0;
+            image->valid = false;
+            wined3d_gl_hwnd_dmabuf_clear_busy(image);
+            return;
+        }
+        wined3d_gl_hwnd_dmabuf_negotiate_desc(ring, &dmabuf_desc);
 
-    wined3d_gl_hwnd_dmabuf_close_fd(ring, &image->dmabuf_fd);
-    image->dmabuf_desc = dmabuf_desc;
-    image->dmabuf_fd = dmabuf_fd;
+        image->dmabuf_desc = dmabuf_desc;
+        image->dmabuf_fd = dmabuf_fd;
+        image->consumer_cached = false;
+    }
     image->present_count = ring->present_count;
     image->release_token = ++ring->next_release_token;
     if (!image->release_token)
@@ -2465,6 +2485,7 @@ HRESULT wined3d_swapchain_gl_init(struct wined3d_swapchain_gl *swapchain_gl, str
         return hr;
 
     swapchain_gl->hwnd_dmabuf.channel_fd = -1;
+    swapchain_gl->hwnd_dmabuf.ring_generation = 1;
     for (i = 0; i < ARRAY_SIZE(swapchain_gl->hwnd_dmabuf.images); ++i)
     {
         swapchain_gl->hwnd_dmabuf.images[i].image_id = i + 1;

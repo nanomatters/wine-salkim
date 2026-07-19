@@ -280,10 +280,9 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_RELEASE_CACHED        0x00000010
 
 
-/* image_id names a stable dmabuf the producer exports once and dups per frame,
- * gated so the slot is not overwritten until its release token returns. Only
- * then may the consumer cache and reuse the wl_buffer per slot. Producers that
- * re-export a fresh dmabuf each publish (e.g. the wined3d GL path) must NOT set it. */
+/* image_id names a dmabuf slot whose backing store stays valid until its release
+ * token returns. The consumer may cache and reuse the wl_buffer for that slot.
+ * Producers that export a fresh dmabuf for every frame must not set this flag. */
 #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
 /* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
 #define HWND_DMABUF_FLAG_SHM              0x00000002

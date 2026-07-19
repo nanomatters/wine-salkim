@@ -124,10 +124,12 @@ static int hwnd_dmabuf_channel_result_from_errno( int err )
 
 int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
 {
-    int send_fd, ret;
+    const hwnd_dmabuf_frame_desc_t *frame = desc;
+    int send_fd = -1, ret;
 
-    if (dmabuf_fd < 0) return HWND_DMABUF_CHANNEL_ERROR;
-    if ((send_fd = dup( dmabuf_fd )) < 0)
+    if (dmabuf_fd < 0 && (!frame || !(frame->flags & HWND_DMABUF_FLAG_STABLE_SLOT)))
+        return HWND_DMABUF_CHANNEL_ERROR;
+    if (dmabuf_fd >= 0 && (send_fd = dup( dmabuf_fd )) < 0)
         return hwnd_dmabuf_channel_result_from_errno( errno );
 
     ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd );
