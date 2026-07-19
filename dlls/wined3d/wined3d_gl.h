@@ -1162,6 +1162,7 @@ struct wined3d_gl_hwnd_dmabuf_image
     uint64_t release_token;
     unsigned int image_id;
     bool valid;
+    bool consumer_cached;
     uint64_t busy_producer_unique_id;
 };
 
@@ -1180,6 +1181,7 @@ struct wined3d_gl_hwnd_dmabuf_ring
     hwnd_dmabuf_format_modifier_t *format_modifiers;
     unsigned int next_image;
     unsigned int last_image;
+    unsigned int ring_generation;
     unsigned int format_modifier_count;
     uint64_t present_count;
     uint64_t next_release_token;
