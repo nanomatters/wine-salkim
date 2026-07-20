@@ -90,6 +90,8 @@ struct pipewire_stream
     struct spa_audio_info_raw info;
     UINT32 frame_size;
     UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
+    char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
+    BOOL pending_error;
 
     DWORD flags;
     AUDCLNT_SHAREMODE share;
@@ -103,8 +105,12 @@ struct pipewire_stream
     BOOL started;
     SIZE_T bufsize_frames, real_bufsize_bytes, period_bytes;
     /* render ring bookkeeping: lcl_offs/held track the application side,
-     * pa_offs/pa_held track the process callback reader. pa_held_bytes
-     * publishes bytes with release/acquire; pa_offs_bytes only needs atomicity. */
+     * pa_offs/pa_held track the process-callback reader (field names kept
+     * from the pulse.c transplant for diffability).  Both sides run under
+     * the pw_thread_loop lock today (process callbacks are dispatched on
+     * that loop), so the counters are not concurrently accessed; the
+     * atomics on pa_held_bytes are retained only as future-proofing if an
+     * RT_PROCESS path returns.  pa_offs_bytes stays plain. */
     SIZE_T lcl_offs_bytes, pa_offs_bytes;
     SIZE_T tmp_buffer_bytes, held_bytes, pa_held_bytes;
     BYTE *local_buffer, *tmp_buffer;
@@ -112,21 +118,24 @@ struct pipewire_stream
     UINT64 mmdev_period_usec;
 
     /* capture staging ring: the analogue of PulseAudio's internal record
-     * buffer.  The pw_stream process callback (a foreign pthread) appends
-     * raw bytes here; the Wine timer thread slices period-sized ACPackets
-     * out of it with QPC timestamps.  cap_held_bytes is SPSC-atomic (RT
-     * producer release-adds, pipewire_read acquire-loads and subtracts);
-     * cap_read_offs stays plain, raced only in the overrun-drop path. */
+     * buffer.  The pw_stream process callback (on the main loop thread,
+     * lock held) appends raw bytes here; the Wine timer thread slices
+     * period-sized ACPackets out of it with QPC timestamps.  Both sides
+     * take the loop lock, so cap_held_bytes is not concurrently accessed;
+     * the atomics are retained only as future-proofing for RT_PROCESS.
+     * cap_read_offs stays plain. */
     BYTE *capture_ring;
     SIZE_T capture_ring_size, cap_read_offs, cap_held_bytes;
 
     INT64 clock_lastpos, clock_written;
-    UINT32 underrun_count, overrun_count; /* render starves / capture drops; one-line summary at release */
+    UINT32 underrun_count, overrun_count, bad_buffer_count;
+    BOOL underrun_logged, overrun_logged, bad_buffer_logged;
 
     struct list packet_free_head;
     struct list packet_filled_head;
 
     char *device;
+    struct list entry;          /* g_streams */
     struct list period_entry;
     struct pipewire_period *period;
 };
@@ -157,7 +166,7 @@ struct pipewire_period
     UINT64 period_usec;
     struct list streams;
     HANDLE timer_thread;
-    BOOL please_quit;
+    LONG please_quit; /* atomic: release_stream store-release, timer load-acquire */
     struct pipewire_stream *timer_stream;
     UINT64 last_time;
     BOOL grid_valid;
@@ -173,6 +182,11 @@ static struct pw_core *pw_core_global;
 static struct spa_hook core_listener;
 static BOOL core_listener_added;
 static BOOL core_dead;
+static int core_last_res;
+static char core_last_message[128];
+static BOOL core_error_logged;
+
+static struct list g_streams = LIST_INIT(g_streams); /* loop-lock protected */
 
 static pthread_mutex_t pw_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -186,26 +200,42 @@ static char g_default_source[256];
  * Small helpers
  * ---------------------------------------------------------------------- */
 
-/* copied from kernelbase */
-static int muldiv(int a, int b, int c)
+/* Safe for TEB-less PW callback threads (no ntdll). */
+static void copy_cstr(char *dst, size_t dst_size, const char *src)
 {
-    LONGLONG ret;
+    size_t i;
 
-    if (!c) return -1;
-
-    if (c < 0)
+    if (!dst_size)
+        return;
+    if (!src)
     {
-        a = -a;
-        c = -c;
+        dst[0] = '\0';
+        return;
     }
+    for (i = 0; i + 1 < dst_size && src[i]; i++)
+        dst[i] = src[i];
+    dst[i] = '\0';
+}
 
-    if ((a < 0 && b < 0) || (a >= 0 && b >= 0))
-        ret = (((LONGLONG)a * b) + (c / 2)) / c;
-    else
-        ret = (((LONGLONG)a * b) - (c / 2)) / c;
+/* frames = round(period * rate / denom); bytes = frames * frame_size.
+ * period/rate/denom are unsigned so callers can pass REFERENCE_TIME (hns)
+ * or usec without intermediate int narrowing. */
+static BOOL calc_period_bytes(UINT64 period, UINT32 rate, UINT32 denom,
+                              UINT32 frame_size, SIZE_T *out_bytes)
+{
+    UINT64 frames;
 
-    if (ret > 2147483647 || ret < -2147483647) return -1;
-    return ret;
+    if (!period || !rate || !denom || !frame_size)
+        return FALSE;
+    if (period > (UINT64_MAX - denom / 2) / rate)
+        return FALSE;
+
+    frames = (period * (UINT64)rate + denom / 2) / denom;
+    if (!frames || frames > (UINT64)SIZE_MAX / frame_size)
+        return FALSE;
+
+    *out_bytes = (SIZE_T)(frames * frame_size);
+    return TRUE;
 }
 
 static char *wstr_to_str(const WCHAR *wstr)
@@ -602,6 +632,9 @@ static void on_core_error(void *data, uint32_t id, int seq, int res, const char 
     if (id == PW_ID_CORE)
     {
         core_dead = TRUE;
+        core_last_res = res;
+        copy_cstr(core_last_message, sizeof(core_last_message), message);
+        core_error_logged = FALSE;
         if (pw_loop_global)
             pw_thread_loop_signal(pw_loop_global, false);
     }
@@ -623,6 +656,43 @@ static HRESULT pipewire_connect(const WCHAR *appname)
 
     if (pw_core_global)
     {
+        /* Existing streams still hold pw_stream objects on this core.
+         * Destroy those objects under the loop lock and mark the Wine-side
+         * streams invalidated so a fresh core can be opened for new clients.
+         * The app recovers by releasing the old IAudioClient after creating
+         * its replacement (standard device-lost order). */
+        if (!list_empty(&g_streams))
+        {
+            struct pipewire_stream *stream;
+            unsigned int n = 0;
+
+            LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
+                n++;
+            if (!core_error_logged)
+            {
+                WARN("core dead (res %d: %s): invalidating %u live stream(s) and reconnecting.\n",
+                     core_last_res, debugstr_a(core_last_message[0] ? core_last_message : NULL),
+                     n);
+                core_error_logged = TRUE;
+            }
+            LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
+            {
+                if (!stream->pw)
+                    continue;
+                spa_hook_remove(&stream->stream_listener);
+                pw_stream_destroy(stream->pw);
+                stream->pw = NULL;
+                copy_cstr(stream->last_error, sizeof(stream->last_error), "core connection lost");
+                stream->pending_error = TRUE;
+            }
+        }
+        else if (!core_error_logged && core_dead)
+        {
+            WARN("reconnecting after core error (res %d: %s).\n",
+                 core_last_res, debugstr_a(core_last_message[0] ? core_last_message : NULL));
+            core_error_logged = TRUE;
+        }
+
         if (core_listener_added)
         {
             spa_hook_remove(&core_listener);
@@ -632,6 +702,9 @@ static HRESULT pipewire_connect(const WCHAR *appname)
         pw_core_global = NULL;
     }
     core_dead = FALSE;
+    core_last_res = 0;
+    core_last_message[0] = '\0';
+    core_error_logged = FALSE;
 
     if ((app = app_name_from_wstr(appname)))
     {
@@ -1112,6 +1185,7 @@ static NTSTATUS pipewire_test_connect(void *args)
 
     if (!(p.core = pw_context_connect(p.context, NULL, 0)))
     {
+        ERR("pw_context_connect failed during probe.\n");
         pw_thread_loop_unlock(p.loop);
         pw_thread_loop_stop(p.loop);
         pw_context_destroy(p.context);
@@ -1396,6 +1470,8 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
                 else if (valid == 24) spafmt = SPA_AUDIO_FORMAT_S24_32_LE;
                 break;
             default:
+                WARN("Unsupported PCM container %u valid %lu.\n",
+                     fmt->wBitsPerSample, (unsigned long)valid);
                 return AUDCLNT_E_UNSUPPORTED_FORMAT;
             }
         }
@@ -1413,7 +1489,12 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
             spafmt = SPA_AUDIO_FORMAT_UNKNOWN;
         }
         if (spafmt == SPA_AUDIO_FORMAT_UNKNOWN)
+        {
+            WARN("Unsupported extensible format: tag=%u ch=%u rate=%u bits=%u mask=%#x.\n",
+                 fmt->wFormatTag, fmt->nChannels, fmt->nSamplesPerSec,
+                 fmt->wBitsPerSample, mask);
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        }
         info->format = spafmt;
         return S_OK;
     }
@@ -1434,12 +1515,17 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
         mask = get_channel_mask(fmt->nChannels);
         break;
     default:
-        WARN("Unhandled tag %x\n", fmt->wFormatTag);
+        WARN("Unhandled tag %#x ch=%u rate=%u bits=%u.\n",
+             fmt->wFormatTag, fmt->nChannels, fmt->nSamplesPerSec, fmt->wBitsPerSample);
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
 
     if (spafmt == SPA_AUDIO_FORMAT_UNKNOWN || !info->channels)
+    {
+        WARN("Rejected format: tag=%#x ch=%u rate=%u bits=%u mask=%#x.\n",
+             fmt->wFormatTag, fmt->nChannels, fmt->nSamplesPerSec, fmt->wBitsPerSample, mask);
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    }
     info->format = spafmt;
     for (j = 0; j < ARRAY_SIZE(spa_pos_from_wfx) && i < info->channels; ++j)
         if (mask & (1u << j))
@@ -1590,6 +1676,14 @@ static void apply_volume(const struct pipewire_stream *stream, BYTE *buffer, UIN
 static void on_stream_state_changed(void *data, enum pw_stream_state old,
                                     enum pw_stream_state state, const char *error)
 {
+    struct pipewire_stream *stream = data;
+
+    /* PW loop thread, lock held: record only, no Wine logging. */
+    if (state == PW_STREAM_STATE_ERROR)
+    {
+        copy_cstr(stream->last_error, sizeof(stream->last_error), error);
+        stream->pending_error = TRUE;
+    }
     if (pw_loop_global)
         pw_thread_loop_signal(pw_loop_global, false);
 }
@@ -1604,8 +1698,10 @@ static void on_stream_process(void *data)
     if (!(b = pw_stream_dequeue_buffer(stream->pw)))
         return;
     buf = b->buffer;
-    if (!buf->n_datas || !(d = &buf->datas[0])->data)
+    if (!buf || !buf->n_datas || !buf->datas ||
+        !(d = &buf->datas[0])->data || !d->chunk)
     {
+        stream->bad_buffer_count++;
         pw_stream_queue_buffer(stream->pw, b);
         return;
     }
@@ -1614,26 +1710,25 @@ static void on_stream_process(void *data)
     {
         UINT32 maxsize = d->maxsize;
         UINT32 req_frames, need_bytes, n;
-        SIZE_T pa_offs;
 
-        req_frames = b->requested ? (UINT32)b->requested : maxsize / stream->frame_size;
-        if (req_frames * stream->frame_size > maxsize)
+        if (!b->requested || b->requested > maxsize / stream->frame_size)
             req_frames = maxsize / stream->frame_size;
+        else
+            req_frames = (UINT32)b->requested;
         need_bytes = req_frames * stream->frame_size;
 
         if (stream->started)
         {
             n = min(need_bytes, __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE));
-            pa_offs = __atomic_load_n(&stream->pa_offs_bytes, __ATOMIC_RELAXED);
-            copy_from_ring(d->data, stream->local_buffer, stream->real_bufsize_bytes, pa_offs, n);
+            copy_from_ring(d->data, stream->local_buffer, stream->real_bufsize_bytes,
+                           stream->pa_offs_bytes, n);
             apply_volume(stream, d->data, n);
             if (n < need_bytes)
             {
                 silence_buffer(stream->info.format, (BYTE *)d->data + n, need_bytes - n);
                 stream->underrun_count++;
             }
-            pa_offs = (pa_offs + n) % stream->real_bufsize_bytes;
-            __atomic_store_n(&stream->pa_offs_bytes, pa_offs, __ATOMIC_RELAXED);
+            stream->pa_offs_bytes = (stream->pa_offs_bytes + n) % stream->real_bufsize_bytes;
             __atomic_sub_fetch(&stream->pa_held_bytes, n, __ATOMIC_RELEASE);
         }
         else
@@ -1691,10 +1786,25 @@ static const struct pw_stream_events stream_events = {
  * Stream creation / release
  * ---------------------------------------------------------------------- */
 
+/* Called with the loop lock held. Emits one WARN per pending ERROR episode. */
 static BOOL stream_valid(struct pipewire_stream *stream)
 {
     enum pw_stream_state st;
-    if (!stream || !stream->pw)
+
+    if (!stream)
+        return FALSE;
+    if (stream->pending_error)
+    {
+        if (stream->pw)
+            st = pw_stream_get_state(stream->pw, NULL);
+        else
+            st = PW_STREAM_STATE_ERROR;
+        WARN("stream %p saw error (now %s): %s.\n", stream,
+             pw_stream_state_as_string(st),
+             debugstr_a(stream->last_error[0] ? stream->last_error : NULL));
+        stream->pending_error = FALSE;
+    }
+    if (!stream->pw)
         return FALSE;
     st = pw_stream_get_state(stream->pw, NULL);
     return st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING;
@@ -1719,7 +1829,6 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
     const struct spa_pod *params[1];
     uint32_t period_frames = stream->period_bytes / stream->frame_size;
     enum pw_stream_state st;
-    enum pw_stream_flags flags;
     char *app;
     int tries;
 
@@ -1764,17 +1873,18 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
     }
 
-    flags = PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_INACTIVE;
-
-    if (stream->dataflow == eRender)
-        flags |= PW_STREAM_FLAG_RT_PROCESS;
-
-    if (pw_stream_connect(stream->pw,
-                          stream->dataflow == eRender ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT,
-                          PW_ID_ANY, flags, params, 1) < 0)
     {
-        WARN("pw_stream_connect failed.\n");
-        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+        int rc = pw_stream_connect(stream->pw,
+                          stream->dataflow == eRender ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT,
+                          PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                          PW_STREAM_FLAG_INACTIVE,
+                          params, 1);
+        if (rc < 0)
+        {
+            WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
+            return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+        }
     }
 
     for (tries = 0; tries < 10; tries++)
@@ -1840,6 +1950,7 @@ static NTSTATUS pipewire_create_stream(void *args)
 
     if (!(stream = calloc(1, sizeof(*stream))))
     {
+        WARN("Out of memory allocating stream.\n");
         params->result = E_OUTOFMEMORY;
         pw_thread_loop_unlock(pw_loop_global);
         return STATUS_SUCCESS;
@@ -1869,12 +1980,13 @@ static NTSTATUS pipewire_create_stream(void *args)
 
     if (!(stream->device = strdup(params->device ? params->device : "")))
     {
+        WARN("Out of memory duplicating device name.\n");
         hr = E_OUTOFMEMORY;
         goto exit;
     }
 
-    stream->period_bytes = stream->frame_size * muldiv(params->period, stream->info.rate, 10000000);
-    if (stream->period_bytes == 0)
+    if (!calc_period_bytes(params->period, stream->info.rate, 10000000,
+                           stream->frame_size, &stream->period_bytes))
     {
         WARN("Invalid period: %lld hns at %u Hz.\n", (long long)params->period, stream->info.rate);
         hr = E_INVALIDARG;
@@ -1898,7 +2010,10 @@ static NTSTATUS pipewire_create_stream(void *args)
         size = stream->real_bufsize_bytes = stream->bufsize_frames * 2 * stream->frame_size;
         if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
+        {
+            WARN("Out of memory allocating render buffer (%lu bytes).\n", (unsigned long)size);
             hr = E_OUTOFMEMORY;
+        }
     }
     else
     {
@@ -1913,7 +2028,10 @@ static NTSTATUS pipewire_create_stream(void *args)
         size = stream->real_bufsize_bytes + capture_packets * sizeof(ACPacket);
         if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
+        {
+            WARN("Out of memory allocating capture buffer (%lu bytes).\n", (unsigned long)size);
             hr = E_OUTOFMEMORY;
+        }
         else
         {
             ACPacket *cur_packet = (ACPacket *)((char *)stream->local_buffer + stream->real_bufsize_bytes);
@@ -1930,7 +2048,10 @@ static NTSTATUS pipewire_create_stream(void *args)
             size = stream->capture_ring_size = stream->real_bufsize_bytes;
             if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->capture_ring,
                                         zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
+            {
+                WARN("Out of memory allocating capture ring (%lu bytes).\n", (unsigned long)size);
                 hr = E_OUTOFMEMORY;
+            }
         }
     }
 
@@ -1958,6 +2079,7 @@ exit:
 
     if (SUCCEEDED(hr))
     {
+        list_add_tail(&g_streams, &stream->entry);
         *params->channel_count = stream->info.channels;
         *params->stream = (stream_handle)(UINT_PTR)stream;
         TRACE("created stream %p, %u channels.\n", stream, stream->info.channels);
@@ -1977,9 +2099,9 @@ static NTSTATUS pipewire_release_stream(void *args)
 
     pw_thread_loop_lock(pw_loop_global);
     TRACE("stream %p.\n", stream);
-    if (stream->underrun_count || stream->overrun_count)
-        WARN("stream %p underran %u times, overran %u times.\n",
-             stream, stream->underrun_count, stream->overrun_count);
+    if (stream->underrun_count || stream->overrun_count || stream->bad_buffer_count)
+        WARN("stream %p underran %u times, overran %u times, bad buffers %u.\n",
+             stream, stream->underrun_count, stream->overrun_count, stream->bad_buffer_count);
     if (stream->period)
     {
         struct pipewire_period *period = stream->period;
@@ -1994,15 +2116,17 @@ static NTSTATUS pipewire_release_stream(void *args)
         if (list_empty(&period->streams))
         {
             list_remove(&period->entry);
-            period->please_quit = TRUE;
+            __atomic_store_n(&period->please_quit, 1, __ATOMIC_RELEASE);
             dead_period = period;
         }
     }
     if (stream->pw)
     {
+        spa_hook_remove(&stream->stream_listener);
         pw_stream_destroy(stream->pw);
         stream->pw = NULL;
     }
+    list_remove(&stream->entry);
     pw_thread_loop_unlock(pw_loop_global);
 
     if (dead_period)
@@ -2087,7 +2211,7 @@ static void pipewire_period_timer_loop(void *args)
 
     delay.QuadPart = -(INT64)period->period_usec * 10;
 
-    while (!period->please_quit)
+    while (!__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
     {
         int have_now = 0;
 
@@ -2096,7 +2220,8 @@ static void pipewire_period_timer_loop(void *args)
         pw_thread_loop_lock(pw_loop_global);
         delay.QuadPart = -(INT64)period->period_usec * 10;
 
-        if (period->timer_stream && !period->timer_stream->started)
+        if (period->timer_stream &&
+            (!period->timer_stream->started || !period->timer_stream->pw))
         {
             period->timer_stream = NULL;
             period->grid_valid = FALSE;
@@ -2105,7 +2230,7 @@ static void pipewire_period_timer_loop(void *args)
         {
             LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
             {
-                if (stream->started)
+                if (stream->started && stream->pw)
                 {
                     period->timer_stream = stream;
                     period->grid_valid = FALSE;
@@ -2188,8 +2313,26 @@ static void pipewire_period_timer_loop(void *args)
         }
 
         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
+        {
+            if (stream->underrun_count && !stream->underrun_logged)
+            {
+                WARN("stream %p first underrun (count %u).\n", stream, stream->underrun_count);
+                stream->underrun_logged = TRUE;
+            }
+            if (stream->overrun_count && !stream->overrun_logged)
+            {
+                WARN("stream %p first overrun (count %u).\n", stream, stream->overrun_count);
+                stream->overrun_logged = TRUE;
+            }
+            if (stream->bad_buffer_count && !stream->bad_buffer_logged)
+            {
+                WARN("stream %p first bad process buffer (count %u).\n",
+                     stream, stream->bad_buffer_count);
+                stream->bad_buffer_logged = TRUE;
+            }
             if (stream->event)
                 NtSetEvent(stream->event, NULL);
+        }
 
         pw_thread_loop_unlock(pw_loop_global);
     }
@@ -2275,12 +2418,6 @@ static NTSTATUS pipewire_start(void *args)
         return STATUS_SUCCESS;
     }
 
-    if (FAILED(params->result = pipewire_add_stream_to_period(stream)))
-    {
-        pw_thread_loop_unlock(pw_loop_global);
-        return STATUS_SUCCESS;
-    }
-
     if (pw_stream_set_active(stream->pw, true) < 0)
     {
         /* mirrors pulse_start's failed-uncork path */
@@ -2289,6 +2426,15 @@ static NTSTATUS pipewire_start(void *args)
         pw_thread_loop_unlock(pw_loop_global);
         return STATUS_SUCCESS;
     }
+
+    if (FAILED(params->result = pipewire_add_stream_to_period(stream)))
+    {
+        if (pw_stream_set_active(stream->pw, false) < 0)
+            WARN("pw_stream_set_active(false) rollback failed for stream %p.\n", stream);
+        pw_thread_loop_unlock(pw_loop_global);
+        return STATUS_SUCCESS;
+    }
+
     stream->started = TRUE;
     pw_thread_loop_unlock(pw_loop_global);
     return STATUS_SUCCESS;
@@ -2315,7 +2461,8 @@ static NTSTATUS pipewire_stop(void *args)
         return STATUS_SUCCESS;
     }
 
-    pw_stream_set_active(stream->pw, false);
+    if (pw_stream_set_active(stream->pw, false) < 0)
+        WARN("pw_stream_set_active(false) failed for stream %p.\n", stream);
     stream->started = FALSE;
     pw_thread_loop_unlock(pw_loop_global);
     params->result = S_OK;
@@ -2350,13 +2497,13 @@ static NTSTATUS pipewire_reset(void *args)
         return STATUS_SUCCESS;
     }
 
-    pw_stream_flush(stream->pw, false);
+    if (pw_stream_flush(stream->pw, false) < 0)
+        WARN("pw_stream_flush failed for stream %p.\n", stream);
 
     if (stream->dataflow == eRender)
     {
         stream->clock_lastpos = stream->clock_written = 0;
-        stream->lcl_offs_bytes = 0;
-        __atomic_store_n(&stream->pa_offs_bytes, 0, __ATOMIC_RELAXED);
+        stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
         stream->held_bytes = 0;
         __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
     }
@@ -2400,7 +2547,10 @@ static BOOL alloc_tmp_buffer(struct pipewire_stream *stream, SIZE_T bytes)
     }
     if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
                                 zero_bits, &bytes, MEM_COMMIT, PAGE_READWRITE))
+    {
+        WARN("Out of memory allocating tmp buffer (%lu bytes).\n", (unsigned long)bytes);
         return FALSE;
+    }
 
     stream->tmp_buffer_bytes = bytes;
     return TRUE;
@@ -2467,6 +2617,7 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
         if (!alloc_tmp_buffer(stream, bytes))
         {
             pw_thread_loop_unlock(pw_loop_global);
+            WARN("Out of memory for render wrap buffer, stream %p.\n", stream);
             params->result = E_OUTOFMEMORY;
             return STATUS_SUCCESS;
         }
@@ -2542,7 +2693,7 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
     if (__atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE) > stream->real_bufsize_bytes)
     {
         WARN("%p PipeWire buffer overflow.\n", stream);
-        __atomic_store_n(&stream->pa_offs_bytes, stream->lcl_offs_bytes, __ATOMIC_RELAXED);
+        stream->pa_offs_bytes = stream->lcl_offs_bytes;
         __atomic_store_n(&stream->pa_held_bytes, stream->held_bytes, __ATOMIC_RELEASE);
     }
     stream->clock_written += written_bytes;
@@ -2775,8 +2926,12 @@ static NTSTATUS pipewire_set_volumes(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
     unsigned int i;
 
-    for (i = 0; i < stream->info.channels; i++)
-        stream->vol[i] = params->volumes[i] * params->master_volume * params->session_volumes[i];
+    pw_thread_loop_lock(pw_loop_global);
+    if (stream_valid(stream))
+        for (i = 0; i < stream->info.channels; i++)
+            stream->vol[i] = params->volumes[i] * params->master_volume *
+                             params->session_volumes[i];
+    pw_thread_loop_unlock(pw_loop_global);
     return STATUS_SUCCESS;
 }
 
@@ -2808,6 +2963,7 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
     HRESULT hr = S_OK;
     float ratio;
+    SIZE_T period_bytes;
 
     TRACE("stream %p rate %u.\n", stream, (unsigned)params->rate);
     pw_thread_loop_lock(pw_loop_global);
@@ -2833,6 +2989,15 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
         goto exit;
     }
 
+    if (!calc_period_bytes(stream->mmdev_period_usec, (UINT32)params->rate, 1000000,
+                           stream->frame_size, &period_bytes))
+    {
+        WARN("Invalid period after rate change: %llu us at %u Hz.\n",
+             (unsigned long long)stream->mmdev_period_usec, (unsigned)params->rate);
+        hr = E_INVALIDARG;
+        goto exit;
+    }
+
     ratio = params->rate / (float)stream->rate_connected;
     if (pw_stream_set_control(stream->pw, SPA_PROP_rate, 1, &ratio, 0) < 0)
     {
@@ -2845,12 +3010,10 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
     pw_stream_flush(stream->pw, false);
 
     stream->clock_lastpos = stream->clock_written = 0;
-    stream->lcl_offs_bytes = 0;
-    __atomic_store_n(&stream->pa_offs_bytes, 0, __ATOMIC_RELAXED);
+    stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
     stream->held_bytes = 0;
     __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
-    stream->period_bytes =
-        stream->frame_size * muldiv(stream->mmdev_period_usec, params->rate, 1000000);
+    stream->period_bytes = period_bytes;
     stream->info.rate = params->rate;
 
     silence_buffer(stream->info.format, stream->local_buffer, stream->real_bufsize_bytes);
