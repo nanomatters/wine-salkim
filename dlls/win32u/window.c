@@ -325,6 +325,17 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
     struct client_surface *surface;
 
     if (!(surface = calloc( 1, size ))) return NULL;
+    if (pthread_mutex_init( &surface->presentation_mutex, NULL ))
+    {
+        free( surface );
+        return NULL;
+    }
+    if (pthread_cond_init( &surface->presentation_cond, NULL ))
+    {
+        pthread_mutex_destroy( &surface->presentation_mutex );
+        free( surface );
+        return NULL;
+    }
     surface->funcs = funcs;
     surface->ref = 1;
     surface->hwnd = hwnd;
@@ -356,8 +367,93 @@ void client_surface_release( struct client_surface *surface )
         pthread_mutex_unlock( &surfaces_lock );
 
         surface->funcs->destroy( surface );
+        assert( !surface->presentation_wait_count );
+        assert( !surface->presentation_retiring );
+        pthread_cond_destroy( &surface->presentation_cond );
+        pthread_mutex_destroy( &surface->presentation_mutex );
         free( surface );
     }
+}
+
+BOOL client_surface_begin_present_wait( struct client_surface *surface, LONG generation )
+{
+    BOOL ret;
+
+    /* Register against the generation under the same lock used by topology
+     * changes. The target is then kept intact until the wait is released. */
+    pthread_mutex_lock( &surface->presentation_mutex );
+    if ((ret = !surface->presentation_retiring &&
+               generation == ReadAcquire( &surface->presentation_generation )))
+        surface->presentation_wait_count++;
+    pthread_mutex_unlock( &surface->presentation_mutex );
+    return ret;
+}
+
+void client_surface_end_present_wait( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    assert( surface->presentation_wait_count );
+    if (!--surface->presentation_wait_count)
+        pthread_cond_broadcast( &surface->presentation_cond );
+    pthread_mutex_unlock( &surface->presentation_mutex );
+}
+
+BOOL client_surface_invalidate_presentation_once( struct client_surface *surface, LONG *invalidated )
+{
+    BOOL ret;
+
+    /* Close the old generation without blocking the window thread. Native
+     * objects are kept intact until the later retirement phase. */
+    pthread_mutex_lock( &surface->presentation_mutex );
+    if ((ret = !InterlockedExchange( invalidated, TRUE )))
+        InterlockedIncrement( &surface->presentation_generation );
+    pthread_mutex_unlock( &surface->presentation_mutex );
+    return ret;
+}
+
+BOOL client_surface_prepare_presentation_retirement( struct client_surface *surface )
+{
+    BOOL wait;
+
+    pthread_mutex_lock( &surface->presentation_mutex );
+    if (!surface->presentation_retiring)
+    {
+        InterlockedIncrement( &surface->presentation_generation );
+        surface->presentation_retiring = TRUE;
+    }
+    wait = surface->presentation_wait_count != 0;
+    pthread_mutex_unlock( &surface->presentation_mutex );
+    return wait;
+}
+
+void client_surface_drain_present_waits( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    while (surface->presentation_wait_count)
+        pthread_cond_wait( &surface->presentation_cond, &surface->presentation_mutex );
+    pthread_mutex_unlock( &surface->presentation_mutex );
+}
+
+void client_surface_cancel_presentation_retirement( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    if (surface->presentation_retiring)
+    {
+        assert( !surface->presentation_wait_count );
+        surface->presentation_retiring = FALSE;
+        pthread_cond_broadcast( &surface->presentation_cond );
+    }
+    pthread_mutex_unlock( &surface->presentation_mutex );
+}
+
+void client_surface_complete_presentation_retirement( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    assert( surface->presentation_retiring );
+    assert( !surface->presentation_wait_count );
+    surface->presentation_retiring = FALSE;
+    pthread_cond_broadcast( &surface->presentation_cond );
+    pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
 void client_surface_present( struct client_surface *surface )

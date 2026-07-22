@@ -82,6 +82,7 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     if (!(data = calloc(1, sizeof(*data)))) return NULL;
 
     data->hwnd = hwnd;
+    data->toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     data->rects = *rects;
     data->ime_enabled = FALSE;
     data->num_ime_children = 0;
@@ -108,15 +109,20 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
  */
 static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
+    struct wayland_client_surface *stashed_client = data->stashed_client;
+    struct wayland_shm_buffer *window_contents = data->window_contents;
+
     TRACE("hwnd=%p\n", data->hwnd);
 
     rb_remove(&win_data_rb, &data->entry);
 
-    pthread_mutex_unlock(&win_data_mutex);
-
-    if (data->stashed_client) client_surface_release(&data->stashed_client->client);
+    /* Keep direct-surface ownership changes serialized with Vulkan release.
+     * Release client references after unlocking to preserve lock ordering. */
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
-    if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
+
+    pthread_mutex_unlock(&win_data_mutex);
+    if (stashed_client) client_surface_release(&stashed_client->client);
+    if (window_contents) wayland_shm_buffer_unref(window_contents);
     free(data);
 }
 
@@ -142,6 +148,16 @@ struct wayland_win_data *wayland_win_data_get(HWND hwnd)
     if ((data = wayland_win_data_get_nolock(hwnd))) return data;
     pthread_mutex_unlock(&win_data_mutex);
     return NULL;
+}
+
+void wayland_win_data_lock(void)
+{
+    pthread_mutex_lock(&win_data_mutex);
+}
+
+void wayland_win_data_unlock(void)
+{
+    pthread_mutex_unlock(&win_data_mutex);
 }
 
 /***********************************************************************
@@ -213,17 +229,19 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     {
         conf->minimized = TRUE;
     }
-    else if (wayland_win_data_get_pending_config_state(data, &pending_state))
-    {
-        window_state |= pending_state;
-    }
-    /* The fullscreen state is implied by the window position and style. */
+    /* The fullscreen state is implied by the window position and style. A
+     * compositor may leave fullscreen while the window is minimized, but that
+     * configure must not replace the state requested when the window restores. */
     else if (wayland_win_data_is_fullscreen(data, style))
     {
         if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
             window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
         else if (!(style & WS_MINIMIZE))
             window_state |= WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    }
+    else if (wayland_win_data_get_pending_config_state(data, &pending_state))
+    {
+        window_state |= pending_state;
     }
     else if (style & WS_MAXIMIZE)
     {
@@ -286,6 +304,42 @@ static void detach_client_surfaces_for_toplevel(HWND toplevel)
         if (data->client_surface && data->client_surface->toplevel == toplevel)
             wayland_client_surface_attach(data->client_surface, NULL);
     }
+}
+
+/* The caller holds win_data_mutex. Direct WSI can borrow a toplevel only when
+ * it is the sole attached client surface, since the borrowed wl_surface cannot
+ * also carry the parent state required by another client subsurface. */
+BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
+                                               struct wayland_client_surface *client)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        struct wayland_client_surface *other = data->client_surface;
+
+        if (other && other != client && other->toplevel == toplevel && other->wl_subsurface)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* The caller holds win_data_mutex. A direct WSI toplevel cannot safely carry
+ * visible child HWND content, since child surfaces require parent commits. */
+BOOL wayland_toplevel_has_visible_child_window(HWND toplevel)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->hwnd == toplevel) continue;
+        if (data->toplevel != toplevel) continue;
+        if (!data->visible) continue;
+        if (IsRectEmpty(&data->rects.visible)) continue;
+
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
@@ -395,7 +449,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     switch (role)
     {
     case WAYLAND_SURFACE_ROLE_NONE:
-        if (surface->role) wayland_surface_clear_role(surface);
+        if (surface->role && !wayland_surface_clear_role(surface)) return FALSE;
         break;
     case WAYLAND_SURFACE_ROLE_POPUP:
         wayland_surface_make_popup(surface, owner_surface);
@@ -458,12 +512,15 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
     {
          /* First do all state unsettings, before setting new state. Some
           * Wayland compositors misbehave if the order is reversed. */
-        if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        /* Minimize preserves the current state for the eventual restore. */
+        if (!surface->window.minimized &&
+            !(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
         {
             xdg_toplevel_unset_maximized(surface->xdg_toplevel);
         }
-        if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        if (!surface->window.minimized &&
+            !(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         {
             xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
@@ -850,11 +907,11 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL, menu_popup_owner = NULL;
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT), toplevel = root, owner = NULL, menu_popup_owner = NULL;
     struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
     struct wayland_client_surface *client;
     struct wayland_win_data *data, *toplevel_data, *owner_data;
-    BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL use_layer_shell = FALSE;
 
@@ -912,6 +969,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     data->rects = *new_rects;
+    data->toplevel = root;
+    data->visible = visible;
     data->is_fullscreen = fullscreen;
     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
     data->managed = managed;
@@ -920,7 +979,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if ((client = data->client_surface))
         {
-            if (toplevel && NtUserIsWindowVisible(hwnd) && !window_or_root_minimized(hwnd))
+            if (toplevel && visible && !window_or_root_minimized(hwnd))
                 wayland_client_surface_attach(client, toplevel);
             else
                 wayland_client_surface_attach(client, NULL);
@@ -1565,7 +1624,7 @@ static BOOL window_client_surface_attached(struct wayland_win_data *data)
 
 static BOOL window_client_surface_pending_first_frame(struct wayland_win_data *data)
 {
-    return data->client_surface && !data->client_surface->has_presented;
+    return data->client_surface && !ReadAcquire(&data->client_surface->has_presented);
 }
 
 static BOOL window_surface_has_requested_configure(HWND hwnd)
@@ -1634,7 +1693,16 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             return TRUE;
         }
 
-        if (wayland_surface_reconfigure(wayland_surface))
+        if (wayland_surface->direct_client &&
+            wayland_surface->direct_client->direct_host_surface)
+        {
+            /* The overlay removes stale GDI contents before the first WSI
+             * frame and carries fresh GDI updates above later WSI frames. */
+            if (data->client_surface == wayland_surface->direct_client)
+                committed = wayland_surface_commit_gdi_overlay(wayland_surface, shm_buffer, damage_region);
+            else committed = TRUE;
+        }
+        else if (wayland_surface_reconfigure(wayland_surface))
         {
             /* sync the alpha multiplier if it has changed due to SLWA/ULW */
             if (data->alpha_multiplier != wayland_surface->alpha_multiplier)
@@ -1647,26 +1715,24 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             {
                 wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
                 wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
-                wayland_surface->transparent_carrier_attached = FALSE;
+                wayland_surface->carrier_attached = FALSE;
                 wl_surface_commit(wayland_surface->wl_surface);
                 wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
                 wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
                 wayland_surface_update_hwnd_dmabufs(wayland_surface);
                 committed = TRUE;
             }
-            else committed = wayland_surface_attach_transparent_carrier(wayland_surface);
+            else if (data->client_surface && window_client_surface_attached(data) &&
+                     !window_client_surface_pending_first_frame(data))
+                committed = TRUE;
+            else
+                committed = wayland_surface_attach_transparent_carrier(wayland_surface);
         }
         else
         {
             TRACE("Wayland surface not configured yet, not flushing\n");
         }
     }
-
-    /* An attached client stays attached on GDI commits. Detaching would flash
-     * the empty GDI buffer. Lifecycle callbacks clear dead client surfaces. */
-    if (committed && shm_buffer && data->client_surface && !window_client_surface_attached(data) &&
-        !window_client_surface_pending_first_frame(data))
-        wayland_client_surface_attach(data->client_surface, NULL);
 
     /* Update the latest window buffer for the wayland surface. Note that we
      * only care whether the buffer contains the latest window contents,
@@ -1678,6 +1744,20 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
     {
         wayland_shm_buffer_ref(shm_buffer);
         data->window_contents = shm_buffer;
+    }
+
+    /* Reclassify an attached client when GDI contents appear or disappear.
+     * The client owns carrier selection when no GDI buffer remains. */
+    if (committed && data->client_surface &&
+        !window_client_surface_pending_first_frame(data))
+    {
+        if (window_client_surface_attached(data))
+        {
+            if (data->client_surface->stack_above_parent || !shm_buffer)
+                wayland_client_surface_attach(data->client_surface, NtUserGetAncestor(hwnd, GA_ROOT));
+        }
+        else if (shm_buffer)
+            wayland_client_surface_attach(data->client_surface, NULL);
     }
 
     wayland_win_data_release(data);
