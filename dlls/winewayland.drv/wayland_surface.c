@@ -55,6 +55,8 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd);
 static void wayland_client_surface_set_content_type(struct wayland_client_surface *client);
 static BOOL wayland_client_surface_set_opaque_region(struct wayland_client_surface *surface,
                                                      BOOL opaque);
+static BOOL wayland_client_surface_retarget_image_description(
+        struct wayland_client_surface *surface, struct wl_surface *wl_surface);
 static const char *wayland_client_surface_direct_toplevel_failure(
         struct wayland_client_surface *surface, HWND hwnd);
 
@@ -5216,6 +5218,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     struct wayland_win_data *data;
     const char *failure;
+    BOOL release_pending_description;
 
     *reason = NULL;
     if (!(data = wayland_win_data_get(hwnd)))
@@ -5256,18 +5259,14 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
         wp_viewport_destroy(surface->wp_viewport);
         surface->wp_viewport = NULL;
     }
-    if (surface->wp_color_management_surface_v1)
-    {
-        wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
-        surface->wp_color_management_surface_v1 = NULL;
-    }
+    release_pending_description =
+        wayland_client_surface_retarget_image_description(surface, toplevel_wl_surface);
     if (surface->wp_content_type_v1)
     {
         wp_content_type_v1_destroy(surface->wp_content_type_v1);
         surface->wp_content_type_v1 = NULL;
     }
     wayland_surface_unset_viewport(data->wayland_surface);
-    surface->wl_surface = toplevel_wl_surface;
     wayland_client_surface_reset_opaque_region(surface);
     surface->owns_wl_surface = FALSE;
     surface->owns_direct_wl_surface = FALSE;
@@ -5297,6 +5296,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
           debugstr_client_surface(client), toplevel_wl_surface, hwnd);
 
     wayland_win_data_release(data);
+    if (release_pending_description) client_surface_release(client);
     return TRUE;
 }
 
@@ -5413,6 +5413,7 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     struct wp_viewport *viewport;
     struct wayland_win_data *data;
     struct wl_region *empty_region;
+    BOOL release_pending_description;
 
     if (!(viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter, new_wl_surface)))
     {
@@ -5459,18 +5460,14 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
             surface->owns_direct_wl_surface = FALSE;
         }
     }
-    if (surface->wp_color_management_surface_v1)
-    {
-        wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
-        surface->wp_color_management_surface_v1 = NULL;
-    }
+    release_pending_description =
+        wayland_client_surface_retarget_image_description(surface, new_wl_surface);
     if (surface->wp_viewport)
     {
         wp_viewport_destroy(surface->wp_viewport);
         surface->wp_viewport = NULL;
     }
 
-    surface->wl_surface = new_wl_surface;
     wayland_client_surface_reset_opaque_region(surface);
     surface->owns_wl_surface = TRUE;
     surface->wp_viewport = viewport;
@@ -5502,6 +5499,7 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     wl_display_flush(process_wayland.wl_display);
     TRACE("demoted %s to child wl_surface=%p for hwnd=%p\n",
           debugstr_client_surface(client), new_wl_surface, hwnd);
+    if (release_pending_description) client_surface_release(client);
     return TRUE;
 }
 
@@ -5668,10 +5666,23 @@ static void wayland_image_description_v1_failed(void *user_data,
                     uint32_t cause, const char *msg)
 {
     struct wayland_client_surface *surface = user_data;
-    ERR("cause=%u msg=%s\n", cause, debugstr_a(msg));
+    BOOL pending;
 
-    wp_image_description_v1_destroy(wp_image_description_v1);
-    client_surface_release(&surface->client);
+    pthread_mutex_lock(&surface->client.presentation_mutex);
+    pending = surface->pending_image_description_v1 == wp_image_description_v1;
+    if (pending)
+    {
+        surface->pending_image_description_v1 = NULL;
+        surface->pending_image_description_wl_surface = NULL;
+    }
+    pthread_mutex_unlock(&surface->client.presentation_mutex);
+
+    if (pending)
+    {
+        ERR("cause=%u msg=%s\n", cause, debugstr_a(msg));
+        wp_image_description_v1_destroy(wp_image_description_v1);
+        client_surface_release(&surface->client);
+    }
 }
 
 static void wayland_image_description_v1_ready2(void *user_data,
@@ -5679,25 +5690,40 @@ static void wayland_image_description_v1_ready2(void *user_data,
                     uint32_t identity_hi, uint32_t identity_lo)
 {
     struct wayland_client_surface *surface = user_data;
+    struct wl_surface *wl_surface;
+    BOOL pending;
+
     TRACE("id=%#x%x\n", identity_hi, identity_lo);
 
-    if (!surface->wp_color_management_surface_v1)
+    pthread_mutex_lock(&surface->client.presentation_mutex);
+    pending = surface->pending_image_description_v1 == wp_image_description_v1;
+    wl_surface = surface->pending_image_description_wl_surface;
+    if (pending)
     {
-        surface->wp_color_management_surface_v1 =
-            wp_color_manager_v1_get_surface(process_wayland.wp_color_manager_v1,
-                                            surface->wl_surface);
-        if (!surface->wp_color_management_surface_v1)
+        surface->pending_image_description_v1 = NULL;
+        surface->pending_image_description_wl_surface = NULL;
+        if (wl_surface == surface->wl_surface)
         {
-            ERR("Failed to create color management surface for client surface!\n");
-            return;
+            if (!surface->wp_color_management_surface_v1)
+                surface->wp_color_management_surface_v1 =
+                    wp_color_manager_v1_get_surface(process_wayland.wp_color_manager_v1,
+                                                    wl_surface);
+            if (surface->wp_color_management_surface_v1)
+                wp_color_management_surface_v1_set_image_description(
+                    surface->wp_color_management_surface_v1,
+                    wp_image_description_v1,
+                    WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+            else
+                ERR("Failed to create color management surface for client surface!\n");
         }
     }
-    wp_color_management_surface_v1_set_image_description(
-        surface->wp_color_management_surface_v1,
-        wp_image_description_v1,
-        WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
-    wp_image_description_v1_destroy(wp_image_description_v1);
-    client_surface_release(&surface->client);
+    pthread_mutex_unlock(&surface->client.presentation_mutex);
+
+    if (pending)
+    {
+        wp_image_description_v1_destroy(wp_image_description_v1);
+        client_surface_release(&surface->client);
+    }
 }
 
 static void wayland_image_description_v1_ready(void *user_data,
@@ -5713,24 +5739,53 @@ static const struct wp_image_description_v1_listener image_description_listener 
     wayland_image_description_v1_ready2
 };
 
+static struct wp_image_description_v1 *wayland_client_surface_reset_image_description_locked(
+        struct wayland_client_surface *surface)
+{
+    struct wp_image_description_v1 *pending = surface->pending_image_description_v1;
+
+    surface->pending_image_description_v1 = NULL;
+    surface->pending_image_description_wl_surface = NULL;
+    if (pending) wp_image_description_v1_destroy(pending);
+    if (surface->wp_color_management_surface_v1)
+    {
+        wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
+        surface->wp_color_management_surface_v1 = NULL;
+    }
+    return pending;
+}
+
+static BOOL wayland_client_surface_retarget_image_description(
+        struct wayland_client_surface *surface, struct wl_surface *wl_surface)
+{
+    struct wp_image_description_v1 *pending;
+
+    pthread_mutex_lock(&surface->client.presentation_mutex);
+    pending = wayland_client_surface_reset_image_description_locked(surface);
+    surface->wl_surface = wl_surface;
+    pthread_mutex_unlock(&surface->client.presentation_mutex);
+    return pending != NULL;
+}
+
 void wayland_client_surface_attach_image_description(struct client_surface *client,
                                                      struct wp_image_description_v1 *image_desc)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wp_image_description_v1 *pending;
 
-    if (!image_desc)
+    pthread_mutex_lock(&surface->client.presentation_mutex);
+    pending = wayland_client_surface_reset_image_description_locked(surface);
+    if (image_desc)
     {
-        if (surface->wp_color_management_surface_v1)
-        {
-            wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
-            surface->wp_color_management_surface_v1 = NULL;
-        }
-        return;
+        surface->pending_image_description_v1 = image_desc;
+        surface->pending_image_description_wl_surface = surface->wl_surface;
+        client_surface_add_ref(&surface->client);
+        wp_image_description_v1_add_listener(image_desc, &image_description_listener, surface);
     }
+    pthread_mutex_unlock(&surface->client.presentation_mutex);
 
-    client_surface_add_ref(&surface->client);
-    wp_image_description_v1_add_listener(image_desc, &image_description_listener, surface);
-    wl_display_flush(process_wayland.wl_display);
+    if (pending) client_surface_release(&surface->client);
+    if (image_desc) wl_display_flush(process_wayland.wl_display);
 }
 
 static BOOL wayland_client_surface_set_opaque_region(struct wayland_client_surface *surface,

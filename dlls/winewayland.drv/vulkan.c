@@ -290,9 +290,13 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
         new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
 
     if (!client) return new;
-    if (new == colorspace) return colorspace;
+    if (new == colorspace)
+    {
+        wayland_client_surface_attach_image_description(client, NULL);
+        return colorspace;
+    }
 
-    switch(colorspace)
+    switch (colorspace)
     {
     case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
         wp_image_description_v1 =
@@ -303,7 +307,11 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
     default: break;
     }
 
-    if (!wp_image_description_v1) goto err;
+    if (!wp_image_description_v1)
+    {
+        wayland_client_surface_attach_image_description(client, NULL);
+        goto err;
+    }
 
     TRACE("mapping colorspace %u => %u\n", colorspace, new);
 
