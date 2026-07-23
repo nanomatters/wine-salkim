@@ -619,6 +619,8 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
+BOOL wayland_surface_has_external_commit_owner(const struct wayland_surface *surface);
+void wayland_surface_commit_pending_state(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
                                           enum wayland_surface_config_state state);
 void wayland_surface_update_toplevel_parent(struct wayland_surface *surface);

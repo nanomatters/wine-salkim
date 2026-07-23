@@ -1248,9 +1248,13 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
                 wl_fixed_from_int(warp.y));
         pthread_mutex_unlock(&pointer->mutex);
 
-        data = wayland_win_data_get(hwnd);
-        wl_surface_commit(wl_surface);
-        wayland_win_data_release(data);
+        if ((data = wayland_win_data_get(hwnd)))
+        {
+            surface = data->wayland_surface;
+            if (surface && surface->wl_surface == wl_surface)
+                wayland_surface_commit_pending_state(surface);
+            wayland_win_data_release(data);
+        }
         TRACE("position hint hwnd=%p wayland_xy=%s screen_xy=%s\n",
                 hwnd, wine_dbgstr_point(&warp), wine_dbgstr_point(&cursor_pos));
         pthread_mutex_lock(&pointer->mutex);
