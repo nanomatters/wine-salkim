@@ -1693,8 +1693,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             return TRUE;
         }
 
-        if (wayland_surface->direct_client &&
-            wayland_surface->direct_client->direct_host_surface)
+        if (wayland_surface_has_external_commit_owner(wayland_surface))
         {
             /* The overlay removes stale GDI contents before the first WSI
              * frame and carries fresh GDI updates above later WSI frames. */
@@ -1816,7 +1815,7 @@ void ensure_window_surface_contents(HWND hwnd)
                 {
                     /* Handle any processed configure request, to ensure the
                      * related surface state is applied by the compositor. */
-                    wl_surface_commit(wayland_surface->wl_surface);
+                    wayland_surface_commit_pending_state(wayland_surface);
                 }
             }
             /* Producer content already visible: do not create a fallback

@@ -1567,7 +1567,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
         else if (server_decor && !surface->zxdg_toplevel_decoration_v1)
             wayland_surface_init_decoration(surface);
 
-        wl_surface_commit(surface->wl_surface);
+        wayland_surface_commit_pending_state(surface);
         wl_display_flush(process_wayland.wl_display);
 
         return;
@@ -1620,7 +1620,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
 
     if (server_decor) wayland_surface_init_decoration(surface);
 
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit_pending_state(surface);
     wl_display_flush(process_wayland.wl_display);
 
     return;
@@ -1994,6 +1994,21 @@ static BOOL wayland_client_surface_has_retired_wl_surface(struct wayland_client_
         if (client->retired_wl_surfaces[i].wl_surface == wl_surface) return TRUE;
 
     return FALSE;
+}
+
+/* Registered surfaces are inspected while holding the win data lock. */
+BOOL wayland_surface_has_external_commit_owner(const struct wayland_surface *surface)
+{
+    const struct wayland_client_surface *client = surface->direct_client;
+
+    return client && client->direct_host_surface &&
+           client->direct_wl_surface == surface->wl_surface;
+}
+
+void wayland_surface_commit_pending_state(struct wayland_surface *surface)
+{
+    if (!surface->wl_surface || wayland_surface_has_external_commit_owner(surface)) return;
+    wl_surface_commit(surface->wl_surface);
 }
 
 /* Transfer a borrowed root wl_surface to its client before changing the root
@@ -2734,6 +2749,9 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
                                              int width, int height)
 {
     int dest_width = width, dest_height = height;
+
+    /* Do not apply Wine's viewport to externally committed buffers. */
+    if (wayland_surface_has_external_commit_owner(surface)) return;
 
     if (width <= 0 || height <= 0)
         dest_width = dest_height = -1;
@@ -3725,7 +3743,8 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
 {
     struct wayland_hwnd_dmabuf_surface *direct = surface->direct_dmabuf_surface;
 
-    if (!direct || !data || !data->window_contents || !wayland_surface_reconfigure(surface))
+    if (wayland_surface_has_external_commit_owner(surface) ||
+        !direct || !data || !data->window_contents || !wayland_surface_reconfigure(surface))
         return FALSE;
 
     wl_surface_set_opaque_region(surface->wl_surface, NULL);
@@ -3757,6 +3776,8 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
     struct wl_region *region = NULL;
     enum wl_shm_format format;
     int width, height;
+
+    if (wayland_surface_has_external_commit_owner(surface)) return FALSE;
 
     width = max(1, surface->window.rect.right - surface->window.rect.left);
     height = max(1, surface->window.rect.bottom - surface->window.rect.top);
@@ -3874,6 +3895,8 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
     struct wayland_hwnd_dmabuf_buffer *buffer, *buffer_next;
     BOOL created_buffer, attached_frame = FALSE;
     int width, height;
+
+    if (wayland_surface_has_external_commit_owner(surface)) return FALSE;
 
     if (!process_wayland.zwp_linux_dmabuf_v1)
     {
@@ -4082,7 +4105,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         if (status != HWND_DMABUF_OK) count = 0;
     }
 
-    if (surface->direct_client && surface->direct_client->direct_host_surface)
+    if (wayland_surface_has_external_commit_owner(surface))
     {
         for (i = 0; i < count; i++)
         {
@@ -4230,7 +4253,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     /* Commit the parent to apply subsurface stacking. No frame callback: import is
      * paced by the producer, not by our toplevel being presented. */
     if (any_new)
-        wl_surface_commit(surface->wl_surface);
+        wayland_surface_commit_pending_state(surface);
     if (frames != stack_frames) free(frames);
 }
 
@@ -4331,7 +4354,7 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
     else
         wl_subsurface_place_above(surface->wl_subsurface,
                                   toplevel_surface->wl_surface);
-    wl_surface_commit(toplevel_surface->wl_surface);
+    wayland_surface_commit_pending_state(toplevel_surface);
     memset(&surface->processing, 0, sizeof(surface->processing));
 }
 
@@ -4748,6 +4771,8 @@ static void wayland_surface_restore_gdi_shm_overlay(struct wayland_surface *surf
                                                     struct wayland_shm_buffer *shm_buffer)
 {
     struct wayland_shm_buffer *clone;
+
+    if (wayland_surface_has_external_commit_owner(surface)) return;
 
     wayland_surface_destroy_gdi_shm_overlay(surface);
     if (!wayland_surface_reconfigure(surface)) return;
@@ -5255,6 +5280,8 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     InterlockedExchange(&surface->has_presented, FALSE);
     wayland_client_surface_set_content_type(surface);
     data->wayland_surface->direct_client = surface;
+    /* The external producer replaces any Wine root buffer. */
+    data->wayland_surface->carrier_attached = FALSE;
 
     /* Move any current Wine window contents out of the way onto an overlay. */
     if (data->window_contents &&
@@ -5305,7 +5332,11 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
     if (data->wayland_surface) wayland_surface_unset_viewport(data->wayland_surface);
     wayland_client_surface_reset_opaque_region(surface);
     InterlockedExchange(&surface->has_presented, FALSE);
-    if (data->wayland_surface) data->wayland_surface->direct_client = surface;
+    if (data->wayland_surface)
+    {
+        data->wayland_surface->direct_client = surface;
+        data->wayland_surface->carrier_attached = FALSE;
+    }
 
     if (data->window_contents &&
         !wayland_surface_promote_shm_to_overlay(data->wayland_surface, data->window_contents))
@@ -5559,8 +5590,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
      * carrier to a wl_surface with explicit synchronization enabled. Invalidate
      * the direct swapchain and wait for its normal out-of-date recreation to
      * restore the child-subsurface topology. */
-    if (surface->direct_client && surface->direct_client != client &&
-        surface->direct_client->direct_host_surface)
+    if (wayland_surface_has_external_commit_owner(surface) &&
+        surface->direct_client != client)
     {
         wayland_surface_invalidate_direct_toplevel(surface, "another client surface appeared");
         wayland_win_data_release(toplevel_data);
@@ -5618,7 +5649,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         wayland_client_surface_set_opaque_region(client, opaque);
 
     /* Commit to apply subsurface positioning. */
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit_pending_state(surface);
 
     if (!toplevel_data->window_contents)
     {
@@ -5872,7 +5903,7 @@ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UI
 
     opacity = (flags & LWA_ALPHA) ? (UINT32_MAX / 0xff) * alpha : UINT32_MAX;
     wp_alpha_modifier_surface_v1_set_multiplier(surface->wp_alpha_modifier_surface_v1, opacity);
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit_pending_state(surface);
     wl_display_flush(process_wayland.wl_display);
 }
 
