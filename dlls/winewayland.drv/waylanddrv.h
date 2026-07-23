@@ -469,7 +469,10 @@ struct wayland_client_surface
     const struct wl_surface *toplevel_wl_surface;
     struct wl_subsurface *wl_subsurface;
     BOOL stack_above_parent;
+    /* Protected by client.presentation_mutex. */
     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
+    struct wp_image_description_v1 *pending_image_description_v1;
+    struct wl_surface *pending_image_description_wl_surface;
     struct wp_viewport *wp_viewport;
     struct wp_content_type_v1 *wp_content_type_v1;
     LONG opaque_region_state;
