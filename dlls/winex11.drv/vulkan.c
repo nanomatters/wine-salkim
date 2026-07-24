@@ -70,6 +70,23 @@ static VkResult X11DRV_vulkan_surface_create( HWND hwnd, BOOL raw, const struct 
     return VK_SUCCESS;
 }
 
+static VkResult X11DRV_vulkan_surface_update( HWND hwnd, const struct vulkan_instance *instance,
+                                              struct client_surface *client, VkSurfaceKHR old_surface,
+                                              VkSurfaceKHR *host_surface, BOOL *updated )
+{
+    *updated = FALSE;
+    return VK_SUCCESS;
+}
+
+static void X11DRV_vulkan_surface_release( struct client_surface *client, VkSurfaceKHR host_surface )
+{
+}
+
+static void X11DRV_vulkan_surface_set_alpha( VkCompositeAlphaFlagBitsKHR alpha_bits,
+                                             struct client_surface *client )
+{
+}
+
 static VkBool32 X11DRV_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device, uint32_t index )
 {
     struct vulkan_instance *instance = physical_device->instance;
@@ -99,6 +116,9 @@ static void X11DRV_map_device_extensions( struct vulkan_device_extensions *exten
 static const struct vulkan_driver_funcs x11drv_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = X11DRV_vulkan_surface_create,
+    .p_vulkan_surface_update = X11DRV_vulkan_surface_update,
+    .p_vulkan_surface_release = X11DRV_vulkan_surface_release,
+    .p_vulkan_surface_set_alpha = X11DRV_vulkan_surface_set_alpha,
     .p_get_physical_device_presentation_support = X11DRV_get_physical_device_presentation_support,
     .p_map_instance_extensions = X11DRV_map_instance_extensions,
     .p_map_device_extensions = X11DRV_map_device_extensions,

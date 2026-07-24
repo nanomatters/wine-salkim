@@ -61,6 +61,16 @@ static const WCHAR layer_menu_hwnd_prop[] =
 static const WCHAR layer_menu_restore_hwnd_prop[] =
     {'_','_','w','i','n','e','_','w','a','y','l','a','n','d','_','l','a','y','e','r','_','m','e','n','u','_','r','e','s','t','o','r','e',0};
 
+void wayland_win_data_lock(void)
+{
+    pthread_mutex_lock(&win_data_mutex);
+}
+
+void wayland_win_data_unlock(void)
+{
+    pthread_mutex_unlock(&win_data_mutex);
+}
+
 /***********************************************************************
  *           wayland_win_data_create
  *
@@ -267,6 +277,39 @@ static void detach_client_surfaces_for_toplevel(HWND toplevel)
     }
 }
 
+/* The caller holds win_data_mutex. A direct WSI client borrows the root
+ * wl_surface, so no other client surface may require parent commits. */
+BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
+                                               struct wayland_client_surface *client)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        struct wayland_client_surface *other = data->client_surface;
+
+        if (other && other != client && other->toplevel == toplevel && other->wl_subsurface)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* The caller holds win_data_mutex. Cached state avoids calling win32u while
+ * scanning every window in the process from a Vulkan transition. */
+BOOL wayland_toplevel_has_visible_child_window(HWND toplevel)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->hwnd == toplevel || data->toplevel != toplevel || !data->visible ||
+            IsRectEmpty(&data->rects.visible))
+            continue;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
 {
     if (!(style & WS_POPUP)) return FALSE;
@@ -363,7 +406,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     switch (role)
     {
     case WAYLAND_SURFACE_ROLE_NONE:
-        if (surface->role) wayland_surface_clear_role(surface);
+        if (surface->role && !wayland_surface_clear_role(surface)) return FALSE;
         break;
     case WAYLAND_SURFACE_ROLE_POPUP:
         wayland_surface_make_popup(surface, owner_surface, &data->rects.window);
@@ -787,7 +830,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
     struct wayland_client_surface *client;
     struct wayland_win_data *data, *toplevel_data, *owner_data;
-    BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL use_layer_shell = FALSE;
 
@@ -838,6 +881,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     data->rects = *new_rects;
+    data->toplevel = toplevel;
+    data->visible = visible;
     data->is_fullscreen = fullscreen;
     data->managed = managed;
 
@@ -845,7 +890,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if ((client = data->client_surface))
         {
-            if (toplevel && NtUserIsWindowVisible(hwnd) && !window_or_root_minimized(hwnd))
+            if (toplevel && visible && !window_or_root_minimized(hwnd))
                 wayland_client_surface_attach(client, toplevel);
             else
                 wayland_client_surface_attach(client, NULL);
@@ -1462,18 +1507,23 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         if (wayland_surface_reconfigure(wayland_surface))
         {
             /* sync the alpha multiplier if it has changed due to SLWA/ULW */
-            if (data->alpha_multiplier != wayland_surface->alpha_multiplier)
+            if (!wayland_surface_has_external_commit_owner(wayland_surface) &&
+                data->alpha_multiplier != wayland_surface->alpha_multiplier)
             {
                 wayland_surface->alpha_multiplier = data->alpha_multiplier;
                 wayland_surface_sync_alpha(wayland_surface);
             }
 
-            if (shm_buffer)
+            if (wayland_surface_has_external_commit_owner(wayland_surface))
+            {
+                committed = wayland_surface_commit_gdi_overlay(wayland_surface, shm_buffer, damage_region);
+            }
+            else if (shm_buffer)
             {
                 wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
                 wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
-                wayland_surface->transparent_carrier_attached = FALSE;
-                wl_surface_commit(wayland_surface->wl_surface);
+                wayland_surface->carrier_attached = FALSE;
+                wayland_surface_commit_pending_state(wayland_surface);
                 wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
                 wayland_surface_update_hwnd_dmabufs(wayland_surface);
                 committed = TRUE;
@@ -1544,7 +1594,7 @@ void ensure_window_surface_contents(HWND hwnd)
                 {
                     /* Handle any processed configure request, to ensure the
                      * related surface state is applied by the compositor. */
-                    wl_surface_commit(wayland_surface->wl_surface);
+                    wayland_surface_commit_pending_state(wayland_surface);
                 }
             }
             /* Producer content already visible: do not create a fallback

@@ -41,6 +41,100 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
+static VkResult wayland_vulkan_create_host_surface(const struct vulkan_instance *instance,
+                                                   struct wl_surface *wl_surface,
+                                                   VkSurfaceKHR *host_surface)
+{
+    VkWaylandSurfaceCreateInfoKHR create_info =
+    {
+        .sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
+        .display = process_wayland.wl_display,
+        .surface = wl_surface,
+    };
+
+    return instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info, NULL, host_surface);
+}
+
+static VkResult wayland_vulkan_surface_demote(HWND hwnd, const struct vulkan_instance *instance,
+                                              struct client_surface *client, VkSurfaceKHR old_host_surface,
+                                              VkSurfaceKHR *host_surface, BOOL *updated)
+{
+    struct wl_surface *new_wl_surface;
+    const char *reason;
+    BOOL needed;
+    VkResult res;
+
+    new_wl_surface = wayland_client_surface_prepare_demotion(client, hwnd, &reason, &needed);
+    if (!new_wl_surface)
+    {
+        client_surface_cancel_presentation_retirement(client);
+        return needed ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
+    }
+    if (client_surface_prepare_presentation_retirement(client))
+    {
+        wl_surface_destroy(new_wl_surface);
+        return VK_NOT_READY;
+    }
+    if (instance && (res = wayland_vulkan_create_host_surface(instance, new_wl_surface, host_surface)))
+    {
+        client_surface_complete_presentation_retirement(client);
+        wl_surface_destroy(new_wl_surface);
+        return res;
+    }
+    if (!wayland_client_surface_finish_demotion(client, hwnd, new_wl_surface, old_host_surface))
+    {
+        if (instance) instance->p_vkDestroySurfaceKHR(instance->host.instance, *host_surface, NULL);
+        client_surface_complete_presentation_retirement(client);
+        wl_surface_destroy(new_wl_surface);
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    client_surface_complete_presentation_retirement(client);
+    *updated = TRUE;
+    return VK_SUCCESS;
+}
+
+static VkResult wayland_vulkan_surface_update(HWND hwnd, const struct vulkan_instance *instance,
+                                              struct client_surface *client, VkSurfaceKHR old_host_surface,
+                                              VkSurfaceKHR *host_surface, BOOL *updated)
+{
+    struct wayland_client_surface *surface = CONTAINING_RECORD(client, struct wayland_client_surface, client);
+    struct wl_surface *toplevel_wl_surface;
+    const char *reason;
+    VkResult res;
+
+    *updated = FALSE;
+    if (surface->hwnd_dmabuf_producer)
+    {
+        client_surface_cancel_presentation_retirement(client);
+        return VK_SUCCESS;
+    }
+    if (ReadAcquire(&surface->direct_toplevel))
+        return wayland_vulkan_surface_demote(hwnd, instance, client, old_host_surface, host_surface, updated);
+
+    if (!(toplevel_wl_surface = wayland_client_surface_prepare_direct_promotion(client, hwnd, &reason)))
+    {
+        client_surface_cancel_presentation_retirement(client);
+        return VK_SUCCESS;
+    }
+    if (client_surface_prepare_presentation_retirement(client)) return VK_NOT_READY;
+    if ((res = wayland_vulkan_create_host_surface(instance, toplevel_wl_surface, host_surface)))
+    {
+        client_surface_complete_presentation_retirement(client);
+        return res;
+    }
+    if (!wayland_client_surface_finish_direct_promotion(client, hwnd, toplevel_wl_surface,
+                                                        old_host_surface, *host_surface, &reason))
+    {
+        instance->p_vkDestroySurfaceKHR(instance->host.instance, *host_surface, NULL);
+        *host_surface = VK_NULL_HANDLE;
+        client_surface_complete_presentation_retirement(client);
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    client_surface_complete_presentation_retirement(client);
+    *updated = TRUE;
+    return VK_SUCCESS;
+}
+
 static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
                                               VkSurfaceKHR *handle, struct client_surface **client)
 {
@@ -66,10 +160,23 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
     }
 
     set_client_surface(hwnd, surface);
+    wayland_client_surface_reactivate_direct_toplevel(&surface->client, hwnd, *handle);
     *client = &surface->client;
 
     TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);
     return VK_SUCCESS;
+}
+
+static void wayland_vulkan_surface_release(struct client_surface *client, VkSurfaceKHR host_surface)
+{
+    wayland_client_surface_release_vulkan_surface(client, host_surface);
+}
+
+static void wayland_vulkan_surface_set_alpha(VkCompositeAlphaFlagBitsKHR alpha_bits,
+                                             struct client_surface *client)
+{
+    /* Wayland does not support inherited alpha. */
+    wayland_client_surface_set_alpha(client, !(alpha_bits & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR));
 }
 
 static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_physical_device *physical_device,
@@ -164,6 +271,9 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = wayland_vulkan_surface_create,
+    .p_vulkan_surface_update = wayland_vulkan_surface_update,
+    .p_vulkan_surface_release = wayland_vulkan_surface_release,
+    .p_vulkan_surface_set_alpha = wayland_vulkan_surface_set_alpha,
     .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
     .p_map_instance_extensions = wayland_map_instance_extensions,

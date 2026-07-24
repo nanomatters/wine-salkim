@@ -90,6 +90,23 @@ err:
     return VK_ERROR_INCOMPATIBLE_DRIVER;
 }
 
+static VkResult macdrv_vulkan_surface_update( HWND hwnd, const struct vulkan_instance *instance,
+                                              struct client_surface *client, VkSurfaceKHR old_surface,
+                                              VkSurfaceKHR *host_surface, BOOL *updated )
+{
+    *updated = FALSE;
+    return VK_SUCCESS;
+}
+
+static void macdrv_vulkan_surface_release( struct client_surface *client, VkSurfaceKHR host_surface )
+{
+}
+
+static void macdrv_vulkan_surface_set_alpha(VkCompositeAlphaFlagBitsKHR alpha_bits,
+                                            struct client_surface *client)
+{
+}
+
 static VkBool32 macdrv_get_physical_device_presentation_support(struct vulkan_physical_device *physical_device,
         uint32_t index)
 {
@@ -121,6 +138,9 @@ static void macdrv_map_device_extensions(struct vulkan_device_extensions *extens
 static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = macdrv_vulkan_surface_create,
+    .p_vulkan_surface_update = macdrv_vulkan_surface_update,
+    .p_vulkan_surface_release = macdrv_vulkan_surface_release,
+    .p_vulkan_surface_set_alpha = macdrv_vulkan_surface_set_alpha,
     .p_get_physical_device_presentation_support = macdrv_get_physical_device_presentation_support,
     .p_map_instance_extensions = macdrv_map_instance_extensions,
     .p_map_device_extensions = macdrv_map_device_extensions,
