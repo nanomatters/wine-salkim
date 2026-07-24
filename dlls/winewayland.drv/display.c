@@ -263,7 +263,6 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
     free(modes);
 }
 
-/* The caller holds output_mutex while selecting a wl_output. */
 struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
 {
     struct wayland_output *output, *best = NULL;
@@ -273,6 +272,7 @@ struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
 
     if (!(target = NtUserMonitorFromRect(window_rect, 0))) return NULL;
 
+    pthread_mutex_lock(&process_wayland.output_mutex);
     wl_array_init(&infos);
     wl_list_for_each(output, &process_wayland.output_list, link)
     {
@@ -291,11 +291,13 @@ struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
         if (NtUserMonitorFromRect(&rect, 0) == target)
         {
             best = CONTAINING_RECORD(info->output, struct wayland_output, current);
+            wayland_output_add_ref(best);
             break;
         }
     }
 
     wl_array_release(&infos);
+    pthread_mutex_unlock(&process_wayland.output_mutex);
     return best;
 }
 

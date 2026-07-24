@@ -114,14 +114,21 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
  */
 static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
+    struct wayland_client_surface *stashed_client = data->stashed_client;
+    struct wayland_shm_buffer *window_contents = data->window_contents;
+
     TRACE("hwnd=%p\n", data->hwnd);
 
     rb_remove(&win_data_rb, &data->entry);
 
+    /* Keep direct-surface ownership changes serialized with Vulkan release.
+     * Release client references after unlocking to preserve lock ordering. */
+    if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
+
     pthread_mutex_unlock(&win_data_mutex);
 
-    if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
-    if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
+    if (stashed_client) client_surface_release(&stashed_client->client);
+    if (window_contents) wayland_shm_buffer_unref(window_contents);
     free(data);
 }
 
@@ -467,12 +474,15 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
 
     /* First do all state unsettings, before setting new state. Some
      * Wayland compositors misbehave if the order is reversed. */
-    if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+    /* Minimize preserves the current state for the eventual restore. */
+    if (!surface->window.minimized &&
+        !(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
         (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
     {
         xdg_toplevel_unset_maximized(surface->xdg_toplevel);
     }
-    if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+    if (!surface->window.minimized &&
+        !(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
         (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
     {
         xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
@@ -1507,8 +1517,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         if (wayland_surface_reconfigure(wayland_surface))
         {
             /* sync the alpha multiplier if it has changed due to SLWA/ULW */
-            if (!wayland_surface_has_external_commit_owner(wayland_surface) &&
-                data->alpha_multiplier != wayland_surface->alpha_multiplier)
+            if (data->alpha_multiplier != wayland_surface->alpha_multiplier)
             {
                 wayland_surface->alpha_multiplier = data->alpha_multiplier;
                 wayland_surface_sync_alpha(wayland_surface);

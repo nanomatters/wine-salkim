@@ -1788,7 +1788,6 @@ static void wayland_surface_init_fractional_scale(struct wayland_surface *surfac
 void wayland_surface_sync_alpha(struct wayland_surface *surface)
 {
     if (!process_wayland.wp_alpha_modifier_v1) return;
-    if (wayland_surface_has_external_commit_owner(surface)) return;
 
     if (surface->alpha_multiplier != UINT32_MAX)
     {
@@ -4798,7 +4797,7 @@ static void wayland_client_surface_detach(struct client_surface *client)
         if (data->wayland_surface && !wl_list_empty(&data->wayland_surface->child_overlays))
         {
             wayland_surface_clear_child_overlays(data->wayland_surface);
-            wl_surface_commit(data->wayland_surface->wl_surface);
+            wayland_surface_commit_pending_state(data->wayland_surface);
         }
         wayland_win_data_release(data);
     }
@@ -5196,6 +5195,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     client->direct_host_surface = new_host_surface;
     client->direct_wl_surface = toplevel_wl_surface;
     InterlockedExchange(&client->has_presented, FALSE);
+    wayland_client_surface_set_content_type(client);
     data->wayland_surface->direct_client = client;
     data->wayland_surface->carrier_attached = FALSE;
     if (data->window_contents &&

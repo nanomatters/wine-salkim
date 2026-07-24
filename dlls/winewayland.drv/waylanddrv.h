@@ -263,8 +263,8 @@ struct wayland_output
     struct zxdg_output_v1 *zxdg_output_v1;
     uint32_t global_id;
     unsigned int pending_flags;
-    struct wayland_output_state pending;
-    struct wayland_output_state current;
+    LONG ref;
+    struct wayland_output_state pending, current;
 };
 
 struct wayland_surface_config
@@ -471,8 +471,10 @@ BOOL wayland_process_init(void);
  *          Wayland output
  */
 
+void wayland_output_add_ref(struct wayland_output *output);
 BOOL wayland_output_create(uint32_t id, uint32_t version);
-void wayland_output_destroy(struct wayland_output *output);
+void wayland_output_release(struct wayland_output *output);
+void wayland_output_remove(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect);
 
@@ -600,6 +602,8 @@ struct wayland_win_data
     struct wayland_surface *wayland_surface;
     /* wayland client surface (if any) for this window */
     struct wayland_client_surface *client_surface;
+    /* client surface kept across VkSurfaceKHR recreation */
+    struct wayland_client_surface *stashed_client;
     /* window rects, relative to parent client area */
     struct window_rects rects;
     HWND toplevel;

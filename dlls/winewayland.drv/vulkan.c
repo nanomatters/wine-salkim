@@ -41,6 +41,44 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
+static struct wayland_client_surface *stash_client_surface(HWND hwnd,
+                                                           struct wayland_client_surface *surface)
+{
+    struct wayland_client_surface *ret = NULL;
+    struct wayland_win_data *data;
+    BOOL detach = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return NULL;
+
+    if (surface)
+    {
+        if ((ret = data->stashed_client) == surface)
+        {
+            wayland_win_data_release(data);
+            return ret;
+        }
+        client_surface_add_ref(&surface->client);
+        data->stashed_client = surface;
+    }
+    else if ((ret = data->stashed_client) && ReadAcquire(&ret->client.ref) == 1 &&
+             !ReadAcquire(&ret->client.busy_ref))
+    {
+        /* Transfer the stash's sole reference to the new VkSurface. */
+        data->stashed_client = NULL;
+        if (data->client_surface == ret) data->client_surface = NULL;
+        detach = TRUE;
+    }
+    else ret = NULL;
+
+    wayland_win_data_release(data);
+
+    /* Detaching may lock the previous toplevel's window data. */
+    if (detach) wayland_client_surface_attach(ret, NULL);
+    if (ret && surface) client_surface_release(&ret->client);
+
+    return ret;
+}
+
 static VkResult wayland_vulkan_create_host_surface(const struct vulkan_instance *instance,
                                                    struct wl_surface *wl_surface,
                                                    VkSurfaceKHR *host_surface)
@@ -144,7 +182,8 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
 
-    if (!(surface = wayland_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(surface = stash_client_surface(hwnd, NULL)) &&
+        !(surface = wayland_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     create_info_host.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
     create_info_host.pNext = NULL;
     create_info_host.flags = 0; /* reserved */
@@ -161,6 +200,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
 
     set_client_surface(hwnd, surface);
     wayland_client_surface_reactivate_direct_toplevel(&surface->client, hwnd, *handle);
+    stash_client_surface(hwnd, surface);
     *client = &surface->client;
 
     TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);

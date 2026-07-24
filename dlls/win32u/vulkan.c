@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -2851,7 +2852,7 @@ static VkResult win32u_vkSetLatencySleepModeNV(VkDevice device, VkSwapchainKHR s
     struct vulkan_device *vk_device = vulkan_device_from_handle(device);
     struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
 
-    if (!vk_swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!vk_swapchain || swapchain_is_out_of_date( vk_swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
     vk_device->low_latency_enabled = pSleepModeInfo->lowLatencyMode;
 
@@ -2873,12 +2874,30 @@ static VkResult win32u_vkLatencySleepNV(VkDevice device, VkSwapchainKHR swapchai
     VkLatencySleepInfoNV sleep_info_host = *pSleepInfo;
     struct vulkan_semaphore *semaphore;
 
-    if (!vk_swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
-
-    if (vk_swapchain->managed) return VK_SUCCESS;
-
     semaphore = sleep_info_host.signalSemaphore ? vulkan_semaphore_from_handle(sleep_info_host.signalSemaphore) : NULL;
     sleep_info_host.signalSemaphore = semaphore ? semaphore->host.semaphore : 0;
+
+    if (!vk_swapchain || swapchain_is_out_of_date( vk_swapchain ) || vk_swapchain->managed)
+    {
+        /* Wake the Reflex sleep immediately: callers wait on the semaphore
+         * without checking our result and would hang forever otherwise. */
+        if (semaphore)
+        {
+            VkSemaphoreSignalInfo signal_info =
+            {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+                .semaphore = semaphore->host.semaphore,
+                .value = sleep_info_host.value,
+            };
+            UINT64 counter = 0;
+
+            if (!vk_device->p_vkGetSemaphoreCounterValue( vk_device->host.device,
+                                                          semaphore->host.semaphore, &counter ) &&
+                counter < sleep_info_host.value)
+                vk_device->p_vkSignalSemaphore( vk_device->host.device, &signal_info );
+        }
+        return (vk_swapchain && vk_swapchain->managed) ? VK_SUCCESS : VK_ERROR_OUT_OF_DATE_KHR;
+    }
 
     return vk_device->p_vkLatencySleepNV(vk_device->host.device, vk_swapchain->obj.host.swapchain, &sleep_info_host);
 }
@@ -2889,7 +2908,7 @@ static void win32u_vkSetLatencyMarkerNV(VkDevice device, VkSwapchainKHR swapchai
     struct vulkan_device *vk_device = vulkan_device_from_handle(device);
     struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
 
-    if (!vk_swapchain) return;
+    if (!vk_swapchain || swapchain_is_out_of_date( vk_swapchain )) return;
 
     if (vk_swapchain->managed) return;
 
@@ -2902,13 +2921,7 @@ static void win32u_vkGetLatencyTimingsNV(VkDevice device, VkSwapchainKHR swapcha
     struct vulkan_device *vk_device = vulkan_device_from_handle(device);
     struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
 
-    if (!vk_swapchain)
-    {
-        pLatencyMarkerInfo->timingCount = 0;
-        return;
-    }
-
-    if (vk_swapchain->managed)
+    if (!vk_swapchain || swapchain_is_out_of_date( vk_swapchain ) || vk_swapchain->managed)
     {
         pLatencyMarkerInfo->timingCount = 0;
         return;
@@ -3375,6 +3388,15 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
 
     *out = NULL;
 
+    if (create_info->flags || create_info->pNext ||
+        create_info->imageArrayLayers != 1 ||
+        create_info->imageSharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+        create_info->minImageCount > WINE_VK_MANAGED_MAX_IMAGES)
+    {
+        TRACE( "unsupported managed swapchain contract, falling back to host WSI\n" );
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
     opaque_alpha = create_info->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     usage = create_info->imageUsage;
 
@@ -3396,10 +3418,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     managed->hwnd = surface->hwnd;
     managed->format = create_info->imageFormat;
     managed->fourcc = fourcc;
-    /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
-     * alpha. Otherwise leave alpha as straight. */
-    managed->alpha_mode = (fourcc == vk_format_to_drm_fourcc( create_info->imageFormat, TRUE ))
-                          ? HWND_DMABUF_ALPHA_MODE_IGNORE : HWND_DMABUF_ALPHA_MODE_UNSPECIFIED;
+    managed->alpha_mode = opaque_alpha ? HWND_DMABUF_ALPHA_MODE_IGNORE : HWND_DMABUF_ALPHA_MODE_UNSPECIFIED;
     managed->extents = create_info->imageExtent;
     managed->usage = usage;
     managed->next_release_token = 0;
@@ -3420,7 +3439,6 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
 
     /* At least 3 images for fire-and-forget publishing (no FIFO pacing). */
     count = max( create_info->minImageCount, 3u );
-    if (count > WINE_VK_MANAGED_MAX_IMAGES) count = WINE_VK_MANAGED_MAX_IMAGES;
 
     /* Pick the signal queue (first host queue) for empty acquire-signal submits. */
     if (device->queue_count) managed->signal_queue = device->queues;
@@ -3497,51 +3515,99 @@ static void managed_mark_lost( struct wine_managed_swapchain *managed );
 
 /* Find a free slot for AcquireNextImage. managed_present paces the ring so one is normally free. */
 static VkResult managed_acquire( struct vulkan_device *device, struct swapchain *swapchain,
-                                 VkSemaphore host_semaphore, VkFence host_fence, uint32_t *image_index )
+                                 uint64_t timeout, VkSemaphore host_semaphore, VkFence host_fence,
+                                 uint32_t *image_index )
 {
     struct wine_managed_swapchain *managed = swapchain->managed;
     struct surface *surface = swapchain->surface;
-    uint32_t i, slot = ~0u;
+    struct timespec ts;
+    uint64_t start_ns = 0;
+    uint32_t slot;
     RECT client_rect;
-    VkResult res = VK_SUCCESS;
+    VkResult res;
 
-    pthread_mutex_lock( &managed->lock );
-    managed_drain_releases( managed );
-    if (managed->lost)
+    if (timeout != UINT64_MAX)
     {
-        pthread_mutex_unlock( &managed->lock );
-        return VK_ERROR_OUT_OF_DATE_KHR;
+        clock_gettime( CLOCK_MONOTONIC, &ts );
+        start_ns = ts.tv_sec * 1000000000ull + ts.tv_nsec;
     }
-    for (i = 0; i < managed->image_count; i++)
+
+    for (;;)
     {
-        uint32_t idx = (managed->next_acquire + i) % managed->image_count;
-        struct wine_managed_image *image = &managed->images[idx];
-        if (image->valid && !image->acquired && !image->busy) { slot = idx; break; }
-    }
-    if (slot == ~0u)
-    {
-        /* Ring full: the consumer is not releasing. If it has made no progress for
-         * the stall window it is wedged (alive but not draining). Force recreate
-         * rather than spin on VK_NOT_READY forever. */
-        VkResult ret = VK_NOT_READY;
+        struct pollfd pfd = { .fd = -1, .events = POLLIN };
+        uint32_t i;
+        int poll_timeout = 50;
+
+        slot = ~0u;
+        pthread_mutex_lock( &managed->lock );
+        managed_drain_releases( managed );
+        if (managed->lost)
+        {
+            pthread_mutex_unlock( &managed->lock );
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
+        for (i = 0; i < managed->image_count; i++)
+        {
+            uint32_t idx = (managed->next_acquire + i) % managed->image_count;
+            struct wine_managed_image *image = &managed->images[idx];
+
+            if (image->valid && !image->acquired && !image->busy)
+            {
+                slot = idx;
+                break;
+            }
+        }
+        if (slot != ~0u)
+        {
+            managed->images[slot].acquired = TRUE;
+            managed->next_acquire = (slot + 1) % managed->image_count;
+            *image_index = slot;
+            pthread_mutex_unlock( &managed->lock );
+            break;
+        }
+
         if ((DWORD)(NtGetTickCount() - managed->last_progress_ms) >= WINE_VK_MANAGED_STALL_MS)
         {
             WARN( "managed dmabuf channel stalled, forcing recreate\n" );
             managed_mark_lost( managed );
-            ret = VK_ERROR_OUT_OF_DATE_KHR;
+            pthread_mutex_unlock( &managed->lock );
+            return VK_ERROR_OUT_OF_DATE_KHR;
         }
+        pfd.fd = managed->channel_fd;
         pthread_mutex_unlock( &managed->lock );
-        return ret;
+
+        if (!timeout) return VK_NOT_READY;
+        if (timeout != UINT64_MAX)
+        {
+            uint64_t elapsed_ns, remaining_ns;
+
+            clock_gettime( CLOCK_MONOTONIC, &ts );
+            elapsed_ns = ts.tv_sec * 1000000000ull + ts.tv_nsec - start_ns;
+            if (elapsed_ns >= timeout) return VK_TIMEOUT;
+
+            remaining_ns = timeout - elapsed_ns;
+            if (remaining_ns < poll_timeout * 1000000ull)
+                poll_timeout = remaining_ns / 1000000ull +
+                               (remaining_ns % 1000000ull != 0);
+        }
+
+        if (poll( &pfd, 1, poll_timeout ) < 0 && errno != EINTR)
+        {
+            pthread_mutex_lock( &managed->lock );
+            managed_mark_lost( managed );
+            pthread_mutex_unlock( &managed->lock );
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
     }
 
-    managed->images[slot].acquired = TRUE;
-    managed->next_acquire = (slot + 1) % managed->image_count;
-    *image_index = slot;
-    pthread_mutex_unlock( &managed->lock );
-
     res = managed_signal_acquire( device, managed, host_semaphore, host_fence );
-
-    if (res) return res;
+    if (res)
+    {
+        pthread_mutex_lock( &managed->lock );
+        managed->images[slot].acquired = FALSE;
+        pthread_mutex_unlock( &managed->lock );
+        return res;
+    }
 
     if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &managed->extents, &client_rect ))
@@ -4069,7 +4135,8 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     surface = swapchain->surface;
 
     if (swapchain->managed)
-        return managed_acquire( device, swapchain, semaphore ? semaphore->host.semaphore : 0,
+        return managed_acquire( device, swapchain, acquire_info->timeout,
+                                semaphore ? semaphore->host.semaphore : 0,
                                 fence ? fence->host.fence : 0, image_index );
 
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
@@ -4110,7 +4177,8 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     surface = swapchain->surface;
 
     if (swapchain->managed)
-        return managed_acquire( device, swapchain, semaphore ? semaphore->host.semaphore : 0,
+        return managed_acquire( device, swapchain, timeout,
+                                semaphore ? semaphore->host.semaphore : 0,
                                 fence ? fence->host.fence : 0, image_index );
 
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
@@ -4355,7 +4423,7 @@ static VkResult win32u_vkReleaseSwapchainImagesEXT( VkDevice client_device,
     struct swapchain *swapchain = swapchain_from_handle( release_info->swapchain );
     VkReleaseSwapchainImagesInfoKHR release_info_host = *release_info;
 
-    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
     if (swapchain->managed) return managed_release_swapchain_images( swapchain, release_info );
 
@@ -4388,7 +4456,7 @@ static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapcha
     for (uint32_t i = 0; i < swapchain_count; i++)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
-        if (!swapchain) continue;
+        if (!swapchain || swapchain_is_out_of_date( swapchain )) continue;
         if (swapchain->managed) continue;
         host_swapchains[host_count] = swapchain->obj.host.swapchain;
         host_metadata[host_count] = metadata[i];
@@ -4733,6 +4801,46 @@ static VkResult repack_present_pnext( struct mempool *pool, VkPresentInfoKHR *ho
                     return VK_ERROR_OUT_OF_HOST_MEMORY;
                 dst->pPresentModes = modes;
                 for (i = 0; i < host_count; i++) modes[i] = src->pPresentModes[host_indices[i]];
+            }
+            append_present_pnext( &tail, dst );
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR:
+        {
+            const VkPresentId2KHR *src = (const VkPresentId2KHR *)header;
+            VkPresentId2KHR *dst;
+
+            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            *dst = *src;
+            dst->swapchainCount = host_count;
+            if (src->pPresentIds)
+            {
+                uint64_t *ids;
+
+                if (!(ids = mem_alloc( pool, host_count * sizeof(*ids) )))
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                dst->pPresentIds = ids;
+                for (i = 0; i < host_count; i++) ids[i] = src->pPresentIds[host_indices[i]];
+            }
+            append_present_pnext( &tail, dst );
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT:
+        {
+            const VkPresentTimingsInfoEXT *src = (const VkPresentTimingsInfoEXT *)header;
+            VkPresentTimingsInfoEXT *dst;
+
+            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            *dst = *src;
+            dst->swapchainCount = host_count;
+            if (src->pTimingInfos)
+            {
+                VkPresentTimingInfoEXT *timings;
+
+                if (!(timings = mem_alloc( pool, host_count * sizeof(*timings) )))
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                dst->pTimingInfos = timings;
+                for (i = 0; i < host_count; i++) timings[i] = src->pTimingInfos[host_indices[i]];
             }
             append_present_pnext( &tail, dst );
             break;
@@ -5341,7 +5449,9 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
         }
     }
 
+    vulkan_queue_lock( queue );
     res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+    vulkan_queue_unlock( queue );
 
 failed:
     mem_free( &pool );
@@ -5404,7 +5514,9 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
         }
     }
 
+    vulkan_queue_lock( queue );
     res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+    vulkan_queue_unlock( queue );
 
 failed:
     mem_free( &pool );
