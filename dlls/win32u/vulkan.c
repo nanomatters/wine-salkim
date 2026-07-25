@@ -2626,9 +2626,17 @@ static VkFormat srgb_to_unorm(VkFormat format)
     }
 }
 
-static BOOL is_srgb(VkFormat format)
+static VkFormat unorm_to_srgb(VkFormat format)
 {
-    return format != srgb_to_unorm(format);
+    switch (format)
+    {
+        case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+        case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+        case VK_FORMAT_R8G8B8_UNORM: return VK_FORMAT_R8G8B8_SRGB;
+        case VK_FORMAT_B8G8R8_UNORM: return VK_FORMAT_B8G8R8_SRGB;
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+        default: return format;
+    }
 }
 
 static VkResult init_compute_state( struct vulkan_device *device, struct swapchain *swapchain )
@@ -2919,6 +2927,9 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
 {
     struct vulkan_physical_device *physical_device = device->physical_device;
     struct vulkan_instance *instance = physical_device->instance;
+    VkFormat user_view_format = swapchain->upscaler.is_fsr
+                                ? srgb_to_unorm( createinfo->imageFormat )
+                                : unorm_to_srgb( createinfo->imageFormat );
     VkResult res;
     VkImage *real_images = NULL;
     VkDeviceSize userMemTotal = 0, offs;
@@ -2977,12 +2988,9 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
         imageInfo.queueFamilyIndexCount = createinfo->queueFamilyIndexCount;
         imageInfo.pQueueFamilyIndices = createinfo->pQueueFamilyIndices;
 
-        if (is_srgb(createinfo->imageFormat))
-            imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-
         if (createinfo->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
             imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        else if (createinfo->imageFormat != VK_FORMAT_B8G8R8A8_SRGB)
+        if (user_view_format != createinfo->imageFormat)
             imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
         if ((res = device->p_vkCreateImage( device->host.device, &imageInfo, NULL, &hack->user_image )))
@@ -3055,7 +3063,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = swapchain->fs_hack_images[i].user_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = swapchain->upscaler.is_fsr ? srgb_to_unorm(createinfo->imageFormat) : VK_FORMAT_B8G8R8A8_SRGB;
+        viewInfo.format = user_view_format;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -4245,9 +4253,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; /* XXX: check if supported by surface */
         }
 
-        if (create_info->imageFormat != VK_FORMAT_B8G8R8A8_UNORM && create_info->imageFormat != VK_FORMAT_B8G8R8A8_SRGB)
-            FIXME( "swapchain image format is not BGRA8 UNORM/SRGB. Things may go badly. %d\n",
-                   create_info_host.imageFormat );
+        if (unorm_to_srgb( create_info->imageFormat ) == create_info->imageFormat &&
+            srgb_to_unorm( create_info->imageFormat ) == create_info->imageFormat)
+            FIXME( "Swapchain image format %d has no UNORM/SRGB format pair; colors may be incorrect.\n",
+                   create_info->imageFormat );
     }
 
     /* check if the new colorspace works with the provided format */
