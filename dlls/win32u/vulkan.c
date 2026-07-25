@@ -5001,9 +5001,9 @@ static VkResult record_fsr_cmd(struct vulkan_device *device, struct swapchain *s
     /* transition fsr image from whatever to GENERAL */
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[1].image = hack->swapchain_image;
+    barriers[1].image = hack->fsr_image;
     barriers[1].srcAccessMask = 0;
-    barriers[1].dstAccessMask = 0;
+    barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 
     device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, barriers );
@@ -5054,13 +5054,13 @@ static VkResult record_fsr_cmd(struct vulkan_device *device, struct swapchain *s
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     barriers[0].image = hack->user_image;
-    barriers[0].srcAccessMask = 0;
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barriers[0].dstAccessMask = 0;
 
     /* transition fsr image from GENERAL to SHADER_READ */
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barriers[1].image = hack->swapchain_image;
+    barriers[1].image = hack->fsr_image;
     barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -5069,10 +5069,10 @@ static VkResult record_fsr_cmd(struct vulkan_device *device, struct swapchain *s
     barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barriers[2].image = hack->swapchain_image;
     barriers[2].srcAccessMask = 0;
-    barriers[2].dstAccessMask = 0;
+    barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 
     device->p_vkCmdPipelineBarrier(hack->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 3, barriers);
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 3, barriers);
 
     /* 2nd pass (rcas) */
 
@@ -5092,7 +5092,7 @@ static VkResult record_fsr_cmd(struct vulkan_device *device, struct swapchain *s
 
     /* transition swapchain image from GENERAL to PRESENT_SRC */
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     barriers[0].image = hack->swapchain_image;
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barriers[0].dstAccessMask = 0;
