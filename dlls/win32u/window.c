@@ -2585,7 +2585,14 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         else
         {
             MONITORINFO monitor_info = monitor_info_from_rect( new_rects->window, dpi );
-            if (is_fullscreen( &monitor_info, &new_rects->visible )) swp_flags |= WINE_SWP_FULLSCREEN;
+            BOOL client_fullscreen = is_fullscreen( &monitor_info, &new_rects->client );
+            BOOL visible_fullscreen = is_fullscreen( &monitor_info, &new_rects->visible );
+
+            /* A framed borderless window may place its non-client frame
+             * outside the monitor while keeping the client area fullscreen. */
+            if (client_fullscreen ||
+                (visible_fullscreen && !window_has_frame_style( win->dwStyle )))
+                swp_flags |= WINE_SWP_FULLSCREEN;
             if (is_fullscreen( &monitor_info, &new_rects->window )) swp_flags &= ~WINE_SWP_RESIZABLE;
             monitor_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
         }
