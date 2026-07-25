@@ -572,9 +572,12 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
 
         surface->comitted.minimized = surface->window.minimized;
 
-        /* reset the size hint since we don't want to poison the next configure event with it */
+        /* Reset the size hint since we don't want to poison the next configure
+         * event with it, and invalidate the cache so fixed-size windows can
+         * restore their limits on the next geometry update. */
         xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
         xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+        memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
     }
     else
     {
