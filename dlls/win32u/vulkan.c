@@ -257,6 +257,13 @@ struct fs_comp_pipeline
     uint32_t push_size;
 };
 
+struct fs_hack_config
+{
+    BOOL enabled;
+    UINT dpi;
+    RECT dst;
+};
+
 static const char *debugstr_vkextent2d( const VkExtent2D *ext )
 {
     if (!ext) return "(null)";
@@ -344,7 +351,7 @@ struct swapchain
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
 
     /* fs hack data below */
-    UINT fshack_dpi;
+    struct fs_hack_config fshack;
     VkExtent2D host_extents;
     VkCommandPool *cmd_pools; /* VkCommandPool[device->queue_count] */
     VkDeviceMemory user_image_memory, fsr_image_memory;
@@ -3166,10 +3173,60 @@ static void win32u_vkGetLatencyTimingsNV(VkDevice device, VkSwapchainKHR swapcha
     vk_device->p_vkGetLatencyTimingsNV(vk_device->host.device, vk_swapchain->obj.host.swapchain, pLatencyMarkerInfo);
 }
 
-static BOOL surface_get_fshack_dpi( struct surface *surface )
+static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D *client_extents,
+                                       VkExtent2D *host_extents, struct fs_hack_config *config )
 {
-    UINT dpi = NtUserGetDpiForWindow( surface->hwnd ), raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
-    return fshack_enabled && dpi != raw ? raw : 0;
+    RECT host_rect;
+    UINT dpi, raw;
+
+    memset( config, 0, sizeof(*config) );
+
+    /* A direct client must compose into the borrowed root when its content
+     * does not cover that surface exactly, regardless of legacy FSHack policy. */
+    if (surface->client->funcs->get_presentation_rects &&
+        surface->client->funcs->get_presentation_rects( surface->client, &host_rect, &config->dst ))
+    {
+        host_extents->width = host_rect.right - host_rect.left;
+        host_extents->height = host_rect.bottom - host_rect.top;
+
+        if (extents_equals( client_extents, &config->dst ) &&
+            config->dst.left == 0 && config->dst.top == 0 &&
+            config->dst.right == (LONG)host_extents->width &&
+            config->dst.bottom == (LONG)host_extents->height)
+        {
+            memset( config, 0, sizeof(*config) );
+            return FALSE;
+        }
+
+        config->enabled = TRUE;
+        return TRUE;
+    }
+
+    dpi = NtUserGetDpiForWindow( surface->hwnd );
+    raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
+    if (!fshack_enabled || !raw || dpi == raw) return FALSE;
+
+    if (!get_surface_rect( surface->hwnd, &host_rect, raw )) return FALSE;
+    host_extents->width = host_rect.right - host_rect.left;
+    host_extents->height = host_rect.bottom - host_rect.top;
+    SetRect( &config->dst, 0, 0, host_extents->width, host_extents->height );
+    config->enabled = TRUE;
+    config->dpi = raw;
+    return TRUE;
+}
+
+static BOOL swapchain_fshack_config_changed( struct swapchain *swapchain )
+{
+    VkExtent2D host_extents = swapchain->host_extents;
+    struct fs_hack_config config;
+    BOOL enabled = surface_get_fshack_config( swapchain->surface, &swapchain->extents,
+                                              &host_extents, &config );
+
+    return enabled != swapchain->fshack.enabled ||
+           (enabled && (config.dpi != swapchain->fshack.dpi ||
+                        host_extents.width != swapchain->host_extents.width ||
+                        host_extents.height != swapchain->host_extents.height ||
+                        !EqualRect( &config.dst, &swapchain->fshack.dst )));
 }
 
 /* Cross-process producer helpers. */
@@ -4059,6 +4116,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     RECT client_rect;
     VkResult res;
     BOOL topology_updated = FALSE;
+    BOOL use_fshack;
     BOOL lite;
     float sharpness;
 
@@ -4155,16 +4213,27 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
-    if ((swapchain->fshack_dpi = surface_get_fshack_dpi( surface )))
+    swapchain->host_extents = capabilities.minImageExtent;
+    use_fshack = surface_get_fshack_config( surface, &create_info->imageExtent,
+                                            &swapchain->host_extents, &swapchain->fshack );
+    if (use_fshack)
     {
+        BOOL full_host = swapchain->fshack.dst.left == 0 && swapchain->fshack.dst.top == 0 &&
+                         swapchain->fshack.dst.right == (LONG)swapchain->host_extents.width &&
+                         swapchain->fshack.dst.bottom == (LONG)swapchain->host_extents.height;
+
         if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
 
         swapchain->upscaler.is_fsr = fs_hack_is_fsr(&lite, &sharpness);
+        if (swapchain->upscaler.is_fsr && !full_host)
+        {
+            WARN( "FSR cannot compose an offset fullscreen destination, using the blit scaler\n" );
+            swapchain->upscaler.is_fsr = FALSE;
+        }
         swapchain->upscaler.fsr.lite = lite;
         swapchain->upscaler.fsr.sharpness = sharpness;
-        swapchain->host_extents = capabilities.minImageExtent;
-        create_info_host.imageExtent = capabilities.minImageExtent;
+        create_info_host.imageExtent = swapchain->host_extents;
         create_info_host.imageFormat = swapchain->upscaler.is_fsr ? VK_FORMAT_B8G8R8A8_SRGB: VK_FORMAT_B8G8R8A8_UNORM;
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
 
@@ -4300,7 +4369,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     swapchain->host_surface->swapchain_count++;
     pthread_mutex_unlock( &surface->host_lock );
 
-    if (swapchain->fshack_dpi)
+    if (swapchain->fshack.enabled)
     {
         if ((res = init_fs_hack_images( device, swapchain, create_info )))
         {
@@ -4316,8 +4385,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             return res;
         }
 
-        WARN( "Enabled fullscreen hack on swapchain %p, scaling from %s -> %s\n", swapchain,
-              debugstr_vkextent2d(&swapchain->extents), debugstr_vkextent2d(&swapchain->host_extents) );
+        WARN( "Enabled fullscreen hack on swapchain %p, scaling from %s to %s in %s\n", swapchain,
+              debugstr_vkextent2d(&swapchain->extents), wine_dbgstr_rect(&swapchain->fshack.dst),
+              debugstr_vkextent2d(&swapchain->host_extents) );
     }
 
     set_window_pixel_format( surface->hwnd, -1, TRUE );
@@ -4337,7 +4407,7 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
 
-    if (swapchain->fshack_dpi && !swapchain->managed)
+    if (swapchain->fshack.enabled && !swapchain->managed)
     {
         for (uint32_t i = 0; i < swapchain->n_images; ++i)
         {
@@ -4419,13 +4489,14 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.fence = fence ? fence->host.fence : 0;
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
 
-    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    if (!res && swapchain_fshack_config_changed( swapchain ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
     }
 
-    if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+    if (!res && !swapchain->fshack.enabled &&
+        get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
@@ -4459,13 +4530,14 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
 
-    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    if (!res && swapchain_fshack_config_changed( swapchain ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
     }
 
-    if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+    if (!res && !swapchain->fshack.enabled &&
+        get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
@@ -4559,7 +4631,7 @@ static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapch
         return n < managed->image_count ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    if (images && swapchain->fshack_dpi)
+    if (images && swapchain->fshack.enabled)
     {
         if (*count > swapchain->n_images) *count = swapchain->n_images;
         for (i = 0; i < *count; ++i) images[i] = swapchain->fs_hack_images[i].user_image;
@@ -4841,17 +4913,19 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                     0, 0, NULL, 0, NULL, 2, barriers );
 
-    /* vec2: blit dst offset in real coords */
-    constants[0] = 0;
-    constants[1] = 0;
+    /* vec2: blit destination offset in host-image coordinates */
+    constants[0] = swapchain->fshack.dst.left;
+    constants[1] = swapchain->fshack.dst.top;
 
     /* offset by 0.5f because sampling is relative to pixel center */
-    constants[0] -= 0.5f * swapchain->host_extents.width / swapchain->extents.width;
-    constants[1] -= 0.5f * swapchain->host_extents.height / swapchain->extents.height;
+    constants[0] -= 0.5f * (swapchain->fshack.dst.right - swapchain->fshack.dst.left) /
+                    swapchain->extents.width;
+    constants[1] -= 0.5f * (swapchain->fshack.dst.bottom - swapchain->fshack.dst.top) /
+                    swapchain->extents.height;
 
-    /* vec2: blit dst extents in real coords */
-    constants[2] = swapchain->host_extents.width;
-    constants[3] = swapchain->host_extents.height;
+    /* vec2: blit destination extents in host-image coordinates */
+    constants[2] = swapchain->fshack.dst.right - swapchain->fshack.dst.left;
+    constants[3] = swapchain->fshack.dst.bottom - swapchain->fshack.dst.top;
     bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, constants);
 
     /* local sizes in shader are 8 */
@@ -5334,7 +5408,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             continue;
         }
         if (swapchain->managed) continue;
-        if (!swapchain->fshack_dpi) continue;
+        if (!swapchain->fshack.enabled) continue;
         hack = &swapchain->fs_hack_images[present_info->pImageIndices[i]];
         blit_sema = hack->blit_finished;
 
@@ -5577,7 +5651,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
         else if (swapchain_res)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
-        else if (!extents_equals( &swapchain->extents, &client_rect ))
+        else if (!swapchain->fshack.enabled && !extents_equals( &swapchain->extents, &client_rect ))
         {
             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );

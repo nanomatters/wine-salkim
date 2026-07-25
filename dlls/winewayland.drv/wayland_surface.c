@@ -4991,6 +4991,32 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
     ensure_window_surface_contents(toplevel);
 }
 
+static BOOL wayland_client_surface_get_presentation_rects(struct client_surface *client,
+                                                          RECT *host, RECT *dst)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_surface *toplevel_surface;
+    struct wayland_win_data *data;
+    BOOL ret = FALSE;
+
+    if (!ReadAcquire(&surface->direct_toplevel)) return FALSE;
+    if (!(data = wayland_win_data_get(client->hwnd))) return FALSE;
+
+    if ((toplevel_surface = data->wayland_surface) &&
+        toplevel_surface->direct_client == surface &&
+        surface->direct_wl_surface == toplevel_surface->wl_surface)
+    {
+        *host = toplevel_surface->window.rect;
+        *dst = toplevel_surface->window.client_rect;
+        OffsetRect(dst, -host->left, -host->top);
+        OffsetRect(host, -host->left, -host->top);
+        ret = !IsRectEmpty(host) && !IsRectEmpty(dst);
+    }
+
+    wayland_win_data_release(data);
+    return ret;
+}
+
 void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
@@ -5036,6 +5062,7 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
     .detach = wayland_client_surface_detach,
     .update = wayland_client_surface_update,
     .present = wayland_client_surface_present,
+    .get_presentation_rects = wayland_client_surface_get_presentation_rects,
 };
 
 static void wayland_client_surface_set_content_type(struct wayland_client_surface *client)

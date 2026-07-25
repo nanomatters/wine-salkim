@@ -256,6 +256,8 @@ struct client_surface_funcs
     void (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
     void (*present)( struct client_surface *surface, HDC hdc );
+    /* return the externally-owned presentation surface and content rectangles */
+    BOOL (*get_presentation_rects)( struct client_surface *surface, RECT *host, RECT *dst );
 };
 
 struct client_surface

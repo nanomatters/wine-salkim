@@ -180,18 +180,6 @@ static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
     data->state_update_foreground = NULL;
 }
 
-static BOOL wayland_win_data_is_fullscreen(struct wayland_win_data *data, DWORD style)
-{
-    RECT rect;
-
-    if (!data->is_fullscreen) return FALSE;
-    if (!(style & WS_POPUP) &&
-        (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
-        return FALSE;
-    if (NtUserGetPresentRect(data->hwnd, &rect, -1)) return TRUE;
-    return !(style & (WS_CAPTION | WS_THICKFRAME));
-}
-
 static BOOL wayland_win_data_get_pending_config_state(struct wayland_win_data *data,
                                                       enum wayland_surface_config_state *state)
 {
@@ -221,6 +209,15 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
     exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
 
+    /* A framed borderless window is fullscreen because its client area covers
+     * the monitor. Keep its non-client extents out of the Wayland geometry. */
+    if (data->is_fullscreen && (style & (WS_CAPTION | WS_THICKFRAME)))
+    {
+        conf->rect = data->rects.client;
+        conf->window_rect = data->rects.client;
+        conf->client_rect = data->rects.client;
+    }
+
     TRACE("window=%s style=%#x exstyle=%#x\n", wine_dbgstr_rect(&conf->rect), style, exstyle);
 
     conf->minimized = FALSE;
@@ -232,7 +229,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     /* The fullscreen state is implied by the window position and style. A
      * compositor may leave fullscreen while the window is minimized, but that
      * configure must not replace the state requested when the window restores. */
-    else if (wayland_win_data_is_fullscreen(data, style))
+    else if (data->is_fullscreen)
     {
         if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
             window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
@@ -434,7 +431,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     surface->ensured_contents = WAYLAND_SURFACE_NOT_ENSURED;
 
-    if (!EqualRect(&data->rects.visible, &data->rects.window)
+    if (!data->is_fullscreen &&
+        !EqualRect(&data->rects.visible, &data->rects.window)
         && is_decoration_enabled(style, exstyle))
     {
         server_decor = TRUE;
