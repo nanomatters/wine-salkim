@@ -12,6 +12,11 @@
 #define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
 #define HWND_DMABUF_ALPHA_MODE_IGNORE          3
 
+#define HWND_DMABUF_SYNC_NONE                  0
+#define HWND_DMABUF_SYNC_FILE                  1
+
+#define HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC     0x00000001
+
 /* DRM fourcc values carried in hwnd_dmabuf_frame_desc_t.fourcc when
  * HWND_DMABUF_FLAG_SHM is set. Consumers translate them to native shm
  * protocol formats where needed. */
@@ -37,6 +42,7 @@ typedef struct
 typedef struct
 {
     unsigned int     format_modifier_count;
+    unsigned int     flags;
 } hwnd_dmabuf_host_caps_t;
 
 #define HWND_DMABUF_TRANCHE_FLAG_SCANOUT       0x1

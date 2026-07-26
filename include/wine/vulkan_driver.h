@@ -203,6 +203,9 @@ struct vulkan_queue
     struct vulkan_device *device;
     VkDeviceQueueInfo2 info;
     pthread_mutex_t mutex; /* serializes host access with Wine-injected queue work */
+    VkSemaphore managed_present_semaphore;
+    VkSemaphore managed_host_semaphore;
+    BOOL managed_present_sync_unavailable;
 };
 
 static inline struct vulkan_queue *vulkan_queue_from_handle( VkQueue handle )

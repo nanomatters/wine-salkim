@@ -3325,8 +3325,9 @@ NTSTATUS WINAPI wow64_NtUserHwndDmaBufPublish( UINT *args )
     int channel_fd = get_ulong( &args );
     const void *desc = get_ptr( &args );
     int dmabuf_fd = get_ulong( &args );
+    int sync_fd = get_ulong( &args );
 
-    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd );
+    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd, sync_fd );
 }
 
 NTSTATUS WINAPI wow64_NtUserInitializeClientPfnArrays( UINT *args )

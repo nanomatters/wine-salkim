@@ -375,6 +375,7 @@ struct wined3d_gl_info
     struct wined3d_fbo_ops fbo_ops;
 
     PFN_wglWineCloseDmaBufWINE p_wglWineCloseDmaBufWINE;
+    PFN_wglWineExportSyncFdWINE p_wglWineExportSyncFdWINE;
     PFN_wglWineDmaBufExportSupportedWINE p_wglWineDmaBufExportSupportedWINE;
     PFN_wglWineExportDmaBufWINE p_wglWineExportDmaBufWINE;
     PFN_wglWineHwndDmaBufOpenProducerWINE p_wglWineHwndDmaBufOpenProducerWINE;
@@ -1190,11 +1191,13 @@ struct wined3d_gl_hwnd_dmabuf_ring
     HWND channel_hwnd;
     int channel_fd;
     bool hwnd_has_caps;
+    bool explicit_sync;
     uint64_t producer_unique_id;
     bool logged_implicit_modifier;
     bool logged_opaque_fourcc;
     bool logged_unsupported_modifier;
     PFN_wglWineCloseDmaBufWINE p_wglWineCloseDmaBufWINE;
+    PFN_wglWineExportSyncFdWINE p_wglWineExportSyncFdWINE;
     PFN_wglWineHwndDmaBufGetCapsWINE p_wglWineHwndDmaBufGetCapsWINE;
     PFN_wglWineHwndDmaBufCloseProducerWINE p_wglWineHwndDmaBufCloseProducerWINE;
     PFN_wglWineHwndDmaBufPublishWINE p_wglWineHwndDmaBufPublishWINE;

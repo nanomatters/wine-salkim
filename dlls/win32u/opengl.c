@@ -4001,6 +4001,7 @@ static void display_funcs_init(void)
     display_funcs.p_wglSetPixelFormat = win32u_wglSetPixelFormat;
     display_funcs.p_wglWineDmaBufExportSupportedWINE = driver_funcs->p_get_proc_address( "wglWineDmaBufExportSupportedWINE" );
     display_funcs.p_wglWineExportDmaBufWINE = driver_funcs->p_get_proc_address( "wglWineExportDmaBufWINE" );
+    display_funcs.p_wglWineExportSyncFdWINE = driver_funcs->p_get_proc_address( "wglWineExportSyncFdWINE" );
 
     display_funcs.p_wglCreateContext = (void *)1; /* never called */
     display_funcs.p_wglDeleteContext = (void *)1; /* never called */

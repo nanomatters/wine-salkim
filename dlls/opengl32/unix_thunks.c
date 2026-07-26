@@ -30828,6 +30828,17 @@ static NTSTATUS ext_wglWineExportDmaBufWINE( void *args )
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS ext_wglWineExportSyncFdWINE( void *args )
+{
+    struct wglWineExportSyncFdWINE_params *params = args;
+    TEB *teb = params->teb;
+    const struct opengl_funcs *funcs = teb->glTable;
+
+    if (!funcs || !funcs->p_wglWineExportSyncFdWINE) return STATUS_NOT_IMPLEMENTED;
+    params->ret = funcs->p_wglWineExportSyncFdWINE();
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     process_attach,
@@ -33943,6 +33954,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     ext_wglWineCloseDmaBufWINE,
     ext_wglWineDmaBufExportSupportedWINE,
     ext_wglWineExportDmaBufWINE,
+    ext_wglWineExportSyncFdWINE,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -87590,6 +87602,21 @@ static NTSTATUS wow64_ext_wglWineExportDmaBufWINE( void *args )
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS wow64_ext_wglWineExportSyncFdWINE( void *args )
+{
+    struct
+    {
+        PTR32 teb;
+        int ret;
+    } *params = args;
+    TEB *teb = get_teb64( params->teb );
+    const struct opengl_funcs *funcs = teb->glTable;
+
+    if (!funcs || !funcs->p_wglWineExportSyncFdWINE) return STATUS_NOT_IMPLEMENTED;
+    params->ret = funcs->p_wglWineExportSyncFdWINE();
+    return STATUS_SUCCESS;
+}
+
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
@@ -90706,6 +90733,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_ext_wglWineCloseDmaBufWINE,
     wow64_ext_wglWineDmaBufExportSupportedWINE,
     wow64_ext_wglWineExportDmaBufWINE,
+    wow64_ext_wglWineExportSyncFdWINE,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

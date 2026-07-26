@@ -5070,6 +5070,7 @@ static BOOL wined3d_adapter_gl_init(struct wined3d_adapter_gl *adapter_gl,
         gl_info->p_wglWineCloseDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineCloseDmaBufWINE");
         gl_info->p_wglWineDmaBufExportSupportedWINE = (void *)GetProcAddress(mod_gl, "wglWineDmaBufExportSupportedWINE");
         gl_info->p_wglWineExportDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineExportDmaBufWINE");
+        gl_info->p_wglWineExportSyncFdWINE = (void *)GetProcAddress(mod_gl, "wglWineExportSyncFdWINE");
         gl_info->p_wglWineHwndDmaBufOpenProducerWINE =
                 (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufOpenProducerWINE");
         gl_info->p_wglWineHwndDmaBufGetCapsWINE =
