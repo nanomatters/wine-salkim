@@ -2752,12 +2752,33 @@ static BOOL wayland_surface_client_fills_window(struct wayland_surface *surface)
     return EqualRect(&surface->window.window_rect, &surface->window.client_rect);
 }
 
+static BOOL wayland_surface_client_covers_presentation(struct wayland_surface *surface)
+{
+    /* Keep letterbox and pillarbox areas on the parent carrier. */
+    return EqualRect(&surface->window.rect, &surface->window.client_rect);
+}
+
+BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
+                                                struct wayland_client_surface *client)
+{
+    if (!surface || !client || ReadAcquire(&client->direct_toplevel)) return FALSE;
+    if (client->client.hwnd != surface->hwnd || surface->window.minimized) return FALSE;
+    if (surface->shaped || ReadAcquire(&client->has_alpha)) return FALSE;
+    return wayland_surface_is_toplevel(surface) &&
+           wayland_surface_client_fills_window(surface) &&
+           !wayland_surface_client_covers_presentation(surface);
+}
+
 static BOOL wayland_client_surface_should_stack_above_parent(struct wayland_surface *surface,
                                                              struct wayland_client_surface *client,
                                                              HWND hwnd, HWND toplevel,
                                                              BOOL has_window_contents,
                                                              DWORD exstyle)
 {
+    if (ReadAcquire(&client->has_presented) &&
+        wayland_client_surface_scales_presentation(surface, client))
+        return TRUE;
+
     /* A single opaque client surface covering the whole toplevel can sit above
      * an opaque parent carrier without using transparent punch-through. */
     if (hwnd != toplevel) return FALSE;
@@ -4991,6 +5012,27 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
     return ret;
 }
 
+static BOOL wayland_client_surface_is_presentation_scaled(struct client_surface *client)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_surface *toplevel_surface;
+    struct wayland_win_data *data;
+    BOOL ret = FALSE;
+
+    /* Direct-toplevel eligibility requires the client to cover the
+     * presentation surface, so only the child path can scale here. */
+    if (ReadAcquire(&surface->direct_toplevel)) return FALSE;
+    if (!(data = wayland_win_data_get(client->hwnd))) return FALSE;
+
+    if ((toplevel_surface = data->wayland_surface) &&
+        data->client_surface == surface &&
+        wayland_client_surface_scales_presentation(toplevel_surface, surface))
+        ret = TRUE;
+
+    wayland_win_data_release(data);
+    return ret;
+}
+
 void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
@@ -5035,6 +5077,7 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
     .update = wayland_client_surface_update,
     .present = wayland_client_surface_present,
     .get_presentation_rects = wayland_client_surface_get_presentation_rects,
+    .is_presentation_scaled = wayland_client_surface_is_presentation_scaled,
 };
 
 static void wayland_client_surface_set_content_type(struct wayland_client_surface *client)
@@ -5123,6 +5166,8 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     if (surface->shaped) return "the window is shaped";
     if (!wayland_surface_client_fills_window(surface))
         return "the client does not fill the toplevel";
+    if (!wayland_surface_client_covers_presentation(surface))
+        return "the client does not cover the presentation surface";
     return NULL;
 }
 
@@ -5150,6 +5195,9 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (!toplevel->window.minimized &&
              !wayland_surface_client_fills_window(toplevel))
         failure = "the client does not fill the toplevel";
+    else if (!toplevel->window.minimized &&
+             !wayland_surface_client_covers_presentation(toplevel))
+        failure = "the client does not cover the presentation surface";
 
     wayland_win_data_release(data);
     return failure;
@@ -5528,7 +5576,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     HWND hwnd = client->client.hwnd;
     RECT client_rect, dst;
     struct wayland_child_visibility_info visibility;
-    BOOL opaque, stack_above_parent;
+    BOOL opaque, presentation_scaled, stack_above_parent;
 
     if (ReadAcquire(&client->direct_toplevel))
     {
@@ -5557,7 +5605,13 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
             surface = toplevel_data->wayland_surface;
             if (surface && surface->direct_client != client &&
                 surface->carrier_attached && surface->carrier_opaque)
-                wayland_surface_attach_transparent_carrier(surface);
+            {
+                if (toplevel_data->window_contents)
+                    wayland_surface_restore_gdi_shm_overlay(surface,
+                                                            toplevel_data->window_contents);
+                else
+                    wayland_surface_attach_transparent_carrier(surface);
+            }
             wayland_win_data_release(toplevel_data);
         }
         return;
@@ -5599,6 +5653,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     stack_above_parent = wayland_client_surface_should_stack_above_parent(
             surface, client, hwnd, toplevel, toplevel_data->window_contents != NULL,
             client_data ? client_data->exstyle : WS_EX_LAYERED);
+    presentation_scaled = ReadAcquire(&client->has_presented) &&
+                          wayland_client_surface_scales_presentation(surface, client);
 
     if (client->toplevel != toplevel ||
         client->toplevel_wl_surface != surface->wl_surface)
@@ -5656,7 +5712,13 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     /* Commit to apply subsurface positioning. */
     wayland_surface_commit_pending_state(surface);
 
-    if (!toplevel_data->window_contents)
+    if (presentation_scaled)
+        wayland_surface_attach_opaque_carrier(surface);
+    else if (toplevel_data->window_contents &&
+             surface->carrier_attached && surface->carrier_opaque)
+        wayland_surface_restore_gdi_shm_overlay(surface,
+                                                toplevel_data->window_contents);
+    else if (!toplevel_data->window_contents)
     {
         if (stack_above_parent)
             wayland_surface_attach_opaque_carrier(surface);

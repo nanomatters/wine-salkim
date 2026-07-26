@@ -349,6 +349,7 @@ struct swapchain
     LONG presentation_generation;
     VkExtent2D extents;
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
+    BOOL compositor_scaling;
 
     /* fs hack data below */
     struct fs_hack_config fshack;
@@ -3223,12 +3224,27 @@ static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D
     return TRUE;
 }
 
-static BOOL swapchain_fshack_config_changed( struct swapchain *swapchain )
+static BOOL surface_is_presentation_scaled( struct surface *surface )
+{
+    return surface->client->funcs->is_presentation_scaled &&
+           surface->client->funcs->is_presentation_scaled( surface->client );
+}
+
+static BOOL swapchain_presentation_config_changed( struct swapchain *swapchain )
 {
     VkExtent2D host_extents = swapchain->host_extents;
     struct fs_hack_config config;
-    BOOL enabled = surface_get_fshack_config( swapchain->surface, &swapchain->extents,
-                                              &host_extents, &config );
+    BOOL compositor_scaling, enabled;
+
+    compositor_scaling = surface_is_presentation_scaled( swapchain->surface );
+    if (compositor_scaling != swapchain->compositor_scaling) return TRUE;
+
+    /* The child viewport follows destination geometry changes independently
+     * of the Vulkan swapchain. */
+    if (compositor_scaling) return FALSE;
+
+    enabled = surface_get_fshack_config( swapchain->surface, &swapchain->extents,
+                                         &host_extents, &config );
 
     return enabled != swapchain->fshack.enabled ||
            (enabled && (config.dpi != swapchain->fshack.dpi ||
@@ -4124,6 +4140,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     RECT client_rect;
     VkResult res;
     BOOL topology_updated = FALSE;
+    BOOL compositor_scaling;
     BOOL use_fshack;
     BOOL lite;
     float sharpness;
@@ -4201,12 +4218,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     driver_funcs->p_vulkan_surface_set_alpha( create_info_host.compositeAlpha, surface->client );
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
+    compositor_scaling = surface_is_presentation_scaled( surface );
 
     /* If the swapchain image size is not equal to the presentation size (e.g. because of DPI virtualization or
      * display mode change emulation), MoltenVK's vkQueuePresentKHR returns VK_SUBOPTIMAL_KHR.
      * Create the swapchain with VkSwapchainPresentScalingCreateInfoEXT to avoid this.
      */
-    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
+    if (!compositor_scaling &&
+        get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
         !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
         instance->extensions.has_VK_EXT_surface_maintenance1 &&
         physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
@@ -4222,7 +4241,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     }
 
     swapchain->host_extents = capabilities.minImageExtent;
-    use_fshack = surface_get_fshack_config( surface, &create_info->imageExtent,
+    swapchain->compositor_scaling = compositor_scaling;
+    if (compositor_scaling)
+        TRACE( "Using compositor presentation scaling for hwnd %p swapchain extent %s\n",
+               surface->hwnd, debugstr_vkextent2d( &create_info->imageExtent ) );
+    use_fshack = !swapchain->compositor_scaling &&
+                 surface_get_fshack_config( surface, &create_info->imageExtent,
                                             &swapchain->host_extents, &swapchain->fshack );
     if (use_fshack)
     {
@@ -4498,13 +4522,14 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.fence = fence ? fence->host.fence : 0;
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
 
-    if (!res && swapchain_fshack_config_changed( swapchain ))
+    if (!res && swapchain_presentation_config_changed( swapchain ))
     {
-        WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+        WARN( "window %p swapchain %p presentation configuration changed, returning VK_SUBOPTIMAL_KHR\n",
+              surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
     }
 
-    if (!res && !swapchain->fshack.enabled &&
+    if (!res && !swapchain->fshack.enabled && !swapchain->compositor_scaling &&
         get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
@@ -4539,13 +4564,14 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
 
-    if (!res && swapchain_fshack_config_changed( swapchain ))
+    if (!res && swapchain_presentation_config_changed( swapchain ))
     {
-        WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+        WARN( "window %p swapchain %p presentation configuration changed, returning VK_SUBOPTIMAL_KHR\n",
+              surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
     }
 
-    if (!res && !swapchain->fshack.enabled &&
+    if (!res && !swapchain->fshack.enabled && !swapchain->compositor_scaling &&
         get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
@@ -5660,7 +5686,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
         else if (swapchain_res)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
-        else if (!swapchain->fshack.enabled && !extents_equals( &swapchain->extents, &client_rect ))
+        else if (!swapchain->fshack.enabled && !swapchain->compositor_scaling &&
+                 !extents_equals( &swapchain->extents, &client_rect ))
         {
             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );

@@ -1763,6 +1763,15 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                 committed = wayland_surface_commit_gdi_overlay(wayland_surface, shm_buffer, damage_region);
             else committed = TRUE;
         }
+        else if (window_client_surface_attached(data) &&
+                 ReadAcquire(&data->client_surface->has_presented) &&
+                 wayland_client_surface_scales_presentation(wayland_surface,
+                                                             data->client_surface))
+        {
+            /* The root carries the bars; GDI-over-producer pixels use the
+             * overlay path prepared by the window-surface flush. */
+            committed = TRUE;
+        }
         else if (wayland_surface_reconfigure(wayland_surface))
         {
             /* sync the alpha multiplier if it has changed due to SLWA/ULW */
