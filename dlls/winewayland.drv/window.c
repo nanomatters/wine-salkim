@@ -1862,6 +1862,7 @@ void ensure_window_surface_contents(HWND hwnd)
     BOOL has_dmabuf_content = FALSE, expose = FALSE;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
+    uint32_t processing_serial;
 
     if (!(data = wayland_win_data_get(hwnd)))
     {
@@ -1878,20 +1879,22 @@ void ensure_window_surface_contents(HWND hwnd)
 
         if (wayland_surface->window.visible)
         {
-            if (data->window_contents)
+            /* Toplevel configure state is independent of its pixel source. */
+            processing_serial = wayland_surface->processing.serial;
+            if (processing_serial && wayland_surface->processing.processed &&
+                wayland_surface_reconfigure(wayland_surface))
             {
-                if (wayland_surface->processing.serial &&
-                    wayland_surface->processing.processed &&
-                    wayland_surface_reconfigure(wayland_surface))
-                {
-                    /* Handle any processed configure request, to ensure the
-                     * related surface state is applied by the compositor. */
-                    wayland_surface_commit_pending_state(wayland_surface);
-                }
+                /* A client request may have superseded the compositor state
+                 * while its configure was being processed. Re-evaluate it
+                 * immediately after promoting that configure. */
+                if (wayland_surface->processing.serial != processing_serial)
+                    wayland_win_data_update_wayland_state(data);
+                wayland_surface_commit_pending_state(wayland_surface);
             }
+
             /* Producer content already visible: do not create a fallback
              * window surface that could replace its carrier with default pixels. */
-            else if (!has_dmabuf_content) expose = TRUE;
+            if (!data->window_contents && !has_dmabuf_content) expose = TRUE;
         }
 
         /* Flush queued commits now: the dmabuf present path has no other flush
