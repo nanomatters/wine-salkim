@@ -402,6 +402,8 @@ struct wayland_surface_config
     enum zxdg_toplevel_decoration_v1_mode decor;
     enum wayland_surface_wm_caps caps;
     uint32_t serial;
+    /* Application request generation when the compositor sent this configure. */
+    uint32_t state_generation;
     BOOL processed;
     BOOL bounds_set;
 };
@@ -440,6 +442,14 @@ struct wayland_window_config
     BOOL visible;
     BOOL managed;
     BOOL resizeable;
+    BOOL minimized;
+};
+
+struct wayland_window_state_request
+{
+    RECT rect;
+    enum wayland_surface_config_state state;
+    uint32_t generation;
     BOOL minimized;
 };
 
@@ -549,7 +559,10 @@ struct wayland_surface
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
 
     struct wayland_surface_config pending, requested, processing, current;
+    struct wayland_window_state_request state_request;
     struct wayland_toplevel_size_limits toplevel_size_limits;
+    /* Configure whose raw position update must not alter state_request. */
+    uint32_t applying_configure_serial;
     BOOL resizing;
     enum wayland_surface_ensure_type ensured_contents;
     struct wl_list hwnd_dmabuf_surfaces;
@@ -626,6 +639,7 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
+void wayland_surface_reconcile_state_request(struct wayland_surface *surface);
 BOOL wayland_surface_has_external_commit_owner(const struct wayland_surface *surface);
 void wayland_surface_commit_pending_state(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,

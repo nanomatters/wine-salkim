@@ -238,6 +238,25 @@ static BOOL wayland_win_data_get_pending_config_state(struct wayland_win_data *d
     return TRUE;
 }
 
+static enum wayland_surface_config_state wayland_win_data_get_app_state(
+        const struct wayland_win_data *data, BOOL *minimized)
+{
+    DWORD style = data->style;
+
+    *minimized = style & WS_MINIMIZE;
+    if (*minimized) return 0;
+
+    if (data->is_fullscreen)
+    {
+        if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
+            return WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
+        return WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    }
+
+    if (style & WS_MAXIMIZE) return WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
+    return 0;
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
@@ -260,30 +279,12 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
 
     TRACE("window=%s style=%#x exstyle=%#x\n", wine_dbgstr_rect(&conf->rect), style, exstyle);
 
-    conf->minimized = FALSE;
-
-    if (style & WS_MINIMIZE)
-    {
-        conf->minimized = TRUE;
-    }
-    /* The fullscreen state is implied by the window position and style. A
-     * compositor may leave fullscreen while the window is minimized, but that
-     * configure must not replace the state requested when the window restores. */
-    else if (data->is_fullscreen)
-    {
-        if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
-            window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
-        else if (!(style & WS_MINIMIZE))
-            window_state |= WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
-    }
-    else if (wayland_win_data_get_pending_config_state(data, &pending_state))
-    {
-        window_state |= pending_state;
-    }
-    else if (style & WS_MAXIMIZE)
-    {
-        window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
-    }
+    window_state = wayland_win_data_get_app_state(data, &conf->minimized);
+    /* Keep pending compositor state authoritative during configure processing,
+     * except when preserving minimized or explicit fullscreen application state. */
+    if (!conf->minimized && !data->is_fullscreen &&
+        wayland_win_data_get_pending_config_state(data, &pending_state))
+        window_state = pending_state;
 
     conf->resizeable = data->resizeable;
     conf->state = window_state;
@@ -387,6 +388,30 @@ static BOOL should_defer_unanchored_menu_popup(DWORD style, DWORD exstyle,
     return is_menu_popup_candidate_style(style, exstyle);
 }
 
+static void wayland_surface_update_state_request(struct wayland_surface *surface,
+                                                 const struct wayland_win_data *data)
+{
+    struct wayland_window_state_request *request = &surface->state_request;
+    BOOL minimized;
+    enum wayland_surface_config_state app_state = wayland_win_data_get_app_state(data, &minimized);
+    enum wayland_surface_config_state state = request->state;
+
+    /* Restoring preserves the state that was active before minimization. */
+    if (!minimized && !request->minimized)
+        state = app_state;
+
+    if (request->state == state && request->minimized == minimized &&
+        (minimized || !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) ||
+         EqualRect(&request->rect, &surface->window.rect)))
+        return;
+
+    request->state = state;
+    request->minimized = minimized;
+    if (!minimized && (state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+        request->rect = surface->window.rect;
+    request->generation++;
+}
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
                                                     struct wayland_surface *owner_surface,
@@ -472,6 +497,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     surface->window.visible = visible;
     wayland_win_data_get_config(data, &surface->window);
+    if (!surface->applying_configure_serial ||
+        surface->applying_configure_serial != surface->processing.serial)
+        wayland_surface_update_state_request(surface, data);
 
     /* If the window is a visible toplevel make it a wayland
      * xdg_toplevel. Otherwise keep it role-less to avoid polluting the
@@ -521,11 +549,13 @@ static BOOL wayland_surface_has_pending_state(struct wayland_surface *surface,
 
 static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
 {
-    const RECT *rect = &surface->window.rect;
+    const struct wayland_window_state_request *request = &surface->state_request;
+    const RECT *rect = &request->rect;
     BOOL processing_config = surface->processing.serial;
+    BOOL configure_requested = FALSE;
 
-    TRACE("hwnd=%p window_state=%#x %s->state=%#x\n",
-          surface->hwnd, surface->window.state,
+    TRACE("hwnd=%p requested_state=%#x %s->state=%#x\n",
+          surface->hwnd, request->state,
           processing_config ? "processing" : "current",
           processing_config ? surface->processing.state : surface->current.state);
 
@@ -534,35 +564,38 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
     wayland_surface_update_toplevel_parent(surface);
 
     /* If we are not processing a compositor requested config, use the
-     * window state to determine and update the Wayland state. */
+     * application request to determine and update the Wayland state. */
     if (!processing_config)
     {
          /* First do all state unsettings, before setting new state. Some
           * Wayland compositors misbehave if the order is reversed. */
         /* Minimize preserves the current state for the eventual restore. */
-        if (!surface->window.minimized &&
-            !(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        if (!request->minimized &&
+            !(request->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
         {
             xdg_toplevel_unset_maximized(surface->xdg_toplevel);
+            configure_requested = TRUE;
         }
-        if (!surface->window.minimized &&
-            !(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        if (!request->minimized &&
+            !(request->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         {
             xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
             wayland_surface_shortcut_control(surface, FALSE);
             surface->requested_output = NULL;
+            configure_requested = TRUE;
         }
 
-        if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        if ((request->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
             !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
             !wayland_surface_has_pending_state(surface,
                                                WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
         {
             xdg_toplevel_set_maximized(surface->xdg_toplevel);
+            configure_requested = TRUE;
         }
-        if (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+        if (request->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
         {
             struct wayland_output *output;
             struct wl_output *wl_output = NULL;
@@ -576,6 +609,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
                 {
                     xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
                     wl_display_flush(process_wayland.wl_display);
+                    configure_requested = TRUE;
                 }
                 else
                     goto skip_fullscreen;
@@ -590,29 +624,81 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
             xdg_toplevel_set_fullscreen(surface->xdg_toplevel, wl_output);
             wayland_surface_shortcut_control(surface, TRUE);
             surface->requested_output = wl_output;
+            configure_requested = TRUE;
 
         skip_fullscreen:
             if (output) wayland_output_release(output);
         }
-        if (surface->window.minimized && !surface->comitted.minimized)
+        if (request->minimized && !surface->comitted.minimized)
         {
+            /* set_minimized does not trigger a configure. */
             xdg_toplevel_set_minimized(surface->xdg_toplevel);
         }
 
-        surface->comitted.minimized = surface->window.minimized;
+        surface->comitted.minimized = request->minimized;
 
-        /* Reset the size hint since we don't want to poison the next configure
-         * event with it, and invalidate the cache so fixed-size windows can
-         * restore their limits on the next geometry update. */
-        xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
-        xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
-        memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
+        if (configure_requested)
+        {
+            /* Reset the size hint since we don't want to poison the next
+             * configure event with it, and invalidate the cache so fixed-size
+             * windows can restore their limits on the next geometry update. */
+            xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
+            xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+            memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
+        }
     }
     else
     {
         /* Keep compositor configures authoritative until promotion. */
         surface->processing.processed = TRUE;
     }
+}
+
+static BOOL wayland_rects_have_equal_size(const RECT *a, const RECT *b)
+{
+    return a->right - a->left == b->right - b->left &&
+           a->bottom - a->top == b->bottom - b->top;
+}
+
+static enum wayland_surface_config_state wayland_surface_current_state_request(
+        struct wayland_surface *surface)
+{
+    struct wayland_window_state_request *request = &surface->state_request;
+    enum wayland_surface_config_state state = surface->current.state &
+        (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+         WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
+
+    if ((state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_TILED) &&
+        (request->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        !wayland_rects_have_equal_size(&surface->current.rect, &request->rect))
+        state &= ~WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+
+    return state;
+}
+
+void wayland_surface_reconcile_state_request(struct wayland_surface *surface)
+{
+    struct wayland_window_state_request *request = &surface->state_request;
+
+    /* A configure can replace the application request only when no newer
+     * application state was observed after the compositor sent it. */
+    if (surface->current.state_generation == request->generation)
+    {
+        if (!surface->window.minimized)
+            request->state = wayland_surface_current_state_request(surface);
+        request->minimized = surface->window.minimized;
+        if (request->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+            request->rect = surface->window.rect;
+    }
+    else
+    {
+        wayland_surface_update_state_toplevel(surface);
+        wl_display_flush(process_wayland.wl_display);
+    }
+
+    if (!surface->processing.serial || surface->applying_configure_serial == surface->current.serial)
+        surface->applying_configure_serial = 0;
 }
 
 static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
@@ -1048,6 +1134,10 @@ static void wayland_configure_window(HWND hwnd)
 {
     struct wayland_surface *surface;
     INT width, height, window_width, window_height, offset_x, offset_y;
+    const enum wayland_surface_config_state managed_state =
+        WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+        WAYLAND_SURFACE_CONFIG_STATE_TILED |
+        WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
     UINT flags = 0;
     UINT state_cmd = 0;
     uint32_t state;
@@ -1080,6 +1170,7 @@ static void wayland_configure_window(HWND hwnd)
 
     surface->processing = surface->requested;
     memset(&surface->requested, 0, sizeof(surface->requested));
+    surface->applying_configure_serial = surface->processing.serial;
 
     state = surface->processing.state;
     /* Ignore size hints if we don't have a state that requires strict
@@ -1130,6 +1221,7 @@ static void wayland_configure_window(HWND hwnd)
      * are very insistent on a particular fullscreen size (which may not match
      * the monitor size). */
     if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        (surface->window.state & managed_state) == (state & managed_state) &&
         wayland_surface_config_is_compatible(&surface->processing, surface->window.rect,
                                              surface->window.state))
     {
@@ -1862,7 +1954,6 @@ void ensure_window_surface_contents(HWND hwnd)
     BOOL has_dmabuf_content = FALSE, expose = FALSE;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
-    uint32_t processing_serial;
 
     if (!(data = wayland_win_data_get(hwnd)))
     {
@@ -1880,15 +1971,9 @@ void ensure_window_surface_contents(HWND hwnd)
         if (wayland_surface->window.visible)
         {
             /* Toplevel configure state is independent of its pixel source. */
-            processing_serial = wayland_surface->processing.serial;
-            if (processing_serial && wayland_surface->processing.processed &&
+            if (wayland_surface->processing.serial && wayland_surface->processing.processed &&
                 wayland_surface_reconfigure(wayland_surface))
             {
-                /* A client request may have superseded the compositor state
-                 * while its configure was being processed. Re-evaluate it
-                 * immediately after promoting that configure. */
-                if (wayland_surface->processing.serial != processing_serial)
-                    wayland_win_data_update_wayland_state(data);
                 wayland_surface_commit_pending_state(wayland_surface);
             }
 

@@ -954,6 +954,7 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
         should_post = surface->requested.serial == 0;
         should_expose = surface->current.serial == 0;
         surface->pending.serial = serial;
+        surface->pending.state_generation = surface->state_request.generation;
         wayland_surface_config_inherit_caps_and_bounds(&surface->pending, surface);
         if (!surface->pending.decor && surface->current.decor)
             surface->pending.decor = surface->current.decor;
@@ -2293,6 +2294,7 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
     memset(&surface->requested, 0, sizeof(surface->requested));
     memset(&surface->processing, 0, sizeof(surface->processing));
     memset(&surface->current, 0, sizeof(surface->current));
+    surface->applying_configure_serial = 0;
 
     memset(&surface->comitted, 0, sizeof(surface->comitted));
     surface->comitted.scale = 0.0;
@@ -4395,14 +4397,16 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
     }
-    /* Initial configure, or a fullscreen/maximized transition: ack from the
-     * requested state so a dmabuf-only toplevel finalizes without the win32
-     * resize round-trip. Decoration changes must go through the message loop. */
+    /* Initial configure, or a fullscreen/maximized transition for the current
+     * application request: ack from the requested state so a dmabuf-only
+     * toplevel finalizes without the win32 resize round-trip. Decoration
+     * changes must go through the message loop. */
     else if (surface->requested.serial &&
              (!surface->current.serial ||
               (surface->requested.state &
                (WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
                 WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))) &&
+             surface->requested.state_generation == surface->state_request.generation &&
              surface->current.decor == surface->requested.decor &&
              wayland_surface_config_is_compatible(&surface->requested, rect,
                                                   window->state))
@@ -4487,6 +4491,7 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
 {
     struct wayland_window_config *window = &surface->window;
     RECT rect = surface->window.rect;
+    uint32_t current_serial = surface->current.serial;
 
     TRACE("hwnd=%p window=%s,%#x processing=%s,%#x current=%s,%#x\n",
           surface->hwnd, wine_dbgstr_rect(&rect), window->state,
@@ -4501,6 +4506,9 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
         if (!wayland_surface_reconfigure_xdg(surface, rect)) return FALSE;
+        if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+            surface->current.serial != current_serial)
+            wayland_surface_reconcile_state_request(surface);
         break;
     case WAYLAND_SURFACE_ROLE_LAYER:
         if (!surface->zwlr_layer_surface_v1) break; /* surface role has been cleared */
