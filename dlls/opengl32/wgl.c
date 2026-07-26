@@ -1032,6 +1032,23 @@ BOOL WINAPI wglWineExportDmaBufWINE( GLuint texture, GLenum target, struct wgl_d
     return args.ret;
 }
 
+int WINAPI wglWineExportSyncFdWINE( void )
+{
+    struct wglWineExportSyncFdWINE_params args = { .teb = NtCurrentTeb(), .ret = -1 };
+    NTSTATUS status;
+
+    TRACE( "\n" );
+
+    if ((status = UNIX_CALL( wglWineExportSyncFdWINE, &args )))
+    {
+        if (status != STATUS_NOT_IMPLEMENTED)
+            WARN( "wglWineExportSyncFdWINE returned %#lx\n", status );
+        return -1;
+    }
+
+    return args.ret;
+}
+
 int WINAPI wglWineHwndDmaBufOpenProducerWINE( HWND hwnd )
 {
     TRACE( "hwnd %p.\n", hwnd );
@@ -1058,13 +1075,13 @@ void WINAPI wglWineHwndDmaBufCloseProducerWINE( HWND hwnd, int channel_fd )
 }
 
 int WINAPI wglWineHwndDmaBufPublishWINE( HWND hwnd, int channel_fd,
-        const hwnd_dmabuf_frame_desc_t *desc, int dmabuf_fd )
+        const hwnd_dmabuf_frame_desc_t *desc, int dmabuf_fd, int sync_fd )
 {
-    TRACE( "hwnd %p, channel_fd %d, desc %p, dmabuf_fd %d.\n",
-            hwnd, channel_fd, desc, dmabuf_fd );
+    TRACE( "hwnd %p, channel_fd %d, desc %p, dmabuf_fd %d, sync_fd %d.\n",
+            hwnd, channel_fd, desc, dmabuf_fd, sync_fd );
 
     if (!desc) return HWND_DMABUF_CHANNEL_ERROR;
-    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd );
+    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd, sync_fd );
 }
 
 int WINAPI wglWineHwndDmaBufDrainReleaseWINE( int channel_fd, hwnd_dmabuf_release_t *release )

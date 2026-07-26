@@ -246,8 +246,9 @@ extern int hwnd_dmabuf_open_channel( HWND hwnd );
 extern int hwnd_dmabuf_open_channel_exclusive( HWND hwnd );
 extern void hwnd_dmabuf_close_channel( HWND hwnd, int channel_fd );
 extern unsigned int hwnd_dmabuf_release_channel( HWND hwnd );
-extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd );
-extern int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd );
+extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd, int sync_fd );
+extern int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc,
+                                        int dmabuf_fd, int sync_fd );
 extern int hwnd_dmabuf_channel_recv_release( int channel_fd, void *release );
 extern void hwnd_dmabuf_post_wake( HWND hwnd );
 

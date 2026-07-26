@@ -69,6 +69,7 @@ struct wgl_dmabuf_desc
 
 typedef BOOL (GLAPIENTRY *PFN_wglWineExportDmaBufWINE)( GLuint texture, GLenum target,
         struct wgl_dmabuf_desc *desc, int *fd );
+typedef int (GLAPIENTRY *PFN_wglWineExportSyncFdWINE)( void );
 typedef void (GLAPIENTRY *PFN_wglWineCloseDmaBufWINE)( int fd );
 typedef BOOL (GLAPIENTRY *PFN_wglWineDmaBufExportSupportedWINE)( void );
 typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufOpenProducerWINE)( HWND hwnd );
@@ -76,7 +77,7 @@ typedef UINT (GLAPIENTRY *PFN_wglWineHwndDmaBufGetCapsWINE)( HWND hwnd, void *ca
         void *format_modifiers, UINT max_format_modifiers, UINT *format_modifier_count );
 typedef void (GLAPIENTRY *PFN_wglWineHwndDmaBufCloseProducerWINE)( HWND hwnd, int channel_fd );
 typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufPublishWINE)( HWND hwnd, int channel_fd,
-        const void *desc, int dmabuf_fd );
+        const void *desc, int dmabuf_fd, int sync_fd );
 typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufDrainReleaseWINE)( int channel_fd, void *release );
 
 #ifdef WINE_UNIX_LIB
@@ -84,7 +85,7 @@ typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufDrainReleaseWINE)( int channel_fd,
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 38
+#define WINE_OPENGL_DRIVER_VERSION 39
 
 struct opengl_drawable;
 struct wgl_context;
@@ -180,6 +181,7 @@ struct opengl_funcs
     BOOL       (*p_wglSwapIntervalEXT)( int interval );
     PFN_wglWineDmaBufExportSupportedWINE p_wglWineDmaBufExportSupportedWINE;
     PFN_wglWineExportDmaBufWINE p_wglWineExportDmaBufWINE;
+    PFN_wglWineExportSyncFdWINE p_wglWineExportSyncFdWINE;
 #define USE_GL_FUNC(x) PFN_##x p_##x;
     ALL_EGL_FUNCS
     ALL_EGL_EXT_FUNCS

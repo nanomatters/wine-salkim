@@ -1140,7 +1140,7 @@
 @ stdcall -syscall NtUserHwndDmaBufDrainRelease(long ptr)
 @ stdcall -syscall NtUserHwndDmaBufGetCaps(long ptr ptr long ptr)
 @ stdcall -syscall NtUserHwndDmaBufOpenProducer(long)
-@ stdcall -syscall NtUserHwndDmaBufPublish(long long ptr long)
+@ stdcall -syscall NtUserHwndDmaBufPublish(long long ptr long long)
 @ stub -syscall NtUserHwndQueryRedirectionInfo
 @ stub -syscall NtUserHwndSetRedirectionInfo
 @ stub -syscall NtUserImpersonateDdeClientWindow

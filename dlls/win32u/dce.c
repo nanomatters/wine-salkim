@@ -353,7 +353,7 @@ static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, co
 
     slot->busy = TRUE;
     slot->release_token = desc.release_token;
-    ret = hwnd_dmabuf_channel_publish( surface->hwnd, surface->channel_fd, &desc, slot->fd );
+    ret = hwnd_dmabuf_channel_publish( surface->hwnd, surface->channel_fd, &desc, slot->fd, -1 );
     if (ret == HWND_DMABUF_CHANNEL_OK)
     {
         TRACE( "foreign_gdi hwnd=%p published shm slot=%u seq=%u size=%ux%u dirty=%s token=%s\n",

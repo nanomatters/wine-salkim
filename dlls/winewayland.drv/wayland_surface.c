@@ -211,6 +211,7 @@ struct wayland_hwnd_dmabuf_buffer
     unsigned int release_flags;
     int channel_fd;    /* dup of surface->channel_fd for sending release tokens */
     int data_fd;       /* dup of the producer backing fd, for per-slice wrappers */
+    int acquire_fd;    /* sync_file for the current frame, consumed at commit */
 };
 
 struct wayland_hwnd_dmabuf_slice_buffer
@@ -232,6 +233,7 @@ struct wayland_hwnd_dmabuf_slice
     struct wl_surface *wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
+    struct zwp_linux_surface_synchronization_v1 *explicit_sync;
     struct wayland_hwnd_dmabuf_slice_geometry geometry;
     BOOL seen;
     BOOL geometry_valid;
@@ -245,6 +247,7 @@ struct wayland_hwnd_dmabuf_surface
     struct wl_surface *wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
+    struct zwp_linux_surface_synchronization_v1 *explicit_sync;
     struct wayland_hwnd_dmabuf_buffer *current;
     struct wl_list buffers;
     struct wl_list slices;
@@ -345,8 +348,36 @@ static void wayland_hwnd_dmabuf_buffer_unref(struct wayland_hwnd_dmabuf_buffer *
                                             buffer->release_flags : HWND_DMABUF_RELEASE_ORPHANED, FALSE);
     if (buffer->channel_fd >= 0) close(buffer->channel_fd);
     if (buffer->data_fd >= 0) close(buffer->data_fd);
+    if (buffer->acquire_fd >= 0) close(buffer->acquire_fd);
     if (buffer->wl_buffer) wl_buffer_destroy(buffer->wl_buffer);
     free(buffer);
+}
+
+static BOOL wayland_hwnd_dmabuf_set_acquire_fence(
+        struct wayland_hwnd_dmabuf_buffer *buffer, struct wl_surface *wl_surface,
+        struct zwp_linux_surface_synchronization_v1 **explicit_sync)
+{
+    int fd;
+
+    if (buffer->acquire_fd < 0) return TRUE;
+    if (!process_wayland.zwp_linux_explicit_synchronization_v1) return FALSE;
+
+    if (!*explicit_sync &&
+        !(*explicit_sync = zwp_linux_explicit_synchronization_v1_get_synchronization(
+                process_wayland.zwp_linux_explicit_synchronization_v1, wl_surface)))
+        return FALSE;
+
+    if ((fd = dup(buffer->acquire_fd)) < 0) return FALSE;
+    zwp_linux_surface_synchronization_v1_set_acquire_fence(*explicit_sync, fd);
+    close(fd);
+    return TRUE;
+}
+
+static void wayland_hwnd_dmabuf_consume_acquire_fence(struct wayland_hwnd_dmabuf_buffer *buffer)
+{
+    if (buffer->acquire_fd < 0) return;
+    close(buffer->acquire_fd);
+    buffer->acquire_fd = -1;
 }
 
 /* Return a release token to the producer. */
@@ -486,6 +517,8 @@ static void wayland_hwnd_dmabuf_slice_destroy(struct wayland_hwnd_dmabuf_slice *
 {
     wl_list_remove(&slice->link);
     if (slice->wl_subsurface) wl_subsurface_destroy(slice->wl_subsurface);
+    if (slice->explicit_sync)
+        zwp_linux_surface_synchronization_v1_destroy(slice->explicit_sync);
     if (slice->wp_viewport) wp_viewport_destroy(slice->wp_viewport);
     if (slice->wl_surface) wl_surface_destroy(slice->wl_surface);
     free(slice);
@@ -802,6 +835,8 @@ static struct wayland_hwnd_dmabuf_slice *wayland_hwnd_dmabuf_surface_get_slice(
 
 err:
     if (slice->wl_subsurface) wl_subsurface_destroy(slice->wl_subsurface);
+    if (slice->explicit_sync)
+        zwp_linux_surface_synchronization_v1_destroy(slice->explicit_sync);
     if (slice->wp_viewport) wp_viewport_destroy(slice->wp_viewport);
     if (slice->wl_surface) wl_surface_destroy(slice->wl_surface);
     free(slice);
@@ -820,11 +855,15 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf
     {
         if (!wayland_hwnd_dmabuf_slice_attach_buffer(slice, buffer))
             return FALSE;
+        if (!wayland_hwnd_dmabuf_set_acquire_fence(buffer, slice->wl_surface,
+                                                    &slice->explicit_sync))
+            return FALSE;
         wl_surface_damage_buffer(slice->wl_surface, 0, 0, buffer->width, buffer->height);
         wl_surface_commit(slice->wl_surface);
         count++;
     }
 
+    wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
     return count == surface->slice_count && count;
 }
 
@@ -835,6 +874,8 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
     wl_list_for_each_safe(buffer, buffer_next, &surface->buffers, link)
         wayland_hwnd_dmabuf_buffer_reap(buffer);
     wayland_hwnd_dmabuf_surface_clear_slices(surface);
+    if (surface->explicit_sync)
+        zwp_linux_surface_synchronization_v1_destroy(surface->explicit_sync);
 
     if (surface->parent && surface->parent->direct_dmabuf_surface == surface)
         surface->parent->direct_dmabuf_surface = NULL;
@@ -3286,15 +3327,18 @@ static void wayland_hwnd_dmabuf_surface_claim_channel(struct wayland_hwnd_dmabuf
 
 /* Receive one frame. Returns 1 on success, 0 if empty, -1 on EOF. */
 static int wayland_hwnd_dmabuf_channel_recv_one(int channel_fd, hwnd_dmabuf_frame_desc_t *desc,
-                                                int *out_fd)
+                                                int *out_fd, int *out_sync_fd)
 {
-    char control[CMSG_SPACE(sizeof(int))];
+    char control[CMSG_SPACE(2 * sizeof(int))];
     struct msghdr msg = {0};
     struct cmsghdr *cmsg;
     struct iovec iov;
-    int fd = -1;
+    int fds[2] = {-1, -1};
+    unsigned int expected, fd_count = 0;
     ssize_t n;
 
+    *out_fd = -1;
+    *out_sync_fd = -1;
     iov.iov_base = desc;
     iov.iov_len = sizeof(*desc);
     msg.msg_iov = &iov;
@@ -3304,12 +3348,57 @@ static int wayland_hwnd_dmabuf_channel_recv_one(int channel_fd, hwnd_dmabuf_fram
 
     n = recvmsg(channel_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
     if (n == 0) return -1;                       /* peer closed the channel */
-    if (n != (ssize_t)sizeof(*desc)) return 0;   /* EAGAIN or short read: nothing usable now */
+    if (n != (ssize_t)sizeof(*desc))
+    {
+        if (n > 0)
+            for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
+                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+                    cmsg->cmsg_len >= CMSG_LEN(0))
+                {
+                    size_t size = cmsg->cmsg_len - CMSG_LEN(0);
+                    int *fd = (int *)CMSG_DATA(cmsg);
+
+                    while (size >= sizeof(*fd))
+                    {
+                        close(*fd++);
+                        size -= sizeof(*fd);
+                    }
+                }
+        return 0;   /* EAGAIN or short packet: nothing usable now */
+    }
 
     for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
-            memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
-    *out_fd = fd;
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(0))
+        {
+            size_t size = cmsg->cmsg_len - CMSG_LEN(0);
+            unsigned int count = min(size / sizeof(int), ARRAY_SIZE(fds) - fd_count);
+
+            memcpy(fds + fd_count, CMSG_DATA(cmsg), count * sizeof(int));
+            fd_count += count;
+        }
+
+    if (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE)
+    {
+        expected = fd_count == 2 ? 2 : 1;
+        if (fd_count == 2) *out_fd = fds[0];
+        if (fd_count) *out_sync_fd = fds[fd_count - 1];
+    }
+    else
+    {
+        expected = fd_count ? 1 : 0;
+        if (fd_count) *out_fd = fds[0];
+    }
+
+    if ((msg.msg_flags & MSG_CTRUNC) || fd_count != expected ||
+        (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE && *out_sync_fd < 0))
+    {
+        unsigned int i;
+
+        for (i = 0; i < fd_count; i++) if (fds[i] >= 0) close(fds[i]);
+        *out_fd = *out_sync_fd = -1;
+        desc->version = 0;
+    }
     return 1;
 }
 
@@ -3419,6 +3508,7 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
     }
     buffer->channel_fd = -1;
     buffer->data_fd = data_fd;
+    buffer->acquire_fd = -1;
     buffer->wl_buffer = wl_buffer;
     buffer->ref = 1;  /* owner ref. A compositor ref is added per attach in the update loop */
     buffer->surface = surface;
@@ -3444,7 +3534,8 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
 /* Make buffer the surface's current frame. Publishing is separate so direct
  * parent mode can validate the frame before it attaches anything. */
 static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *surface,
-        struct wayland_hwnd_dmabuf_buffer *buffer, const hwnd_dmabuf_frame_desc_t *desc)
+        struct wayland_hwnd_dmabuf_buffer *buffer, const hwnd_dmabuf_frame_desc_t *desc,
+        int acquire_fd)
 {
     if (wayland_hwnd_dmabuf_buffer_exchange_release_token(buffer, desc->release_token))
         WARN("hwnd=%p slot=%u overwrote an unreleased token\n", surface->hwnd, desc->image_id);
@@ -3452,6 +3543,8 @@ static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *su
     buffer->dirty_count = min(desc->dirty_count, HWND_DMABUF_MAX_DIRTY_RECTS);
     memcpy(buffer->dirty_rects, desc->dirty_rects, sizeof(buffer->dirty_rects));
     buffer->release_flags = HWND_DMABUF_RELEASE_ORPHANED;
+    if (buffer->acquire_fd >= 0) close(buffer->acquire_fd);
+    buffer->acquire_fd = acquire_fd;
     surface->current = buffer;
     surface->frame_seq = desc->frame_seq;
     surface->current_committed = FALSE;
@@ -3499,6 +3592,7 @@ static void wayland_hwnd_dmabuf_drop_current_frame(struct wayland_hwnd_dmabuf_su
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
 
     if (!buffer) return;
+    wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
     wayland_hwnd_dmabuf_buffer_send_release(buffer, flags, buffer->stable_slot);
     surface->current = NULL;
     surface->current_committed = FALSE;
@@ -3581,11 +3675,16 @@ static void wayland_hwnd_dmabuf_retire_frame(struct wayland_hwnd_dmabuf_surface 
 static BOOL wayland_hwnd_dmabuf_desc_is_valid(const hwnd_dmabuf_frame_desc_t *desc)
 {
     return desc->version == HWND_DMABUF_DESC_VERSION_V1 && desc->width && desc->height &&
-           desc->stride && desc->fourcc && desc->release_token;
+           desc->stride && desc->fourcc && desc->release_token &&
+           (desc->sync_fd_kind == HWND_DMABUF_SYNC_NONE ||
+            desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE);
 }
 
 static BOOL wayland_hwnd_dmabuf_desc_format_supported(const hwnd_dmabuf_frame_desc_t *desc)
 {
+    if (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE &&
+        !process_wayland.zwp_linux_explicit_synchronization_v1)
+        return FALSE;
     if (wayland_hwnd_dmabuf_desc_is_shm(desc))
         return process_wayland.wl_shm && wayland_hwnd_shm_format_from_fourcc(desc->fourcc, NULL);
     return process_wayland.zwp_linux_dmabuf_v1 &&
@@ -3604,7 +3703,7 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
     hwnd_dmabuf_frame_desc_t pdesc, desc;
     BOOL have_pending = FALSE;
     BOOL retried = FALSE;
-    int pfd = -1, fd, r;
+    int pfd = -1, psync_fd = -1, fd, sync_fd, r;
 
     *created_buffer = FALSE;
     *attached_frame = FALSE;
@@ -3614,7 +3713,8 @@ retry:
     wayland_hwnd_dmabuf_surface_claim_channel(surface);
     if (surface->channel_fd < 0) return surface->current;
 
-    while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc, &fd)) > 0)
+    while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc,
+                                                      &fd, &sync_fd)) > 0)
     {
         BOOL desc_valid = wayland_hwnd_dmabuf_desc_is_valid(&desc);
         BOOL format_supported = desc_valid &&
@@ -3634,6 +3734,7 @@ retry:
                  (unsigned int)(desc.release_token >> 32),
                  (unsigned int)desc.release_token, format_supported);
             if (fd >= 0) close(fd);
+            if (sync_fd >= 0) close(sync_fd);
             if (desc.release_token)
                 wayland_hwnd_dmabuf_send_release(surface, desc.producer_unique_id, desc.release_token,
                                                  HWND_DMABUF_RELEASE_FAILED,
@@ -3641,9 +3742,13 @@ retry:
             continue;
         }
         if (have_pending)
+        {
             wayland_hwnd_dmabuf_retire_frame(surface, &pdesc, pfd, created_buffer);
+            if (psync_fd >= 0) close(psync_fd);
+        }
         pdesc = desc;
         pfd = fd;
+        psync_fd = sync_fd;
         have_pending = TRUE;
     }
     if (r < 0)
@@ -3685,9 +3790,10 @@ retry:
         wayland_hwnd_dmabuf_send_release(surface, pdesc.producer_unique_id, pdesc.release_token,
                                          HWND_DMABUF_RELEASE_FAILED,
                                          pdesc.image_id, pdesc.ring_generation);
+        if (psync_fd >= 0) close(psync_fd);
         return surface->current;
     }
-    wayland_hwnd_dmabuf_set_frame(surface, buffer, &pdesc);
+    wayland_hwnd_dmabuf_set_frame(surface, buffer, &pdesc, psync_fd);
     *attached_frame = TRUE;
     return buffer;
 }
@@ -3960,12 +4066,22 @@ commit_current:
         return TRUE;
 
     if (!direct->current_committed)
+    {
         wayland_hwnd_dmabuf_attach_current(direct);
+        if (!wayland_hwnd_dmabuf_set_acquire_fence(direct->current, surface->wl_surface,
+                                                    &direct->explicit_sync))
+        {
+            wayland_hwnd_dmabuf_drop_current_frame(direct, HWND_DMABUF_RELEASE_FAILED);
+            wayland_surface_clear_direct_dmabuf(surface, data);
+            return FALSE;
+        }
+    }
     surface->carrier_attached = FALSE;
     wayland_hwnd_dmabuf_surface_set_opaque(direct, width, height);
     wl_surface_commit(surface->wl_surface);
     if (!direct->current_committed)
     {
+        wayland_hwnd_dmabuf_consume_acquire_fence(direct->current);
         wayland_hwnd_dmabuf_buffer_add_commit_ref(direct->current);
         direct->current_committed = TRUE;
     }
@@ -4184,7 +4300,20 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
 
         if (configure_result == WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED)
         {
+            if (attached_frame && !dmabuf_surface->sliced &&
+                !wayland_hwnd_dmabuf_set_acquire_fence(dmabuf_surface->current,
+                                                       dmabuf_surface->wl_surface,
+                                                       &dmabuf_surface->explicit_sync))
+            {
+                wayland_hwnd_dmabuf_drop_current_frame(dmabuf_surface,
+                                                       HWND_DMABUF_RELEASE_FAILED);
+                wl_surface_attach(dmabuf_surface->wl_surface, NULL, 0, 0);
+                wl_surface_commit(dmabuf_surface->wl_surface);
+                continue;
+            }
             wl_surface_commit(dmabuf_surface->wl_surface);
+            if (attached_frame && !dmabuf_surface->sliced)
+                wayland_hwnd_dmabuf_consume_acquire_fence(dmabuf_surface->current);
             any_new = TRUE;
         }
         /* One compositor ref per attached frame. The wl_buffer.release handler drops

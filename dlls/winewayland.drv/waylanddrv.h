@@ -40,6 +40,7 @@ struct xkb_compose_table;
 #include "text-input-unstable-v3-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "linux-explicit-synchronization-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
@@ -290,6 +291,7 @@ struct wayland
     struct wp_viewporter *wp_viewporter;
     struct wl_subcompositor *wl_subcompositor;
     struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+    struct zwp_linux_explicit_synchronization_v1 *zwp_linux_explicit_synchronization_v1;
     struct wayland_dmabuf_feedback dmabuf_default_feedback;
     struct wl_list dmabuf_formats;
     pthread_mutex_t dmabuf_mutex;

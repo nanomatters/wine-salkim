@@ -547,6 +547,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_content_type_manager_v1 =
             wl_registry_bind(registry, id, &wp_content_type_manager_v1_interface, 1);
     }
+    else if (strcmp(interface, "zwp_linux_explicit_synchronization_v1") == 0)
+    {
+        process_wayland.zwp_linux_explicit_synchronization_v1 =
+            wl_registry_bind(registry, id, &zwp_linux_explicit_synchronization_v1_interface, 1);
+    }
     else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0)
     {
         if (wayland_disable_ssd()) return;
@@ -768,6 +773,10 @@ BOOL wayland_process_init(void)
 
     if (!process_wayland.zwp_linux_dmabuf_v1)
         WARN("Wayland compositor doesn't support optional zwp_linux_dmabuf_v1 (HWND dmabuf forwarding won't work)\n");
+
+    if (!process_wayland.zwp_linux_explicit_synchronization_v1)
+        TRACE("Wayland compositor doesn't support optional zwp_linux_explicit_synchronization_v1; "
+              "HWND dmabuf forwarding will wait for GPU completion\n");
 
     if (!process_wayland.zwlr_layer_shell_v1)
         WARN("Wayland compositor doesn't support optional zwlr_layer_shell_v1 (some tray menus may be misplaced)\n");

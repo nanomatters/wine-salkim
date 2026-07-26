@@ -228,6 +228,7 @@ my @wine_export_funcs =
      "wglWineCloseDmaBufWINE",
      "wglWineDmaBufExportSupportedWINE",
      "wglWineExportDmaBufWINE",
+     "wglWineExportSyncFdWINE",
      "wglWineHwndDmaBufOpenProducerWINE",
      "wglWineHwndDmaBufGetCapsWINE",
      "wglWineHwndDmaBufCloseProducerWINE",
@@ -239,16 +240,18 @@ my @wine_unix_call_funcs =
      "wglWineCloseDmaBufWINE",
      "wglWineDmaBufExportSupportedWINE",
      "wglWineExportDmaBufWINE",
+     "wglWineExportSyncFdWINE",
     );
 my %wine_unix_call_specs =
     (
      "wglWineCloseDmaBufWINE" => "long",
      "wglWineDmaBufExportSupportedWINE" => "",
      "wglWineExportDmaBufWINE" => "long long ptr ptr",
+     "wglWineExportSyncFdWINE" => "",
      "wglWineHwndDmaBufOpenProducerWINE" => "ptr",
      "wglWineHwndDmaBufGetCapsWINE" => "ptr ptr ptr long ptr",
      "wglWineHwndDmaBufCloseProducerWINE" => "ptr long",
-     "wglWineHwndDmaBufPublishWINE" => "ptr long ptr long",
+     "wglWineHwndDmaBufPublishWINE" => "ptr long ptr long long",
      "wglWineHwndDmaBufDrainReleaseWINE" => "long ptr",
     );
 my %hide_default_fbo_thunks =
@@ -929,6 +932,11 @@ sub print_wine_unix_call_params($)
     print $out "    int *fd;\n";
     print $out "    BOOL ret;\n";
     print $out "};\n\n";
+    print $out "struct wglWineExportSyncFdWINE_params\n";
+    print $out "{\n";
+    print $out "    TEB *teb;\n";
+    print $out "    int ret;\n";
+    print $out "};\n\n";
 }
 
 sub print_wine_unix_call_thunks($$)
@@ -1002,6 +1010,28 @@ sub print_wine_unix_call_thunks($$)
         print $out "    params->ret = funcs->p_wglWineExportDmaBufWINE( params->texture, params->target,\n";
         print $out "            params->desc, params->fd );\n";
     }
+    print $out "    return STATUS_SUCCESS;\n";
+    print $out "}\n\n";
+
+    print $out "static NTSTATUS ${prefix}ext_wglWineExportSyncFdWINE( void *args )\n";
+    print $out "{\n";
+    if ($is_wow64)
+    {
+        print $out "    struct\n";
+        print $out "    {\n";
+        print $out "        PTR32 teb;\n";
+        print $out "        int ret;\n";
+        print $out "    } *params = args;\n";
+        print $out "    TEB *teb = get_teb64( params->teb );\n";
+    }
+    else
+    {
+        print $out "    struct wglWineExportSyncFdWINE_params *params = args;\n";
+        print $out "    TEB *teb = params->teb;\n";
+    }
+    print $out "    const struct opengl_funcs *funcs = teb->glTable;\n\n";
+    print $out "    if (!funcs || !funcs->p_wglWineExportSyncFdWINE) return STATUS_NOT_IMPLEMENTED;\n";
+    print $out "    params->ret = funcs->p_wglWineExportSyncFdWINE();\n";
     print $out "    return STATUS_SUCCESS;\n";
     print $out "}\n\n";
 

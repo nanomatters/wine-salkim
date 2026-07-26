@@ -928,7 +928,8 @@ W32KAPI int     WINAPI NtUserHwndDmaBufDrainRelease( int channel_fd, void *relea
 W32KAPI UINT    WINAPI NtUserHwndDmaBufGetCaps( HWND hwnd, void *caps, void *format_modifiers,
                                                 UINT max_format_modifiers, UINT *format_modifier_count );
 W32KAPI int     WINAPI NtUserHwndDmaBufOpenProducer( HWND hwnd );
-W32KAPI int     WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd );
+W32KAPI int     WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc,
+                                                int dmabuf_fd, int sync_fd );
 W32KAPI BOOL    WINAPI NtUserHiliteMenuItem( HWND hwnd, HMENU handle, UINT item, UINT hilite );
 W32KAPI NTSTATUS WINAPI NtUserInitializeClientPfnArrays( const ntuser_client_func_ptr *client_procsA,
                                                          const ntuser_client_func_ptr *client_procsW,

@@ -657,6 +657,7 @@ static bool wined3d_gl_hwnd_dmabuf_probe_support(struct wined3d_gl_hwnd_dmabuf_r
         return false;
 
     ring->p_wglWineCloseDmaBufWINE = gl_info->p_wglWineCloseDmaBufWINE;
+    ring->p_wglWineExportSyncFdWINE = gl_info->p_wglWineExportSyncFdWINE;
     ring->p_wglWineHwndDmaBufGetCapsWINE = gl_info->p_wglWineHwndDmaBufGetCapsWINE;
     InterlockedExchange(&ring->support, WINED3D_GL_HWND_DMABUF_SUPPORT_YES);
     return true;
@@ -667,6 +668,7 @@ static void wined3d_gl_hwnd_dmabuf_clear_caps(struct wined3d_gl_hwnd_dmabuf_ring
     free(ring->format_modifiers);
     ring->format_modifiers = NULL;
     ring->format_modifier_count = 0;
+    ring->explicit_sync = false;
     ring->caps_hwnd = NULL;
     ring->hwnd_has_caps = false;
     ring->logged_implicit_modifier = false;
@@ -701,6 +703,8 @@ static bool wined3d_gl_hwnd_dmabuf_query_caps(struct wined3d_gl_hwnd_dmabuf_ring
 
     ring->format_modifiers = format_modifiers;
     ring->format_modifier_count = caps.format_modifier_count;
+    ring->explicit_sync = !!(caps.flags & HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC)
+            && ring->p_wglWineExportSyncFdWINE;
     return true;
 }
 
@@ -994,19 +998,25 @@ static void wined3d_gl_hwnd_dmabuf_desc_from_image(const struct wined3d_gl_hwnd_
 }
 
 static void wined3d_gl_hwnd_dmabuf_publish_channel(struct wined3d_gl_hwnd_dmabuf_ring *ring,
-        struct wined3d_gl_hwnd_dmabuf_image *image)
+        struct wined3d_gl_hwnd_dmabuf_image *image, int sync_fd)
 {
     hwnd_dmabuf_frame_desc_t desc;
     int ret;
 
     if (ring->channel_fd < 0 || !ring->p_wglWineHwndDmaBufPublishWINE)
+    {
+        if (sync_fd >= 0) ring->p_wglWineCloseDmaBufWINE(sync_fd);
         return;
+    }
 
     wined3d_gl_hwnd_dmabuf_desc_from_image(ring, image, &desc);
+    desc.sync_fd_kind = sync_fd >= 0 ? HWND_DMABUF_SYNC_FILE : HWND_DMABUF_SYNC_NONE;
     image->busy_producer_unique_id = ring->producer_unique_id;
     /* The consumer needs the fd until it confirms the slot is cached. */
     ret = ring->p_wglWineHwndDmaBufPublishWINE(ring->channel_hwnd, ring->channel_fd,
-            &desc, image->consumer_cached ? -1 : image->dmabuf_fd);
+            &desc, image->consumer_cached ? -1 : image->dmabuf_fd, sync_fd);
+    if (sync_fd >= 0)
+        ring->p_wglWineCloseDmaBufWINE(sync_fd);
     if (!ret)
         return;
 
@@ -1163,6 +1173,7 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
     unsigned int width, height, i, idx;
     DWORD src_location;
     int dmabuf_fd = -1;
+    int sync_fd = -1;
 
     context_gl = wined3d_context_gl(context);
     gl_info = context_gl->gl_info;
@@ -1229,10 +1240,6 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
     gl_info->fbo_ops.glBlitFramebuffer(src_rect.left, src_rect.top, src_rect.right, src_rect.bottom,
             0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    /* SYNC_NONE consumers need the copy complete before the frame publishes. */
-    gl_info->gl_ops.gl.p_glFinish();
-    checkGLcall("copy HWND dmabuf image");
-
     /* Export each texture once and retain its fd for the slot's lifetime. */
     if (image->dmabuf_fd < 0)
     {
@@ -1254,6 +1261,12 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
         image->dmabuf_fd = dmabuf_fd;
         image->consumer_cached = false;
     }
+
+    if (ring->explicit_sync)
+        sync_fd = ring->p_wglWineExportSyncFdWINE();
+    if (sync_fd < 0)
+        gl_info->gl_ops.gl.p_glFinish();
+    checkGLcall("copy HWND dmabuf image");
     image->present_count = ring->present_count;
     image->release_token = ++ring->next_release_token;
     if (!image->release_token)
@@ -1262,7 +1275,7 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
     wined3d_gl_hwnd_dmabuf_clear_busy(image);
     ring->last_image = idx;
     ring->next_image = (idx + 1) % ARRAY_SIZE(ring->images);
-    wined3d_gl_hwnd_dmabuf_publish_channel(ring, image);
+    wined3d_gl_hwnd_dmabuf_publish_channel(ring, image, sync_fd);
 
     device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
 }
