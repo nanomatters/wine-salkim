@@ -746,47 +746,86 @@ void wayland_output_release(struct wayland_output *output)
 }
 
 /**********************************************************************
- *          wayland_output_for_rect
+ *          output_info_for_rect
  */
-struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
+static struct output_info *output_info_for_rect(const RECT *window_rect,
+                                                RECT *output_rect, BOOL *have_outputs,
+                                                BOOL trace_outputs)
 {
-    struct wayland_output *best = NULL;
-    struct output_info *output_info;
-    HMONITOR target = NtUserMonitorFromRect(window_rect, 0);
+    struct output_info *best = NULL, *output_info;
+    UINT64 best_area = 0;
 
-    TRACE("window %s\n", wine_dbgstr_rect(window_rect));
-
-    if (!target) return NULL;
-
-    pthread_mutex_lock(&process_wayland.output_mutex);
+    if (output_rect) SetRectEmpty(output_rect);
+    *have_outputs = FALSE;
 
     wl_array_for_each(output_info, &process_wayland.output_info_array)
     {
-        RECT rect;
+        RECT intersect, rect;
+        UINT64 area;
+
+        *have_outputs = TRUE;
         SetRect(&rect, 0, 0,
                 output_info->output->current_mode->width,
                 output_info->output->current_mode->height);
         OffsetRect(&rect, output_info->x, output_info->y);
 
-        TRACE("output %s: %s\n",
-              debugstr_a(output_info->output->name),
-              wine_dbgstr_rect(&rect));
+        if (trace_outputs)
+            TRACE("output %s: %s\n",
+                  debugstr_a(output_info->output->name),
+                  wine_dbgstr_rect(&rect));
 
-        if (NtUserMonitorFromRect(&rect, 0) == target)
+        if (!intersect_rect(&intersect, window_rect, &rect)) continue;
+        area = (UINT64)(intersect.right - intersect.left) *
+               (intersect.bottom - intersect.top);
+        if (!best || area > best_area)
         {
-            best = CONTAINING_RECORD(output_info->output,
-                                     struct wayland_output,
-                                     current);
-            wayland_output_add_ref(best);
-            break;
+            best = output_info;
+            best_area = area;
+            if (output_rect) *output_rect = rect;
         }
     }
 
+    return best;
+}
+
+/**********************************************************************
+ *          wayland_output_for_rect
+ */
+struct wayland_output *wayland_output_for_rect(const RECT *window_rect, RECT *output_rect)
+{
+    struct wayland_output *output = NULL;
+    struct output_info *output_info;
+    BOOL have_outputs;
+
+    TRACE("window %s\n", wine_dbgstr_rect(window_rect));
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    if ((output_info = output_info_for_rect(window_rect, output_rect, &have_outputs, TRUE)))
+    {
+        output = CONTAINING_RECORD(output_info->output, struct wayland_output, current);
+        wayland_output_add_ref(output);
+    }
     pthread_mutex_unlock(&process_wayland.output_mutex);
 
-    if (!best) WARN("Could not find output for rect %s!\n", wine_dbgstr_rect(window_rect));
+    if (!output) WARN("Could not find output for rect %s!\n", wine_dbgstr_rect(window_rect));
 
-    return best;
+    return output;
+}
+
+/**********************************************************************
+ *          wayland_output_layout_intersects_rect
+ */
+BOOL wayland_output_layout_intersects_rect(const RECT *rect)
+{
+    struct output_info *output_info;
+    BOOL have_outputs, intersects;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    output_info = output_info_for_rect(rect, NULL, &have_outputs, FALSE);
+    intersects = output_info != NULL;
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+
+    return !have_outputs || intersects;
 }
 
 BOOL wayland_color_manager_may_support_hdr(void)

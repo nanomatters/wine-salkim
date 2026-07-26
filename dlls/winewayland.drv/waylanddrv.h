@@ -591,7 +591,8 @@ void wayland_output_release(struct wayland_output *output);
 void wayland_output_remove(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
 void wayland_output_use_image_description(struct wayland_output *output);
-struct wayland_output *wayland_output_for_rect(const RECT *rect);
+struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *output_rect);
+BOOL wayland_output_layout_intersects_rect(const RECT *rect);
 void output_info_array_update(void);
 BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);
 BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len);
@@ -609,9 +610,10 @@ struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void
  */
 
 unsigned long long wayland_time_ms(void);
-struct wayland_surface *wayland_surface_create(HWND hwnd);
+struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flags);
 void wayland_surface_destroy(struct wayland_surface *surface);
-void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor);
+void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
+                                   HWND owner, LPCWSTR title);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_make_popup(struct wayland_surface *surface,
@@ -635,7 +637,7 @@ BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *s
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
-                                         struct window_surface *window_surface);
+                                         struct window_surface *window_surface, DWORD exstyle);
 BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
 BOOL wayland_surface_promote_shm_to_overlay(struct wayland_surface *surface,
                                             struct wayland_shm_buffer *shm_buffer);
@@ -729,9 +731,15 @@ struct wayland_win_data
     struct rb_entry entry;
     /* hwnd that this private data belongs to */
     HWND hwnd;
-    /* cached root and visibility, updated before taking win_data_mutex */
+    /* Win32 state cached before taking win_data_mutex. */
     HWND toplevel;
+    HWND owner;
+    WCHAR *window_text;
     BOOL visible;
+    DWORD style;
+    DWORD exstyle;
+    RECT client_rect_in_toplevel;
+    BOOL client_rect_in_toplevel_valid;
     /* last buffer that was set as window contents */
     struct wayland_shm_buffer *window_contents;
     /* wayland surface (if any) for this window */
@@ -746,6 +754,8 @@ struct wayland_win_data
     BOOL resizeable;
     BOOL managed;
     BOOL layered_attribs_set;
+    BYTE layered_alpha;
+    DWORD layered_flags;
     BOOL ime_enabled;
     int num_ime_children;
     UINT32 alpha_multiplier;

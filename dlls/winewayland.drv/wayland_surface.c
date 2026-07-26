@@ -132,9 +132,9 @@ static struct wl_region *wayland_surface_create_shape_input_region(struct waylan
     return region;
 }
 
-static void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region)
+static void wayland_surface_sync_shape_input_region(struct wayland_surface *surface,
+                                                    HRGN shape_region, DWORD exstyle)
 {
-    DWORD exstyle = NtUserGetWindowLongW(surface->hwnd, GWL_EXSTYLE);
     BOOL transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
     struct wl_region *region = NULL;
 
@@ -153,36 +153,15 @@ static void wayland_surface_sync_shape_input_region(struct wayland_surface *surf
     if (region) wl_region_destroy(region);
 }
 
-static HRGN wayland_surface_get_window_shape_region(HWND hwnd)
-{
-    HRGN shape_region = NtGdiCreateRectRgn(0, 0, 0, 0);
-
-    if (!shape_region) return 0;
-    if (NtUserGetWindowRgnEx(hwnd, shape_region, 0) == ERROR)
-    {
-        NtGdiDeleteObjectApp(shape_region);
-        return 0;
-    }
-
-    return shape_region;
-}
-
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
-                                         struct window_surface *window_surface)
+                                         struct window_surface *window_surface, DWORD exstyle)
 {
-    HRGN shape_region, owned_shape_region = 0;
+    HRGN shape_region;
 
-    if (window_surface && window_surface->shape_region)
-        shape_region = window_surface->shape_region;
-    else
-        shape_region = owned_shape_region =
-            wayland_surface_get_window_shape_region(surface->hwnd);
-
-    wayland_surface_sync_shape_input_region(surface, shape_region);
-    wayland_surface_set_region_constraints(surface, shape_region,
-                                           window_surface ? window_surface->clip_region : 0);
-
-    if (owned_shape_region) NtGdiDeleteObjectApp(owned_shape_region);
+    assert(window_surface);
+    shape_region = window_surface->shape_region;
+    wayland_surface_sync_shape_input_region(surface, shape_region, exstyle);
+    wayland_surface_set_region_constraints(surface, shape_region, window_surface->clip_region);
 }
 
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
@@ -1343,7 +1322,7 @@ static struct wl_surface *wayland_surface_client_stack_anchor(struct wayland_sur
  *
  * Creates a role-less wayland surface.
  */
-struct wayland_surface *wayland_surface_create(HWND hwnd)
+struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flags)
 {
     struct wayland_surface *surface;
 
@@ -1377,14 +1356,9 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
     }
     if (process_wayland.wp_alpha_modifier_v1)
     {
-        COLORREF key;
-        DWORD flags;
-        BYTE alpha;
-
         surface->wp_alpha_modifier_surface_v1 =
             wp_alpha_modifier_v1_get_surface(process_wayland.wp_alpha_modifier_v1, surface->wl_surface);
 
-        if (!NtUserGetLayeredWindowAttributes(hwnd, &key, &alpha, &flags)) flags = 0;
         wayland_surface_set_opacity(surface, alpha, flags);
     }
 
@@ -1544,17 +1518,16 @@ void wayland_surface_sync_alpha(struct wayland_surface *surface)
  *
  * Gives the toplevel role to a plain wayland surface.
  */
-void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor)
+void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
+                                   HWND owner, LPCWSTR title)
 {
     static char steam_proton[] = "steam_proton";
     const char *app_id = getenv("SteamAppId");
     char proton_app_class[128];
-    WCHAR text[1024];
-
     TRACE("surface=%p\n", surface);
 
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL);
-    surface->owner_hwnd = NtUserGetWindowRelative(surface->hwnd, GW_OWNER);
+    surface->owner_hwnd = owner;
 
     if (surface->xdg_surface && surface->xdg_toplevel)
     {
@@ -1610,9 +1583,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
         );
     }
 
-    if (!NtUserInternalGetWindowText(surface->hwnd, text, ARRAY_SIZE(text)))
-        text[0] = 0;
-    wayland_surface_set_title(surface, text);
+    wayland_surface_set_title(surface, title);
 
     wayland_surface_assign_icon(surface);
 
@@ -1704,7 +1675,11 @@ static struct xdg_positioner *create_xdg_positioner(RECT rect)
 
 static BOOL hwnd_matches_popup_owner(HWND hwnd, HWND owner)
 {
-    return hwnd == owner || NtUserGetAncestor(hwnd, GA_ROOT) == owner;
+    struct wayland_win_data *data;
+
+    /* The popup role is assigned with win_data_mutex held. */
+    if (hwnd == owner) return TRUE;
+    return (data = wayland_win_data_get_nolock(hwnd)) && data->toplevel == owner;
 }
 
 static void clear_pointer_popup_serial(uint32_t serial, HWND hwnd)
@@ -1857,41 +1832,32 @@ err:
     ERR("Failed to assign popup role to wayland surface\n");
 }
 
-static struct wl_output *layer_surface_get_output(const RECT *rect, RECT *monitor_rect)
+static struct wl_output *layer_surface_get_output(const RECT *rect, RECT *output_rect)
 {
     struct wayland_output *output;
     struct wl_output *wl_output = NULL;
-    MONITORINFO mi;
-    HMONITOR monitor;
 
-    if (monitor_rect) SetRectEmpty(monitor_rect);
-    if ((output = wayland_output_for_rect(rect)))
+    if ((output = wayland_output_for_rect(rect, output_rect)))
     {
         wl_output = output->wl_output;
         wayland_output_release(output);
     }
 
-    mi.cbSize = sizeof(mi);
-    if (wl_output && monitor_rect && (monitor = NtUserMonitorFromRect(rect, 0)) &&
-        NtUserGetMonitorInfo(monitor, (MONITORINFO *)&mi))
-        *monitor_rect = mi.rcMonitor;
-
     return wl_output;
 }
 
 static void wayland_surface_update_layer_config(struct wayland_surface *surface,
-                                                const RECT *rect)
+                                                const RECT *rect,
+                                                const RECT *output_rect)
 {
-    RECT monitor_rect;
     int x = rect->left, y = rect->top;
     int width = rect->right - rect->left, height = rect->bottom - rect->top;
     uint32_t keyboard_interactivity = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
 
-    layer_surface_get_output(rect, &monitor_rect);
-    if (!IsRectEmpty(&monitor_rect))
+    if (surface->layer_output && !IsRectEmpty(output_rect))
     {
-        x -= monitor_rect.left;
-        y -= monitor_rect.top;
+        x -= output_rect->left;
+        y -= output_rect->top;
     }
 
     wayland_surface_coords_from_window(surface, x, y, &x, &y);
@@ -1920,15 +1886,16 @@ static void wayland_surface_update_layer_config(struct wayland_surface *surface,
 void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect)
 {
     struct wl_output *output;
+    RECT output_rect;
 
     TRACE("surface=%p rect=%s\n", surface, wine_dbgstr_rect(rect));
 
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_LAYER);
-    output = layer_surface_get_output(rect, NULL);
+    output = layer_surface_get_output(rect, &output_rect);
 
     if (surface->zwlr_layer_surface_v1)
     {
-        wayland_surface_update_layer_config(surface, rect);
+        wayland_surface_update_layer_config(surface, rect, &output_rect);
         wayland_set_layer_menu_hwnd(surface->hwnd);
         wl_surface_commit(surface->wl_surface);
         wl_display_flush(process_wayland.wl_display);
@@ -1949,7 +1916,7 @@ void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rec
                                        &zwlr_layer_surface_v1_listener,
                                        surface->hwnd);
 
-    wayland_surface_update_layer_config(surface, rect);
+    wayland_surface_update_layer_config(surface, rect, &output_rect);
     wayland_set_layer_menu_hwnd(surface->hwnd);
     wayland_surface_init_fractional_scale(surface, 1.0);
     wayland_surface_sync_alpha(surface);
@@ -2588,18 +2555,17 @@ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, R
 static void wayland_surface_get_rect_in_monitor(struct wayland_surface *surface,
                                                 RECT *rect)
 {
-    HMONITOR hmonitor;
-    MONITORINFO mi;
+    struct wayland_output *output;
+    RECT monitor_rect;
 
-    mi.cbSize = sizeof(mi);
-    if (!(hmonitor = NtUserMonitorFromRect(&surface->window.rect, 0)) ||
-        !NtUserGetMonitorInfo(hmonitor, (MONITORINFO *)&mi))
+    if (!(output = wayland_output_for_rect(&surface->window.rect, &monitor_rect)))
     {
         SetRectEmpty(rect);
         return;
     }
+    wayland_output_release(output);
 
-    intersect_rect(rect, &mi.rcMonitor, &surface->window.rect);
+    intersect_rect(rect, &monitor_rect, &surface->window.rect);
     OffsetRect(rect, -surface->window.rect.left, -surface->window.rect.top);
 }
 
@@ -2789,13 +2755,14 @@ static BOOL wayland_surface_client_fills_window(struct wayland_surface *surface)
 static BOOL wayland_client_surface_should_stack_above_parent(struct wayland_surface *surface,
                                                              struct wayland_client_surface *client,
                                                              HWND hwnd, HWND toplevel,
-                                                             BOOL has_window_contents)
+                                                             BOOL has_window_contents,
+                                                             DWORD exstyle)
 {
     /* A single opaque client surface covering the whole toplevel can sit above
      * an opaque parent carrier without using transparent punch-through. */
     if (hwnd != toplevel) return FALSE;
     if (has_window_contents || ReadAcquire(&client->has_alpha)) return FALSE;
-    if (NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED) return FALSE;
+    if (exstyle & WS_EX_LAYERED) return FALSE;
     if (!wayland_surface_is_toplevel(surface) || surface->window.minimized) return FALSE;
     if (!wayland_surface_client_fills_window(surface)) return FALSE;
     if (surface->shaped || surface->occlusion_clipped) return FALSE;
@@ -4890,7 +4857,7 @@ static BOOL wayland_client_surface_update_visual_constraint(struct wayland_clien
                                                             HWND toplevel)
 {
     struct wayland_child_visibility_info visibility;
-    struct wayland_win_data *toplevel_data;
+    struct wayland_win_data *client_data, *toplevel_data;
     struct wayland_surface *surface;
     HWND hwnd = client->client.hwnd;
     RECT client_rect, dst;
@@ -4910,10 +4877,17 @@ static BOOL wayland_client_surface_update_visual_constraint(struct wayland_clien
                 surface->window.client_rect.right - surface->window.client_rect.left,
                 surface->window.client_rect.bottom - surface->window.client_rect.top);
     }
+    else if ((client_data = wayland_win_data_get_nolock(hwnd)) &&
+             client_data->toplevel == toplevel &&
+             client_data->client_rect_in_toplevel_valid)
+    {
+        client_rect = client_data->client_rect_in_toplevel;
+    }
     else
     {
-        NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
-        NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+        client->visual_constraint.valid = FALSE;
+        wayland_win_data_release(toplevel_data);
+        return FALSE;
     }
 
     dst = client_rect;
@@ -5022,14 +4996,12 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_client_surface *old_client;
     struct wayland_win_data *data;
-    BOOL visible;
+    BOOL visible = is_client_visible(hwnd);
 
     /* ownership is shared with the callers, the last caller to release
      * its reference will also destroy it and clear our pointer. */
 
     if (!(data = wayland_win_data_get(hwnd))) return;
-
-    visible = is_client_visible(hwnd);
 
     if (new_client && new_client != data->client_surface && data->client_surface &&
         ReadAcquire(&data->client_surface->has_presented) &&
@@ -5551,7 +5523,7 @@ static BOOL wayland_surface_has_live_role(struct wayland_surface *surface)
 
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
 {
-    struct wayland_win_data *toplevel_data;
+    struct wayland_win_data *client_data, *toplevel_data;
     struct wayland_surface *surface = NULL;
     HWND hwnd = client->client.hwnd;
     RECT client_rect, dst;
@@ -5623,8 +5595,10 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         return;
     }
 
+    client_data = wayland_win_data_get_nolock(hwnd);
     stack_above_parent = wayland_client_surface_should_stack_above_parent(
-            surface, client, hwnd, toplevel, toplevel_data->window_contents != NULL);
+            surface, client, hwnd, toplevel, toplevel_data->window_contents != NULL,
+            client_data ? client_data->exstyle : WS_EX_LAYERED);
 
     if (client->toplevel != toplevel ||
         client->toplevel_wl_surface != surface->wl_surface)
@@ -5656,10 +5630,16 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
                 surface->window.client_rect.right - surface->window.client_rect.left,
                 surface->window.client_rect.bottom - surface->window.client_rect.top);
     }
+    else if (client_data && client_data->toplevel == toplevel &&
+             client_data->client_rect_in_toplevel_valid)
+    {
+        client_rect = client_data->client_rect_in_toplevel;
+    }
     else
     {
-        NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
-        NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+        wayland_win_data_release(toplevel_data);
+        wayland_client_surface_attach(client, NULL);
+        return;
     }
 
     dst = client_rect;

@@ -876,7 +876,8 @@ static void wayland_window_surface_sync_regions(struct window_surface *window_su
         return;
 
     if (data->wayland_surface)
-        wayland_surface_sync_window_regions(data->wayland_surface, window_surface);
+        wayland_surface_sync_window_regions(data->wayland_surface, window_surface,
+                                            data->exstyle);
 
     wayland_win_data_release(data);
 }
