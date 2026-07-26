@@ -673,6 +673,8 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
 void wayland_client_surface_release_vulkan_surface(struct client_surface *client,
                                                    UINT64 host_surface);
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
+BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
+                                                struct wayland_client_surface *client);
 void wayland_client_surface_attach_image_description(struct client_surface *client,
                                                      struct wp_image_description_v1 *image_desc);
 struct wayland_client_surface *impl_from_client_surface(struct client_surface *client);

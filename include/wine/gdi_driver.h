@@ -258,6 +258,8 @@ struct client_surface_funcs
     void (*present)( struct client_surface *surface, HDC hdc );
     /* return the externally-owned presentation surface and content rectangles */
     BOOL (*get_presentation_rects)( struct client_surface *surface, RECT *host, RECT *dst );
+    /* return whether the native client surface handles presentation scaling */
+    BOOL (*is_presentation_scaled)( struct client_surface *surface );
 };
 
 struct client_surface
