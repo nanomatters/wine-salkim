@@ -1228,8 +1228,8 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_NOSIZE;
     }
 
-    wayland_surface_coords_to_window(surface, width, height,
-                                     &window_width, &window_height);
+    window_width = width;
+    window_height = height;
     offset_x = ((surface->window.rect.left - surface->window.window_rect.left) +
                 (surface->window.window_rect.right - surface->window.rect.right));
     offset_y = ((surface->window.rect.top - surface->window.window_rect.top) +
