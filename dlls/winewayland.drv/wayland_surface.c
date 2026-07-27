@@ -1038,6 +1038,9 @@ static void xdg_toplevel_handle_configure(void *private,
 
     if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
     {
+        surface->pending.surface_width = width;
+        surface->pending.surface_height = height;
+        surface->pending.scale = surface->window.scale;
         surface->pending.rect = rect = map_rect_from_surface(surface, rect);
         surface->pending.state = config_state;
         if (!surface->pending.decor)
@@ -1245,6 +1248,7 @@ void wp_fractional_scale_handle_scale(void* user_data,
                                       struct wp_fractional_scale_v1 *fractional_scale_v1,
                                       uint32_t scale_fixed)
 {
+    struct wayland_client_surface *client;
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     double scale = scale_fixed / 120.0;
@@ -1260,6 +1264,15 @@ void wp_fractional_scale_handle_scale(void* user_data,
     }
 
     surface->window.scale = scale;
+
+    /* Recreate direct presentation so the next handoff uses the new scale. */
+    if ((client = surface->direct_client))
+    {
+        TRACE("invalidating direct toplevel %s: fractional scale changed\n",
+              debugstr_client_surface(&client->client));
+        client_surface_invalidate_presentation_once(&client->client,
+                                                    &client->direct_toplevel_invalidated);
+    }
 
     wayland_win_data_release(data);
 
@@ -2398,6 +2411,16 @@ static void wayland_surface_unset_viewport(struct wayland_surface *surface)
     surface->content_width = surface->content_height = 0;
 }
 
+/* External WSI needs the full buffer source, but keeps Wine's logical
+ * destination for fractional-scale mapping. */
+static void wayland_surface_unset_viewport_source(struct wayland_surface *surface)
+{
+    if (!surface->wp_viewport) return;
+
+    wp_viewport_set_source(surface->wp_viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                           wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+}
+
 struct wayland_gdi_shm_overlay
 {
     struct wl_surface *wl_surface;
@@ -2708,6 +2731,30 @@ static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *s
 }
 
 /**********************************************************************
+ *          wayland_surface_get_surface_size
+ *
+ * Computes the surface-local size for a window-space rect.
+ */
+static void wayland_surface_get_surface_size(struct wayland_surface *surface, RECT rect,
+                                             int *width, int *height)
+{
+    const struct wayland_surface_config *config = &surface->current;
+    int win_width = rect.right - rect.left, win_height = rect.bottom - rect.top;
+
+    /* Avoid position-dependent per-edge rounding. */
+    *width = round(win_width / surface->window.scale);
+    *height = round(win_height / surface->window.scale);
+
+    /* Raw configure sizes are scale-specific. */
+    if (!config->serial || config->scale != surface->window.scale) return;
+
+    if (config->surface_width > 0 && win_width == config->rect.right - config->rect.left)
+        *width = config->surface_width;
+    if (config->surface_height > 0 && win_height == config->rect.bottom - config->rect.top)
+        *height = config->surface_height;
+}
+
+/**********************************************************************
  *          wayland_surface_reconfigure_geometry
  *
  * Sets the xdg_surface geometry
@@ -2715,6 +2762,7 @@ static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *s
 static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface, RECT rect)
 {
     const RECT *current = &surface->current.rect;
+    int width, height;
     /* If the window size is bigger than the current state accepts, use the
      * largest visible (from Windows' perspective) subregion of the window. */
     if ((surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
@@ -2741,14 +2789,15 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
         TRACE("Window is too large for Wayland state, using subregion\n");
     }
 
+    wayland_surface_get_surface_size(surface, rect, &width, &height);
     rect = map_rect_to_surface(surface, rect);
+    rect.right = rect.left + width;
+    rect.bottom = rect.top + height;
 
     TRACE("hwnd=%p geometry=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
 
-    if (!IsRectEmpty(&rect))
+    if (width > 0 && height > 0)
     {
-        int width = rect.right - rect.left, height = rect.bottom - rect.top;
-
         xdg_surface_set_window_geometry(surface->xdg_surface, 0, 0, width, height);
         surface->geometry = rect;
         /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
@@ -4506,6 +4555,7 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
 {
     struct wayland_window_config *window = &surface->window;
     RECT rect = surface->window.rect;
+    int width, height;
 
     TRACE("hwnd=%p window=%s,%#x processing=%s,%#x current=%s,%#x\n",
           surface->hwnd, wine_dbgstr_rect(&rect), window->state,
@@ -4531,8 +4581,8 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
         break;
     }
 
-    rect = map_rect_to_surface(surface, rect);
-    wayland_surface_reconfigure_size(surface, rect.right - rect.left, rect.bottom - rect.top);
+    wayland_surface_get_surface_size(surface, rect, &width, &height);
+    wayland_surface_reconfigure_size(surface, width, height);
 
     return TRUE;
 }
@@ -5459,7 +5509,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
         wp_content_type_v1_destroy(surface->wp_content_type_v1);
         surface->wp_content_type_v1 = NULL;
     }
-    wayland_surface_unset_viewport(data->wayland_surface);
+    wayland_surface_unset_viewport_source(data->wayland_surface);
     wayland_client_surface_reset_opaque_region(surface);
     surface->owns_wl_surface = FALSE;
     surface->owns_direct_wl_surface = FALSE;
@@ -5485,8 +5535,11 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
 
-    TRACE("promoted %s to borrowed toplevel wl_surface=%p for hwnd=%p\n",
-          debugstr_client_surface(client), toplevel_wl_surface, hwnd);
+    TRACE("promoted %s to borrowed toplevel wl_surface=%p for hwnd=%p scale=%.3f dest=%dx%d client=%s\n",
+          debugstr_client_surface(client), toplevel_wl_surface, hwnd,
+          data->wayland_surface->window.scale,
+          data->wayland_surface->viewport_dest_width, data->wayland_surface->viewport_dest_height,
+          wine_dbgstr_rect(&data->wayland_surface->window.client_rect));
 
     wayland_win_data_release(data);
     if (release_pending_description) client_surface_release(client);
@@ -5522,7 +5575,7 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
     surface->direct_host_surface = host_surface;
     surface->direct_wl_surface = surface->wl_surface;
     InterlockedExchange(&surface->direct_toplevel_invalidated, FALSE);
-    if (data->wayland_surface) wayland_surface_unset_viewport(data->wayland_surface);
+    if (data->wayland_surface) wayland_surface_unset_viewport_source(data->wayland_surface);
     wayland_client_surface_reset_opaque_region(surface);
     InterlockedExchange(&surface->has_presented, FALSE);
     if (data->wayland_surface)
@@ -5537,8 +5590,12 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
 
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
-    TRACE("reactivated %s on borrowed toplevel wl_surface=%p for hwnd=%p\n",
-          debugstr_client_surface(client), surface->wl_surface, hwnd);
+    TRACE("reactivated %s on borrowed toplevel wl_surface=%p for hwnd=%p scale=%.3f dest=%dx%d client=%s\n",
+          debugstr_client_surface(client), surface->wl_surface, hwnd,
+          data->wayland_surface ? data->wayland_surface->window.scale : 0.0,
+          data->wayland_surface ? data->wayland_surface->viewport_dest_width : 0,
+          data->wayland_surface ? data->wayland_surface->viewport_dest_height : 0,
+          data->wayland_surface ? wine_dbgstr_rect(&data->wayland_surface->window.client_rect) : "(none)");
     ret = TRUE;
 
 done:

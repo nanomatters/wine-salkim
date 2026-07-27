@@ -397,6 +397,10 @@ struct output_info
 struct wayland_surface_config
 {
     RECT rect;
+    /* Raw configure size in surface-local units, plus the scale used when
+     * converting it to rect. */
+    int32_t surface_width, surface_height;
+    double scale;
     int32_t bounds_width, bounds_height;
     enum wayland_surface_config_state state;
     enum zxdg_toplevel_decoration_v1_mode decor;
