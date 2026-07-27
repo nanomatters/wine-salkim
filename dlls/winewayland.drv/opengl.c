@@ -44,6 +44,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 #include "wine/opengl_driver.h"
 
+#ifndef EGL_SYNC_NATIVE_FENCE_ANDROID
+#define EGL_SYNC_NATIVE_FENCE_ANDROID 0x3144
+#endif
+
 static const struct egl_platform *egl;
 static const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs wayland_drawable_funcs;
@@ -60,9 +64,13 @@ static PFN_eglCreateImageKHR pfn_eglCreateImageKHR;
 static PFN_eglDestroyImageKHR pfn_eglDestroyImageKHR;
 static PFN_eglExportDMABUFImageMESA pfn_eglExportDMABUFImageMESA;
 static PFN_eglExportDMABUFImageQueryMESA pfn_eglExportDMABUFImageQueryMESA;
+static PFN_eglCreateSyncKHR pfn_eglCreateSyncKHR;
+static PFN_eglDestroySyncKHR pfn_eglDestroySyncKHR;
+static EGLint (*pfn_eglDupNativeFenceFDANDROID)(EGLDisplay display, EGLSyncKHR sync);
 
 static pthread_once_t dmabuf_export_init_once = PTHREAD_ONCE_INIT;
 static BOOL dmabuf_export_supported;
+static BOOL native_fence_supported;
 
 static BOOL dmabuf_export_type_supported(GLenum type)
 {
@@ -102,6 +110,14 @@ static void dmabuf_export_init_support(void)
         return;
 
     dmabuf_export_supported = TRUE;
+
+    if (!strstr(extensions, "EGL_ANDROID_native_fence_sync")) return;
+    pfn_eglCreateSyncKHR = (void *)funcs->p_eglGetProcAddress("eglCreateSyncKHR");
+    pfn_eglDestroySyncKHR = (void *)funcs->p_eglGetProcAddress("eglDestroySyncKHR");
+    pfn_eglDupNativeFenceFDANDROID =
+        (void *)funcs->p_eglGetProcAddress("eglDupNativeFenceFDANDROID");
+    native_fence_supported = pfn_eglCreateSyncKHR && pfn_eglDestroySyncKHR &&
+                             pfn_eglDupNativeFenceFDANDROID;
 }
 
 static BOOL dmabuf_export_bridge_supported(void)
@@ -397,12 +413,32 @@ static BOOL GLAPIENTRY wayland_wglWineDmaBufExportSupportedWINE(void)
     return dmabuf_export_bridge_supported();
 }
 
+static int GLAPIENTRY wayland_wglWineExportSyncFdWINE(void)
+{
+    const EGLint attributes[] = {EGL_NONE};
+    EGLSyncKHR sync;
+    int fd = -1;
+
+    if (!dmabuf_export_bridge_supported() || !native_fence_supported) return -1;
+    if ((sync = pfn_eglCreateSyncKHR(egl->display, EGL_SYNC_NATIVE_FENCE_ANDROID,
+                                     attributes)) == EGL_NO_SYNC_KHR)
+        return -1;
+
+    funcs->p_glFlush();
+    fd = pfn_eglDupNativeFenceFDANDROID(egl->display, sync);
+    pfn_eglDestroySyncKHR(egl->display, sync);
+    return fd;
+}
+
 static void *wayland_get_proc_address(const char *name)
 {
     if (!strcmp(name, "wglWineDmaBufExportSupportedWINE"))
         return wayland_wglWineDmaBufExportSupportedWINE;
     if (!strcmp(name, "wglWineExportDmaBufWINE"))
         return dmabuf_export_bridge_supported() ? (void *)wayland_wglWineExportDmaBufWINE : NULL;
+    if (!strcmp(name, "wglWineExportSyncFdWINE"))
+        return dmabuf_export_bridge_supported() && native_fence_supported
+               ? (void *)wayland_wglWineExportSyncFdWINE : NULL;
 
     return prev_get_proc_address ? prev_get_proc_address(name) : NULL;
 }

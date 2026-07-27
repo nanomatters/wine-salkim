@@ -75,33 +75,45 @@ unsigned int hwnd_dmabuf_release_channel( HWND hwnd )
 }
 
 /* Send one frame. The caller must reclaim the slot on error. */
-int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd )
+int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd, int sync_fd )
 {
-    char control[CMSG_SPACE( sizeof(int) )];
+    hwnd_dmabuf_frame_desc_t frame = *(const hwnd_dmabuf_frame_desc_t *)desc;
+    char control[CMSG_SPACE( 2 * sizeof(int) )];
     struct msghdr msg = { 0 };
     struct iovec iov;
+    int fds[2], fd_count = 0;
     ssize_t n;
 
-    iov.iov_base = (void *)desc;
-    iov.iov_len = sizeof(hwnd_dmabuf_frame_desc_t);
+    if (dmabuf_fd >= 0)
+        fds[fd_count++] = dmabuf_fd;
+    if (sync_fd >= 0)
+    {
+        frame.sync_fd_kind = HWND_DMABUF_SYNC_FILE;
+        fds[fd_count++] = sync_fd;
+    }
+    else frame.sync_fd_kind = HWND_DMABUF_SYNC_NONE;
+
+    iov.iov_base = &frame;
+    iov.iov_len = sizeof(frame);
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
-    if (dmabuf_fd >= 0)
+    if (fd_count)
     {
         struct cmsghdr *cmsg;
         msg.msg_control = control;
-        msg.msg_controllen = sizeof(control);
+        msg.msg_controllen = CMSG_SPACE( fd_count * sizeof(int) );
         cmsg = CMSG_FIRSTHDR( &msg );
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN( sizeof(int) );
-        memcpy( CMSG_DATA( cmsg ), &dmabuf_fd, sizeof(int) );
+        cmsg->cmsg_len = CMSG_LEN( fd_count * sizeof(int) );
+        memcpy( CMSG_DATA( cmsg ), fds, fd_count * sizeof(int) );
     }
 
     do n = sendmsg( channel_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT );
     while (n < 0 && errno == EINTR);
     if (dmabuf_fd >= 0) close( dmabuf_fd );
-    return n == sizeof(hwnd_dmabuf_frame_desc_t) ? 0 : n < 0 ? errno : EMSGSIZE;
+    if (sync_fd >= 0) close( sync_fd );
+    return n == sizeof(frame) ? 0 : n < 0 ? errno : EMSGSIZE;
 }
 
 static int hwnd_dmabuf_channel_result_from_errno( int err )
@@ -122,15 +134,23 @@ static int hwnd_dmabuf_channel_result_from_errno( int err )
     }
 }
 
-int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
+int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc,
+                                 int dmabuf_fd, int sync_fd )
 {
-    int send_fd, ret;
+    const hwnd_dmabuf_frame_desc_t *frame = desc;
+    int send_fd = -1, send_sync_fd = -1, ret;
 
-    if (dmabuf_fd < 0) return HWND_DMABUF_CHANNEL_ERROR;
-    if ((send_fd = dup( dmabuf_fd )) < 0)
+    if (dmabuf_fd < 0 && (!frame || !(frame->flags & HWND_DMABUF_FLAG_STABLE_SLOT)))
+        return HWND_DMABUF_CHANNEL_ERROR;
+    if (dmabuf_fd >= 0 && (send_fd = dup( dmabuf_fd )) < 0)
         return hwnd_dmabuf_channel_result_from_errno( errno );
+    if (sync_fd >= 0 && (send_sync_fd = dup( sync_fd )) < 0)
+    {
+        if (send_fd >= 0) close( send_fd );
+        return hwnd_dmabuf_channel_result_from_errno( errno );
+    }
 
-    ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd );
+    ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd, send_sync_fd );
     if (!ret) hwnd_dmabuf_post_wake( hwnd );
     return ret ? hwnd_dmabuf_channel_result_from_errno( ret ) : HWND_DMABUF_CHANNEL_OK;
 }
@@ -162,10 +182,11 @@ void WINAPI NtUserHwndDmaBufCloseProducer( HWND hwnd, int channel_fd )
     hwnd_dmabuf_close_channel( hwnd, channel_fd );
 }
 
-int WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
+int WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc,
+                                    int dmabuf_fd, int sync_fd )
 {
     if (!desc) return HWND_DMABUF_CHANNEL_ERROR;
-    return hwnd_dmabuf_channel_publish( hwnd, channel_fd, desc, dmabuf_fd );
+    return hwnd_dmabuf_channel_publish( hwnd, channel_fd, desc, dmabuf_fd, sync_fd );
 }
 
 int WINAPI NtUserHwndDmaBufDrainRelease( int channel_fd, void *release )

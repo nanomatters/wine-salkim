@@ -94,7 +94,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 48
+#define WINE_VULKAN_DRIVER_VERSION 49
 
 struct vulkan_object
 {
@@ -202,6 +202,10 @@ struct vulkan_queue
     VULKAN_OBJECT_HEADER( VkQueue, queue );
     struct vulkan_device *device;
     VkDeviceQueueInfo2 info;
+    pthread_mutex_t mutex; /* serializes host access with Wine-injected queue work */
+    VkSemaphore managed_present_semaphore;
+    VkSemaphore managed_host_semaphore;
+    BOOL managed_present_sync_unavailable;
 };
 
 static inline struct vulkan_queue *vulkan_queue_from_handle( VkQueue handle )
@@ -224,6 +228,31 @@ struct vulkan_device
     VkQueueFamilyProperties *queue_props;
     BOOL low_latency_enabled;
 };
+
+static inline void vulkan_queue_lock( struct vulkan_queue *queue )
+{
+    pthread_mutex_lock( &queue->mutex );
+}
+
+static inline void vulkan_queue_unlock( struct vulkan_queue *queue )
+{
+    pthread_mutex_unlock( &queue->mutex );
+}
+
+static inline void vulkan_device_lock_queues( struct vulkan_device *device )
+{
+    uint64_t i;
+
+    /* A stable order allows device-wide operations to exclude every queue. */
+    for (i = 0; i < device->queue_count; i++) vulkan_queue_lock( device->queues + i );
+}
+
+static inline void vulkan_device_unlock_queues( struct vulkan_device *device )
+{
+    uint64_t i;
+
+    for (i = device->queue_count; i; i--) vulkan_queue_unlock( device->queues + i - 1 );
+}
 
 static inline struct vulkan_device *vulkan_device_from_handle( VkDevice handle )
 {
@@ -370,6 +399,8 @@ struct vulkan_funcs
     PFN_vkQueueSubmit2KHR p_vkQueueSubmit2KHR;
     PFN_vkUnmapMemory p_vkUnmapMemory;
     PFN_vkUnmapMemory2KHR p_vkUnmapMemory2KHR;
+    PFN_vkWaitForPresentKHR p_vkWaitForPresentKHR;
+    PFN_vkWaitForPresent2KHR p_vkWaitForPresent2KHR;
 };
 
 /* interface between win32u and the user drivers */
@@ -377,7 +408,11 @@ struct client_surface;
 struct vulkan_driver_funcs
 {
     VkResult (*p_vulkan_surface_create)(HWND, BOOL, const struct vulkan_instance *, VkSurfaceKHR *, struct client_surface **);
+    VkResult (*p_vulkan_surface_update)(HWND, const struct vulkan_instance *, struct client_surface *,
+                                        VkSurfaceKHR, VkSurfaceKHR *, BOOL *);
+    void (*p_vulkan_surface_release)(struct client_surface *, VkSurfaceKHR);
     VkColorSpaceKHR (*p_vulkan_map_colorspace)( VkColorSpaceKHR, struct client_surface * );
+    void (*p_vulkan_surface_set_alpha)( VkCompositeAlphaFlagBitsKHR, struct client_surface * );
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
     UINT (*p_vulkan_get_hwnd_dmabuf_caps)( HWND, void *, void *, UINT, UINT * );
     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );

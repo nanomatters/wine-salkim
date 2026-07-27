@@ -113,6 +113,12 @@ struct wglWineExportDmaBufWINE_params
     BOOL ret;
 };
 
+struct wglWineExportSyncFdWINE_params
+{
+    TEB *teb;
+    int ret;
+};
+
 struct glAccum_params
 {
     TEB *teb;
@@ -29054,6 +29060,7 @@ enum unix_funcs
     unix_wglWineCloseDmaBufWINE,
     unix_wglWineDmaBufExportSupportedWINE,
     unix_wglWineExportDmaBufWINE,
+    unix_wglWineExportSyncFdWINE,
     funcs_count
 };
 

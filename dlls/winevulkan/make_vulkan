@@ -247,6 +247,8 @@ USER_DRIVER_FUNCS = {
     "vkSetSwapchainPresentTimingQueueSizeEXT",
     "vkUnmapMemory",
     "vkUnmapMemory2KHR",
+    "vkWaitForPresentKHR",
+    "vkWaitForPresent2KHR",
 }
 
 # functions for which the unix thunk is manually implemented
@@ -800,11 +802,25 @@ class VkFunction(object):
         else:
             func_prefix = "{0}->p_".format(self.params[0].dispatch_table(params_prefix, conv))
 
+        queue = None
+        if self.params[0].type == "VkQueue" and self.name not in USER_DRIVER_FUNCS:
+            queue = "vulkan_queue_from_handle({0})".format(self.params[0].value(params_prefix, conv))
+            body += "    vulkan_queue_lock({0});\n".format(queue)
+        elif self.name == "vkDeviceWaitIdle":
+            body += "    vulkan_device_lock_queues({0});\n".format(
+                self.params[0].dispatch_table(params_prefix, conv))
+
         # Call the host Vulkan function.
         if self.type == "void":
             body += "    {0}{1}({2});\n".format(func_prefix, self.name, params)
         else:
             body += "    {0}result = {1}{2}({3});\n".format(params_prefix, func_prefix, self.name, params)
+
+        if queue:
+            body += "    vulkan_queue_unlock({0});\n".format(queue)
+        elif self.name == "vkDeviceWaitIdle":
+            body += "    vulkan_device_unlock_queues({0});\n".format(
+                self.params[0].dispatch_table(params_prefix, conv))
 
         # Call any host_to_win conversion calls.
         for p in self.params:
