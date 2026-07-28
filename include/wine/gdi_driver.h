@@ -283,6 +283,7 @@ W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI BOOL client_surface_begin_present_wait( struct client_surface *surface, LONG generation );
 W32KAPI void client_surface_end_present_wait( struct client_surface *surface );
+W32KAPI void client_surface_invalidate_presentation( struct client_surface *surface );
 W32KAPI BOOL client_surface_invalidate_presentation_once( struct client_surface *surface,
                                                           LONG *invalidated );
 W32KAPI BOOL client_surface_prepare_presentation_retirement( struct client_surface *surface );

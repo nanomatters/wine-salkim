@@ -156,12 +156,16 @@ static void wayland_surface_sync_shape_input_region(struct wayland_surface *surf
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface, DWORD exstyle)
 {
+    struct wayland_win_data *data;
     HRGN shape_region;
 
     assert(window_surface);
     shape_region = window_surface->shape_region;
     wayland_surface_sync_shape_input_region(surface, shape_region, exstyle);
     wayland_surface_set_region_constraints(surface, shape_region, window_surface->clip_region);
+
+    if ((data = wayland_win_data_get_nolock(surface->hwnd)))
+        wayland_client_surface_sync_presentation_scaling(surface, data);
 }
 
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
@@ -904,7 +908,7 @@ static BOOL wayland_surface_config_has_bounds(const struct wayland_surface_confi
 
 static const struct wayland_surface_config *wayland_surface_latest_config(struct wayland_surface *surface)
 {
-    if (surface->requested.serial) return &surface->requested;
+    if (surface->queued.serial) return &surface->queued;
     if (surface->processing.serial) return &surface->processing;
     if (surface->current.serial) return &surface->current;
     return NULL;
@@ -948,25 +952,24 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
 
     if (wayland_surface_is_toplevel(surface))
     {
-        /* If we have a previously requested config, we have already sent a
+        /* If we have a queued configure, we have already sent a
          * WM_WAYLAND_CONFIGURE which hasn't been handled yet. In that case,
          * avoid sending another message to reduce message queue traffic. */
-        should_post = surface->requested.serial == 0;
+        should_post = surface->queued.serial == 0;
         should_expose = surface->current.serial == 0;
         surface->pending.serial = serial;
-        surface->pending.state_generation = surface->state_request.generation;
         wayland_surface_config_inherit_caps_and_bounds(&surface->pending, surface);
         if (!surface->pending.decor && surface->current.decor)
             surface->pending.decor = surface->current.decor;
-        else if (!surface->pending.decor && surface->requested.decor)
-            surface->pending.decor = surface->requested.decor;
+        else if (!surface->pending.decor && surface->queued.decor)
+            surface->pending.decor = surface->queued.decor;
         if (surface->pending.decor &&
             surface->pending.decor != surface->current.decor)
         {
             should_post = TRUE;
             should_expose = TRUE;
         }
-        surface->requested = surface->pending;
+        surface->queued = surface->pending;
         memset(&surface->pending, 0, sizeof(surface->pending));
     }
     else if (wayland_surface_is_popup(surface))
@@ -2291,11 +2294,9 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
     }
 
     memset(&surface->pending, 0, sizeof(surface->pending));
-    memset(&surface->requested, 0, sizeof(surface->requested));
+    memset(&surface->queued, 0, sizeof(surface->queued));
     memset(&surface->processing, 0, sizeof(surface->processing));
     memset(&surface->current, 0, sizeof(surface->current));
-    surface->applying_configure_serial = 0;
-
     memset(&surface->comitted, 0, sizeof(surface->comitted));
     surface->comitted.scale = 0.0;
     memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
@@ -2640,6 +2641,13 @@ static BOOL wayland_surface_config_is_managed(const struct wayland_surface_confi
                             WAYLAND_SURFACE_CONFIG_STATE_TILED);
 }
 
+/* Tiled does not imply a compositor-owned size. */
+static BOOL wayland_surface_config_dictates_size(const struct wayland_surface_config *config)
+{
+    return config->state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                            WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
+}
+
 BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size)
 {
     const struct wayland_surface_config *config = &surface->current;
@@ -2677,7 +2685,7 @@ static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *s
             limits.max_height = surface->current.bounds_height;
         }
     }
-    else
+    else if (!wayland_surface_config_dictates_size(&surface->current))
     {
         limits.min_width = limits.max_width = width;
         limits.min_height = limits.max_height = height;
@@ -2810,6 +2818,22 @@ BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
     return wayland_surface_is_toplevel(surface) &&
            wayland_surface_client_fills_window(surface) &&
            !wayland_surface_client_covers_presentation(surface);
+}
+
+void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *surface,
+                                                      struct wayland_win_data *data)
+{
+    struct wayland_client_surface *client = data->client_surface;
+    BOOL scaled;
+
+    if (!client || !surface || surface->window.minimized) return;
+    if (ReadAcquire(&client->direct_toplevel)) return;
+
+    scaled = wayland_client_surface_scales_presentation(surface, client);
+    if (ReadAcquire(&client->presentation_scaling) == scaled) return;
+
+    InterlockedExchange(&client->presentation_scaling, scaled);
+    client_surface_invalidate_presentation(&client->client);
 }
 
 static BOOL wayland_client_surface_should_stack_above_parent(struct wayland_surface *surface,
@@ -4381,8 +4405,8 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
 /**********************************************************************
  *          wayland_surface_reconfigure_xdg
  *
- * Reconfigures the xdg surface as needed to match the latest requested
- * state.
+ * Reconfigures the xdg surface as needed to match the latest processed
+ * configure.
  */
 static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, RECT rect)
 {
@@ -4397,23 +4421,14 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
     }
-    /* Initial configure, or a fullscreen/maximized transition for the current
-     * application request: ack from the requested state so a dmabuf-only
-     * toplevel finalizes without the win32 resize round-trip. Decoration
-     * changes must go through the message loop. */
-    else if (surface->requested.serial &&
-             (!surface->current.serial ||
-              (surface->requested.state &
-               (WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
-                WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))) &&
-             surface->requested.state_generation == surface->state_request.generation &&
-             surface->current.decor == surface->requested.decor &&
-             wayland_surface_config_is_compatible(&surface->requested, rect,
+    else if (!surface->current.serial && surface->queued.serial &&
+             surface->current.decor == surface->queued.decor &&
+             wayland_surface_config_is_compatible(&surface->queued, rect,
                                                   window->state))
     {
-        surface->current = surface->requested;
+        surface->current = surface->queued;
         memset(&surface->processing, 0, sizeof(surface->processing));
-        memset(&surface->requested, 0, sizeof(surface->requested));
+        memset(&surface->queued, 0, sizeof(surface->queued));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
     }
     else if (!surface->current.serial ||
@@ -4484,14 +4499,13 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
 /**********************************************************************
  *          wayland_surface_reconfigure
  *
- * Reconfigures the wayland surface as needed to match the latest requested
- * state.
+ * Reconfigures the wayland surface as needed to match the latest processed
+ * configure.
  */
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
 {
     struct wayland_window_config *window = &surface->window;
     RECT rect = surface->window.rect;
-    uint32_t current_serial = surface->current.serial;
 
     TRACE("hwnd=%p window=%s,%#x processing=%s,%#x current=%s,%#x\n",
           surface->hwnd, wine_dbgstr_rect(&rect), window->state,
@@ -4506,9 +4520,6 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
         if (!wayland_surface_reconfigure_xdg(surface, rect)) return FALSE;
-        if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
-            surface->current.serial != current_serial)
-            wayland_surface_reconcile_state_request(surface);
         break;
     case WAYLAND_SURFACE_ROLE_LAYER:
         if (!surface->zwlr_layer_surface_v1) break; /* surface role has been cleared */
@@ -5152,19 +5163,17 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
 static BOOL wayland_client_surface_is_presentation_scaled(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    struct wayland_surface *toplevel_surface;
     struct wayland_win_data *data;
-    BOOL ret = FALSE;
+    BOOL ret;
 
     /* Direct-toplevel eligibility requires the client to cover the
      * presentation surface, so only the child path can scale here. */
     if (ReadAcquire(&surface->direct_toplevel)) return FALSE;
     if (!(data = wayland_win_data_get(client->hwnd))) return FALSE;
 
-    if ((toplevel_surface = data->wayland_surface) &&
-        data->client_surface == surface &&
-        wayland_client_surface_scales_presentation(toplevel_surface, surface))
-        ret = TRUE;
+    ret = wayland_client_surface_scales_presentation(data->wayland_surface, surface);
+
+    InterlockedExchange(&surface->presentation_scaling, ret);
 
     wayland_win_data_release(data);
     return ret;
@@ -6024,6 +6033,13 @@ void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha)
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     BOOL changed = InterlockedExchange(&surface->has_alpha, alpha) != alpha;
     BOOL opaque = !alpha;
+    struct wayland_win_data *data;
+
+    if (changed && (data = wayland_win_data_get(client->hwnd)))
+    {
+        wayland_client_surface_sync_presentation_scaling(data->wayland_surface, data);
+        wayland_win_data_release(data);
+    }
 
     /* The external WSI producer owns commits on this wl_surface. Clearing an
      * opaque region is safe for an older opaque frame, but setting one must

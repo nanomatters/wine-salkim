@@ -398,6 +398,13 @@ void client_surface_end_present_wait( struct client_surface *surface )
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
+void client_surface_invalidate_presentation( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    InterlockedIncrement( &surface->presentation_generation );
+    pthread_mutex_unlock( &surface->presentation_mutex );
+}
+
 BOOL client_surface_invalidate_presentation_once( struct client_surface *surface, LONG *invalidated )
 {
     BOOL ret;
