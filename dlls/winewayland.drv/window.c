@@ -649,6 +649,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
              * windows can restore their limits on the next geometry update. */
             xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
             xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+            wayland_surface_mark_pending_commit(surface);
             memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
         }
     }
@@ -1866,7 +1867,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                     wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
                     wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
                     wayland_surface->carrier_attached = FALSE;
-                    wl_surface_commit(wayland_surface->wl_surface);
+                    wayland_surface_commit(wayland_surface);
                     wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
                     wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
                     wayland_surface_update_hwnd_dmabufs(wayland_surface);

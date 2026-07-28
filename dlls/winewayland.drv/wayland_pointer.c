@@ -1026,6 +1026,17 @@ static BOOL wayland_surface_client_covers_vscreen(struct wayland_surface *surfac
  *
  *  Enables/disables pointer confinement.
  */
+static BOOL wayland_pointer_needs_lock(struct wayland_pointer *pointer,
+                                       struct wl_surface *wl_surface,
+                                       const RECT *confine_rect,
+                                       BOOL covers_vscreen, BOOL force_lock)
+{
+    BOOL is_visible = pointer->cursor.wl_surface || pointer->wp_cursor_shape_device_v1;
+
+    return wl_surface && (((confine_rect || covers_vscreen) && !is_visible) || force_lock) &&
+           pointer->wl_pointer;
+}
+
 static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
                                               RECT *confine_rect,
                                               BOOL covers_vscreen,
@@ -1043,9 +1054,8 @@ static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
     }
 
     is_visible = pointer->cursor.wl_surface || pointer->wp_cursor_shape_device_v1;
-    needs_lock = wl_surface &&
-                 (((confine_rect || covers_vscreen) && !is_visible) || force_lock) &&
-                 pointer->wl_pointer;
+    needs_lock = wayland_pointer_needs_lock(pointer, wl_surface, confine_rect,
+                                            covers_vscreen, force_lock);
     needs_confine = wl_surface && confine_rect && is_visible && !force_lock &&
                     pointer->wl_pointer;
 
@@ -1192,7 +1202,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     struct wl_surface *wl_surface = NULL;
     struct wayland_surface *surface = NULL;
     struct wayland_win_data *data;
-    BOOL covers_vscreen = FALSE;
+    BOOL commit_position_hint = FALSE, covers_vscreen = FALSE;
     RECT confine_rect;
     POINT cursor_pos, warp;
 
@@ -1246,21 +1256,32 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
                 pointer->zwp_locked_pointer_v1,
                 wl_fixed_from_int(warp.x),
                 wl_fixed_from_int(warp.y));
-        pthread_mutex_unlock(&pointer->mutex);
+        commit_position_hint =
+                !wayland_pointer_needs_lock(pointer, wl_surface,
+                                            (clip && wl_surface) ? &confine_rect : NULL,
+                                            covers_vscreen, FALSE);
+    }
+    pthread_mutex_unlock(&pointer->mutex);
 
+    if (commit_position_hint)
+    {
         if ((data = wayland_win_data_get(hwnd)))
         {
             surface = data->wayland_surface;
             if (surface && surface->wl_surface == wl_surface)
+            {
+                wayland_surface_mark_pending_commit(surface);
                 wayland_surface_commit_pending_state(surface);
+            }
             wayland_win_data_release(data);
         }
         TRACE("position hint hwnd=%p wayland_xy=%s screen_xy=%s\n",
                 hwnd, wine_dbgstr_point(&warp), wine_dbgstr_point(&cursor_pos));
-        pthread_mutex_lock(&pointer->mutex);
     }
 
-   /* Since we are running in the context of the foreground thread we know
+    pthread_mutex_lock(&pointer->mutex);
+
+    /* Since we are running in the context of the foreground thread we know
     * that the wl_surface of the foreground HWND will not be invalidated,
     * so we can access it without having the win data lock. */
     wayland_pointer_update_constraint(wl_surface,

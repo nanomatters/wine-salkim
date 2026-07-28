@@ -151,6 +151,7 @@ static void wayland_surface_sync_shape_input_region(struct wayland_surface *surf
     else wl_surface_set_input_region(surface->wl_surface, NULL);
 
     if (region) wl_region_destroy(region);
+    wayland_surface_mark_pending_commit(surface);
 }
 
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
@@ -804,6 +805,7 @@ static BOOL wayland_hwnd_dmabuf_surface_apply_slice_layout(
     surface->slice_count = count;
     surface->slice_layout_sibling = initial_sibling;
     surface->stack_bottom = sibling;
+    wayland_surface_mark_pending_commit(surface->parent);
     wayland_hwnd_dmabuf_surface_assert_slice_cache(surface);
     return TRUE;
 }
@@ -1563,11 +1565,13 @@ void wayland_surface_sync_alpha(struct wayland_surface *surface)
         }
         wp_alpha_modifier_surface_v1_set_multiplier(surface->wp_alpha_modifier_surface_v1,
                                                     surface->alpha_multiplier);
+        wayland_surface_mark_pending_commit(surface);
     }
     else if (surface->wp_alpha_modifier_surface_v1)
     {
         wp_alpha_modifier_surface_v1_destroy(surface->wp_alpha_modifier_surface_v1);
         surface->wp_alpha_modifier_surface_v1 = NULL;
+        wayland_surface_mark_pending_commit(surface);
     }
 }
 
@@ -1651,7 +1655,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
 
     if (server_decor) wayland_surface_init_decoration(surface);
 
-    wayland_surface_commit_pending_state(surface);
+    wayland_surface_commit(surface);
     wl_display_flush(process_wayland.wl_display);
 
     return;
@@ -1837,7 +1841,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
 
         xdg_popup_reposition(surface->xdg_popup, xdg_positioner, 0);
         xdg_positioner_destroy(xdg_positioner);
-        wl_surface_commit(surface->wl_surface);
+        wayland_surface_commit(surface);
         wl_display_flush(process_wayland.wl_display);
         return;
     }
@@ -1881,7 +1885,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
 
     wayland_surface_sync_alpha(surface);
     surface->owner_hwnd = owner->hwnd;
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     wl_display_flush(process_wayland.wl_display);
 
     return;
@@ -1955,7 +1959,7 @@ void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rec
     {
         wayland_surface_update_layer_config(surface, rect, &output_rect);
         wayland_set_layer_menu_hwnd(surface->hwnd);
-        wl_surface_commit(surface->wl_surface);
+        wayland_surface_commit(surface);
         wl_display_flush(process_wayland.wl_display);
         return;
     }
@@ -1979,7 +1983,7 @@ void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rec
     wayland_surface_init_fractional_scale(surface, 1.0);
     wayland_surface_sync_alpha(surface);
 
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     wl_display_flush(process_wayland.wl_display);
 
     return;
@@ -2032,9 +2036,23 @@ BOOL wayland_surface_has_external_commit_owner(const struct wayland_surface *sur
            client->direct_wl_surface == surface->wl_surface;
 }
 
+void wayland_surface_mark_pending_commit(struct wayland_surface *surface)
+{
+    InterlockedExchange(&surface->pending_commit, TRUE);
+}
+
+void wayland_surface_commit(struct wayland_surface *surface)
+{
+    if (!surface->wl_surface) return;
+    InterlockedExchange(&surface->pending_commit, FALSE);
+    wl_surface_commit(surface->wl_surface);
+}
+
 void wayland_surface_commit_pending_state(struct wayland_surface *surface)
 {
-    if (!surface->wl_surface || wayland_surface_has_external_commit_owner(surface)) return;
+    if (!surface->wl_surface || wayland_surface_has_external_commit_owner(surface) ||
+        !InterlockedExchange(&surface->pending_commit, FALSE))
+        return;
     wl_surface_commit(surface->wl_surface);
 }
 
@@ -2322,7 +2340,7 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
     {
         wayland_surface_unset_viewport(surface);
         wl_surface_attach(surface->wl_surface, NULL, 0, 0);
-        wl_surface_commit(surface->wl_surface);
+        wayland_surface_commit(surface);
     }
 
     surface->ensured_contents = WAYLAND_SURFACE_NOT_ENSURED;
@@ -2392,6 +2410,7 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
     wp_viewport_set_source(surface->wp_viewport, 0, 0,
                            wl_fixed_from_int(win_width),
                            wl_fixed_from_int(win_height));
+    wayland_surface_mark_pending_commit(surface);
 
     surface->content_width = win_width;
     surface->content_height = win_height;
@@ -2409,6 +2428,7 @@ static void wayland_viewport_unset(struct wp_viewport *viewport)
 static void wayland_surface_unset_viewport(struct wayland_surface *surface)
 {
     wayland_viewport_unset(surface->wp_viewport);
+    wayland_surface_mark_pending_commit(surface);
     surface->configured_wp_viewport = NULL;
     surface->viewport_dest_width = surface->viewport_dest_height = 0;
     surface->content_width = surface->content_height = 0;
@@ -2422,6 +2442,7 @@ static void wayland_surface_unset_viewport_source(struct wayland_surface *surfac
 
     wp_viewport_set_source(surface->wp_viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                            wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+    wayland_surface_mark_pending_commit(surface);
 }
 
 struct wayland_gdi_shm_overlay
@@ -2524,6 +2545,7 @@ static BOOL wayland_surface_attach_gdi_shm_overlay(struct wayland_surface *surfa
 
     wl_subsurface_set_position(overlay->wl_subsurface, 0, 0);
     wl_subsurface_place_above(overlay->wl_subsurface, surface->wl_surface);
+    wayland_surface_mark_pending_commit(surface);
     wp_viewport_set_source(overlay->wp_viewport, 0, 0,
                            wl_fixed_from_int(source_width), wl_fixed_from_int(source_height));
     wp_viewport_set_destination(overlay->wp_viewport, width, height);
@@ -2552,7 +2574,7 @@ BOOL wayland_surface_promote_shm_to_overlay(struct wayland_surface *surface,
     wayland_shm_buffer_unref(clone);
     if (!ret) return FALSE;
 
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     return TRUE;
 }
 
@@ -2728,6 +2750,7 @@ static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *s
                               limits.min_height);
     xdg_toplevel_set_max_size(surface->xdg_toplevel, limits.max_width,
                               limits.max_height);
+    wayland_surface_mark_pending_commit(surface);
 
     limits.valid = TRUE;
     surface->toplevel_size_limits = limits;
@@ -2802,6 +2825,7 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
     if (width > 0 && height > 0)
     {
         xdg_surface_set_window_geometry(surface->xdg_surface, 0, 0, width, height);
+        wayland_surface_mark_pending_commit(surface);
         surface->geometry = rect;
         /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
         if (!wayland_surface_is_toplevel(surface)) return;
@@ -2838,6 +2862,7 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
         wp_viewport_set_destination(surface->wp_viewport, dest_width, dest_height);
     else
         wp_viewport_set_destination(surface->wp_viewport, -1, -1);
+    wayland_surface_mark_pending_commit(surface);
 
     surface->configured_wp_viewport = surface->wp_viewport;
     surface->viewport_dest_width = dest_width;
@@ -2919,6 +2944,7 @@ static void wayland_client_surface_stack(struct wayland_surface *surface,
     else
         wl_subsurface_place_below(client->wl_subsurface,
                                   wayland_surface_client_stack_anchor(surface));
+    wayland_surface_mark_pending_commit(surface);
 }
 
 static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
@@ -2949,7 +2975,10 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
         if (client->wl_subsurface)
         {
             if (rect_changed)
+            {
                 wl_subsurface_set_position(client->wl_subsurface, rect.left, rect.top);
+                wayland_surface_mark_pending_commit(surface);
+            }
             wayland_client_surface_stack(surface, client, stack_above_parent);
         }
 
@@ -3224,6 +3253,7 @@ static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabu
     wp_viewport_set_destination(surface->wp_viewport, geometry->width, geometry->height);
     wayland_hwnd_dmabuf_surface_set_opaque(surface, geometry->width, geometry->height);
     surface->stack_bottom = surface->wl_surface;
+    wayland_surface_mark_pending_commit(surface->parent);
 }
 
 static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_configure_slices(
@@ -3925,7 +3955,7 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
     wayland_surface_attach_shm(surface, data->window_contents,
                                data->window_contents->damage_region);
     surface->carrier_attached = FALSE;
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     wayland_hwnd_dmabuf_surface_destroy(direct);
     return TRUE;
 }
@@ -3982,7 +4012,7 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
     }
     else wl_surface_set_opaque_region(surface->wl_surface, NULL);
     wayland_surface_attach_shm(surface, shm_buffer, shm_buffer->damage_region);
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     wayland_shm_buffer_unref(shm_buffer);
     surface->carrier_attached = TRUE;
     surface->carrier_opaque = opaque;
@@ -4156,7 +4186,7 @@ commit_current:
     }
     surface->carrier_attached = FALSE;
     wayland_hwnd_dmabuf_surface_set_opaque(direct, width, height);
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     if (!direct->current_committed)
     {
         wayland_hwnd_dmabuf_consume_acquire_fence(direct->current);
@@ -4443,12 +4473,10 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     {
         wl_subsurface_place_below(data->client_surface->wl_subsurface,
                                   wayland_surface_client_stack_anchor(surface));
+        wayland_surface_mark_pending_commit(surface);
         any_new = TRUE;
     }
 
-    /* Commit and arm the next vsync only when something changed. An idle window costs nothing. */
-    /* Commit the parent to apply subsurface stacking. No frame callback: import is
-     * paced by the producer, not by our toplevel being presented. */
     if (any_new)
         wayland_surface_commit_pending_state(surface);
     if (frames != stack_frames) free(frames);
@@ -4472,6 +4500,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        wayland_surface_mark_pending_commit(surface);
     }
     else if (!surface->current.serial && surface->queued.serial &&
              surface->current.decor == surface->queued.decor &&
@@ -4482,6 +4511,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
         memset(&surface->processing, 0, sizeof(surface->processing));
         memset(&surface->queued, 0, sizeof(surface->queued));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        wayland_surface_mark_pending_commit(surface);
     }
     else if (!surface->current.serial ||
              !wayland_surface_config_is_compatible(&surface->current, rect,
@@ -4500,8 +4530,11 @@ static BOOL wayland_surface_reconfigure_layer(struct wayland_surface *surface)
     if (surface->processing.serial && surface->processing.processed)
     {
         if (surface->processing.serial != surface->current.serial)
+        {
             zwlr_layer_surface_v1_ack_configure(surface->zwlr_layer_surface_v1,
                                                 surface->processing.serial);
+            wayland_surface_mark_pending_commit(surface);
+        }
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
     }
@@ -4544,6 +4577,7 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
     else
         wl_subsurface_place_above(surface->wl_subsurface,
                                   toplevel_surface->wl_surface);
+    wayland_surface_mark_pending_commit(toplevel_surface);
     wayland_surface_commit_pending_state(toplevel_surface);
     memset(&surface->processing, 0, sizeof(surface->processing));
 }
@@ -4982,7 +5016,7 @@ static void wayland_surface_restore_gdi_shm_overlay(struct wayland_surface *surf
     wl_surface_set_opaque_region(surface->wl_surface, NULL);
     wayland_surface_attach_shm(surface, clone, clone->damage_region);
     surface->carrier_attached = FALSE;
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(surface);
     wayland_shm_buffer_unref(clone);
 }
 
@@ -5472,9 +5506,8 @@ struct wl_surface *wayland_client_surface_prepare_direct_promotion(struct client
     if (!failure)
     {
         toplevel_wl_surface = data->wayland_surface->wl_surface;
-        /* Commit the configure acknowledgment before the external WSI attaches
-         * its first buffer. Wayland request ordering preserves this sequence. */
-        wl_surface_commit(toplevel_wl_surface);
+        /* Apply pending state before WSI takes ownership. */
+        wayland_surface_commit(data->wayland_surface);
         wl_display_flush(process_wayland.wl_display);
     }
 
@@ -5567,7 +5600,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
 
     /* Latch the subsurface removal and overlay placement. The external WSI
      * has not attached to the toplevel yet, so this commits no foreign state. */
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(data->wayland_surface);
     wl_display_flush(process_wayland.wl_display);
 
     TRACE("promoted %s to borrowed toplevel wl_surface=%p for hwnd=%p scale=%.3f dest=%dx%d client=%s\n",
@@ -5623,7 +5656,7 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
         !wayland_surface_promote_shm_to_overlay(data->wayland_surface, data->window_contents))
         WARN("Failed to move Wine window contents to an overlay for hwnd=%p\n", hwnd);
 
-    wl_surface_commit(surface->wl_surface);
+    wayland_surface_commit(data->wayland_surface);
     wl_display_flush(process_wayland.wl_display);
     TRACE("reactivated %s on borrowed toplevel wl_surface=%p for hwnd=%p scale=%.3f dest=%dx%d client=%s\n",
           debugstr_client_surface(client), surface->wl_surface, hwnd,
@@ -5950,7 +5983,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
     if (wayland_client_surface_can_set_opaque_region(client, opaque))
         wayland_client_surface_set_opaque_region(client, opaque);
 
-    /* Commit to apply subsurface positioning. */
+    /* Apply pending parent state. */
     wayland_surface_commit_pending_state(surface);
 
     if (presentation_scaled)
@@ -6281,6 +6314,7 @@ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UI
 
     opacity = (flags & LWA_ALPHA) ? (UINT32_MAX / 0xff) * alpha : UINT32_MAX;
     wp_alpha_modifier_surface_v1_set_multiplier(surface->wp_alpha_modifier_surface_v1, opacity);
+    wayland_surface_mark_pending_commit(surface);
     wayland_surface_commit_pending_state(surface);
     wl_display_flush(process_wayland.wl_display);
 }

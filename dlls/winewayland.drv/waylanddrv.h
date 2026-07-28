@@ -514,6 +514,7 @@ struct wayland_surface
     unsigned int serial;
 
     struct wl_surface *wl_surface;
+    LONG pending_commit;
     struct wp_viewport *wp_viewport;
     struct wp_viewport *configured_wp_viewport;
     int viewport_dest_width, viewport_dest_height;
@@ -634,6 +635,8 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 HRGN surface_damage_region);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
 BOOL wayland_surface_has_external_commit_owner(const struct wayland_surface *surface);
+void wayland_surface_mark_pending_commit(struct wayland_surface *surface);
+void wayland_surface_commit(struct wayland_surface *surface);
 void wayland_surface_commit_pending_state(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
                                           enum wayland_surface_config_state state);
