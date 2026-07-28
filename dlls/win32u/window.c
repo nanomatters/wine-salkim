@@ -2200,37 +2200,35 @@ static BOOL has_collapsed_frame( const RECT *window, const RECT *client, BOOL al
            left <= 1 && top <= 1 && right <= 1 && bottom <= 1;
 }
 
-/* Custom title bars can collapse the caption while keeping resize borders. */
-static BOOL has_collapsed_caption( UINT style, const RECT *window, const RECT *client )
+static BOOL has_collapsed_caption( UINT style, UINT ex_style,
+                                   const RECT *window, const RECT *client )
 {
-    int top = client->top - window->top;
+    RECT border = {0};
+    int border_top, top = client->top - window->top;
 
     if ((style & WS_CAPTION) != WS_CAPTION) return FALSE;
-    if (style & WS_MAXIMIZE) return FALSE;
     if (top < 0 || client->left < window->left ||
         client->right > window->right || client->bottom > window->bottom)
         return FALSE;
-    return top <= 1;
+    if (!adjust_window_rect( &border, style & ~WS_CAPTION, FALSE, ex_style, get_system_dpi() ))
+        return FALSE;
+
+    border_top = max( 0, -border.top );
+    return top <= border_top;
 }
 
-static BOOL is_frameless_window( HWND hwnd, UINT style, const struct window_rects *rects )
+static BOOL is_frameless_window( HWND hwnd, UINT style, UINT ex_style,
+    const struct window_rects *rects )
 {
     if (!window_has_frame_style( style )) return FALSE;
-    if (NtUserGetProp( hwnd, frameless_window_prop )) return TRUE;
-    if (has_collapsed_caption( style, &rects->window, &rects->client )) return TRUE;
-    return get_custom_frame( hwnd ) && has_collapsed_frame( &rects->window, &rects->client, TRUE );
+    return has_collapsed_frame( &rects->window, &rects->client, get_custom_frame( hwnd ) ) ||
+           has_collapsed_caption( style, ex_style, &rects->window, &rects->client );
 }
 
 static void update_frameless_window( HWND hwnd, WND *win )
 {
-    BOOL frameless = FALSE;
-
-    if (win->dwStyle & WS_MAXIMIZE) return;
-    if (window_has_frame_style( win->dwStyle ))
-        frameless = has_collapsed_frame( &win->rects.window, &win->rects.client, get_custom_frame( hwnd ) ) ||
-                    has_collapsed_caption( win->dwStyle, &win->rects.window, &win->rects.client );
-
-    if (frameless) NtUserSetProp( hwnd, frameless_window_prop, (HANDLE)1 );
+    if (is_frameless_window( hwnd, win->dwStyle, win->dwExStyle, &win->rects ))
+        NtUserSetProp( hwnd, frameless_window_prop, (HANDLE)1 );
     else NtUserRemoveProp( hwnd, frameless_window_prop );
 }
 
@@ -2242,7 +2240,7 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
     /* Kept borders are non-client space; present only the client area. */
-    if (is_frameless_window( hwnd, style, rects )) return rects->client;
+    if (is_frameless_window( hwnd, style, ex_style, rects )) return rects->client;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
     if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
 
