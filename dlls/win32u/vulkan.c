@@ -408,8 +408,11 @@ static void surface_host_release_if_unused( struct vulkan_instance *instance, st
 
 static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
 {
-    return swapchain->surface && swapchain->presentation_generation !=
-           ReadAcquire( &swapchain->surface->client->presentation_generation );
+    LONG generation;
+
+    if (!swapchain->surface) return FALSE;
+    generation = ReadAcquire( &swapchain->surface->client->presentation_generation );
+    return swapchain->presentation_generation != generation;
 }
 
 static LONG get_swapchain_presentation_generation( struct surface *surface, BOOL topology_updated,
@@ -4694,13 +4697,52 @@ static BOOL should_skip_wait( HWND hwnd )
     return FALSE;
 }
 
+/* Keep host present waits interruptible when Wine invalidates the
+ * presentation target. */
+#define WINE_VK_PRESENT_WAIT_SLICE_NS (100 * 1000000ull)
+
+static VkResult swapchain_wait_for_present( struct vulkan_device *device, struct swapchain *swapchain,
+                                            uint64_t present_id, uint64_t timeout,
+                                            const VkPresentWait2InfoKHR *info )
+{
+    struct client_surface *client = swapchain->surface->client;
+    VkResult res;
+
+    for (;;)
+    {
+        uint64_t slice = min( timeout, WINE_VK_PRESENT_WAIT_SLICE_NS );
+
+        if (swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
+        if (!client_surface_begin_present_wait( client, swapchain->presentation_generation ))
+            return VK_ERROR_OUT_OF_DATE_KHR;
+
+        if (info)
+        {
+            VkPresentWait2InfoKHR slice_info = *info;
+            slice_info.timeout = slice;
+            res = device->p_vkWaitForPresent2KHR( device->host.device, swapchain->obj.host.swapchain,
+                                                  &slice_info );
+        }
+        else
+        {
+            res = device->p_vkWaitForPresentKHR( device->host.device, swapchain->obj.host.swapchain,
+                                                 present_id, slice );
+        }
+
+        client_surface_end_present_wait( client );
+
+        if (res != VK_TIMEOUT) return res;
+        if (timeout == UINT64_MAX) continue;
+        if (timeout <= slice) return VK_TIMEOUT;
+        timeout -= slice;
+    }
+}
+
 static VkResult win32u_vkWaitForPresentKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
                                             uint64_t presentId, uint64_t timeout )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
-    struct client_surface *client;
-    VkResult res;
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
@@ -4710,13 +4752,7 @@ static VkResult win32u_vkWaitForPresentKHR( VkDevice client_device, VkSwapchainK
 
     if (swapchain->surface && should_skip_wait( swapchain->surface->hwnd )) return VK_SUCCESS;
 
-    client = swapchain->surface->client;
-    if (!client_surface_begin_present_wait( client, swapchain->presentation_generation ))
-        return VK_ERROR_OUT_OF_DATE_KHR;
-    res = device->p_vkWaitForPresentKHR( device->host.device, swapchain->obj.host.swapchain,
-                                         presentId, timeout );
-    client_surface_end_present_wait( client );
-    return res;
+    return swapchain_wait_for_present( device, swapchain, presentId, timeout, NULL );
 }
 
 static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
@@ -4724,8 +4760,6 @@ static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchain
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
-    struct client_surface *client;
-    VkResult res;
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
@@ -4733,12 +4767,7 @@ static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchain
 
     if (swapchain->surface && should_skip_wait( swapchain->surface->hwnd )) return VK_SUCCESS;
 
-    client = swapchain->surface->client;
-    if (!client_surface_begin_present_wait( client, swapchain->presentation_generation ))
-        return VK_ERROR_OUT_OF_DATE_KHR;
-    res = device->p_vkWaitForPresent2KHR( device->host.device, swapchain->obj.host.swapchain, info );
-    client_surface_end_present_wait( client );
-    return res;
+    return swapchain_wait_for_present( device, swapchain, info->presentId, info->timeout, info );
 }
 
 static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
