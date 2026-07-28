@@ -4697,15 +4697,18 @@ static BOOL should_skip_wait( HWND hwnd )
     return FALSE;
 }
 
-/* Keep host present waits interruptible when Wine invalidates the
- * presentation target. */
+/* Keep host waits interruptible across presentation changes. */
 #define WINE_VK_PRESENT_WAIT_SLICE_NS (100 * 1000000ull)
+/* Recover infinite waits when presentation feedback stalls. */
+#define WINE_VK_PRESENT_WAIT_STALL_NS (3000 * 1000000ull)
 
 static VkResult swapchain_wait_for_present( struct vulkan_device *device, struct swapchain *swapchain,
                                             uint64_t present_id, uint64_t timeout,
                                             const VkPresentWait2InfoKHR *info )
 {
     struct client_surface *client = swapchain->surface->client;
+    BOOL infinite = timeout == UINT64_MAX;
+    uint64_t stalled = 0;
     VkResult res;
 
     for (;;)
@@ -4732,7 +4735,18 @@ static VkResult swapchain_wait_for_present( struct vulkan_device *device, struct
         client_surface_end_present_wait( client );
 
         if (res != VK_TIMEOUT) return res;
-        if (timeout == UINT64_MAX) continue;
+
+        if (should_skip_wait( swapchain->surface->hwnd )) return VK_SUCCESS;
+
+        if (infinite && (stalled += slice) >= WINE_VK_PRESENT_WAIT_STALL_NS)
+        {
+            client_surface_invalidate_presentation( client );
+            WARN( "hwnd %p swapchain %p present wait stalled, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+                  swapchain->surface->hwnd, swapchain );
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
+
+        if (infinite) continue;
         if (timeout <= slice) return VK_TIMEOUT;
         timeout -= slice;
     }
