@@ -2207,6 +2207,9 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
 
     if (!wayland_surface_evict_direct_client(surface)) return FALSE;
 
+    if (surface->role != WAYLAND_SURFACE_ROLE_NONE)
+        wayland_surface_invalidate_attached_clients(surface->hwnd, surface->wl_surface);
+
     /* Keep input state across role churn; it follows wl_surface enter/leave. */
     wayland_surface_destroy_gdi_shm_overlay(surface);
     wayland_surface_clear_child_surfaces(surface);
@@ -5068,27 +5071,39 @@ static void wayland_client_surface_update(struct client_surface *client)
     }
 
     set_client_surface(client->hwnd, surface);
+    surface->updated_attachment_generation =
+        ReadAcquire(&surface->attachment_generation);
 }
 
 static BOOL wayland_surface_has_live_role(struct wayland_surface *surface);
 
+static BOOL wayland_visual_constraint_equal(const struct wayland_visual_constraint *a,
+                                            const struct wayland_visual_constraint *b)
+{
+    if (a->valid != b->valid) return FALSE;
+    if (!a->valid) return TRUE;
+    return a->visibility == b->visibility && a->rect_count == b->rect_count &&
+           EqualRect(&a->dst, &b->dst) && EqualRect(&a->rect, &b->rect);
+}
+
 static BOOL wayland_client_surface_update_visual_constraint(struct wayland_client_surface *client,
                                                             HWND toplevel)
 {
+    struct wayland_visual_constraint previous;
     struct wayland_child_visibility_info visibility;
     struct wayland_win_data *client_data, *toplevel_data;
     struct wayland_surface *surface;
     HWND hwnd = client->client.hwnd;
     RECT client_rect, dst;
+    BOOL ret = FALSE;
 
-    if (!(toplevel_data = wayland_win_data_get(toplevel)) ||
+    wayland_win_data_lock();
+    previous = client->visual_constraint;
+
+    if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) ||
         !(surface = toplevel_data->wayland_surface) ||
         !wayland_surface_has_live_role(surface))
-    {
-        if (toplevel_data) wayland_win_data_release(toplevel_data);
-        client->visual_constraint.valid = FALSE;
-        return FALSE;
-    }
+        goto done;
 
     if (hwnd == toplevel)
     {
@@ -5103,19 +5118,21 @@ static BOOL wayland_client_surface_update_visual_constraint(struct wayland_clien
         client_rect = client_data->client_rect_in_toplevel;
     }
     else
-    {
-        client->visual_constraint.valid = FALSE;
-        wayland_win_data_release(toplevel_data);
-        return FALSE;
-    }
+        goto done;
 
     dst = client_rect;
     OffsetRect(&dst, surface->window.client_rect.left - surface->window.rect.left,
                surface->window.client_rect.top - surface->window.rect.top);
     wayland_surface_classify_child_visibility(surface, &dst, &visibility);
     wayland_surface_update_child_visibility(&dst, &visibility, &client->visual_constraint);
-    wayland_win_data_release(toplevel_data);
-    return TRUE;
+    ret = TRUE;
+
+done:
+    if (!ret) client->visual_constraint.valid = FALSE;
+    if (!wayland_visual_constraint_equal(&previous, &client->visual_constraint))
+        InterlockedIncrement(&client->attachment_generation);
+    wayland_win_data_unlock();
+    return ret;
 }
 
 static BOOL wayland_client_surface_is_hwnd_dmabuf_producer(struct wayland_client_surface *surface)
@@ -5156,6 +5173,7 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_win_data *data;
+    BOOL first_present;
 
     TRACE("%s hdc=%p toplevel=%p\n", debugstr_client_surface(client), hdc, toplevel);
     wayland_client_surface_update_visual_constraint(surface, toplevel);
@@ -5179,8 +5197,17 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
         return;
     }
 
-    InterlockedExchange(&surface->has_presented, TRUE);
-    set_client_surface(hwnd, surface);
+    first_present = !InterlockedExchange(&surface->has_presented, TRUE);
+
+    /* Apply attachment changes made after the pre-present update. */
+    if (first_present ||
+        ReadAcquire(&surface->attachment_generation) !=
+        surface->updated_attachment_generation)
+    {
+        set_client_surface(hwnd, surface);
+        surface->updated_attachment_generation =
+            ReadAcquire(&surface->attachment_generation);
+    }
     ensure_window_surface_contents(toplevel);
 }
 
@@ -5335,6 +5362,13 @@ err:
     return NULL;
 }
 
+static BOOL direct_toplevel_disabled(void)
+{
+    const char *env = getenv("WAYLANDDRV_NO_DIRECT_TOPLEVEL");
+
+    return env && atoi(env);
+}
+
 /* Shared direct-toplevel eligibility checks. The caller holds the win_data
  * lock. expected_client is the client surface that must currently be attached
  * to the window (NULL if none must be). Returns NULL when eligible, or the
@@ -5344,6 +5378,7 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
 {
     struct wayland_surface *surface = data->wayland_surface;
 
+    if (direct_toplevel_disabled()) return "direct toplevel disabled by environment";
     if (!surface) return "no Wayland surface";
     if (!wayland_surface_is_toplevel(surface)) return "surface is not a live toplevel";
     if (surface->window.minimized) return "the toplevel is minimized";
@@ -5772,7 +5807,8 @@ static BOOL wayland_surface_has_live_role(struct wayland_surface *surface)
     return FALSE;
 }
 
-void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
+static void wayland_client_surface_attach_internal(struct wayland_client_surface *client,
+                                                   HWND toplevel)
 {
     struct wayland_win_data *client_data, *toplevel_data;
     struct wayland_surface *surface = NULL;
@@ -5795,6 +5831,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 
         if (client->wl_subsurface)
         {
+            client_surface_invalidate_presentation(&client->client);
             wl_subsurface_destroy(client->wl_subsurface);
             client->wl_subsurface = NULL;
             client->toplevel_wl_surface = NULL;
@@ -5822,7 +5859,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 
     if (client->hwnd_dmabuf_producer)
     {
-        wayland_client_surface_attach(client, NULL);
+        wayland_client_surface_attach_internal(client, NULL);
         return;
     }
 
@@ -5831,11 +5868,12 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         !wayland_surface_has_live_role(surface))
     {
         if (toplevel_data) wayland_win_data_release(toplevel_data);
-        return wayland_client_surface_attach(client, NULL);
+        return wayland_client_surface_attach_internal(client, NULL);
     }
     if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
     {
-        wayland_client_surface_attach(client, NULL);
+        wayland_win_data_release(toplevel_data);
+        wayland_client_surface_attach_internal(client, NULL);
         return;
     }
 
@@ -5862,7 +5900,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     if (client->toplevel != toplevel ||
         client->toplevel_wl_surface != surface->wl_surface)
     {
-        wayland_client_surface_attach(client, NULL);
+        wayland_client_surface_attach_internal(client, NULL);
 
         client->wl_subsurface =
             wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
@@ -5897,7 +5935,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
     else
     {
         wayland_win_data_release(toplevel_data);
-        wayland_client_surface_attach(client, NULL);
+        wayland_client_surface_attach_internal(client, NULL);
         return;
     }
 
@@ -5931,6 +5969,12 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 
 done:
     wayland_win_data_release(toplevel_data);
+}
+
+void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
+{
+    wayland_client_surface_attach_internal(client, toplevel);
+    InterlockedIncrement(&client->attachment_generation);
 }
 
 static void wayland_image_description_v1_failed(void *user_data,

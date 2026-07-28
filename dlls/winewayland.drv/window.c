@@ -364,6 +364,22 @@ BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
     return FALSE;
 }
 
+/* Caller holds win_data_mutex. */
+void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *parent)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        struct wayland_client_surface *client = data->client_surface;
+
+        if (!client || !client->wl_subsurface) continue;
+        if (client->toplevel != hwnd || client->toplevel_wl_surface != parent) continue;
+
+        client_surface_invalidate_presentation(&client->client);
+    }
+}
+
 /* The caller holds win_data_mutex. A direct WSI toplevel cannot safely carry
  * visible child HWND content, since child surfaces require parent commits. */
 BOOL wayland_toplevel_has_visible_child_window(HWND toplevel)

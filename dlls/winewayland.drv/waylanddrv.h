@@ -486,6 +486,8 @@ struct wayland_client_surface
     LONG has_alpha;
     LONG has_presented;
     LONG presentation_scaling;
+    LONG attachment_generation;
+    LONG updated_attachment_generation;
     struct wayland_visual_constraint visual_constraint;
 };
 
@@ -792,6 +794,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
 BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
                                                struct wayland_client_surface *client);
 BOOL wayland_toplevel_has_visible_child_window(HWND toplevel);
+void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *parent);
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
