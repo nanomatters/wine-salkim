@@ -2132,6 +2132,12 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
     return TRUE;
 }
 
+static BOOL get_swapchain_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
+{
+    if (!get_surface_rect( hwnd, rect, dpi )) return FALSE;
+    return !IsRectEmpty( rect );
+}
+
 static void adjust_surface_capabilities( struct vulkan_instance *instance, struct surface *surface,
                                          VkSurfaceCapabilitiesKHR *capabilities )
 {
@@ -3232,7 +3238,7 @@ static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D
     raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
     if (!fshack_enabled || !raw || dpi == raw) return FALSE;
 
-    if (!get_surface_rect( surface->hwnd, &host_rect, raw )) return FALSE;
+    if (!get_swapchain_surface_rect( surface->hwnd, &host_rect, raw )) return FALSE;
     host_extents->width = host_rect.right - host_rect.left;
     host_extents->height = host_rect.bottom - host_rect.top;
     SetRect( &config->dst, 0, 0, host_extents->width, host_extents->height );
@@ -3251,14 +3257,12 @@ static BOOL swapchain_presentation_config_changed( struct swapchain *swapchain )
 {
     VkExtent2D host_extents = swapchain->host_extents;
     struct fs_hack_config config;
-    BOOL compositor_scaling, enabled;
+    BOOL enabled;
 
-    compositor_scaling = surface_is_presentation_scaled( swapchain->surface );
-    if (compositor_scaling != swapchain->compositor_scaling) return TRUE;
+    if (swapchain->compositor_scaling) return FALSE;
 
-    /* The child viewport follows destination geometry changes independently
-     * of the Vulkan swapchain. */
-    if (compositor_scaling) return FALSE;
+    if (NtUserGetWindowLongW( swapchain->surface->hwnd, GWL_STYLE ) & WS_MINIMIZE)
+        return FALSE;
 
     enabled = surface_get_fshack_config( swapchain->surface, &swapchain->extents,
                                          &host_extents, &config );
@@ -3950,7 +3954,7 @@ static VkResult managed_acquire( struct vulkan_device *device, struct swapchain 
         return res;
     }
 
-    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+    if (get_swapchain_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &managed->extents, &client_rect ))
         return VK_SUBOPTIMAL_KHR;
 
@@ -4211,7 +4215,7 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
         pthread_mutex_unlock( &managed->lock );
     }
 
-    if (res >= VK_SUCCESS && !extents_equals( &managed->extents, &client_rect ))
+    if (res >= VK_SUCCESS && !IsRectEmpty( &client_rect ) && !extents_equals( &managed->extents, &client_rect ))
         res = VK_SUBOPTIMAL_KHR;
 
     return res;
@@ -4321,7 +4325,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
      * Create the swapchain with VkSwapchainPresentScalingCreateInfoEXT to avoid this.
      */
     if (!compositor_scaling &&
-        get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
+        get_swapchain_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
         !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
         instance->extensions.has_VK_EXT_surface_maintenance1 &&
         physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
@@ -4626,7 +4630,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     }
 
     if (!res && !swapchain->fshack.enabled && !swapchain->compositor_scaling &&
-        get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+        get_swapchain_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
@@ -4668,7 +4672,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     }
 
     if (!res && !swapchain->fshack.enabled && !swapchain->compositor_scaling &&
-        get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+        get_swapchain_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
@@ -5963,6 +5967,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         else if (swapchain_res)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
         else if (!swapchain->fshack.enabled && !swapchain->compositor_scaling &&
+                 !IsRectEmpty( &client_rect ) &&
                  !extents_equals( &swapchain->extents, &client_rect ))
         {
             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
