@@ -765,6 +765,7 @@ struct wayland_win_data
     BOOL has_present_rect;
     BOOL resizeable;
     BOOL managed;
+    BOOL frameless;
     RECT restore_rect;
     BOOL restore_rect_valid;
     BOOL layered_attribs_set;

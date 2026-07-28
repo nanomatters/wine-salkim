@@ -115,6 +115,8 @@ static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
 static const WCHAR focus_time_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
+static const WCHAR frameless_window_prop[] =
+    {'_','_','w','i','n','e','_','w','i','n','3','2','u','_','f','r','a','m','e','l','e','s','s',0};
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -565,6 +567,8 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
 static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
 {
     if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
+    /* Frameless windows may still keep non-client borders. */
+    if (NtUserGetProp( data->hwnd, frameless_window_prop )) return 0;
     return get_mwm_decorations_for_style( style, ex_style );
 }
 

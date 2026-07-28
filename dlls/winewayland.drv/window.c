@@ -117,6 +117,7 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     data->window_text = get_window_text(hwnd);
     data->style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     data->exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+    data->frameless = NtUserGetProp(hwnd, frameless_window_prop) != NULL;
     data->layered_attribs_set = NtUserGetLayeredWindowAttributes(
         hwnd, NULL, &data->layered_alpha, &data->layered_flags);
     if (!data->layered_attribs_set) data->layered_flags = 0;
@@ -477,6 +478,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     if (!data->is_fullscreen &&
         !EqualRect(&data->rects.visible, &data->rects.window)
+        && !data->frameless
         && is_decoration_enabled(style, exstyle))
     {
         server_decor = TRUE;
@@ -978,6 +980,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     HWND window_owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     DWORD exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+    BOOL frameless = NtUserGetProp(hwnd, frameless_window_prop) != NULL;
     BOOL client_rect_in_toplevel_valid =
         get_client_rect_in_toplevel(hwnd, root, &client_rect_in_toplevel);
     BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
@@ -1045,6 +1048,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->visible = visible;
     data->style = style;
     data->exstyle = exstyle;
+    data->frameless = frameless;
     data->client_rect_in_toplevel = client_rect_in_toplevel;
     data->client_rect_in_toplevel_valid = client_rect_in_toplevel_valid;
     data->is_fullscreen = fullscreen;
@@ -1192,7 +1196,7 @@ static void wayland_configure_window(HWND hwnd)
         window_height += offset_y;
         window_width += offset_x;
     }
-    else if (NtUserGetProp(hwnd, frameless_window_prop))
+    else if (data->frameless)
     {
         window_width += (data->rects.client.left - data->rects.window.left) +
                         (data->rects.window.right - data->rects.client.right);
