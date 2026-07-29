@@ -388,6 +388,11 @@ struct swapchain
     VkExtent2D extents;
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
     BOOL compositor_scaling;
+    pthread_mutex_t color_lock;
+    VkColorSpaceKHR color_space;
+    VkHdrMetadataEXT hdr_metadata;
+    BOOL has_hdr_metadata;
+    BOOL uses_color_description;
 
     /* fs hack data below */
     struct fs_hack_config fshack;
@@ -406,6 +411,21 @@ struct swapchain
     struct fs_comp_pipeline fsr_easu_pipeline;
     struct fs_comp_pipeline fsr_rcas_pipeline;
 };
+
+static struct swapchain *swapchain_alloc( void )
+{
+    struct swapchain *swapchain;
+
+    if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return NULL;
+    pthread_mutex_init( &swapchain->color_lock, NULL );
+    return swapchain;
+}
+
+static void swapchain_free( struct swapchain *swapchain )
+{
+    pthread_mutex_destroy( &swapchain->color_lock );
+    free( swapchain );
+}
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
@@ -499,6 +519,39 @@ static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
     if (!swapchain->surface) return FALSE;
     generation = ReadAcquire( &swapchain->surface->client->presentation_generation );
     return swapchain->presentation_generation != generation;
+}
+
+static void swapchain_forward_color_description( struct swapchain *swapchain )
+{
+    driver_funcs->p_vulkan_surface_set_color_description(
+            swapchain->color_space, swapchain->uses_color_description,
+            swapchain->uses_color_description && swapchain->has_hdr_metadata ?
+            &swapchain->hdr_metadata : NULL,
+            swapchain->surface->client);
+}
+
+static void swapchain_apply_color_description( struct swapchain *swapchain )
+{
+    if (!swapchain->uses_color_description)
+    {
+        swapchain_forward_color_description( swapchain );
+        return;
+    }
+
+    pthread_mutex_lock( &swapchain->color_lock );
+    swapchain_forward_color_description( swapchain );
+    pthread_mutex_unlock( &swapchain->color_lock );
+}
+
+static void swapchain_set_hdr_metadata( struct swapchain *swapchain,
+                                        const VkHdrMetadataEXT *metadata )
+{
+    pthread_mutex_lock( &swapchain->color_lock );
+    swapchain->hdr_metadata = *metadata;
+    swapchain->hdr_metadata.pNext = NULL;
+    swapchain->has_hdr_metadata = TRUE;
+    swapchain_forward_color_description( swapchain );
+    pthread_mutex_unlock( &swapchain->color_lock );
 }
 
 static LONG get_swapchain_presentation_generation( struct surface *surface, BOOL topology_updated,
@@ -4382,6 +4435,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     LONG generation_before_update;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
+    VkColorSpaceKHR mapped_color_space;
     uint32_t format_count = 0;
     VkSurfaceFormatKHR *formats;
     RECT client_rect;
@@ -4461,7 +4515,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         return res;
     }
 
-    create_info_host.imageColorSpace = driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
+    mapped_color_space =
+        driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
+    create_info_host.imageColorSpace = mapped_color_space;
     driver_funcs->p_vulkan_surface_set_alpha( create_info_host.compositeAlpha, surface->client );
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
@@ -4481,12 +4537,15 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         create_info_host.pNext = &scaling;
     }
 
-    if (!(swapchain = calloc( 1, sizeof(*swapchain) )))
+    if (!(swapchain = swapchain_alloc()))
     {
         pthread_mutex_unlock( &surface->host_lock );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
+    swapchain->color_space = create_info->imageColorSpace;
+    swapchain->uses_color_description =
+        mapped_color_space != create_info->imageColorSpace;
     swapchain->host_extents = capabilities.minImageExtent;
     swapchain->compositor_scaling = compositor_scaling;
     if (compositor_scaling)
@@ -4551,7 +4610,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                 ERR( "Swapchain does not support storage images for colorspace %u\n",
                      create_info->imageColorSpace );
                 pthread_mutex_unlock( &surface->host_lock );
-                free( swapchain );
+                swapchain_free( swapchain );
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
         }
@@ -4568,7 +4627,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             ERR( "Cannot preserve format %u for fullscreen scaling\n", create_info->imageFormat );
             pthread_mutex_unlock( &surface->host_lock );
-            free( swapchain );
+            swapchain_free( swapchain );
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         if (swapchain->upscaler.color_mode == FS_HACK_COLOR_RAW &&
@@ -4591,14 +4650,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         if (res)
         {
             pthread_mutex_unlock( &surface->host_lock );
-            free( swapchain );
+            swapchain_free( swapchain );
             return res;
         }
 
         if (!(formats = calloc( format_count, sizeof(*formats) )))
         {
             pthread_mutex_unlock( &surface->host_lock );
-            free( swapchain );
+            swapchain_free( swapchain );
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
 
@@ -4608,7 +4667,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             pthread_mutex_unlock( &surface->host_lock );
             free( formats );
-            free( swapchain );
+            swapchain_free( swapchain );
             return res;
         }
 
@@ -4686,7 +4745,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     {
         pthread_mutex_unlock( &surface->host_lock );
         InterlockedDecrement( &surface->client->busy_ref );
-        free( swapchain );
+        swapchain_free( swapchain );
         return res;
     }
 
@@ -4793,7 +4852,7 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     }
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
-    free( swapchain );
+    swapchain_free( swapchain );
 }
 
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
@@ -5182,6 +5241,7 @@ static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapcha
             pthread_mutex_unlock( &swapchain->managed->lock );
             continue;
         }
+        swapchain_set_hdr_metadata( swapchain, &metadata[i] );
         host_swapchains[host_count] = swapchain->obj.host.swapchain;
         host_metadata[host_count] = metadata[i];
         host_count++;
@@ -5920,6 +5980,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             continue;
         }
         if (swapchain->managed) continue;
+        swapchain_apply_color_description( swapchain );
         if (!swapchain->fshack.enabled) continue;
         hack = &swapchain->fs_hack_images[present_info->pImageIndices[i]];
         blit_sema = hack->blit_finished;
@@ -7251,6 +7312,12 @@ static VkColorSpaceKHR nulldrv_vulkan_map_colorspace( VkColorSpaceKHR colorspace
     return colorspace;
 }
 
+static void nulldrv_vulkan_surface_set_color_description(
+        VkColorSpaceKHR colorspace, BOOL use_image_description,
+        const VkHdrMetadataEXT *metadata, struct client_surface *client )
+{
+}
+
 static void nulldrv_vulkan_surface_set_alpha( VkCompositeAlphaFlagBitsKHR alpha_bits,
                                               struct client_surface *client )
 {
@@ -7292,6 +7359,8 @@ static const struct vulkan_driver_funcs nulldrv_funcs =
     .p_vulkan_surface_update = nulldrv_vulkan_surface_update,
     .p_vulkan_surface_release = nulldrv_vulkan_surface_release,
     .p_vulkan_map_colorspace = nulldrv_vulkan_map_colorspace,
+    .p_vulkan_surface_set_color_description =
+        nulldrv_vulkan_surface_set_color_description,
     .p_vulkan_surface_set_alpha = nulldrv_vulkan_surface_set_alpha,
     .p_get_physical_device_presentation_support = nulldrv_get_physical_device_presentation_support,
     .p_vulkan_get_hwnd_dmabuf_caps = nulldrv_vulkan_get_hwnd_dmabuf_caps,
@@ -7346,6 +7415,15 @@ static VkColorSpaceKHR lazydrv_vulkan_map_colorspace( VkColorSpaceKHR colorspace
     return driver_funcs->p_vulkan_map_colorspace( colorspace, client );
 }
 
+static void lazydrv_vulkan_surface_set_color_description(
+        VkColorSpaceKHR colorspace, BOOL use_image_description,
+        const VkHdrMetadataEXT *metadata, struct client_surface *client )
+{
+    vulkan_driver_load();
+    driver_funcs->p_vulkan_surface_set_color_description(
+            colorspace, use_image_description, metadata, client );
+}
+
 static void lazydrv_vulkan_surface_set_alpha( VkCompositeAlphaFlagBitsKHR alpha_bits,
                                               struct client_surface *client )
 {
@@ -7390,6 +7468,8 @@ static const struct vulkan_driver_funcs lazydrv_funcs =
     .p_vulkan_surface_update = lazydrv_vulkan_surface_update,
     .p_vulkan_surface_release = lazydrv_vulkan_surface_release,
     .p_vulkan_map_colorspace = lazydrv_vulkan_map_colorspace,
+    .p_vulkan_surface_set_color_description =
+        lazydrv_vulkan_surface_set_color_description,
     .p_vulkan_surface_set_alpha = lazydrv_vulkan_surface_set_alpha,
     .p_get_physical_device_presentation_support = lazydrv_get_physical_device_presentation_support,
     .p_vulkan_get_hwnd_dmabuf_caps = lazydrv_vulkan_get_hwnd_dmabuf_caps,

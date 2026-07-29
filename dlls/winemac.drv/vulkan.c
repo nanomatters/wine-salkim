@@ -95,6 +95,12 @@ static VkColorSpaceKHR macdrv_vulkan_map_colorspace(VkColorSpaceKHR colorspace, 
     return colorspace;
 }
 
+static void macdrv_vulkan_surface_set_color_description(
+        VkColorSpaceKHR colorspace, BOOL use_image_description,
+        const VkHdrMetadataEXT *metadata, struct client_surface *client)
+{
+}
+
 static void macdrv_vulkan_surface_set_alpha(VkCompositeAlphaFlagBitsKHR alpha_bits,
                                             struct client_surface *client)
 {
@@ -146,6 +152,8 @@ static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs =
     .p_vulkan_surface_update = macdrv_vulkan_surface_update,
     .p_vulkan_surface_release = macdrv_vulkan_surface_release,
     .p_vulkan_map_colorspace = macdrv_vulkan_map_colorspace,
+    .p_vulkan_surface_set_color_description =
+        macdrv_vulkan_surface_set_color_description,
     .p_vulkan_surface_set_alpha = macdrv_vulkan_surface_set_alpha,
     .p_get_physical_device_presentation_support = macdrv_get_physical_device_presentation_support,
     .p_map_instance_extensions = macdrv_map_instance_extensions,

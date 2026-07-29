@@ -6361,6 +6361,7 @@ static void wayland_image_description_v1_failed(void *user_data,
     {
         surface->pending_image_description_v1 = NULL;
         surface->pending_image_description_wl_surface = NULL;
+        surface->image_description_state.wl_surface = NULL;
     }
     pthread_mutex_unlock(&surface->client.presentation_mutex);
 
@@ -6426,7 +6427,47 @@ static const struct wp_image_description_v1_listener image_description_listener 
     wayland_image_description_v1_ready2
 };
 
-static struct wp_image_description_v1 *wayland_client_surface_reset_image_description_locked(
+static BOOL wayland_image_description_state_equal(
+        const struct wayland_image_description_state *a,
+        const struct wayland_image_description_state *b)
+{
+    if (a->wl_surface != b->wl_surface ||
+        a->color_space != b->color_space ||
+        a->has_hdr10_metadata != b->has_hdr10_metadata)
+        return FALSE;
+    if (!a->has_hdr10_metadata) return TRUE;
+
+    return a->hdr10_metadata.red_x == b->hdr10_metadata.red_x &&
+           a->hdr10_metadata.red_y == b->hdr10_metadata.red_y &&
+           a->hdr10_metadata.green_x == b->hdr10_metadata.green_x &&
+           a->hdr10_metadata.green_y == b->hdr10_metadata.green_y &&
+           a->hdr10_metadata.blue_x == b->hdr10_metadata.blue_x &&
+           a->hdr10_metadata.blue_y == b->hdr10_metadata.blue_y &&
+           a->hdr10_metadata.white_x == b->hdr10_metadata.white_x &&
+           a->hdr10_metadata.white_y == b->hdr10_metadata.white_y &&
+           a->hdr10_metadata.min_luminance == b->hdr10_metadata.min_luminance &&
+           a->hdr10_metadata.max_luminance == b->hdr10_metadata.max_luminance &&
+           a->hdr10_metadata.max_cll == b->hdr10_metadata.max_cll &&
+           a->hdr10_metadata.max_fall == b->hdr10_metadata.max_fall;
+}
+
+static struct wp_image_description_v1 *wayland_client_surface_create_image_description(
+        const struct wayland_image_description_state *state)
+{
+    switch (state->color_space)
+    {
+    case WAYLAND_IMAGE_DESCRIPTION_SCRGB:
+        return wp_color_manager_v1_create_windows_scrgb(
+                process_wayland.wp_color_manager_v1);
+    case WAYLAND_IMAGE_DESCRIPTION_BT2100:
+        return wayland_color_manager_create_windows_bt2100_with_metadata(
+                state->has_hdr10_metadata ? &state->hdr10_metadata : NULL);
+    default:
+        return NULL;
+    }
+}
+
+static struct wp_image_description_v1 *wayland_client_surface_cancel_image_description_locked(
         struct wayland_client_surface *surface)
 {
     struct wp_image_description_v1 *pending = surface->pending_image_description_v1;
@@ -6434,6 +6475,15 @@ static struct wp_image_description_v1 *wayland_client_surface_reset_image_descri
     surface->pending_image_description_v1 = NULL;
     surface->pending_image_description_wl_surface = NULL;
     if (pending) wp_image_description_v1_destroy(pending);
+    return pending;
+}
+
+static struct wp_image_description_v1 *wayland_client_surface_reset_image_description_locked(
+        struct wayland_client_surface *surface)
+{
+    struct wp_image_description_v1 *pending =
+        wayland_client_surface_cancel_image_description_locked(surface);
+
     if (surface->wp_color_management_surface_v1)
     {
         wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
@@ -6450,29 +6500,60 @@ static BOOL wayland_client_surface_retarget_image_description(
     pthread_mutex_lock(&surface->client.presentation_mutex);
     pending = wayland_client_surface_reset_image_description_locked(surface);
     surface->wl_surface = wl_surface;
+    surface->image_description_state.wl_surface = NULL;
+    InterlockedExchange(&surface->has_image_description, FALSE);
     pthread_mutex_unlock(&surface->client.presentation_mutex);
     return pending != NULL;
 }
 
-void wayland_client_surface_attach_image_description(struct client_surface *client,
-                                                     struct wp_image_description_v1 *image_desc)
+BOOL wayland_client_surface_set_image_description(
+        struct client_surface *client,
+        enum wayland_image_description_color_space color_space,
+        const struct wayland_hdr10_metadata *metadata)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    struct wp_image_description_v1 *pending;
+    struct wayland_image_description_state state = {.color_space = color_space};
+    struct wp_image_description_v1 *pending = NULL, *image_desc = NULL;
+
+    if (color_space == WAYLAND_IMAGE_DESCRIPTION_BT2100 && metadata)
+    {
+        state.has_hdr10_metadata = TRUE;
+        state.hdr10_metadata = *metadata;
+    }
 
     pthread_mutex_lock(&surface->client.presentation_mutex);
-    pending = wayland_client_surface_reset_image_description_locked(surface);
+    state.wl_surface = surface->wl_surface;
+    if (wayland_image_description_state_equal(&surface->image_description_state, &state))
+    {
+        pthread_mutex_unlock(&surface->client.presentation_mutex);
+        return TRUE;
+    }
+
+    if (color_space != WAYLAND_IMAGE_DESCRIPTION_DEFAULT &&
+        !(image_desc = wayland_client_surface_create_image_description(&state)))
+    {
+        pthread_mutex_unlock(&surface->client.presentation_mutex);
+        return FALSE;
+    }
+
     if (image_desc)
     {
+        pending = wayland_client_surface_cancel_image_description_locked(surface);
         surface->pending_image_description_v1 = image_desc;
         surface->pending_image_description_wl_surface = surface->wl_surface;
         client_surface_add_ref(&surface->client);
         wp_image_description_v1_add_listener(image_desc, &image_description_listener, surface);
     }
+    else
+        pending = wayland_client_surface_reset_image_description_locked(surface);
+    surface->image_description_state = state;
+    InterlockedExchange(&surface->has_image_description,
+                        color_space != WAYLAND_IMAGE_DESCRIPTION_DEFAULT);
     pthread_mutex_unlock(&surface->client.presentation_mutex);
 
     if (pending) client_surface_release(&surface->client);
     if (image_desc) wl_display_flush(process_wayland.wl_display);
+    return TRUE;
 }
 
 static BOOL wayland_client_surface_set_opaque_region(struct wayland_client_surface *surface,

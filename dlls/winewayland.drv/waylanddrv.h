@@ -454,6 +454,33 @@ struct wayland_retired_wl_surface
     struct wl_surface *wl_surface;
 };
 
+struct wayland_hdr10_metadata
+{
+    int red_x, red_y;
+    int green_x, green_y;
+    int blue_x, blue_y;
+    int white_x, white_y;
+    unsigned int min_luminance;
+    unsigned int max_luminance;
+    unsigned int max_cll;
+    unsigned int max_fall;
+};
+
+enum wayland_image_description_color_space
+{
+    WAYLAND_IMAGE_DESCRIPTION_DEFAULT,
+    WAYLAND_IMAGE_DESCRIPTION_SCRGB,
+    WAYLAND_IMAGE_DESCRIPTION_BT2100,
+};
+
+struct wayland_image_description_state
+{
+    enum wayland_image_description_color_space color_space;
+    BOOL has_hdr10_metadata;
+    struct wayland_hdr10_metadata hdr10_metadata;
+    const struct wl_surface *wl_surface;
+};
+
 struct wayland_client_surface
 {
     struct client_surface client;
@@ -480,6 +507,8 @@ struct wayland_client_surface
     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
     struct wp_image_description_v1 *pending_image_description_v1;
     struct wl_surface *pending_image_description_wl_surface;
+    struct wayland_image_description_state image_description_state;
+    LONG has_image_description;
     struct wp_viewport *wp_viewport;
     struct wp_content_type_v1 *wp_content_type_v1;
     LONG opaque_region_state;
@@ -611,17 +640,6 @@ UINT wayland_generic_output_get_edid_override(const char *output_name, unsigned 
 UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned char **edid);
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
                                      BOOL hdr_supported, unsigned char **edid);
-struct wayland_hdr10_metadata
-{
-    int red_x, red_y;
-    int green_x, green_y;
-    int blue_x, blue_y;
-    int white_x, white_y;
-    unsigned int min_luminance;
-    unsigned int max_luminance;
-    unsigned int max_cll;
-    unsigned int max_fall;
-};
 void wayland_color_manager_init(void);
 BOOL wayland_color_manager_can_present_bt2100(void);
 BOOL wayland_color_manager_may_support_hdr(void);
@@ -703,8 +721,10 @@ void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *su
                                                       struct wayland_win_data *data);
 BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
                                                 struct wayland_client_surface *client);
-void wayland_client_surface_attach_image_description(struct client_surface *client,
-                                                     struct wp_image_description_v1 *image_desc);
+BOOL wayland_client_surface_set_image_description(
+        struct client_surface *client,
+        enum wayland_image_description_color_space color_space,
+        const struct wayland_hdr10_metadata *metadata);
 struct wayland_client_surface *impl_from_client_surface(struct client_surface *client);
 void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha);
 void wayland_surface_ensure_contents(struct wayland_surface *surface,

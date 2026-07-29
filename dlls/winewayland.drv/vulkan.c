@@ -25,6 +25,8 @@
 #include "config.h"
 
 #include <dlfcn.h>
+#include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -277,49 +279,90 @@ static void wayland_map_device_extensions(struct vulkan_device_extensions *exten
     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
 }
 
-static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace, struct client_surface *client)
+static enum wayland_image_description_color_space wayland_vulkan_image_color_space(
+        VkColorSpaceKHR colorspace)
 {
-    struct wp_image_description_v1 *wp_image_description_v1 = NULL;
-    VkColorSpaceKHR new = colorspace;
+    if (colorspace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT &&
+        process_wayland.supports_win_scrgb)
+        return WAYLAND_IMAGE_DESCRIPTION_SCRGB;
+    if (colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+        wayland_color_manager_can_present_bt2100())
+        return WAYLAND_IMAGE_DESCRIPTION_BT2100;
+    return WAYLAND_IMAGE_DESCRIPTION_DEFAULT;
+}
 
-    if (process_wayland.supports_win_scrgb && new == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
-        new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
-    else if (wayland_color_manager_can_present_bt2100() &&
-             colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
-        new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
+                                                     struct client_surface *client)
+{
+    enum wayland_image_description_color_space color_space =
+        wayland_vulkan_image_color_space(colorspace);
 
-    if (!client) return new;
-    if (new == colorspace)
+    if (!client)
+        return color_space == WAYLAND_IMAGE_DESCRIPTION_DEFAULT ?
+               colorspace : VK_COLOR_SPACE_PASS_THROUGH_EXT;
+
+    if (!wayland_client_surface_set_image_description(client, color_space, NULL))
     {
-        wayland_client_surface_attach_image_description(client, NULL);
+        wayland_client_surface_set_image_description(
+                client, WAYLAND_IMAGE_DESCRIPTION_DEFAULT, NULL);
+        ERR("Failed to configure image description for client surface.\n");
         return colorspace;
     }
 
-    switch (colorspace)
+    if (color_space == WAYLAND_IMAGE_DESCRIPTION_DEFAULT) return colorspace;
+    TRACE("mapping colorspace %u => %u\n", colorspace, VK_COLOR_SPACE_PASS_THROUGH_EXT);
+    return VK_COLOR_SPACE_PASS_THROUGH_EXT;
+}
+
+static unsigned int wayland_vulkan_hdr_uint(float value, double scale,
+                                            unsigned int max_value)
+{
+    double scaled;
+
+    if (!isfinite(value) || value <= 0.0f) return 0;
+    scaled = value * scale;
+    if (scaled >= max_value) return max_value;
+    return (unsigned int)llround(scaled);
+}
+
+static void wayland_vulkan_surface_set_color_description(
+        VkColorSpaceKHR colorspace, BOOL use_image_description,
+        const VkHdrMetadataEXT *metadata, struct client_surface *client)
+{
+    enum wayland_image_description_color_space color_space;
+    struct wayland_client_surface *surface;
+    struct wayland_hdr10_metadata hdr = {0};
+
+    if (!client) return;
+    surface = impl_from_client_surface(client);
+    if (!use_image_description &&
+        !ReadAcquire(&surface->has_image_description))
+        return;
+
+    color_space = use_image_description ?
+                  wayland_vulkan_image_color_space(colorspace) :
+                  WAYLAND_IMAGE_DESCRIPTION_DEFAULT;
+
+    if (color_space == WAYLAND_IMAGE_DESCRIPTION_BT2100 && metadata)
     {
-    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
-        wp_image_description_v1 =
-            wp_color_manager_v1_create_windows_scrgb(process_wayland.wp_color_manager_v1);
-        break;
-    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-        wp_image_description_v1 = wayland_color_manager_create_windows_bt2100();
-    default: break;
+        hdr.red_x = wayland_vulkan_hdr_uint(metadata->displayPrimaryRed.x, 1000000.0, 1000000);
+        hdr.red_y = wayland_vulkan_hdr_uint(metadata->displayPrimaryRed.y, 1000000.0, 1000000);
+        hdr.green_x = wayland_vulkan_hdr_uint(metadata->displayPrimaryGreen.x, 1000000.0, 1000000);
+        hdr.green_y = wayland_vulkan_hdr_uint(metadata->displayPrimaryGreen.y, 1000000.0, 1000000);
+        hdr.blue_x = wayland_vulkan_hdr_uint(metadata->displayPrimaryBlue.x, 1000000.0, 1000000);
+        hdr.blue_y = wayland_vulkan_hdr_uint(metadata->displayPrimaryBlue.y, 1000000.0, 1000000);
+        hdr.white_x = wayland_vulkan_hdr_uint(metadata->whitePoint.x, 1000000.0, 1000000);
+        hdr.white_y = wayland_vulkan_hdr_uint(metadata->whitePoint.y, 1000000.0, 1000000);
+        hdr.min_luminance = wayland_vulkan_hdr_uint(metadata->minLuminance, 10000.0, UINT_MAX);
+        hdr.max_luminance = wayland_vulkan_hdr_uint(metadata->maxLuminance, 1.0, UINT_MAX);
+        hdr.max_cll = wayland_vulkan_hdr_uint(metadata->maxContentLightLevel, 1.0, UINT_MAX);
+        hdr.max_fall = wayland_vulkan_hdr_uint(metadata->maxFrameAverageLightLevel, 1.0, UINT_MAX);
     }
 
-    if (!wp_image_description_v1)
-    {
-        wayland_client_surface_attach_image_description(client, NULL);
-        goto err;
-    }
-
-    TRACE("mapping colorspace %u => %u\n", colorspace, new);
-
-    wayland_client_surface_attach_image_description(client, wp_image_description_v1);
-
-    return new;
-err:
-    ERR("Failed to configure image description for client surface!\n");
-    return colorspace;
+    if (!wayland_client_surface_set_image_description(
+            client, color_space,
+            color_space == WAYLAND_IMAGE_DESCRIPTION_BT2100 && metadata ? &hdr : NULL))
+        WARN("Failed to update image description for client surface.\n");
 }
 
 static void wayland_vulkan_surface_set_alpha(VkCompositeAlphaFlagBitsKHR alpha_bits,
@@ -400,6 +443,8 @@ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
     .p_vulkan_surface_update = wayland_vulkan_surface_update,
     .p_vulkan_surface_release = wayland_vulkan_surface_release,
     .p_vulkan_map_colorspace = wayland_vulkan_map_colorspace,
+    .p_vulkan_surface_set_color_description =
+        wayland_vulkan_surface_set_color_description,
     .p_vulkan_surface_set_alpha = wayland_vulkan_surface_set_alpha,
     .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
