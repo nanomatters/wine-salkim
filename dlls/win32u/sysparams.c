@@ -66,6 +66,7 @@ static const char devpropkey_monitor_output_idA[] = "Properties\\{CA085853-16CE-
 static const char wine_devpropkey_monitor_rcworkA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0004";
 static const char wine_devpropkey_monitor_hdr_supportedA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0005";
 static const char wine_devpropkey_monitor_hdr_enabledA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0006";
+static const char wine_devpropkey_monitor_sdr_white_levelA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0007";
 
 static const WCHAR linkedW[] = {'L','i','n','k','e','d',0};
 static const WCHAR symbolic_link_valueW[] =
@@ -159,6 +160,7 @@ struct monitor
     struct edid_monitor_info edid_info;
     BOOL hdr_supported;
     BOOL hdr_enabled;
+    UINT sdr_white_level;
 };
 
 static struct list gpus = LIST_INIT(gpus);
@@ -180,6 +182,7 @@ static struct monitor virtual_monitor =
     .handle = VIRTUAL_HMONITOR,
     .rc_work.right = 1024,
     .rc_work.bottom = 768,
+    .sdr_white_level = WINE_SDR_WHITE_LEVEL_DEFAULT,
 };
 
 /* the various registry keys that are used to store parameters */
@@ -839,6 +842,14 @@ static BOOL read_monitor_from_registry( struct monitor *monitor )
         monitor->hdr_supported = *(const BOOL *)value->Data;
     else
         monitor->hdr_supported = monitor->hdr_enabled;
+
+    /* WINE_DEVPROPKEY_MONITOR_SDR_WHITE_LEVEL */
+    size = query_reg_subkey_value( hkey, wine_devpropkey_monitor_sdr_white_levelA,
+                                   value, sizeof(buffer) );
+    if (size == sizeof(monitor->sdr_white_level))
+        monitor->sdr_white_level = *(const UINT *)value->Data;
+    else
+        monitor->sdr_white_level = WINE_SDR_WHITE_LEVEL_DEFAULT;
 
     NtClose( hkey );
     return TRUE;
@@ -2098,6 +2109,14 @@ static BOOL write_monitor_to_registry( struct monitor *monitor, const BYTE *edid
         NtClose( subkey );
     }
 
+    /* WINE_DEVPROPKEY_MONITOR_SDR_WHITE_LEVEL */
+    if ((subkey = reg_create_ascii_key( hkey, wine_devpropkey_monitor_sdr_white_levelA, 0, NULL )))
+    {
+        set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_UINT32,
+                       &monitor->sdr_white_level, sizeof(monitor->sdr_white_level) );
+        NtClose( subkey );
+    }
+
     NtClose( hkey );
 
 
@@ -2129,6 +2148,8 @@ static void add_monitor( const struct gdi_monitor *gdi_monitor, void *param )
     monitor->rc_work = gdi_monitor->rc_work;
     monitor->hdr_supported = gdi_monitor->hdr_supported;
     monitor->hdr_enabled = gdi_monitor->hdr_enabled;
+    monitor->sdr_white_level = gdi_monitor->sdr_white_level;
+    if (!monitor->sdr_white_level) monitor->sdr_white_level = WINE_SDR_WHITE_LEVEL_DEFAULT;
 
     TRACE( "%u %s %s\n", monitor->id, wine_dbgstr_rect(&gdi_monitor->rc_monitor), wine_dbgstr_rect(&gdi_monitor->rc_work) );
 
@@ -8421,12 +8442,36 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         unlock_display_devices();
         return ret;
     }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL:
+    {
+        DISPLAYCONFIG_SDR_WHITE_LEVEL *white_level = (DISPLAYCONFIG_SDR_WHITE_LEVEL *)packet;
+        struct monitor *monitor;
+
+        if (packet->size < sizeof(*white_level))
+            return STATUS_INVALID_PARAMETER;
+
+        if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
+
+        LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
+        {
+            if (white_level->header.id != monitor->output_id) continue;
+            if (memcmp( &white_level->header.adapterId, &monitor->source->gpu->luid,
+                        sizeof(monitor->source->gpu->luid) ))
+                continue;
+
+            white_level->SDRWhiteLevel = monitor->sdr_white_level;
+            ret = STATUS_SUCCESS;
+            break;
+        }
+
+        unlock_display_devices();
+        return ret;
+    }
     case DISPLAYCONFIG_DEVICE_INFO_SET_TARGET_PERSISTENCE:
     case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE:
     case DISPLAYCONFIG_DEVICE_INFO_GET_SUPPORT_VIRTUAL_RESOLUTION:
     case DISPLAYCONFIG_DEVICE_INFO_SET_SUPPORT_VIRTUAL_RESOLUTION:
     case DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE:
-    case DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL:
     default:
         FIXME( "Unimplemented packet type %u.\n", packet->type );
         return STATUS_INVALID_PARAMETER;

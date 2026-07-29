@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 111
+#define WINE_GDI_DRIVER_VERSION 112
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -372,7 +372,10 @@ struct gdi_monitor
     UINT edid_len;
     BOOL hdr_supported;
     BOOL hdr_enabled;
+    UINT sdr_white_level; /* DISPLAYCONFIG_SDR_WHITE_LEVEL units */
 };
+
+#define WINE_SDR_WHITE_LEVEL_DEFAULT 1000
 
 struct gdi_device_manager
 {

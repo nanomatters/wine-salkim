@@ -265,9 +265,11 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
                                        void *param, struct output_info *output_info,
                                        struct output_info *primary)
 {
+    const struct wayland_output_state *output = output_info->output;
     BOOL desktop_hdr_enabled, panel_hdr_supported;
     const char *env;
     struct gdi_monitor monitor = {0};
+    UINT64 sdr_white_level;
 
     SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
             output_info->x + output_info->output->current_mode->width,
@@ -287,9 +289,8 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
         panel_hdr_supported = wayland_color_manager_may_support_hdr();
 
     monitor.hdr_supported = panel_hdr_supported && wayland_color_manager_can_present_bt2100();
-    desktop_hdr_enabled = output_info->output->supports_hdr;
+    desktop_hdr_enabled = output->supports_hdr;
     monitor.hdr_enabled = monitor.hdr_supported && desktop_hdr_enabled;
-
     if ((env = getenv("DXVK_HDR")) && *env == '1')
     {
         monitor.hdr_supported = TRUE;
@@ -300,15 +301,22 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
         monitor.hdr_enabled = FALSE;
     }
 
+    monitor.sdr_white_level = WINE_SDR_WHITE_LEVEL_DEFAULT;
+    if (monitor.hdr_enabled && output->ref_lum)
+    {
+        sdr_white_level = ((UINT64)output->ref_lum * 1000 + 40) / 80;
+        monitor.sdr_white_level = min(sdr_white_level, (UINT64)(UINT)-1);
+    }
+
     if (!monitor.edid_len)
         monitor.edid_len = wayland_generic_output_get_edid(output_info->output,
                                                            monitor.hdr_supported, &monitor.edid);
     /* We don't have a direct way to get the work area in Wayland. */
     monitor.rc_work = monitor.rc_monitor;
 
-    TRACE("name=%s rc_monitor=rc_work=%s hdr_supported=%u hdr_enabled=%u\n",
+    TRACE("name=%s rc_monitor=rc_work=%s hdr_supported=%u hdr_enabled=%u sdr_white_level=%u\n",
           output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor),
-          monitor.hdr_supported, monitor.hdr_enabled);
+          monitor.hdr_supported, monitor.hdr_enabled, monitor.sdr_white_level);
 
     device_manager->add_monitor(&monitor, param);
     free(monitor.edid);
