@@ -1213,14 +1213,6 @@ static void wayland_configure_window(HWND hwnd)
         window_height += offset_y;
         window_width += offset_x;
     }
-    else if (data->frameless)
-    {
-        window_width += (data->rects.client.left - data->rects.window.left) +
-                        (data->rects.window.right - data->rects.client.right);
-        window_height += (data->rects.client.top - data->rects.window.top) +
-                         (data->rects.window.bottom - data->rects.client.bottom);
-    }
-
     SetRect(&rect, 0, 0, window_width, window_height);
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
     if (!IsRectEmpty(&rect)) rect = window_rect_from_visible(&data->rects, rect);

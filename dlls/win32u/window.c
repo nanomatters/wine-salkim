@@ -2210,7 +2210,7 @@ static BOOL has_collapsed_caption( UINT style, UINT ex_style,
     if (top < 0 || client->left < window->left ||
         client->right > window->right || client->bottom > window->bottom)
         return FALSE;
-    if (!adjust_window_rect( &border, style & ~WS_CAPTION, FALSE, ex_style, get_system_dpi() ))
+    if (!adjust_window_rect( &border, style & ~WS_DLGFRAME, FALSE, ex_style, get_system_dpi() ))
         return FALSE;
 
     border_top = max( 0, -border.top );
@@ -2221,6 +2221,9 @@ static BOOL is_frameless_window( HWND hwnd, UINT style, UINT ex_style,
     const struct window_rects *rects )
 {
     if (!window_has_frame_style( style )) return FALSE;
+    if ((style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME) &&
+        (style & WS_CAPTION) != WS_CAPTION)
+        return TRUE;
     return has_collapsed_frame( &rects->window, &rects->client, get_custom_frame( hwnd ) ) ||
            has_collapsed_caption( style, ex_style, &rects->window, &rects->client );
 }
