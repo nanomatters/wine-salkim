@@ -39,6 +39,7 @@
 #include "ntuser_private.h"
 #include "wine/hwnd_dmabuf.h"
 
+#include "fshack_color_spv.h"
 #include "fsr_spv.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
@@ -210,9 +211,38 @@ static VkSurfaceKHR surface_host_handle( struct surface *surface )
     return surface->active_host->handle;
 }
 
+enum fs_hack_color_mode
+{
+    FS_HACK_COLOR_SRGB,
+    FS_HACK_COLOR_EXTENDED_SRGB,
+    FS_HACK_COLOR_RAW,
+    FS_HACK_COLOR_PQ,
+    FS_HACK_COLOR_HLG,
+};
+
+enum fs_hack_transfer
+{
+    FS_HACK_TRANSFER_NONE,
+    FS_HACK_TRANSFER_PQ,
+    FS_HACK_TRANSFER_HLG,
+    FS_HACK_TRANSFER_SRGB,
+};
+
+struct fs_hack_color_constants
+{
+    float offset[2];
+    float extents[2];
+    uint32_t transfer;
+    uint32_t linear_filter;
+};
+
+C_ASSERT(sizeof(struct fs_hack_color_constants) == 24);
+
 struct fs_hack_upscaler
 {
+    enum fs_hack_color_mode color_mode;
     BOOL is_blit, is_fsr, is_nis;
+    BOOL linear_filter;
     union {
         struct {
         } blit;
@@ -2666,6 +2696,39 @@ static VkFormat unorm_to_srgb(VkFormat format)
     }
 }
 
+static enum fs_hack_color_mode fs_hack_color_mode_from_colorspace( VkColorSpaceKHR colorspace )
+{
+    switch (colorspace)
+    {
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+        return FS_HACK_COLOR_SRGB;
+    case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT:
+    case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
+        return FS_HACK_COLOR_EXTENDED_SRGB;
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+        return FS_HACK_COLOR_PQ;
+    case VK_COLOR_SPACE_HDR10_HLG_EXT:
+        return FS_HACK_COLOR_HLG;
+    default:
+        return FS_HACK_COLOR_RAW;
+    }
+}
+
+static BOOL fs_hack_format_supports( struct vulkan_physical_device *physical_device,
+                                     VkFormat format, VkFormatFeatureFlags features )
+{
+    struct vulkan_instance *instance = physical_device->instance;
+    PFN_vkGetPhysicalDeviceFormatProperties p_get_format_props;
+    VkFormatProperties props;
+
+    p_get_format_props = (PFN_vkGetPhysicalDeviceFormatProperties)
+        p_vkGetInstanceProcAddr( instance->host.instance, "vkGetPhysicalDeviceFormatProperties" );
+    if (!p_get_format_props) return FALSE;
+
+    p_get_format_props( physical_device->host.physical_device, format, &props );
+    return (props.optimalTilingFeatures & features) == features;
+}
+
 static VkResult init_compute_state( struct vulkan_device *device, struct swapchain *swapchain )
 {
     VkResult res;
@@ -2684,10 +2747,16 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
     uint32_t fsr_memory_type = -1;
 
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    samplerInfo.magFilter = samplerInfo.minFilter = fs_hack_is_integer() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    samplerInfo.addressModeU = swapchain->upscaler.is_fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    samplerInfo.addressModeV = swapchain->upscaler.is_fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    samplerInfo.addressModeW = swapchain->upscaler.is_fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.magFilter = samplerInfo.minFilter =
+        (swapchain->upscaler.is_fsr ||
+         (swapchain->upscaler.linear_filter &&
+          (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB ||
+           swapchain->upscaler.color_mode == FS_HACK_COLOR_RAW))) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    samplerInfo.addressModeU = swapchain->upscaler.is_fsr ||
+        swapchain->upscaler.color_mode != FS_HACK_COLOR_SRGB ?
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = samplerInfo.addressModeU;
+    samplerInfo.addressModeW = samplerInfo.addressModeU;
     samplerInfo.anisotropyEnable = VK_FALSE;
     samplerInfo.maxAnisotropy = 1;
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -2751,8 +2820,13 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
         goto fail;
     }
 
-    if ((res = create_pipeline( device, swapchain, blit_comp_spv, sizeof(blit_comp_spv),
-                                4 * sizeof(float) /* 2 * vec2 */, &swapchain->blit_pipeline )))
+    if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
+        res = create_pipeline( device, swapchain, blit_comp_spv, sizeof(blit_comp_spv),
+                               4 * sizeof(float), &swapchain->blit_pipeline );
+    else
+        res = create_pipeline( device, swapchain, fshack_color_comp_spv, sizeof(fshack_color_comp_spv),
+                               4 * sizeof(float) + 2 * sizeof(uint32_t), &swapchain->blit_pipeline );
+    if (res)
         goto fail;
 
     if (swapchain->upscaler.is_fsr)
@@ -2886,7 +2960,11 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = hack->swapchain_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = swapchain->upscaler.is_fsr ? srgb_to_unorm(swapchain->format) : VK_FORMAT_B8G8R8A8_UNORM;
+        if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
+            viewInfo.format = swapchain->upscaler.is_fsr ?
+                              srgb_to_unorm(swapchain->format) : VK_FORMAT_B8G8R8A8_UNORM;
+        else
+            viewInfo.format = swapchain->format;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -2954,7 +3032,8 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
 {
     struct vulkan_physical_device *physical_device = device->physical_device;
     struct vulkan_instance *instance = physical_device->instance;
-    VkFormat user_view_format = swapchain->upscaler.is_fsr
+    VkFormat user_view_format = swapchain->upscaler.is_fsr ||
+                                swapchain->upscaler.color_mode != FS_HACK_COLOR_SRGB
                                 ? srgb_to_unorm( createinfo->imageFormat )
                                 : unorm_to_srgb( createinfo->imageFormat );
     VkResult res;
@@ -4353,14 +4432,22 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                                             &swapchain->host_extents, &swapchain->fshack );
     if (use_fshack)
     {
+        VkFormat source_view_format;
+        BOOL fsr_requested;
         BOOL full_host = swapchain->fshack.dst.left == 0 && swapchain->fshack.dst.top == 0 &&
                          swapchain->fshack.dst.right == (LONG)swapchain->host_extents.width &&
                          swapchain->fshack.dst.bottom == (LONG)swapchain->host_extents.height;
 
-        if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
-            FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
-
-        swapchain->upscaler.is_fsr = fs_hack_is_fsr(&lite, &sharpness);
+        swapchain->upscaler.color_mode = fs_hack_color_mode_from_colorspace( create_info->imageColorSpace );
+        swapchain->upscaler.linear_filter =
+            !fs_hack_is_integer() &&
+            (create_info->imageExtent.width != (UINT)(swapchain->fshack.dst.right - swapchain->fshack.dst.left) ||
+             create_info->imageExtent.height != (UINT)(swapchain->fshack.dst.bottom - swapchain->fshack.dst.top));
+        fsr_requested = fs_hack_is_fsr( &lite, &sharpness );
+        swapchain->upscaler.is_fsr = fsr_requested &&
+                                     swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB;
+        if (fsr_requested && !swapchain->upscaler.is_fsr)
+            WARN( "FSR is disabled for colorspace %u\n", create_info->imageColorSpace );
         if (swapchain->upscaler.is_fsr && !full_host)
         {
             WARN( "FSR cannot compose an offset fullscreen destination, using the blit scaler\n" );
@@ -4369,7 +4456,11 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         swapchain->upscaler.fsr.lite = lite;
         swapchain->upscaler.fsr.sharpness = sharpness;
         create_info_host.imageExtent = swapchain->host_extents;
-        create_info_host.imageFormat = swapchain->upscaler.is_fsr ? VK_FORMAT_B8G8R8A8_SRGB: VK_FORMAT_B8G8R8A8_UNORM;
+        if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
+            create_info_host.imageFormat = swapchain->upscaler.is_fsr ?
+                                           VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+        else
+            create_info_host.imageFormat = srgb_to_unorm( create_info->imageFormat );
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
 
         swapchain->format = create_info_host.imageFormat;
@@ -4380,10 +4471,50 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; /* XXX: check if supported by surface */
         }
 
-        if (unorm_to_srgb( create_info->imageFormat ) == create_info->imageFormat &&
+        if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB &&
+            unorm_to_srgb( create_info->imageFormat ) == create_info->imageFormat &&
             srgb_to_unorm( create_info->imageFormat ) == create_info->imageFormat)
             FIXME( "Swapchain image format %d has no UNORM/SRGB format pair; colors may be incorrect.\n",
                    create_info->imageFormat );
+
+        if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
+        {
+            if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
+                FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
+            else
+            {
+                ERR( "Swapchain does not support storage images for colorspace %u\n",
+                     create_info->imageColorSpace );
+                pthread_mutex_unlock( &surface->host_lock );
+                free( swapchain );
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
+
+        source_view_format = swapchain->upscaler.is_fsr ||
+                             swapchain->upscaler.color_mode != FS_HACK_COLOR_SRGB ?
+                             srgb_to_unorm( create_info->imageFormat ) :
+                             unorm_to_srgb( create_info->imageFormat );
+        if (swapchain->upscaler.color_mode != FS_HACK_COLOR_SRGB &&
+            (!fs_hack_format_supports( physical_device, source_view_format,
+                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ) ||
+             !fs_hack_format_supports( physical_device, create_info_host.imageFormat,
+                                       VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT )))
+        {
+            ERR( "Cannot preserve format %u for fullscreen scaling\n", create_info->imageFormat );
+            pthread_mutex_unlock( &surface->host_lock );
+            free( swapchain );
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (swapchain->upscaler.color_mode == FS_HACK_COLOR_RAW &&
+            swapchain->upscaler.linear_filter &&
+            !fs_hack_format_supports( physical_device, source_view_format,
+                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT ))
+        {
+            WARN( "Format %u does not support linear filtering, using nearest\n",
+                  create_info->imageFormat );
+            swapchain->upscaler.linear_filter = FALSE;
+        }
     }
 
     /* check if the new colorspace works with the provided format */
@@ -5057,6 +5188,7 @@ static void init_barrier(VkImageMemoryBarrier *barrier)
 
 static VkResult record_compute_cmd( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
 {
+    struct fs_hack_color_constants color_constants;
     VkResult res;
     VkImageMemoryBarrier barriers[3] = {{0}};
     VkCommandBufferBeginInfo beginInfo = {0};
@@ -5091,20 +5223,33 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                     0, 0, NULL, 0, NULL, 2, barriers );
 
-    /* vec2: blit destination offset in host-image coordinates */
-    constants[0] = swapchain->fshack.dst.left;
-    constants[1] = swapchain->fshack.dst.top;
-
-    /* offset by 0.5f because sampling is relative to pixel center */
-    constants[0] -= 0.5f * (swapchain->fshack.dst.right - swapchain->fshack.dst.left) /
-                    swapchain->extents.width;
-    constants[1] -= 0.5f * (swapchain->fshack.dst.bottom - swapchain->fshack.dst.top) /
-                    swapchain->extents.height;
-
-    /* vec2: blit destination extents in host-image coordinates */
-    constants[2] = swapchain->fshack.dst.right - swapchain->fshack.dst.left;
-    constants[3] = swapchain->fshack.dst.bottom - swapchain->fshack.dst.top;
-    bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, constants);
+    if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
+    {
+        constants[0] = swapchain->fshack.dst.left;
+        constants[1] = swapchain->fshack.dst.top;
+        constants[0] -= 0.5f * (swapchain->fshack.dst.right - swapchain->fshack.dst.left) /
+                        swapchain->extents.width;
+        constants[1] -= 0.5f * (swapchain->fshack.dst.bottom - swapchain->fshack.dst.top) /
+                        swapchain->extents.height;
+        constants[2] = swapchain->fshack.dst.right - swapchain->fshack.dst.left;
+        constants[3] = swapchain->fshack.dst.bottom - swapchain->fshack.dst.top;
+        bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, constants);
+    }
+    else
+    {
+        color_constants.offset[0] = swapchain->fshack.dst.left;
+        color_constants.offset[1] = swapchain->fshack.dst.top;
+        color_constants.extents[0] = swapchain->fshack.dst.right - swapchain->fshack.dst.left;
+        color_constants.extents[1] = swapchain->fshack.dst.bottom - swapchain->fshack.dst.top;
+        color_constants.transfer = swapchain->upscaler.color_mode == FS_HACK_COLOR_PQ ?
+                                   FS_HACK_TRANSFER_PQ :
+                                   swapchain->upscaler.color_mode == FS_HACK_COLOR_HLG ?
+                                   FS_HACK_TRANSFER_HLG :
+                                   swapchain->upscaler.color_mode == FS_HACK_COLOR_EXTENDED_SRGB ?
+                                   FS_HACK_TRANSFER_SRGB : FS_HACK_TRANSFER_NONE;
+        color_constants.linear_filter = swapchain->upscaler.linear_filter;
+        bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, &color_constants);
+    }
 
     /* local sizes in shader are 8 */
     device->p_vkCmdDispatch( hack->cmd, ceil( swapchain->host_extents.width / 8. ),
