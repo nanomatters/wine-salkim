@@ -284,10 +284,12 @@ enum hwnd_dmabuf_status
  * token returns. The consumer may cache and reuse the wl_buffer for that slot.
  * Producers that export a fresh dmabuf for every frame must not set this flag. */
 #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
-/* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
+
 #define HWND_DMABUF_FLAG_SHM              0x00000002
-/* Frame is a GDI overlay carried above normal self-presenting producers. */
+
 #define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
+
+#define HWND_DMABUF_FLAG_COLOR_SPACE      0x00000008
 
 #define HWND_DMABUF_FRAME_OPENED          0x00000001
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002

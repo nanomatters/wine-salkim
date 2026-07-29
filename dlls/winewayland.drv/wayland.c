@@ -120,6 +120,8 @@ static void wayland_color_manager_handle_supported_feature(void *data,
         process_wayland.supports_set_primaries = TRUE;
     else if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES)
         process_wayland.supports_set_luminances = TRUE;
+    else if (feature == WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES)
+        process_wayland.supports_set_mastering_display_primaries = TRUE;
     else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB)
         process_wayland.supports_win_scrgb = TRUE;
     else if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100)

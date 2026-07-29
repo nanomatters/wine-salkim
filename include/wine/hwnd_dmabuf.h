@@ -12,6 +12,13 @@
 #define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
 #define HWND_DMABUF_ALPHA_MODE_IGNORE          3
 
+#define HWND_DMABUF_COLOR_SPACE_SRGB            0x00
+#define HWND_DMABUF_COLOR_SPACE_SCRGB           0x01
+#define HWND_DMABUF_COLOR_SPACE_HDR10_ST2084    0x0c
+
+#define HWND_DMABUF_HDR_METADATA_NONE           0
+#define HWND_DMABUF_HDR_METADATA_HDR10          1
+
 #define HWND_DMABUF_SYNC_NONE                  0
 #define HWND_DMABUF_SYNC_FILE                  1
 

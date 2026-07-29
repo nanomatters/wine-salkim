@@ -304,6 +304,8 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FLAG_SHM              0x00000002
 /* Frame is a GDI overlay carried above normal self-presenting producers. */
 #define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
+/* color_space and hdr_metadata describe the frame contents. */
+#define HWND_DMABUF_FLAG_COLOR_SPACE      0x00000008
 
 #define HWND_DMABUF_FRAME_OPENED          0x00000001
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002

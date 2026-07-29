@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -348,9 +349,13 @@ struct wine_managed_swapchain
     uint64_t realized_modifier;
     unsigned int fourcc;
     unsigned int alpha_mode;        /* DXGI_ALPHA_MODE_* hint for the compositor */
+    unsigned int color_space;
+    unsigned int hdr_metadata_type;
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
     VkFormat format;
     VkExtent2D extents;
     VkImageUsageFlags usage;
+    BOOL has_color_space;
 
     /* ring / publish state */
     uint32_t next_acquire;
@@ -406,6 +411,57 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
     struct vulkan_swapchain *obj = vulkan_swapchain_from_handle( handle );
     return CONTAINING_RECORD( obj, struct swapchain, obj );
+}
+
+static BOOL managed_color_space_from_vulkan( VkColorSpaceKHR color_space, unsigned int *wire_color_space )
+{
+    switch (color_space)
+    {
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+        *wire_color_space = HWND_DMABUF_COLOR_SPACE_SRGB;
+        return TRUE;
+    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+        *wire_color_space = HWND_DMABUF_COLOR_SPACE_SCRGB;
+        return TRUE;
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+        *wire_color_space = HWND_DMABUF_COLOR_SPACE_HDR10_ST2084;
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static unsigned int managed_hdr_uint( float value, double scale, unsigned int max_value )
+{
+    double scaled;
+
+    if (!isfinite( value ) || value <= 0.0f) return 0;
+    scaled = value * scale;
+    if (scaled >= max_value) return max_value;
+    return (unsigned int)llround( scaled );
+}
+
+static void managed_set_hdr_metadata( struct wine_managed_swapchain *managed,
+                                      const VkHdrMetadataEXT *metadata )
+{
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr = {0};
+
+    hdr.RedPrimary[0] = managed_hdr_uint( metadata->displayPrimaryRed.x, 50000.0, 50000 );
+    hdr.RedPrimary[1] = managed_hdr_uint( metadata->displayPrimaryRed.y, 50000.0, 50000 );
+    hdr.GreenPrimary[0] = managed_hdr_uint( metadata->displayPrimaryGreen.x, 50000.0, 50000 );
+    hdr.GreenPrimary[1] = managed_hdr_uint( metadata->displayPrimaryGreen.y, 50000.0, 50000 );
+    hdr.BluePrimary[0] = managed_hdr_uint( metadata->displayPrimaryBlue.x, 50000.0, 50000 );
+    hdr.BluePrimary[1] = managed_hdr_uint( metadata->displayPrimaryBlue.y, 50000.0, 50000 );
+    hdr.WhitePoint[0] = managed_hdr_uint( metadata->whitePoint.x, 50000.0, 50000 );
+    hdr.WhitePoint[1] = managed_hdr_uint( metadata->whitePoint.y, 50000.0, 50000 );
+    hdr.MaxMasteringLuminance = managed_hdr_uint( metadata->maxLuminance, 1.0, UINT_MAX );
+    hdr.MinMasteringLuminance = managed_hdr_uint( metadata->minLuminance, 10000.0, UINT_MAX );
+    hdr.MaxContentLightLevel = managed_hdr_uint( metadata->maxContentLightLevel, 1.0, USHRT_MAX );
+    hdr.MaxFrameAverageLightLevel =
+        managed_hdr_uint( metadata->maxFrameAverageLightLevel, 1.0, USHRT_MAX );
+
+    managed->hdr_metadata_type = HWND_DMABUF_HDR_METADATA_HDR10;
+    managed->hdr_metadata = hdr;
 }
 
 void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
@@ -3820,6 +3876,11 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     image->desc.offset = image->desc.plane_offsets[0];
     image->desc.modifier = wire_modifier;
     image->desc.alpha_mode = managed->alpha_mode;
+    if (managed->has_color_space)
+    {
+        image->desc.flags |= HWND_DMABUF_FLAG_COLOR_SPACE;
+        image->desc.color_space = managed->color_space;
+    }
     image->desc.sync_fd_kind = HWND_DMABUF_SYNC_NONE;
     image->desc.producer_unique_id = 0; /* set from the managed producer id at present */
 
@@ -3874,6 +3935,8 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     managed->hwnd = surface->hwnd;
     managed->format = create_info->imageFormat;
     managed->fourcc = fourcc;
+    managed->has_color_space =
+        managed_color_space_from_vulkan( create_info->imageColorSpace, &managed->color_space );
     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
      * alpha. Otherwise leave alpha as straight. */
     managed->alpha_mode = (fourcc == vk_format_to_drm_fourcc( create_info->imageFormat, TRUE ))
@@ -4214,6 +4277,8 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     desc.frame_seq = (unsigned int)(++managed->present_id);
     desc.release_token = release_token;
     desc.sync_fd_kind = sync_fd >= 0 ? HWND_DMABUF_SYNC_FILE : HWND_DMABUF_SYNC_NONE;
+    desc.hdr_metadata_type = managed->hdr_metadata_type;
+    desc.hdr_metadata = managed->hdr_metadata;
 
     assert(image->completion_fd < 0);
     image->completion_fd = sync_fd;
@@ -5110,7 +5175,13 @@ static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapcha
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         if (!swapchain || swapchain_is_out_of_date( swapchain )) continue;
-        if (swapchain->managed) continue;
+        if (swapchain->managed)
+        {
+            pthread_mutex_lock( &swapchain->managed->lock );
+            managed_set_hdr_metadata( swapchain->managed, &metadata[i] );
+            pthread_mutex_unlock( &swapchain->managed->lock );
+            continue;
+        }
         host_swapchains[host_count] = swapchain->obj.host.swapchain;
         host_metadata[host_count] = metadata[i];
         host_count++;

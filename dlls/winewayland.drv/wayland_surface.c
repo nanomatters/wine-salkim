@@ -188,6 +188,7 @@ static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
 }
 
 struct wayland_hwnd_dmabuf_surface;
+struct wayland_hwnd_dmabuf_color_surface;
 
 struct wayland_hwnd_dmabuf_buffer
 {
@@ -239,6 +240,7 @@ struct wayland_hwnd_dmabuf_slice
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
     struct zwp_linux_surface_synchronization_v1 *explicit_sync;
+    struct wayland_hwnd_dmabuf_color_surface *color_surface;
     struct wayland_hwnd_dmabuf_slice_geometry geometry;
     BOOL seen;
     BOOL geometry_valid;
@@ -253,6 +255,7 @@ struct wayland_hwnd_dmabuf_surface
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
     struct zwp_linux_surface_synchronization_v1 *explicit_sync;
+    struct wayland_hwnd_dmabuf_color_surface *color_surface;
     struct wayland_hwnd_dmabuf_buffer *current;
     struct wl_list buffers;
     struct wl_list slices;
@@ -281,6 +284,308 @@ enum wayland_hwnd_dmabuf_configure_result
     WAYLAND_HWNDDMABUF_CONFIGURE_NOOP,
     WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED,
 };
+
+struct wayland_hwnd_dmabuf_color_state
+{
+    BOOL valid;
+    unsigned int color_space;
+    unsigned int hdr_metadata_type;
+    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
+};
+
+struct wayland_hwnd_dmabuf_color_surface
+{
+    LONG ref;
+    LONG pending_commit;
+    pthread_mutex_t mutex;
+    HWND hwnd;
+    struct wl_surface *wl_surface;
+    struct wp_color_management_surface_v1 *management_surface;
+    struct wp_image_description_v1 *pending_description;
+    struct wayland_hwnd_dmabuf_color_state state;
+};
+
+static LONG warned_unsupported_scrgb;
+
+static void wayland_hwnd_dmabuf_color_surface_release(
+        struct wayland_hwnd_dmabuf_color_surface *surface)
+{
+    if (InterlockedDecrement(&surface->ref)) return;
+    pthread_mutex_destroy(&surface->mutex);
+    free(surface);
+}
+
+static void wayland_hwnd_dmabuf_color_description_failed(
+        void *data, struct wp_image_description_v1 *description,
+        uint32_t cause, const char *message)
+{
+    struct wayland_hwnd_dmabuf_color_surface *surface = data;
+    HWND hwnd = 0;
+    BOOL pending;
+
+    pthread_mutex_lock(&surface->mutex);
+    pending = surface->pending_description == description;
+    if (pending)
+    {
+        surface->pending_description = NULL;
+        if (surface->management_surface)
+        {
+            wp_color_management_surface_v1_destroy(surface->management_surface);
+            surface->management_surface = NULL;
+            InterlockedExchange(&surface->pending_commit, TRUE);
+            hwnd = surface->hwnd;
+        }
+    }
+    pthread_mutex_unlock(&surface->mutex);
+
+    if (!pending) return;
+    WARN("dmabuf color description failed, cause=%u message=%s\n",
+         cause, debugstr_a(message));
+    wp_image_description_v1_destroy(description);
+    wayland_hwnd_dmabuf_color_surface_release(surface);
+    if (hwnd) request_window_surface_expose(hwnd, FALSE);
+}
+
+static void wayland_hwnd_dmabuf_color_description_ready2(
+        void *data, struct wp_image_description_v1 *description,
+        uint32_t identity_hi, uint32_t identity_lo)
+{
+    struct wayland_hwnd_dmabuf_color_surface *surface = data;
+    HWND hwnd = 0;
+    BOOL pending;
+
+    pthread_mutex_lock(&surface->mutex);
+    pending = surface->pending_description == description;
+    if (pending)
+    {
+        surface->pending_description = NULL;
+        if (surface->wl_surface)
+        {
+            if (!surface->management_surface)
+                surface->management_surface =
+                    wp_color_manager_v1_get_surface(process_wayland.wp_color_manager_v1,
+                                                    surface->wl_surface);
+            if (surface->management_surface)
+            {
+                wp_color_management_surface_v1_set_image_description(
+                    surface->management_surface, description,
+                    WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+                InterlockedExchange(&surface->pending_commit, TRUE);
+                hwnd = surface->hwnd;
+            }
+        }
+    }
+    pthread_mutex_unlock(&surface->mutex);
+
+    if (!pending) return;
+    wp_image_description_v1_destroy(description);
+    wayland_hwnd_dmabuf_color_surface_release(surface);
+    if (hwnd) request_window_surface_expose(hwnd, FALSE);
+}
+
+static void wayland_hwnd_dmabuf_color_description_ready(
+        void *data, struct wp_image_description_v1 *description, uint32_t identity)
+{
+    wayland_hwnd_dmabuf_color_description_ready2(data, description, 0, identity);
+}
+
+static const struct wp_image_description_v1_listener
+wayland_hwnd_dmabuf_color_description_listener =
+{
+    wayland_hwnd_dmabuf_color_description_failed,
+    wayland_hwnd_dmabuf_color_description_ready,
+    wayland_hwnd_dmabuf_color_description_ready2,
+};
+
+static void wayland_hwnd_dmabuf_color_state_from_desc(
+        struct wayland_hwnd_dmabuf_color_state *state,
+        const hwnd_dmabuf_frame_desc_t *desc)
+{
+    memset(state, 0, sizeof(*state));
+    if (!(desc->flags & HWND_DMABUF_FLAG_COLOR_SPACE)) return;
+
+    state->valid = TRUE;
+    state->color_space = desc->color_space;
+    if (state->color_space == HWND_DMABUF_COLOR_SPACE_HDR10_ST2084 &&
+        desc->hdr_metadata_type == HWND_DMABUF_HDR_METADATA_HDR10)
+    {
+        state->hdr_metadata_type = desc->hdr_metadata_type;
+        state->hdr_metadata = desc->hdr_metadata;
+    }
+}
+
+static BOOL wayland_hwnd_dmabuf_color_state_equal(
+        const struct wayland_hwnd_dmabuf_color_state *a,
+        const struct wayland_hwnd_dmabuf_color_state *b)
+{
+    return a->valid == b->valid &&
+           (!a->valid ||
+            (a->color_space == b->color_space &&
+             a->hdr_metadata_type == b->hdr_metadata_type &&
+             !memcmp(&a->hdr_metadata, &b->hdr_metadata, sizeof(a->hdr_metadata))));
+}
+
+static struct wp_image_description_v1 *wayland_hwnd_dmabuf_create_color_description(
+        const struct wayland_hwnd_dmabuf_color_state *state)
+{
+    struct wayland_hdr10_metadata metadata;
+    const hwnd_dmabuf_hdr_metadata_hdr10_t *hdr;
+
+    if (!state->valid || !process_wayland.wp_color_manager_v1) return NULL;
+
+    switch (state->color_space)
+    {
+    case HWND_DMABUF_COLOR_SPACE_SRGB:
+        return NULL;
+    case HWND_DMABUF_COLOR_SPACE_SCRGB:
+        if (!process_wayland.supports_win_scrgb)
+        {
+            if (!InterlockedExchange(&warned_unsupported_scrgb, TRUE))
+                WARN("Compositor cannot describe scRGB dmabuf content; using default color handling.\n");
+            return NULL;
+        }
+        return wp_color_manager_v1_create_windows_scrgb(process_wayland.wp_color_manager_v1);
+    case HWND_DMABUF_COLOR_SPACE_HDR10_ST2084:
+        if (state->hdr_metadata_type != HWND_DMABUF_HDR_METADATA_HDR10)
+            return wayland_color_manager_create_windows_bt2100();
+
+        hdr = &state->hdr_metadata;
+        metadata.red_x = hdr->RedPrimary[0] * 20;
+        metadata.red_y = hdr->RedPrimary[1] * 20;
+        metadata.green_x = hdr->GreenPrimary[0] * 20;
+        metadata.green_y = hdr->GreenPrimary[1] * 20;
+        metadata.blue_x = hdr->BluePrimary[0] * 20;
+        metadata.blue_y = hdr->BluePrimary[1] * 20;
+        metadata.white_x = hdr->WhitePoint[0] * 20;
+        metadata.white_y = hdr->WhitePoint[1] * 20;
+        metadata.min_luminance = hdr->MinMasteringLuminance;
+        metadata.max_luminance = hdr->MaxMasteringLuminance;
+        metadata.max_cll = hdr->MaxContentLightLevel;
+        metadata.max_fall = hdr->MaxFrameAverageLightLevel;
+        return wayland_color_manager_create_windows_bt2100_with_metadata(&metadata);
+    default:
+        return NULL;
+    }
+}
+
+static void wayland_hwnd_dmabuf_color_surface_sync(
+        struct wayland_hwnd_dmabuf_color_surface **surface_ptr,
+        HWND hwnd, struct wl_surface *wl_surface,
+        const hwnd_dmabuf_frame_desc_t *desc)
+{
+    struct wayland_hwnd_dmabuf_color_surface *surface = *surface_ptr;
+    struct wayland_hwnd_dmabuf_color_state state;
+    struct wp_image_description_v1 *pending = NULL, *description;
+
+    wayland_hwnd_dmabuf_color_state_from_desc(&state, desc);
+    if (!surface)
+    {
+        if (!state.valid || !process_wayland.wp_color_manager_v1) return;
+        if (!(surface = calloc(1, sizeof(*surface)))) return;
+        surface->ref = 1;
+        surface->hwnd = hwnd;
+        surface->wl_surface = wl_surface;
+        pthread_mutex_init(&surface->mutex, NULL);
+        *surface_ptr = surface;
+    }
+    else if (wayland_hwnd_dmabuf_color_state_equal(&surface->state, &state))
+        return;
+
+    pthread_mutex_lock(&surface->mutex);
+    if (wayland_hwnd_dmabuf_color_state_equal(&surface->state, &state))
+    {
+        pthread_mutex_unlock(&surface->mutex);
+        return;
+    }
+
+    description = wayland_hwnd_dmabuf_create_color_description(&state);
+    pending = surface->pending_description;
+    surface->pending_description = NULL;
+    if (pending) wp_image_description_v1_destroy(pending);
+    if (!description && surface->management_surface)
+    {
+        wp_color_management_surface_v1_destroy(surface->management_surface);
+        surface->management_surface = NULL;
+        InterlockedExchange(&surface->pending_commit, TRUE);
+    }
+    surface->state = state;
+
+    if (description)
+    {
+        surface->pending_description = description;
+        InterlockedIncrement(&surface->ref);
+        wp_image_description_v1_add_listener(
+            description, &wayland_hwnd_dmabuf_color_description_listener, surface);
+    }
+    pthread_mutex_unlock(&surface->mutex);
+
+    if (pending) wayland_hwnd_dmabuf_color_surface_release(surface);
+    if (description) wl_display_flush(process_wayland.wl_display);
+}
+
+static void wayland_hwnd_dmabuf_color_surface_destroy(
+        struct wayland_hwnd_dmabuf_color_surface *surface)
+{
+    struct wp_image_description_v1 *pending;
+
+    if (!surface) return;
+
+    pthread_mutex_lock(&surface->mutex);
+    surface->hwnd = 0;
+    surface->wl_surface = NULL;
+    pending = surface->pending_description;
+    surface->pending_description = NULL;
+    if (pending) wp_image_description_v1_destroy(pending);
+    if (surface->management_surface)
+    {
+        wp_color_management_surface_v1_destroy(surface->management_surface);
+        surface->management_surface = NULL;
+    }
+    pthread_mutex_unlock(&surface->mutex);
+
+    if (pending) wayland_hwnd_dmabuf_color_surface_release(surface);
+    wayland_hwnd_dmabuf_color_surface_release(surface);
+}
+
+static BOOL wayland_hwnd_dmabuf_color_surface_needs_commit(
+        struct wayland_hwnd_dmabuf_color_surface *surface)
+{
+    return surface && ReadAcquire(&surface->pending_commit);
+}
+
+static BOOL wayland_hwnd_dmabuf_color_surface_take_pending_commit(
+        struct wayland_hwnd_dmabuf_color_surface *surface)
+{
+    return surface && InterlockedExchange(&surface->pending_commit, FALSE);
+}
+
+static void wayland_hwnd_dmabuf_surface_commit_pending_color(
+        struct wayland_hwnd_dmabuf_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_slice *slice;
+
+    if (surface->sliced)
+    {
+        wl_list_for_each(slice, &surface->slices, link)
+        {
+            if (!wayland_hwnd_dmabuf_color_surface_take_pending_commit(
+                    slice->color_surface))
+                continue;
+            wl_surface_commit(slice->wl_surface);
+        }
+    }
+    else if (wayland_hwnd_dmabuf_color_surface_take_pending_commit(surface->color_surface))
+    {
+        wl_surface_commit(surface->wl_surface);
+    }
+}
+
+static void wayland_hwnd_dmabuf_surface_reset_color(
+        struct wayland_hwnd_dmabuf_surface *surface)
+{
+    wayland_hwnd_dmabuf_color_surface_destroy(surface->color_surface);
+    surface->color_surface = NULL;
+}
 
 /* A child may briefly drop out of the descendant list between frames. Tearing its surface
  * (and dmabuf cache) down on a single miss churns the cache and, with fd-once, strands slots
@@ -524,6 +829,7 @@ static void wayland_hwnd_dmabuf_slice_destroy(struct wayland_hwnd_dmabuf_slice *
     if (slice->wl_subsurface) wl_subsurface_destroy(slice->wl_subsurface);
     if (slice->explicit_sync)
         zwp_linux_surface_synchronization_v1_destroy(slice->explicit_sync);
+    wayland_hwnd_dmabuf_color_surface_destroy(slice->color_surface);
     if (slice->wp_viewport) wp_viewport_destroy(slice->wp_viewport);
     if (slice->wl_surface) wl_surface_destroy(slice->wl_surface);
     free(slice);
@@ -859,12 +1165,16 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf
 
     wl_list_for_each(slice, &surface->slices, link)
     {
+        wayland_hwnd_dmabuf_color_surface_sync(
+            &slice->color_surface, surface->parent->hwnd,
+            slice->wl_surface, &buffer->desc);
         if (!wayland_hwnd_dmabuf_slice_attach_buffer(slice, buffer))
             return FALSE;
         if (!wayland_hwnd_dmabuf_set_acquire_fence(buffer, slice->wl_surface,
                                                     &slice->explicit_sync))
             return FALSE;
         wl_surface_damage_buffer(slice->wl_surface, 0, 0, buffer->width, buffer->height);
+        wayland_hwnd_dmabuf_color_surface_take_pending_commit(slice->color_surface);
         wl_surface_commit(slice->wl_surface);
         count++;
     }
@@ -887,6 +1197,7 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
         surface->parent->direct_dmabuf_surface = NULL;
     if (surface->linked) wl_list_remove(&surface->link);
     if (surface->wl_subsurface) wl_subsurface_destroy(surface->wl_subsurface);
+    wayland_hwnd_dmabuf_surface_reset_color(surface);
     if (!surface->direct && surface->wp_viewport) wp_viewport_destroy(surface->wp_viewport);
     if (!surface->direct && surface->wl_surface) wl_surface_destroy(surface->wl_surface);
     if (surface->channel_fd >= 0) close(surface->channel_fd);
@@ -3648,6 +3959,11 @@ static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *su
     if (wayland_hwnd_dmabuf_buffer_exchange_release_token(buffer, desc->release_token))
         WARN("hwnd=%p slot=%u overwrote an unreleased token\n", surface->hwnd, desc->image_id);
     buffer->alpha_mode = desc->alpha_mode;
+    buffer->desc.flags &= ~HWND_DMABUF_FLAG_COLOR_SPACE;
+    buffer->desc.flags |= desc->flags & HWND_DMABUF_FLAG_COLOR_SPACE;
+    buffer->desc.color_space = desc->color_space;
+    buffer->desc.hdr_metadata_type = desc->hdr_metadata_type;
+    buffer->desc.hdr_metadata = desc->hdr_metadata;
     buffer->dirty_count = min(desc->dirty_count, HWND_DMABUF_MAX_DIRTY_RECTS);
     memcpy(buffer->dirty_rects, desc->dirty_rects, sizeof(buffer->dirty_rects));
     buffer->release_flags = HWND_DMABUF_RELEASE_ORPHANED;
@@ -3951,6 +4267,7 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
         !direct || !data || !data->window_contents || !wayland_surface_reconfigure(surface))
         return FALSE;
 
+    wayland_hwnd_dmabuf_surface_reset_color(direct);
     wl_surface_set_opaque_region(surface->wl_surface, NULL);
     wayland_surface_attach_shm(surface, data->window_contents,
                                data->window_contents->damage_region);
@@ -4039,6 +4356,7 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wa
 
     /* Keep a pure-dmabuf toplevel mapped when it leaves direct mode before any
      * real GDI buffer exists; do not leave the stale producer frame as base. */
+    wayland_hwnd_dmabuf_surface_reset_color(direct);
     if (!wayland_surface_attach_transparent_carrier(surface)) return FALSE;
 
     wayland_hwnd_dmabuf_surface_destroy(direct);
@@ -4071,7 +4389,10 @@ static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface)
 {
     if (surface->direct_dmabuf_surface)
+    {
+        wayland_hwnd_dmabuf_surface_reset_color(surface->direct_dmabuf_surface);
         wl_surface_set_opaque_region(surface->wl_surface, NULL);
+    }
 }
 
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface)
@@ -4170,7 +4491,8 @@ commit_current:
     height = max(1, height);
 
     if (!attached_frame && direct->current_committed &&
-        direct->committed_width == width && direct->committed_height == height)
+        direct->committed_width == width && direct->committed_height == height &&
+        !wayland_hwnd_dmabuf_color_surface_needs_commit(direct->color_surface))
         return TRUE;
 
     if (!direct->current_committed)
@@ -4186,6 +4508,10 @@ commit_current:
     }
     surface->carrier_attached = FALSE;
     wayland_hwnd_dmabuf_surface_set_opaque(direct, width, height);
+    wayland_hwnd_dmabuf_color_surface_sync(
+        &direct->color_surface, surface->hwnd, surface->wl_surface,
+        &direct->current->desc);
+    wayland_hwnd_dmabuf_color_surface_take_pending_commit(direct->color_surface);
     wayland_surface_commit(surface);
     if (!direct->current_committed)
     {
@@ -4364,9 +4690,13 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                 {
                     if (configure_result == WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED)
                     {
+                        wayland_hwnd_dmabuf_color_surface_take_pending_commit(
+                            dmabuf_surface->color_surface);
                         wl_surface_commit(dmabuf_surface->wl_surface);
                         any_new = TRUE;
                     }
+                    else
+                        wayland_hwnd_dmabuf_surface_commit_pending_color(dmabuf_surface);
                     bottom = sibling = dmabuf_surface->stack_bottom;
                 }
             }
@@ -4419,11 +4749,19 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                 wl_surface_commit(dmabuf_surface->wl_surface);
                 continue;
             }
+            if (!dmabuf_surface->sliced)
+                wayland_hwnd_dmabuf_color_surface_sync(
+                    &dmabuf_surface->color_surface, surface->hwnd,
+                    dmabuf_surface->wl_surface, &dmabuf_surface->current->desc);
+            wayland_hwnd_dmabuf_color_surface_take_pending_commit(
+                dmabuf_surface->color_surface);
             wl_surface_commit(dmabuf_surface->wl_surface);
             if (attached_frame && !dmabuf_surface->sliced)
                 wayland_hwnd_dmabuf_consume_acquire_fence(dmabuf_surface->current);
             any_new = TRUE;
         }
+        else
+            wayland_hwnd_dmabuf_surface_commit_pending_color(dmabuf_surface);
         /* One compositor ref per attached frame. The wl_buffer.release handler drops
          * it. Cached slots re-attach the same wl_buffer each new frame, hence the ref
          * is per-attach. The busy gate keeps at most one attach of a slot outstanding. */

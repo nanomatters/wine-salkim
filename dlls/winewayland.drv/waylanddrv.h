@@ -330,6 +330,7 @@ struct wayland
     BOOL supports_windows_bt2100;
     BOOL supports_set_primaries;
     BOOL supports_set_luminances;
+    BOOL supports_set_mastering_display_primaries;
     BOOL supports_bt2020_primaries;
     BOOL supports_extended_volume;
 };
@@ -610,10 +611,23 @@ UINT wayland_generic_output_get_edid_override(const char *output_name, unsigned 
 UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned char **edid);
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
                                      BOOL hdr_supported, unsigned char **edid);
+struct wayland_hdr10_metadata
+{
+    int red_x, red_y;
+    int green_x, green_y;
+    int blue_x, blue_y;
+    int white_x, white_y;
+    unsigned int min_luminance;
+    unsigned int max_luminance;
+    unsigned int max_cll;
+    unsigned int max_fall;
+};
 void wayland_color_manager_init(void);
 BOOL wayland_color_manager_can_present_bt2100(void);
 BOOL wayland_color_manager_may_support_hdr(void);
 struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void);
+struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100_with_metadata(
+        const struct wayland_hdr10_metadata *metadata);
 
 /**********************************************************************
  *          Wayland surface
