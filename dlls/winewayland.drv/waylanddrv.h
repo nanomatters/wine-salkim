@@ -536,7 +536,6 @@ struct wayland_shm_buffer
 
 struct wayland_hwnd_dmabuf_surface;
 struct wayland_win_data;
-struct wayland_gdi_shm_overlay;
 
 struct wayland_surface
 {
@@ -592,7 +591,6 @@ struct wayland_surface
     enum wayland_surface_ensure_type ensured_contents;
     struct wl_list hwnd_dmabuf_surfaces;
     struct wayland_hwnd_dmabuf_surface *direct_dmabuf_surface;
-    struct wayland_gdi_shm_overlay *gdi_shm_overlay;
     /* The direct-toplevel client surface currently borrowing wl_surface for
      * external WSI presentation, if any. Role changes and destruction must
      * evict the borrower (transferring wl_surface ownership to it) first. */
@@ -683,12 +681,6 @@ BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface, DWORD exstyle);
 BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
-BOOL wayland_surface_promote_shm_to_overlay(struct wayland_surface *surface,
-                                            struct wayland_shm_buffer *shm_buffer);
-BOOL wayland_surface_commit_gdi_overlay(struct wayland_surface *surface,
-                                        struct wayland_shm_buffer *shm_buffer,
-                                        HRGN damage_region);
-void wayland_surface_hide_gdi_overlay(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
@@ -720,7 +712,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *surface,
                                                       struct wayland_win_data *data);
 BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
-                                                struct wayland_client_surface *client);
+                                                struct wayland_client_surface *client,
+                                                BOOL content_over_producer);
 BOOL wayland_client_surface_set_image_description(
         struct client_surface *client,
         enum wayland_image_description_color_space color_space,
@@ -792,6 +785,7 @@ struct wayland_win_data
     BOOL client_rect_in_toplevel_valid;
     /* last buffer that was set as window contents */
     struct wayland_shm_buffer *window_contents;
+    BOOL content_over_producer;
     /* wayland surface (if any) for this window */
     struct wayland_surface *wayland_surface;
     /* wayland client surface (if any) for this window */
@@ -830,9 +824,10 @@ struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
 BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
                                                struct wayland_client_surface *client);
-BOOL wayland_toplevel_has_visible_child_window(HWND toplevel);
+BOOL wayland_toplevel_has_visible_child_surface(HWND toplevel);
 void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *parent);
-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
+                                 BOOL content_over_producer);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
 void wayland_window_init(void);

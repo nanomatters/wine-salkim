@@ -45,8 +45,7 @@ static LONG wayland_surface_serial_counter;
 
 static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
                                                 struct wayland_win_data *data);
-static void wayland_surface_destroy_gdi_shm_overlay(struct wayland_surface *surface);
-static void wayland_surface_restore_gdi_shm_overlay(struct wayland_surface *surface,
+static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *surface,
                                                     struct wayland_shm_buffer *shm_buffer);
 static void wayland_surface_orphan_direct_client(struct wayland_surface *surface);
 static void wayland_surface_unset_viewport(struct wayland_surface *surface);
@@ -2462,7 +2461,7 @@ void wayland_client_surface_release_vulkan_surface(struct client_surface *client
             if (surface && surface->direct_client == client)
             {
                 if (!ReadAcquire(&client->direct_toplevel)) surface->direct_client = NULL;
-                wayland_surface_restore_gdi_shm_overlay(surface, data->window_contents);
+                wayland_surface_restore_gdi_shm_contents(surface, data->window_contents);
                 if (!ReadAcquire(&client->direct_toplevel))
                     wayland_client_surface_attach(client, data->hwnd);
             }
@@ -2540,7 +2539,6 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
         wayland_surface_invalidate_attached_clients(surface->hwnd, surface->wl_surface);
 
     /* Keep input state across role churn; it follows wl_surface enter/leave. */
-    wayland_surface_destroy_gdi_shm_overlay(surface);
     wayland_surface_clear_child_surfaces(surface);
     surface->carrier_attached = FALSE;
     surface->carrier_opaque = FALSE;
@@ -2756,15 +2754,7 @@ static void wayland_surface_unset_viewport_source(struct wayland_surface *surfac
     wayland_surface_mark_pending_commit(surface);
 }
 
-struct wayland_gdi_shm_overlay
-{
-    struct wl_surface *wl_surface;
-    struct wl_subsurface *wl_subsurface;
-    struct wp_viewport *wp_viewport;
-    BOOL attached;
-};
-
-static void gdi_shm_overlay_buffer_release(void *data, struct wl_buffer *buffer)
+static void wayland_shm_buffer_clone_release(void *data, struct wl_buffer *buffer)
 {
     struct wayland_shm_buffer *shm_buffer = data;
 
@@ -2773,56 +2763,10 @@ static void gdi_shm_overlay_buffer_release(void *data, struct wl_buffer *buffer)
     wayland_shm_buffer_unref(shm_buffer);
 }
 
-static const struct wl_buffer_listener gdi_shm_overlay_buffer_listener =
+static const struct wl_buffer_listener wayland_shm_buffer_clone_listener =
 {
-    gdi_shm_overlay_buffer_release
+    wayland_shm_buffer_clone_release
 };
-
-static void wayland_surface_destroy_gdi_shm_overlay(struct wayland_surface *surface)
-{
-    struct wayland_gdi_shm_overlay *overlay = surface->gdi_shm_overlay;
-
-    if (!overlay) return;
-
-    if (overlay->wl_subsurface) wl_subsurface_destroy(overlay->wl_subsurface);
-    if (overlay->wp_viewport) wp_viewport_destroy(overlay->wp_viewport);
-    if (overlay->wl_surface) wl_surface_destroy(overlay->wl_surface);
-    free(overlay);
-    surface->gdi_shm_overlay = NULL;
-}
-
-static struct wayland_gdi_shm_overlay *wayland_surface_create_gdi_shm_overlay(
-        struct wayland_surface *surface)
-{
-    struct wayland_gdi_shm_overlay *overlay;
-    struct wl_region *empty_region;
-
-    if (surface->gdi_shm_overlay) return surface->gdi_shm_overlay;
-    if (!(overlay = calloc(1, sizeof(*overlay)))) return NULL;
-
-    if (!(overlay->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor))) goto err;
-    wl_surface_set_user_data(overlay->wl_surface, surface->hwnd);
-
-    if (!(empty_region = wl_compositor_create_region(process_wayland.wl_compositor))) goto err;
-    wl_surface_set_input_region(overlay->wl_surface, empty_region);
-    wl_region_destroy(empty_region);
-
-    if (!(overlay->wp_viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter,
-                                                             overlay->wl_surface))) goto err;
-    if (!(overlay->wl_subsurface = wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
-                                                                   overlay->wl_surface,
-                                                                   surface->wl_surface))) goto err;
-    wl_subsurface_set_desync(overlay->wl_subsurface);
-    surface->gdi_shm_overlay = overlay;
-    return overlay;
-
-err:
-    if (overlay->wl_subsurface) wl_subsurface_destroy(overlay->wl_subsurface);
-    if (overlay->wp_viewport) wp_viewport_destroy(overlay->wp_viewport);
-    if (overlay->wl_surface) wl_surface_destroy(overlay->wl_surface);
-    free(overlay);
-    return NULL;
-}
 
 static struct wayland_shm_buffer *wayland_shm_buffer_clone(struct wayland_shm_buffer *source)
 {
@@ -2831,87 +2775,10 @@ static struct wayland_shm_buffer *wayland_shm_buffer_clone(struct wayland_shm_bu
     if (!(clone = wayland_shm_buffer_create(source->width, source->height, source->format))) return NULL;
     memcpy(clone->map_data, source->map_data, source->map_size);
     NtGdiSetRectRgn(clone->damage_region, 0, 0, clone->width, clone->height);
-    wl_buffer_add_listener(clone->wl_buffer, &gdi_shm_overlay_buffer_listener, clone);
+    wl_buffer_add_listener(clone->wl_buffer, &wayland_shm_buffer_clone_listener, clone);
     return clone;
 }
 
-static BOOL wayland_surface_attach_gdi_shm_overlay(struct wayland_surface *surface,
-                                                   struct wayland_shm_buffer *shm_buffer,
-                                                   HRGN damage_region)
-{
-    struct wayland_gdi_shm_overlay *overlay;
-    int width, height, source_width, source_height;
-
-    if (!(overlay = wayland_surface_create_gdi_shm_overlay(surface))) return FALSE;
-
-    width = surface->window.rect.right - surface->window.rect.left;
-    height = surface->window.rect.bottom - surface->window.rect.top;
-    wayland_surface_coords_from_window(surface, width, height, &width, &height);
-    width = max(1, width);
-    height = max(1, height);
-    source_width = max(1, min(shm_buffer->width,
-                              surface->window.rect.right - surface->window.rect.left));
-    source_height = max(1, min(shm_buffer->height,
-                               surface->window.rect.bottom - surface->window.rect.top));
-
-    wl_subsurface_set_position(overlay->wl_subsurface, 0, 0);
-    wl_subsurface_place_above(overlay->wl_subsurface, surface->wl_surface);
-    wayland_surface_mark_pending_commit(surface);
-    wp_viewport_set_source(overlay->wp_viewport, 0, 0,
-                           wl_fixed_from_int(source_width), wl_fixed_from_int(source_height));
-    wp_viewport_set_destination(overlay->wp_viewport, width, height);
-    wl_surface_set_opaque_region(overlay->wl_surface, NULL);
-
-    shm_buffer->busy = TRUE;
-    wayland_shm_buffer_ref(shm_buffer);
-    wl_surface_attach(overlay->wl_surface, shm_buffer->wl_buffer, 0, 0);
-    wayland_surface_damage_shm_buffer(overlay->wl_surface, damage_region);
-    wl_surface_commit(overlay->wl_surface);
-    overlay->attached = TRUE;
-    return TRUE;
-}
-
-BOOL wayland_surface_promote_shm_to_overlay(struct wayland_surface *surface,
-                                            struct wayland_shm_buffer *shm_buffer)
-{
-    struct wayland_shm_buffer *clone;
-    BOOL ret;
-
-    if (!shm_buffer) return TRUE;
-    if (!(clone = wayland_shm_buffer_clone(shm_buffer))) return FALSE;
-
-    TRACE("hwnd=%p moving Wine SHM contents to an overlay\n", surface->hwnd);
-    ret = wayland_surface_attach_gdi_shm_overlay(surface, clone, clone->damage_region);
-    wayland_shm_buffer_unref(clone);
-    if (!ret) return FALSE;
-
-    wayland_surface_commit(surface);
-    return TRUE;
-}
-
-BOOL wayland_surface_commit_gdi_overlay(struct wayland_surface *surface,
-                                        struct wayland_shm_buffer *shm_buffer,
-                                        HRGN damage_region)
-{
-    if (!shm_buffer)
-    {
-        wayland_surface_hide_gdi_overlay(surface);
-        return TRUE;
-    }
-    return wayland_surface_attach_gdi_shm_overlay(surface, shm_buffer, damage_region);
-}
-
-void wayland_surface_hide_gdi_overlay(struct wayland_surface *surface)
-{
-    struct wayland_gdi_shm_overlay *overlay = surface->gdi_shm_overlay;
-
-    if (!overlay || !overlay->attached) return;
-    TRACE("hwnd=%p hiding the Wine SHM overlay after a direct client present\n", surface->hwnd);
-    wayland_viewport_unset(overlay->wp_viewport);
-    wl_surface_attach(overlay->wl_surface, NULL, 0, 0);
-    wl_surface_commit(overlay->wl_surface);
-    overlay->attached = FALSE;
-}
 
 /**********************************************************************
  *          wayland_surface_config_is_compatible
@@ -3156,8 +3023,7 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
 {
     int dest_width = width, dest_height = height;
 
-    /* Do not apply Wine's viewport to externally committed buffers. */
-    if (wayland_surface_has_external_commit_owner(surface)) return;
+    if (!surface->wp_viewport) return;
 
     if (width <= 0 || height <= 0)
         dest_width = dest_height = -1;
@@ -3173,7 +3039,8 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
         wp_viewport_set_destination(surface->wp_viewport, dest_width, dest_height);
     else
         wp_viewport_set_destination(surface->wp_viewport, -1, -1);
-    wayland_surface_mark_pending_commit(surface);
+    if (!wayland_surface_has_external_commit_owner(surface))
+        wayland_surface_mark_pending_commit(surface);
 
     surface->configured_wp_viewport = surface->wp_viewport;
     surface->viewport_dest_width = dest_width;
@@ -3198,10 +3065,12 @@ static BOOL wayland_surface_client_covers_presentation(struct wayland_surface *s
 }
 
 BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
-                                                struct wayland_client_surface *client)
+                                                struct wayland_client_surface *client,
+                                                BOOL content_over_producer)
 {
     if (!surface || !client || ReadAcquire(&client->direct_toplevel)) return FALSE;
     if (client->client.hwnd != surface->hwnd || surface->window.minimized) return FALSE;
+    if (content_over_producer) return FALSE;
     if (surface->shaped || ReadAcquire(&client->has_alpha)) return FALSE;
     return wayland_surface_is_toplevel(surface) &&
            wayland_surface_client_fills_window(surface) &&
@@ -3217,7 +3086,8 @@ void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *su
     if (!client || !surface || surface->window.minimized) return;
     if (ReadAcquire(&client->direct_toplevel)) return;
 
-    scaled = wayland_client_surface_scales_presentation(surface, client);
+    scaled = wayland_client_surface_scales_presentation(surface, client,
+                                                        data->content_over_producer);
     if (ReadAcquire(&client->presentation_scaling) == scaled) return;
 
     InterlockedExchange(&client->presentation_scaling, scaled);
@@ -3227,21 +3097,24 @@ void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *su
 static BOOL wayland_client_surface_should_stack_above_parent(struct wayland_surface *surface,
                                                              struct wayland_client_surface *client,
                                                              HWND hwnd, HWND toplevel,
-                                                             BOOL has_window_contents,
+                                                             BOOL content_over_producer,
                                                              DWORD exstyle)
 {
+    if (content_over_producer) return FALSE;
+
     if (ReadAcquire(&client->has_presented) &&
-        wayland_client_surface_scales_presentation(surface, client))
+        wayland_client_surface_scales_presentation(surface, client,
+                                                   content_over_producer))
         return TRUE;
 
     /* A single opaque client surface covering the whole toplevel can sit above
      * an opaque parent carrier without using transparent punch-through. */
     if (hwnd != toplevel) return FALSE;
-    if (has_window_contents || ReadAcquire(&client->has_alpha)) return FALSE;
+    if (ReadAcquire(&client->has_alpha)) return FALSE;
     if (exstyle & WS_EX_LAYERED) return FALSE;
     if (!wayland_surface_is_toplevel(surface) || surface->window.minimized) return FALSE;
     if (!wayland_surface_client_fills_window(surface)) return FALSE;
-    if (surface->shaped || surface->occlusion_clipped) return FALSE;
+    if (surface->shaped) return FALSE;
     if (wayland_surface_dmabuf_stack_bottom(surface)) return FALSE;
     return TRUE;
 }
@@ -4809,10 +4682,8 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     if (any_new && data && data->client_surface && data->client_surface->wl_subsurface &&
         data->client_surface->toplevel == surface->hwnd)
     {
-        wl_subsurface_place_below(data->client_surface->wl_subsurface,
-                                  wayland_surface_client_stack_anchor(surface));
-        wayland_surface_mark_pending_commit(surface);
-        any_new = TRUE;
+        wayland_client_surface_stack(surface, data->client_surface,
+                                     data->client_surface->stack_above_parent);
     }
 
     if (any_new)
@@ -5330,14 +5201,13 @@ static BOOL wayland_client_surface_can_set_opaque_region(struct wayland_client_s
            !ReadAcquire(&surface->client.busy_ref);
 }
 
-static void wayland_surface_restore_gdi_shm_overlay(struct wayland_surface *surface,
+static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *surface,
                                                     struct wayland_shm_buffer *shm_buffer)
 {
     struct wayland_shm_buffer *clone;
 
     if (wayland_surface_has_external_commit_owner(surface)) return;
 
-    wayland_surface_destroy_gdi_shm_overlay(surface);
     if (!wayland_surface_reconfigure(surface)) return;
 
     if (!shm_buffer)
@@ -5372,7 +5242,7 @@ static void wayland_client_surface_destroy(struct client_surface *client)
         if (data->wayland_surface && data->wayland_surface->direct_client == surface)
         {
             data->wayland_surface->direct_client = NULL;
-            wayland_surface_restore_gdi_shm_overlay(data->wayland_surface, data->window_contents);
+            wayland_surface_restore_gdi_shm_contents(data->wayland_surface, data->window_contents);
         }
     }
 
@@ -5554,7 +5424,6 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
     {
         if (!ReadAcquire(&surface->has_presented) && (data = wayland_win_data_get(toplevel)))
         {
-            if (data->wayland_surface) wayland_surface_hide_gdi_overlay(data->wayland_surface);
             wayland_win_data_release(data);
         }
         InterlockedExchange(&surface->has_presented, TRUE);
@@ -5620,7 +5489,8 @@ static BOOL wayland_client_surface_is_presentation_scaled(struct client_surface 
     if (ReadAcquire(&surface->direct_toplevel)) return FALSE;
     if (!(data = wayland_win_data_get(client->hwnd))) return FALSE;
 
-    ret = wayland_client_surface_scales_presentation(data->wayland_surface, surface);
+    ret = wayland_client_surface_scales_presentation(data->wayland_surface, surface,
+                                                     data->content_over_producer);
 
     InterlockedExchange(&surface->presentation_scaling, ret);
 
@@ -5734,9 +5604,9 @@ err:
     return NULL;
 }
 
-static BOOL direct_toplevel_disabled(void)
+static BOOL direct_toplevel_enabled(void)
 {
-    const char *env = getenv("WAYLANDDRV_NO_DIRECT_TOPLEVEL");
+    const char *env = getenv("WAYLANDDRV_DIRECT_TOPLEVEL");
 
     return env && atoi(env);
 }
@@ -5750,7 +5620,7 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
 {
     struct wayland_surface *surface = data->wayland_surface;
 
-    if (direct_toplevel_disabled()) return "direct toplevel disabled by environment";
+    if (!direct_toplevel_enabled()) return "direct toplevel not enabled by environment";
     if (!surface) return "no Wayland surface";
     if (!wayland_surface_is_toplevel(surface)) return "surface is not a live toplevel";
     if (surface->window.minimized) return "the toplevel is minimized";
@@ -5758,8 +5628,8 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     if (data->client_surface != expected_client)
         return expected_client ? "the window has a different client surface"
                                : "another client surface is attached";
-    if (wayland_toplevel_has_visible_child_window(data->hwnd))
-        return "the toplevel has visible child windows";
+    if (wayland_toplevel_has_visible_child_surface(data->hwnd))
+        return "the toplevel has a visible child surface";
     if (wayland_toplevel_has_other_client_surface(data->hwnd, expected_client))
         return "another client surface is attached";
     if (wayland_surface_has_hwnd_dmabuf_content(surface))
@@ -5790,8 +5660,6 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (!wayland_surface_is_toplevel(toplevel)) failure = "surface is not a live toplevel";
     else if (data->client_surface != surface) failure = "the window has a different client surface";
     else if (toplevel->direct_client != surface) failure = "the toplevel has a different direct client";
-    else if (wayland_toplevel_has_visible_child_window(hwnd))
-        failure = "the toplevel has visible child windows";
     else if (toplevel->shaped) failure = "the window is shaped";
     /* Minimize detaches the direct client and uses an iconic window rectangle.
      * Keep the borrowed toplevel alive until the window is restored. */
@@ -5894,8 +5762,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
         return FALSE;
     }
 
-    /* Dropping the subsurface role unmaps the old client surface, so the
-     * toplevel no longer has a visible child blocking direct scanout. */
+    /* Unmap the retired child before borrowing the toplevel. */
     if (surface->wl_subsurface)
     {
         wl_subsurface_destroy(surface->wl_subsurface);
@@ -5931,13 +5798,8 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     /* The external producer replaces any Wine root buffer. */
     data->wayland_surface->carrier_attached = FALSE;
 
-    /* Move any current Wine window contents out of the way onto an overlay. */
-    if (data->window_contents &&
-        !wayland_surface_promote_shm_to_overlay(data->wayland_surface, data->window_contents))
-        WARN("Failed to move Wine window contents to an overlay for hwnd=%p\n", hwnd);
-
-    /* Latch the subsurface removal and overlay placement. The external WSI
-     * has not attached to the toplevel yet, so this commits no foreign state. */
+    /* Latch the subsurface removal. The external WSI has not attached to the
+     * toplevel yet, so this commits no foreign state. */
     wayland_surface_commit(data->wayland_surface);
     wl_display_flush(process_wayland.wl_display);
 
@@ -5989,10 +5851,6 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
         data->wayland_surface->direct_client = surface;
         data->wayland_surface->carrier_attached = FALSE;
     }
-
-    if (data->window_contents &&
-        !wayland_surface_promote_shm_to_overlay(data->wayland_surface, data->window_contents))
-        WARN("Failed to move Wine window contents to an overlay for hwnd=%p\n", hwnd);
 
     wayland_surface_commit(data->wayland_surface);
     wl_display_flush(process_wayland.wl_display);
@@ -6145,10 +6003,6 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
      * The replacement child is placed above it while that happens. */
     if (data)
     {
-        if (data->wayland_surface)
-        {
-            wayland_surface_hide_gdi_overlay(data->wayland_surface);
-        }
         wayland_win_data_release(data);
     }
 
@@ -6218,7 +6072,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
                 surface->carrier_attached && surface->carrier_opaque)
             {
                 if (toplevel_data->window_contents)
-                    wayland_surface_restore_gdi_shm_overlay(surface,
+                    wayland_surface_restore_gdi_shm_contents(surface,
                                                             toplevel_data->window_contents);
                 else
                     wayland_surface_attach_transparent_carrier(surface);
@@ -6248,11 +6102,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
         return;
     }
 
-    /* The borrowed toplevel belongs exclusively to its direct WSI client. A
-     * child would require a parent commit, which could attach a non-dmabuf
-     * carrier to a wl_surface with explicit synchronization enabled. Invalidate
-     * the direct swapchain and wait for its normal out-of-date recreation to
-     * restore the child-subsurface topology. */
+    /* Another client surface cannot share a borrowed toplevel. */
     if (wayland_surface_has_external_commit_owner(surface) &&
         surface->direct_client != client)
     {
@@ -6263,10 +6113,11 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
 
     client_data = wayland_win_data_get_nolock(hwnd);
     stack_above_parent = wayland_client_surface_should_stack_above_parent(
-            surface, client, hwnd, toplevel, toplevel_data->window_contents != NULL,
+            surface, client, hwnd, toplevel, toplevel_data->content_over_producer,
             client_data ? client_data->exstyle : WS_EX_LAYERED);
     presentation_scaled = ReadAcquire(&client->has_presented) &&
-                          wayland_client_surface_scales_presentation(surface, client);
+                          wayland_client_surface_scales_presentation(surface, client,
+                                                                     toplevel_data->content_over_producer);
 
     if (client->toplevel != toplevel ||
         client->toplevel_wl_surface != surface->wl_surface)
@@ -6328,7 +6179,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
         wayland_surface_attach_opaque_carrier(surface);
     else if (toplevel_data->window_contents &&
              surface->carrier_attached && surface->carrier_opaque)
-        wayland_surface_restore_gdi_shm_overlay(surface,
+        wayland_surface_restore_gdi_shm_contents(surface,
                                                 toplevel_data->window_contents);
     else if (!toplevel_data->window_contents)
     {

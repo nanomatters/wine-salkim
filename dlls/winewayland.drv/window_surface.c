@@ -1030,6 +1030,17 @@ static HRGN create_occluded_region(const RECT *surface_rect, HRGN clip_region)
     return occluded_region;
 }
 
+static BOOL region_has_pixels(HRGN region)
+{
+    RECT box;
+    int type;
+
+    if (!region) return FALSE;
+    type = NtGdiGetRgnBox(region, &box);
+    if (type == ERROR) return TRUE;
+    return type != NULLREGION;
+}
+
 static HRGN union_regions(HRGN a, HRGN b)
 {
     HRGN region;
@@ -1113,12 +1124,13 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     HRGN merged_gdi_over_region = NULL;
     HRGN gdi_over_region, gdi_over_paint_region;
     HRGN copy_from_window_region = NULL;
+    BOOL content_over_producer = FALSE;
     uint32_t buffer_format;
 
     if (!window_surface->app_painted_full && !window_surface->app_painted_region)
     {
         if (shape_changed) wayland_window_surface_sync_regions(window_surface);
-        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE);
         wl_display_flush(process_wayland.wl_display);
         goto done;
     }
@@ -1203,6 +1215,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     gdi_over_region = window_surface->gdi_over_producer_region;
     gdi_over_paint_region = window_surface->gdi_over_paint_region;
+    content_over_producer = region_has_pixels(gdi_over_region) ||
+                            region_has_pixels(window_surface->clip_region);
     if (wws->occlusion_clipped && !wws->layered)
     {
         occluded_region = create_occluded_region(&surface_rect, window_surface->clip_region);
@@ -1223,7 +1237,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
      * cannot publish yet, leave the surface dirty so the next idle flush
      * retries both together. */
     if (overlay_flushed)
-        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
+        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region,
+                                              content_over_producer);
     wl_display_flush(process_wayland.wl_display);
 
 done:

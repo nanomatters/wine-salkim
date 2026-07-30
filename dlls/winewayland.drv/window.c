@@ -364,6 +364,34 @@ BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
     return FALSE;
 }
 
+static void invalidate_direct_toplevel(struct wayland_surface *surface)
+{
+    struct wayland_client_surface *client = surface->direct_client;
+
+    if (!client || !client->direct_host_surface || !ReadAcquire(&client->direct_toplevel)) return;
+    client_surface_invalidate_presentation_once(&client->client,
+                                                &client->direct_toplevel_invalidated);
+}
+
+/* Caller holds win_data_mutex. */
+BOOL wayland_toplevel_has_visible_child_surface(HWND toplevel)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        struct wayland_surface *surface = data->wayland_surface;
+
+        if (data->hwnd == toplevel || data->toplevel != toplevel ||
+            !data->visible || IsRectEmpty(&data->rects.visible) || !surface)
+            continue;
+        if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE ||
+            surface->role == WAYLAND_SURFACE_ROLE_POPUP)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 /* Caller holds win_data_mutex. */
 void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *parent)
 {
@@ -378,24 +406,6 @@ void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *p
 
         client_surface_invalidate_presentation(&client->client);
     }
-}
-
-/* The caller holds win_data_mutex. A direct WSI toplevel cannot safely carry
- * visible child HWND content, since child surfaces require parent commits. */
-BOOL wayland_toplevel_has_visible_child_window(HWND toplevel)
-{
-    struct wayland_win_data *data;
-
-    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
-    {
-        if (data->hwnd == toplevel) continue;
-        if (data->toplevel != toplevel) continue;
-        if (!data->visible) continue;
-        if (IsRectEmpty(&data->rects.visible)) continue;
-
-        return TRUE;
-    }
-    return FALSE;
 }
 
 static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
@@ -425,7 +435,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                                                     BOOL has_menu_popup_owner)
 {
     struct wayland_client_surface *client = data->client_surface;
-    struct wayland_surface *surface;
+    struct wayland_surface *parent_surface, *surface;
     enum wayland_surface_role role;
     BOOL visible, layer_set, keep_mapped, server_decor = FALSE;
     DWORD exstyle = data->exstyle;
@@ -463,6 +473,12 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         role = WAYLAND_SURFACE_ROLE_NONE;
     else if (!IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     else role = WAYLAND_SURFACE_ROLE_NONE;
+
+    parent_surface = owner_surface ? owner_surface : toplevel_surface;
+    if (parent_surface &&
+        (role == WAYLAND_SURFACE_ROLE_POPUP || role == WAYLAND_SURFACE_ROLE_SUBSURFACE) &&
+        wayland_surface_has_external_commit_owner(parent_surface))
+        invalidate_direct_toplevel(parent_surface);
 
     if (surface && role == WAYLAND_SURFACE_ROLE_LAYER &&
         (surface->role == WAYLAND_SURFACE_ROLE_NONE ||
@@ -1805,14 +1821,19 @@ static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)
     return ret;
 }
 
-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
+BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer,
+                                 HRGN damage_region, BOOL content_over_producer)
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
     BOOL committed = FALSE;
+    BOOL has_content_over_producer = shm_buffer && content_over_producer;
+    BOOL content_over_changed;
     uint32_t current_serial;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    content_over_changed = data->content_over_producer != has_content_over_producer;
+    data->content_over_producer = has_content_over_producer;
 
     if ((wayland_surface = data->wayland_surface))
     {
@@ -1825,16 +1846,14 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 
         if (wayland_surface_has_external_commit_owner(wayland_surface))
         {
-            /* The overlay removes stale GDI contents before the first WSI
-             * frame and carries fresh GDI updates above later WSI frames. */
-            if (data->client_surface == wayland_surface->direct_client)
-                committed = wayland_surface_commit_gdi_overlay(wayland_surface, shm_buffer, damage_region);
-            else committed = TRUE;
+            if (has_content_over_producer) invalidate_direct_toplevel(wayland_surface);
+            committed = TRUE;
         }
         else if (window_client_surface_attached(data) &&
                  ReadAcquire(&data->client_surface->has_presented) &&
                  wayland_client_surface_scales_presentation(wayland_surface,
-                                                             data->client_surface))
+                                                             data->client_surface,
+                                                             has_content_over_producer))
         {
             committed = TRUE;
         }
@@ -1890,19 +1909,22 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         data->window_contents = shm_buffer;
     }
 
-    /* Reclassify an attached client when GDI contents appear or disappear.
-     * The client owns carrier selection when no GDI buffer remains. */
+    /* Reclassify when parent content over the producer changes. */
     if (committed && data->client_surface &&
         !window_client_surface_pending_first_frame(data))
     {
         if (window_client_surface_attached(data))
         {
-            if (data->client_surface->stack_above_parent || !shm_buffer)
+            if (!shm_buffer || content_over_changed ||
+                (has_content_over_producer && data->client_surface->stack_above_parent))
                 wayland_client_surface_attach(data->client_surface, data->toplevel);
         }
         else if (shm_buffer)
             wayland_client_surface_attach(data->client_surface, NULL);
     }
+
+    if (committed && wayland_surface)
+        wayland_client_surface_sync_presentation_scaling(wayland_surface, data);
 
     wayland_win_data_release(data);
 
