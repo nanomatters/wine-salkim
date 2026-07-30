@@ -5195,8 +5195,7 @@ static void wayland_client_surface_reset_opaque_region(struct wayland_client_sur
 static BOOL wayland_client_surface_can_set_opaque_region(struct wayland_client_surface *surface,
                                                          BOOL opaque)
 {
-    /* Clearing the region is safe for an older opaque frame. Do not mark an
-     * active alpha-producing surface opaque before its WSI has retired. */
+    /* A busy WSI may still present an alpha frame. */
     return !opaque || !ReadAcquire(&surface->has_presented) ||
            !ReadAcquire(&surface->client.busy_ref);
 }
@@ -6169,6 +6168,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
 
     wayland_surface_reconfigure_client(surface, client, &client_rect, stack_above_parent);
     opaque = !ReadAcquire(&client->has_alpha);
+    /* OpenGL clients do not report their composite-alpha state. */
     if (wayland_client_surface_can_set_opaque_region(client, opaque))
         wayland_client_surface_set_opaque_region(client, opaque);
 
@@ -6445,19 +6445,13 @@ void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha)
         wayland_win_data_release(data);
     }
 
-    /* The external WSI producer owns commits on this wl_surface. Clearing an
-     * opaque region is safe for an older opaque frame, but setting one must
-     * wait until no alpha-producing WSI can commit. */
-    if (surface->wl_surface &&
-        wayland_client_surface_can_set_opaque_region(surface, opaque))
+    /* Vulkan reports the aggregate state of its live swapchains. */
+    if (surface->wl_surface)
     {
         TRACE("%s opaque=%d\n", debugstr_client_surface(client), opaque);
         if (wayland_client_surface_set_opaque_region(surface, opaque))
             wl_display_flush(process_wayland.wl_display);
     }
-    else if (surface->wl_surface && changed)
-        TRACE("Deferring opaque region update while WSI is active on %s\n",
-              debugstr_client_surface(client));
 }
 
 /**********************************************************************

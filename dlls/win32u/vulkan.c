@@ -195,10 +195,11 @@ struct surface
     struct client_surface *client;
     struct swapchain *swapchain;
     HWND hwnd;
-    /* Protects active_host, host_surfaces, and surface_host swapchain counts. */
+    /* Protects host state. Driver callbacks may take win_data_mutex. */
     pthread_mutex_t host_lock;
     struct list host_surfaces;
     struct surface_host *active_host;
+    UINT alpha_swapchain_count;
 };
 
 static struct surface *surface_from_handle( VkSurfaceKHR handle )
@@ -387,6 +388,7 @@ struct swapchain
     LONG presentation_generation;
     VkExtent2D extents;
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
+    BOOL has_alpha;
     BOOL compositor_scaling;
     pthread_mutex_t color_lock;
     VkColorSpaceKHR color_space;
@@ -510,6 +512,14 @@ static void surface_host_release_if_unused( struct vulkan_instance *instance, st
 {
     if (host != surface->active_host && !host->swapchain_count)
         surface_host_destroy( instance, surface, host );
+}
+
+static void surface_update_client_alpha( struct surface *surface )
+{
+    driver_funcs->p_vulkan_surface_set_alpha(
+            surface->alpha_swapchain_count ? VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR :
+                                             VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            surface->client );
 }
 
 static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
@@ -4518,7 +4528,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     mapped_color_space =
         driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
     create_info_host.imageColorSpace = mapped_color_space;
-    driver_funcs->p_vulkan_surface_set_alpha( create_info_host.compositeAlpha, surface->client );
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
     compositor_scaling = surface_is_presentation_scaled( surface );
@@ -4696,6 +4705,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         free( formats );
     }
 
+    swapchain->has_alpha = !(create_info_host.compositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
+    if (swapchain->has_alpha) surface->alpha_swapchain_count++;
+    surface_update_client_alpha( surface );
     InterlockedIncrement( &surface->client->busy_ref );
 
     /* Interpose a managed cross-process producer only when the window advertises
@@ -4743,6 +4755,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
     {
+        if (swapchain->has_alpha)
+        {
+            if (surface->alpha_swapchain_count) surface->alpha_swapchain_count--;
+            else ERR( "surface %p alpha swapchain count underflow\n", surface );
+            surface_update_client_alpha( surface );
+        }
         pthread_mutex_unlock( &surface->host_lock );
         InterlockedDecrement( &surface->client->busy_ref );
         swapchain_free( swapchain );
@@ -4846,6 +4864,12 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
                 ERR( "surface host 0x%s has no swapchain reference\n",
                      wine_dbgstr_longlong( swapchain->host_surface->handle ) );
             surface_host_release_if_unused( instance, surface, swapchain->host_surface );
+        }
+        if (swapchain->has_alpha)
+        {
+            if (surface->alpha_swapchain_count) surface->alpha_swapchain_count--;
+            else ERR( "surface %p alpha swapchain count underflow\n", surface );
+            surface_update_client_alpha( surface );
         }
         pthread_mutex_unlock( &surface->host_lock );
         InterlockedDecrement( &surface->client->busy_ref );
