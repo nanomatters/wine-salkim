@@ -600,6 +600,7 @@ struct wayland_surface
     struct wl_surface *dmabuf_bottom;
     BOOL carrier_attached;
     BOOL carrier_opaque;
+    BOOL carrier_single_pixel;
     int carrier_width, carrier_height;
     HRGN child_region;
     BOOL shaped;

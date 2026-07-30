@@ -2542,6 +2542,7 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
     wayland_surface_clear_child_surfaces(surface);
     surface->carrier_attached = FALSE;
     surface->carrier_opaque = FALSE;
+    surface->carrier_single_pixel = FALSE;
     surface->carrier_width = surface->carrier_height = 0;
 
     /* some objects are shared between several roles */
@@ -2709,10 +2710,8 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
     win_width = surface->window.rect.right - surface->window.rect.left;
     win_height = surface->window.rect.bottom - surface->window.rect.top;
 
-    /* It is an error to specify a wp_viewporter source rectangle that
-     * is partially or completely outside of the wl_buffe.
-     * 0 is also an invalid width / height value so use 1x1 instead.
-     */
+    /* Source must be inside the buffer. A 1x1 carrier uses its viewport to
+     * cover the full surface. */
     win_width = max(1, min(win_width, shm_buffer->width));
     win_height = max(1, min(win_height, shm_buffer->height));
 
@@ -4164,26 +4163,31 @@ static const struct wl_buffer_listener carrier_buffer_listener =
     carrier_buffer_release
 };
 
-static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL opaque)
+static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL opaque,
+                                           BOOL single_pixel)
 {
     struct wayland_shm_buffer *shm_buffer;
     struct wl_region *region = NULL;
     enum wl_shm_format format;
-    int width, height;
+    int width, height, buffer_width, buffer_height;
 
     if (wayland_surface_has_external_commit_owner(surface)) return FALSE;
 
     width = max(1, surface->window.rect.right - surface->window.rect.left);
     height = max(1, surface->window.rect.bottom - surface->window.rect.top);
+    /* The viewport stretches a single black pixel over the parent. */
+    buffer_width = single_pixel ? 1 : width;
+    buffer_height = single_pixel ? 1 : height;
 
     if (surface->carrier_attached && surface->carrier_opaque == opaque &&
+        surface->carrier_single_pixel == single_pixel &&
         surface->carrier_width == width && surface->carrier_height == height)
         return TRUE;
 
     if (!wayland_surface_reconfigure(surface)) return FALSE;
 
     format = opaque ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
-    if (!(shm_buffer = wayland_shm_buffer_create(width, height, format)))
+    if (!(shm_buffer = wayland_shm_buffer_create(buffer_width, buffer_height, format)))
         return FALSE;
 
     if (opaque && !(region = wl_compositor_create_region(process_wayland.wl_compositor)))
@@ -4206,6 +4210,8 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
     wayland_shm_buffer_unref(shm_buffer);
     surface->carrier_attached = TRUE;
     surface->carrier_opaque = opaque;
+    surface->carrier_single_pixel = single_pixel;
+    /* Cache the viewport destination, not the backing buffer size. */
     surface->carrier_width = width;
     surface->carrier_height = height;
     return TRUE;
@@ -4213,12 +4219,12 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
 
 BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
 {
-    return wayland_surface_attach_carrier(surface, FALSE);
+    return wayland_surface_attach_carrier(surface, FALSE, FALSE);
 }
 
-static BOOL wayland_surface_attach_opaque_carrier(struct wayland_surface *surface)
+static BOOL wayland_surface_attach_opaque_carrier(struct wayland_surface *surface, BOOL single_pixel)
 {
-    return wayland_surface_attach_carrier(surface, TRUE);
+    return wayland_surface_attach_carrier(surface, TRUE, single_pixel);
 }
 
 static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wayland_surface *surface)
@@ -6176,7 +6182,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
     wayland_surface_commit_pending_state(surface);
 
     if (presentation_scaled)
-        wayland_surface_attach_opaque_carrier(surface);
+        wayland_surface_attach_opaque_carrier(surface, FALSE);
     else if (toplevel_data->window_contents &&
              surface->carrier_attached && surface->carrier_opaque)
         wayland_surface_restore_gdi_shm_contents(surface,
@@ -6184,7 +6190,8 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
     else if (!toplevel_data->window_contents)
     {
         if (stack_above_parent)
-            wayland_surface_attach_opaque_carrier(surface);
+            wayland_surface_attach_opaque_carrier(surface,
+                                                  wayland_surface_client_covers_presentation(surface));
         else
             wayland_surface_attach_transparent_carrier(surface);
     }
