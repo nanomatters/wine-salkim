@@ -77,7 +77,7 @@ static VkColorSpaceKHR X11DRV_vulkan_map_colorspace( VkColorSpaceKHR colorspace,
 
 static void X11DRV_vulkan_surface_set_color_description(
         VkColorSpaceKHR colorspace, BOOL use_image_description,
-        const VkHdrMetadataEXT *metadata, struct client_surface *client )
+        struct client_surface *client )
 {
 }
 

@@ -413,7 +413,6 @@ struct vulkan_driver_funcs
     void (*p_vulkan_surface_release)(struct client_surface *, VkSurfaceKHR);
     VkColorSpaceKHR (*p_vulkan_map_colorspace)( VkColorSpaceKHR, struct client_surface * );
     void (*p_vulkan_surface_set_color_description)( VkColorSpaceKHR, BOOL,
-                                                    const VkHdrMetadataEXT *,
                                                     struct client_surface * );
     void (*p_vulkan_surface_set_alpha)( VkCompositeAlphaFlagBitsKHR, struct client_surface * );
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);

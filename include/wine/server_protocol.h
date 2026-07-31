@@ -298,18 +298,6 @@ enum hwnd_dmabuf_status
 
 typedef struct
 {
-    unsigned short RedPrimary[2];
-    unsigned short GreenPrimary[2];
-    unsigned short BluePrimary[2];
-    unsigned short WhitePoint[2];
-    unsigned int   MaxMasteringLuminance;
-    unsigned int   MinMasteringLuminance;
-    unsigned short MaxContentLightLevel;
-    unsigned short MaxFrameAverageLightLevel;
-} hwnd_dmabuf_hdr_metadata_hdr10_t;
-
-typedef struct
-{
     unsigned int     version;
     unsigned int     flags;
     unsigned int     width;
@@ -330,8 +318,6 @@ typedef struct
     unsigned int     dxgi_format;
     unsigned int     alpha_mode;
     unsigned int     color_space;
-    unsigned int     hdr_metadata_type;
-    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
 
     unsigned int     plane_count;
     unsigned int     plane_offsets[HWND_DMABUF_MAX_PLANES];

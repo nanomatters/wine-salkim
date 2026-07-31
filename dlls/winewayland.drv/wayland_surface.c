@@ -288,8 +288,6 @@ struct wayland_hwnd_dmabuf_color_state
 {
     BOOL valid;
     unsigned int color_space;
-    unsigned int hdr_metadata_type;
-    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
 };
 
 struct wayland_hwnd_dmabuf_color_surface
@@ -405,12 +403,6 @@ static void wayland_hwnd_dmabuf_color_state_from_desc(
 
     state->valid = TRUE;
     state->color_space = desc->color_space;
-    if (state->color_space == HWND_DMABUF_COLOR_SPACE_HDR10_ST2084 &&
-        desc->hdr_metadata_type == HWND_DMABUF_HDR_METADATA_HDR10)
-    {
-        state->hdr_metadata_type = desc->hdr_metadata_type;
-        state->hdr_metadata = desc->hdr_metadata;
-    }
 }
 
 static BOOL wayland_hwnd_dmabuf_color_state_equal(
@@ -419,17 +411,12 @@ static BOOL wayland_hwnd_dmabuf_color_state_equal(
 {
     return a->valid == b->valid &&
            (!a->valid ||
-            (a->color_space == b->color_space &&
-             a->hdr_metadata_type == b->hdr_metadata_type &&
-             !memcmp(&a->hdr_metadata, &b->hdr_metadata, sizeof(a->hdr_metadata))));
+            a->color_space == b->color_space);
 }
 
 static struct wp_image_description_v1 *wayland_hwnd_dmabuf_create_color_description(
         const struct wayland_hwnd_dmabuf_color_state *state)
 {
-    struct wayland_hdr10_metadata metadata;
-    const hwnd_dmabuf_hdr_metadata_hdr10_t *hdr;
-
     if (!state->valid || !process_wayland.wp_color_manager_v1) return NULL;
 
     switch (state->color_space)
@@ -445,23 +432,7 @@ static struct wp_image_description_v1 *wayland_hwnd_dmabuf_create_color_descript
         }
         return wp_color_manager_v1_create_windows_scrgb(process_wayland.wp_color_manager_v1);
     case HWND_DMABUF_COLOR_SPACE_HDR10_ST2084:
-        if (state->hdr_metadata_type != HWND_DMABUF_HDR_METADATA_HDR10)
-            return wayland_color_manager_create_windows_bt2100();
-
-        hdr = &state->hdr_metadata;
-        metadata.red_x = hdr->RedPrimary[0] * 20;
-        metadata.red_y = hdr->RedPrimary[1] * 20;
-        metadata.green_x = hdr->GreenPrimary[0] * 20;
-        metadata.green_y = hdr->GreenPrimary[1] * 20;
-        metadata.blue_x = hdr->BluePrimary[0] * 20;
-        metadata.blue_y = hdr->BluePrimary[1] * 20;
-        metadata.white_x = hdr->WhitePoint[0] * 20;
-        metadata.white_y = hdr->WhitePoint[1] * 20;
-        metadata.min_luminance = hdr->MinMasteringLuminance;
-        metadata.max_luminance = hdr->MaxMasteringLuminance;
-        metadata.max_cll = hdr->MaxContentLightLevel;
-        metadata.max_fall = hdr->MaxFrameAverageLightLevel;
-        return wayland_color_manager_create_windows_bt2100_with_metadata(&metadata);
+        return wayland_color_manager_create_windows_bt2100();
     default:
         return NULL;
     }
@@ -3834,8 +3805,6 @@ static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *su
     buffer->desc.flags &= ~HWND_DMABUF_FLAG_COLOR_SPACE;
     buffer->desc.flags |= desc->flags & HWND_DMABUF_FLAG_COLOR_SPACE;
     buffer->desc.color_space = desc->color_space;
-    buffer->desc.hdr_metadata_type = desc->hdr_metadata_type;
-    buffer->desc.hdr_metadata = desc->hdr_metadata;
     buffer->dirty_count = min(desc->dirty_count, HWND_DMABUF_MAX_DIRTY_RECTS);
     memcpy(buffer->dirty_rects, desc->dirty_rects, sizeof(buffer->dirty_rects));
     buffer->release_flags = HWND_DMABUF_RELEASE_ORPHANED;
@@ -6289,24 +6258,8 @@ static BOOL wayland_image_description_state_equal(
         const struct wayland_image_description_state *a,
         const struct wayland_image_description_state *b)
 {
-    if (a->wl_surface != b->wl_surface ||
-        a->color_space != b->color_space ||
-        a->has_hdr10_metadata != b->has_hdr10_metadata)
-        return FALSE;
-    if (!a->has_hdr10_metadata) return TRUE;
-
-    return a->hdr10_metadata.red_x == b->hdr10_metadata.red_x &&
-           a->hdr10_metadata.red_y == b->hdr10_metadata.red_y &&
-           a->hdr10_metadata.green_x == b->hdr10_metadata.green_x &&
-           a->hdr10_metadata.green_y == b->hdr10_metadata.green_y &&
-           a->hdr10_metadata.blue_x == b->hdr10_metadata.blue_x &&
-           a->hdr10_metadata.blue_y == b->hdr10_metadata.blue_y &&
-           a->hdr10_metadata.white_x == b->hdr10_metadata.white_x &&
-           a->hdr10_metadata.white_y == b->hdr10_metadata.white_y &&
-           a->hdr10_metadata.min_luminance == b->hdr10_metadata.min_luminance &&
-           a->hdr10_metadata.max_luminance == b->hdr10_metadata.max_luminance &&
-           a->hdr10_metadata.max_cll == b->hdr10_metadata.max_cll &&
-           a->hdr10_metadata.max_fall == b->hdr10_metadata.max_fall;
+    return a->wl_surface == b->wl_surface &&
+           a->color_space == b->color_space;
 }
 
 static struct wp_image_description_v1 *wayland_client_surface_create_image_description(
@@ -6318,8 +6271,7 @@ static struct wp_image_description_v1 *wayland_client_surface_create_image_descr
         return wp_color_manager_v1_create_windows_scrgb(
                 process_wayland.wp_color_manager_v1);
     case WAYLAND_IMAGE_DESCRIPTION_BT2100:
-        return wayland_color_manager_create_windows_bt2100_with_metadata(
-                state->has_hdr10_metadata ? &state->hdr10_metadata : NULL);
+        return wayland_color_manager_create_windows_bt2100();
     default:
         return NULL;
     }
@@ -6366,18 +6318,11 @@ static BOOL wayland_client_surface_retarget_image_description(
 
 BOOL wayland_client_surface_set_image_description(
         struct client_surface *client,
-        enum wayland_image_description_color_space color_space,
-        const struct wayland_hdr10_metadata *metadata)
+        enum wayland_image_description_color_space color_space)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     struct wayland_image_description_state state = {.color_space = color_space};
     struct wp_image_description_v1 *pending = NULL, *image_desc = NULL;
-
-    if (color_space == WAYLAND_IMAGE_DESCRIPTION_BT2100 && metadata)
-    {
-        state.has_hdr10_metadata = TRUE;
-        state.hdr10_metadata = *metadata;
-    }
 
     pthread_mutex_lock(&surface->client.presentation_mutex);
     state.wl_surface = surface->wl_surface;

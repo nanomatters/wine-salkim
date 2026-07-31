@@ -330,7 +330,6 @@ struct wayland
     BOOL supports_windows_bt2100;
     BOOL supports_set_primaries;
     BOOL supports_set_luminances;
-    BOOL supports_set_mastering_display_primaries;
     BOOL supports_bt2020_primaries;
     BOOL supports_extended_volume;
 };
@@ -454,18 +453,6 @@ struct wayland_retired_wl_surface
     struct wl_surface *wl_surface;
 };
 
-struct wayland_hdr10_metadata
-{
-    int red_x, red_y;
-    int green_x, green_y;
-    int blue_x, blue_y;
-    int white_x, white_y;
-    unsigned int min_luminance;
-    unsigned int max_luminance;
-    unsigned int max_cll;
-    unsigned int max_fall;
-};
-
 enum wayland_image_description_color_space
 {
     WAYLAND_IMAGE_DESCRIPTION_DEFAULT,
@@ -476,8 +463,6 @@ enum wayland_image_description_color_space
 struct wayland_image_description_state
 {
     enum wayland_image_description_color_space color_space;
-    BOOL has_hdr10_metadata;
-    struct wayland_hdr10_metadata hdr10_metadata;
     const struct wl_surface *wl_surface;
 };
 
@@ -643,8 +628,6 @@ void wayland_color_manager_init(void);
 BOOL wayland_color_manager_can_present_bt2100(void);
 BOOL wayland_color_manager_may_support_hdr(void);
 struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void);
-struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100_with_metadata(
-        const struct wayland_hdr10_metadata *metadata);
 
 /**********************************************************************
  *          Wayland surface
@@ -717,8 +700,7 @@ BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
                                                 BOOL content_over_producer);
 BOOL wayland_client_surface_set_image_description(
         struct client_surface *client,
-        enum wayland_image_description_color_space color_space,
-        const struct wayland_hdr10_metadata *metadata);
+        enum wayland_image_description_color_space color_space);
 struct wayland_client_surface *impl_from_client_surface(struct client_surface *client);
 void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha);
 void wayland_surface_ensure_contents(struct wayland_surface *surface,

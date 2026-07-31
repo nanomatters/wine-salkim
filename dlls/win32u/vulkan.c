@@ -25,7 +25,6 @@
 #include "config.h"
 
 #include <assert.h>
-#include <limits.h>
 #include <math.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -351,8 +350,6 @@ struct wine_managed_swapchain
     unsigned int fourcc;
     unsigned int alpha_mode;        /* DXGI_ALPHA_MODE_* hint for the compositor */
     unsigned int color_space;
-    unsigned int hdr_metadata_type;
-    hwnd_dmabuf_hdr_metadata_hdr10_t hdr_metadata;
     VkFormat format;
     VkExtent2D extents;
     VkImageUsageFlags usage;
@@ -390,10 +387,7 @@ struct swapchain
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
     BOOL has_alpha;
     BOOL compositor_scaling;
-    pthread_mutex_t color_lock;
     VkColorSpaceKHR color_space;
-    VkHdrMetadataEXT hdr_metadata;
-    BOOL has_hdr_metadata;
     BOOL uses_color_description;
 
     /* fs hack data below */
@@ -413,21 +407,6 @@ struct swapchain
     struct fs_comp_pipeline fsr_easu_pipeline;
     struct fs_comp_pipeline fsr_rcas_pipeline;
 };
-
-static struct swapchain *swapchain_alloc( void )
-{
-    struct swapchain *swapchain;
-
-    if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return NULL;
-    pthread_mutex_init( &swapchain->color_lock, NULL );
-    return swapchain;
-}
-
-static void swapchain_free( struct swapchain *swapchain )
-{
-    pthread_mutex_destroy( &swapchain->color_lock );
-    free( swapchain );
-}
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
@@ -451,39 +430,6 @@ static BOOL managed_color_space_from_vulkan( VkColorSpaceKHR color_space, unsign
     default:
         return FALSE;
     }
-}
-
-static unsigned int managed_hdr_uint( float value, double scale, unsigned int max_value )
-{
-    double scaled;
-
-    if (!isfinite( value ) || value <= 0.0f) return 0;
-    scaled = value * scale;
-    if (scaled >= max_value) return max_value;
-    return (unsigned int)llround( scaled );
-}
-
-static void managed_set_hdr_metadata( struct wine_managed_swapchain *managed,
-                                      const VkHdrMetadataEXT *metadata )
-{
-    hwnd_dmabuf_hdr_metadata_hdr10_t hdr = {0};
-
-    hdr.RedPrimary[0] = managed_hdr_uint( metadata->displayPrimaryRed.x, 50000.0, 50000 );
-    hdr.RedPrimary[1] = managed_hdr_uint( metadata->displayPrimaryRed.y, 50000.0, 50000 );
-    hdr.GreenPrimary[0] = managed_hdr_uint( metadata->displayPrimaryGreen.x, 50000.0, 50000 );
-    hdr.GreenPrimary[1] = managed_hdr_uint( metadata->displayPrimaryGreen.y, 50000.0, 50000 );
-    hdr.BluePrimary[0] = managed_hdr_uint( metadata->displayPrimaryBlue.x, 50000.0, 50000 );
-    hdr.BluePrimary[1] = managed_hdr_uint( metadata->displayPrimaryBlue.y, 50000.0, 50000 );
-    hdr.WhitePoint[0] = managed_hdr_uint( metadata->whitePoint.x, 50000.0, 50000 );
-    hdr.WhitePoint[1] = managed_hdr_uint( metadata->whitePoint.y, 50000.0, 50000 );
-    hdr.MaxMasteringLuminance = managed_hdr_uint( metadata->maxLuminance, 1.0, UINT_MAX );
-    hdr.MinMasteringLuminance = managed_hdr_uint( metadata->minLuminance, 10000.0, UINT_MAX );
-    hdr.MaxContentLightLevel = managed_hdr_uint( metadata->maxContentLightLevel, 1.0, USHRT_MAX );
-    hdr.MaxFrameAverageLightLevel =
-        managed_hdr_uint( metadata->maxFrameAverageLightLevel, 1.0, USHRT_MAX );
-
-    managed->hdr_metadata_type = HWND_DMABUF_HDR_METADATA_HDR10;
-    managed->hdr_metadata = hdr;
 }
 
 void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
@@ -531,37 +477,11 @@ static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
     return swapchain->presentation_generation != generation;
 }
 
-static void swapchain_forward_color_description( struct swapchain *swapchain )
+static void swapchain_apply_color_description( struct swapchain *swapchain )
 {
     driver_funcs->p_vulkan_surface_set_color_description(
             swapchain->color_space, swapchain->uses_color_description,
-            swapchain->uses_color_description && swapchain->has_hdr_metadata ?
-            &swapchain->hdr_metadata : NULL,
-            swapchain->surface->client);
-}
-
-static void swapchain_apply_color_description( struct swapchain *swapchain )
-{
-    if (!swapchain->uses_color_description)
-    {
-        swapchain_forward_color_description( swapchain );
-        return;
-    }
-
-    pthread_mutex_lock( &swapchain->color_lock );
-    swapchain_forward_color_description( swapchain );
-    pthread_mutex_unlock( &swapchain->color_lock );
-}
-
-static void swapchain_set_hdr_metadata( struct swapchain *swapchain,
-                                        const VkHdrMetadataEXT *metadata )
-{
-    pthread_mutex_lock( &swapchain->color_lock );
-    swapchain->hdr_metadata = *metadata;
-    swapchain->hdr_metadata.pNext = NULL;
-    swapchain->has_hdr_metadata = TRUE;
-    swapchain_forward_color_description( swapchain );
-    pthread_mutex_unlock( &swapchain->color_lock );
+            swapchain->surface->client );
 }
 
 static LONG get_swapchain_presentation_generation( struct surface *surface, BOOL topology_updated,
@@ -4340,9 +4260,6 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     desc.frame_seq = (unsigned int)(++managed->present_id);
     desc.release_token = release_token;
     desc.sync_fd_kind = sync_fd >= 0 ? HWND_DMABUF_SYNC_FILE : HWND_DMABUF_SYNC_NONE;
-    desc.hdr_metadata_type = managed->hdr_metadata_type;
-    desc.hdr_metadata = managed->hdr_metadata;
-
     assert(image->completion_fd < 0);
     image->completion_fd = sync_fd;
     sync_fd = -1;
@@ -4546,7 +4463,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         create_info_host.pNext = &scaling;
     }
 
-    if (!(swapchain = swapchain_alloc()))
+    if (!(swapchain = calloc( 1, sizeof(*swapchain) )))
     {
         pthread_mutex_unlock( &surface->host_lock );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -4619,7 +4536,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                 ERR( "Swapchain does not support storage images for colorspace %u\n",
                      create_info->imageColorSpace );
                 pthread_mutex_unlock( &surface->host_lock );
-                swapchain_free( swapchain );
+                free( swapchain );
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
         }
@@ -4636,7 +4553,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             ERR( "Cannot preserve format %u for fullscreen scaling\n", create_info->imageFormat );
             pthread_mutex_unlock( &surface->host_lock );
-            swapchain_free( swapchain );
+            free( swapchain );
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         if (swapchain->upscaler.color_mode == FS_HACK_COLOR_RAW &&
@@ -4659,14 +4576,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         if (res)
         {
             pthread_mutex_unlock( &surface->host_lock );
-            swapchain_free( swapchain );
+            free( swapchain );
             return res;
         }
 
         if (!(formats = calloc( format_count, sizeof(*formats) )))
         {
             pthread_mutex_unlock( &surface->host_lock );
-            swapchain_free( swapchain );
+            free( swapchain );
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
 
@@ -4676,7 +4593,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             pthread_mutex_unlock( &surface->host_lock );
             free( formats );
-            swapchain_free( swapchain );
+            free( swapchain );
             return res;
         }
 
@@ -4763,7 +4680,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         }
         pthread_mutex_unlock( &surface->host_lock );
         InterlockedDecrement( &surface->client->busy_ref );
-        swapchain_free( swapchain );
+        free( swapchain );
         return res;
     }
 
@@ -4876,7 +4793,7 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     }
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
-    swapchain_free( swapchain );
+    free( swapchain );
 }
 
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
@@ -5258,14 +5175,8 @@ static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapcha
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         if (!swapchain || swapchain_is_out_of_date( swapchain )) continue;
-        if (swapchain->managed)
-        {
-            pthread_mutex_lock( &swapchain->managed->lock );
-            managed_set_hdr_metadata( swapchain->managed, &metadata[i] );
-            pthread_mutex_unlock( &swapchain->managed->lock );
-            continue;
-        }
-        swapchain_set_hdr_metadata( swapchain, &metadata[i] );
+        /* HDR metadata does not define the Windows swapchain encoding. */
+        if (swapchain->managed) continue;
         host_swapchains[host_count] = swapchain->obj.host.swapchain;
         host_metadata[host_count] = metadata[i];
         host_count++;
@@ -7338,7 +7249,7 @@ static VkColorSpaceKHR nulldrv_vulkan_map_colorspace( VkColorSpaceKHR colorspace
 
 static void nulldrv_vulkan_surface_set_color_description(
         VkColorSpaceKHR colorspace, BOOL use_image_description,
-        const VkHdrMetadataEXT *metadata, struct client_surface *client )
+        struct client_surface *client )
 {
 }
 
@@ -7441,11 +7352,11 @@ static VkColorSpaceKHR lazydrv_vulkan_map_colorspace( VkColorSpaceKHR colorspace
 
 static void lazydrv_vulkan_surface_set_color_description(
         VkColorSpaceKHR colorspace, BOOL use_image_description,
-        const VkHdrMetadataEXT *metadata, struct client_surface *client )
+        struct client_surface *client )
 {
     vulkan_driver_load();
     driver_funcs->p_vulkan_surface_set_color_description(
-            colorspace, use_image_description, metadata, client );
+            colorspace, use_image_description, client );
 }
 
 static void lazydrv_vulkan_surface_set_alpha( VkCompositeAlphaFlagBitsKHR alpha_bits,

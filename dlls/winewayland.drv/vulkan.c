@@ -25,8 +25,6 @@
 #include "config.h"
 
 #include <dlfcn.h>
-#include <limits.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -301,10 +299,10 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
         return color_space == WAYLAND_IMAGE_DESCRIPTION_DEFAULT ?
                colorspace : VK_COLOR_SPACE_PASS_THROUGH_EXT;
 
-    if (!wayland_client_surface_set_image_description(client, color_space, NULL))
+    if (!wayland_client_surface_set_image_description(client, color_space))
     {
         wayland_client_surface_set_image_description(
-                client, WAYLAND_IMAGE_DESCRIPTION_DEFAULT, NULL);
+                client, WAYLAND_IMAGE_DESCRIPTION_DEFAULT);
         ERR("Failed to configure image description for client surface.\n");
         return colorspace;
     }
@@ -314,24 +312,12 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
     return VK_COLOR_SPACE_PASS_THROUGH_EXT;
 }
 
-static unsigned int wayland_vulkan_hdr_uint(float value, double scale,
-                                            unsigned int max_value)
-{
-    double scaled;
-
-    if (!isfinite(value) || value <= 0.0f) return 0;
-    scaled = value * scale;
-    if (scaled >= max_value) return max_value;
-    return (unsigned int)llround(scaled);
-}
-
 static void wayland_vulkan_surface_set_color_description(
         VkColorSpaceKHR colorspace, BOOL use_image_description,
-        const VkHdrMetadataEXT *metadata, struct client_surface *client)
+        struct client_surface *client)
 {
     enum wayland_image_description_color_space color_space;
     struct wayland_client_surface *surface;
-    struct wayland_hdr10_metadata hdr = {0};
 
     if (!client) return;
     surface = impl_from_client_surface(client);
@@ -343,25 +329,7 @@ static void wayland_vulkan_surface_set_color_description(
                   wayland_vulkan_image_color_space(colorspace) :
                   WAYLAND_IMAGE_DESCRIPTION_DEFAULT;
 
-    if (color_space == WAYLAND_IMAGE_DESCRIPTION_BT2100 && metadata)
-    {
-        hdr.red_x = wayland_vulkan_hdr_uint(metadata->displayPrimaryRed.x, 1000000.0, 1000000);
-        hdr.red_y = wayland_vulkan_hdr_uint(metadata->displayPrimaryRed.y, 1000000.0, 1000000);
-        hdr.green_x = wayland_vulkan_hdr_uint(metadata->displayPrimaryGreen.x, 1000000.0, 1000000);
-        hdr.green_y = wayland_vulkan_hdr_uint(metadata->displayPrimaryGreen.y, 1000000.0, 1000000);
-        hdr.blue_x = wayland_vulkan_hdr_uint(metadata->displayPrimaryBlue.x, 1000000.0, 1000000);
-        hdr.blue_y = wayland_vulkan_hdr_uint(metadata->displayPrimaryBlue.y, 1000000.0, 1000000);
-        hdr.white_x = wayland_vulkan_hdr_uint(metadata->whitePoint.x, 1000000.0, 1000000);
-        hdr.white_y = wayland_vulkan_hdr_uint(metadata->whitePoint.y, 1000000.0, 1000000);
-        hdr.min_luminance = wayland_vulkan_hdr_uint(metadata->minLuminance, 10000.0, UINT_MAX);
-        hdr.max_luminance = wayland_vulkan_hdr_uint(metadata->maxLuminance, 1.0, UINT_MAX);
-        hdr.max_cll = wayland_vulkan_hdr_uint(metadata->maxContentLightLevel, 1.0, UINT_MAX);
-        hdr.max_fall = wayland_vulkan_hdr_uint(metadata->maxFrameAverageLightLevel, 1.0, UINT_MAX);
-    }
-
-    if (!wayland_client_surface_set_image_description(
-            client, color_space,
-            color_space == WAYLAND_IMAGE_DESCRIPTION_BT2100 && metadata ? &hdr : NULL))
+    if (!wayland_client_surface_set_image_description(client, color_space))
         WARN("Failed to update image description for client surface.\n");
 }
 

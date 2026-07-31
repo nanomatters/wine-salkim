@@ -849,28 +849,19 @@ BOOL wayland_color_manager_can_present_bt2100(void)
             process_wayland.supports_set_primaries);
 }
 
-struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100_with_metadata(
-        const struct wayland_hdr10_metadata *metadata)
+struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void)
 {
     struct wp_image_description_creator_params_v1 *params;
     struct wp_image_description_v1 *description;
-    unsigned int min_luminance = 50, max_luminance = 10000;
-    unsigned int max_cll = 0, max_fall = 0;
-    BOOL have_mastering_luminance = FALSE, have_mastering_primaries;
 
     if (!process_wayland.wp_color_manager_v1)
         return NULL;
 
-    if (!metadata && process_wayland.supports_windows_bt2100)
+    if (process_wayland.supports_windows_bt2100)
         return wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
 
     if (!wayland_color_manager_can_present_bt2100())
         return NULL;
-
-    if (!process_wayland.supports_parametric || !process_wayland.supports_pq ||
-        (!process_wayland.supports_bt2020_primaries &&
-         !process_wayland.supports_set_primaries))
-        return wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
 
     params = wp_color_manager_v1_create_parametric_creator(process_wayland.wp_color_manager_v1);
     if (!params)
@@ -893,63 +884,13 @@ struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100_with
 
     if (process_wayland.supports_set_luminances &&
         process_wayland.supports_extended_volume)
-    {
         wp_image_description_creator_params_v1_set_luminances(params, 0, 10000, 203);
-        min_luminance = 0;
-    }
-
-    if (metadata)
-    {
-        have_mastering_primaries =
-            metadata->red_x > 0 && metadata->red_y > 0 &&
-            metadata->green_x > 0 && metadata->green_y > 0 &&
-            metadata->blue_x > 0 && metadata->blue_y > 0 &&
-            metadata->white_x > 0 && metadata->white_y > 0;
-
-        if (process_wayland.supports_set_mastering_display_primaries &&
-            have_mastering_primaries)
-            wp_image_description_creator_params_v1_set_mastering_display_primaries(
-                params, metadata->red_x, metadata->red_y,
-                metadata->green_x, metadata->green_y,
-                metadata->blue_x, metadata->blue_y,
-                metadata->white_x, metadata->white_y);
-
-        have_mastering_luminance =
-            process_wayland.supports_set_mastering_display_primaries &&
-            metadata->max_luminance &&
-            metadata->min_luminance < (UINT64)metadata->max_luminance * 10000;
-        if (have_mastering_luminance)
-        {
-            wp_image_description_creator_params_v1_set_mastering_luminance(
-                params, metadata->min_luminance, metadata->max_luminance);
-            min_luminance = metadata->min_luminance;
-            max_luminance = metadata->max_luminance;
-        }
-
-        max_cll = metadata->max_cll;
-        max_fall = metadata->max_fall;
-        if (wp_color_manager_v1_get_version(process_wayland.wp_color_manager_v1) < 2)
-        {
-            if ((UINT64)max_cll * 10000 <= min_luminance || max_cll > max_luminance)
-                max_cll = 0;
-            if ((UINT64)max_fall * 10000 <= min_luminance || max_fall > max_luminance)
-                max_fall = 0;
-        }
-        if (max_cll && max_fall > max_cll) max_fall = 0;
-        if (max_cll) wp_image_description_creator_params_v1_set_max_cll(params, max_cll);
-        if (max_fall) wp_image_description_creator_params_v1_set_max_fall(params, max_fall);
-    }
 
     description = wp_image_description_creator_params_v1_create(params);
     if (description)
         TRACE("Using parametric Windows BT.2100 image description.\n");
 
     return description;
-}
-
-struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void)
-{
-    return wayland_color_manager_create_windows_bt2100_with_metadata(NULL);
 }
 
 /**********************************************************************
