@@ -119,8 +119,13 @@ static void test_irp_struct(IRP *irp, DEVICE_OBJECT *device)
        "IRP thread is not the current thread\n");
 
     ok(IoGetRequestorProcess(irp) == IoGetCurrentProcess(), "processes didn't match\n");
+    ok(IoGetRequestorProcessId(irp) == (ULONG_PTR)PsGetCurrentProcessId(), "process id didn't match\n");
 
     irp = IoAllocateIrp(1, FALSE);
+    ok(irp != NULL, "IoAllocateIrp failed\n");
+    if (!irp) return;
+    ok(!irp->Tail.Overlay.Thread, "expected no thread, got %p\n", irp->Tail.Overlay.Thread);
+    ok(!IoGetRequestorProcessId(irp), "expected no requestor process id\n");
     ok(irp->AllocationFlags == IRP_ALLOCATED_FIXED_SIZE, "Got unexpected irp->AllocationFlags %#x.\n",
             irp->AllocationFlags);
     ok(irp->CurrentLocation == 2,

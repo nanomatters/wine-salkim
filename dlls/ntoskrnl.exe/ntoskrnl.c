@@ -4825,6 +4825,16 @@ PEPROCESS WINAPI IoGetRequestorProcess(IRP *irp)
     return irp->Tail.Overlay.Thread->kthread.process;
 }
 
+/***********************************************************************
+ *           IoGetRequestorProcessId   (NTOSKRNL.EXE.@)
+ */
+ULONG WINAPI IoGetRequestorProcessId(IRP *irp)
+{
+    TRACE("irp %p.\n", irp);
+    if (!irp->Tail.Overlay.Thread) return 0;
+    return irp->Tail.Overlay.Thread->kthread.process->info.UniqueProcessId;
+}
+
 #ifdef _WIN64
 /***********************************************************************
  *           IoIs32bitProcess   (NTOSKRNL.EXE.@)
