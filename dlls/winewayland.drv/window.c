@@ -1121,7 +1121,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 static void wayland_configure_window(HWND hwnd)
 {
     struct wayland_surface *surface;
-    INT width, height, window_width, window_height, offset_x, offset_y;
+    INT width, height, window_width, window_height;
     const enum wayland_surface_config_state managed_state =
         WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
         WAYLAND_SURFACE_CONFIG_STATE_TILED |
@@ -1216,19 +1216,9 @@ static void wayland_configure_window(HWND hwnd)
 
     window_width = width;
     window_height = height;
-    offset_x = ((surface->window.rect.left - surface->window.window_rect.left) +
-                (surface->window.window_rect.right - surface->window.rect.right));
-    offset_y = ((surface->window.rect.top - surface->window.window_rect.top) +
-                (surface->window.window_rect.bottom - surface->window.rect.bottom));
 
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
     if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
-    /* avoid any behavior differences when server side decorations is disabled */
-    else if (surface->processing.decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
-    {
-        window_height += offset_y;
-        window_width += offset_x;
-    }
     SetRect(&rect, 0, 0, window_width, window_height);
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
     if (!IsRectEmpty(&rect)) rect = window_rect_from_visible(&data->rects, rect);
