@@ -460,6 +460,15 @@ enum wayland_image_description_color_space
     WAYLAND_IMAGE_DESCRIPTION_BT2100,
 };
 
+enum wayland_image_description_status
+{
+    WAYLAND_IMAGE_DESCRIPTION_UNINITIALIZED,
+    WAYLAND_IMAGE_DESCRIPTION_UNSUPPORTED,
+    WAYLAND_IMAGE_DESCRIPTION_PENDING,
+    WAYLAND_IMAGE_DESCRIPTION_READY,
+    WAYLAND_IMAGE_DESCRIPTION_FAILED,
+};
+
 struct wayland_image_description_state
 {
     enum wayland_image_description_color_space color_space;
@@ -490,8 +499,6 @@ struct wayland_client_surface
     BOOL stack_above_parent;
     /* Protected by client.presentation_mutex. */
     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
-    struct wp_image_description_v1 *pending_image_description_v1;
-    struct wl_surface *pending_image_description_wl_surface;
     struct wayland_image_description_state image_description_state;
     LONG has_image_description;
     struct wp_viewport *wp_viewport;
@@ -628,6 +635,9 @@ void wayland_color_manager_init(void);
 BOOL wayland_color_manager_can_present_bt2100(void);
 BOOL wayland_color_manager_may_support_hdr(void);
 struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void);
+enum wayland_image_description_status wayland_color_manager_get_image_description(
+        enum wayland_image_description_color_space color_space,
+        struct wp_image_description_v1 **description);
 
 /**********************************************************************
  *          Wayland surface

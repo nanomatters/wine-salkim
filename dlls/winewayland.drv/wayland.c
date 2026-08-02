@@ -54,6 +54,23 @@ struct wayland process_wayland =
     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
+struct wayland_cached_image_description
+{
+    enum wayland_image_description_color_space color_space;
+    enum wayland_image_description_status status;
+    struct wp_image_description_v1 *description;
+};
+
+static pthread_mutex_t image_description_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Ready image descriptions are immutable and may be reused on any surface. */
+static struct wayland_cached_image_description cached_image_descriptions[] =
+{
+    [WAYLAND_IMAGE_DESCRIPTION_SCRGB] =
+        {.color_space = WAYLAND_IMAGE_DESCRIPTION_SCRGB},
+    [WAYLAND_IMAGE_DESCRIPTION_BT2100] =
+        {.color_space = WAYLAND_IMAGE_DESCRIPTION_BT2100},
+};
+
 /**********************************************************************
  *          xdg_wm_base handling
  */
@@ -156,9 +173,145 @@ static void wayland_color_manager_handle_supported_primaries(void *data,
     pthread_mutex_unlock(&process_wayland.output_mutex);
 }
 
+static const char *wayland_image_description_color_space_name(
+        enum wayland_image_description_color_space color_space)
+{
+    switch (color_space)
+    {
+    case WAYLAND_IMAGE_DESCRIPTION_SCRGB:
+        return "Windows scRGB";
+    case WAYLAND_IMAGE_DESCRIPTION_BT2100:
+        return "Windows BT.2100";
+    default:
+        return "unknown";
+    }
+}
+
+static void cached_image_description_failed(void *data,
+        struct wp_image_description_v1 *description, uint32_t cause,
+        const char *message)
+{
+    struct wayland_cached_image_description *cached = data;
+
+    pthread_mutex_lock(&image_description_mutex);
+    if (cached->description == description)
+    {
+        cached->description = NULL;
+        cached->status = WAYLAND_IMAGE_DESCRIPTION_FAILED;
+    }
+    pthread_mutex_unlock(&image_description_mutex);
+
+    ERR("Failed to create %s image description, cause=%u message=%s\n",
+        wayland_image_description_color_space_name(cached->color_space),
+        cause, debugstr_a(message));
+    wp_image_description_v1_destroy(description);
+}
+
+static void cached_image_description_ready2(void *data,
+        struct wp_image_description_v1 *description,
+        uint32_t identity_hi, uint32_t identity_lo)
+{
+    struct wayland_cached_image_description *cached = data;
+
+    pthread_mutex_lock(&image_description_mutex);
+    if (cached->description == description)
+        cached->status = WAYLAND_IMAGE_DESCRIPTION_READY;
+    pthread_mutex_unlock(&image_description_mutex);
+
+    TRACE("%s image description ready, id=%#x%x\n",
+          wayland_image_description_color_space_name(cached->color_space),
+          identity_hi, identity_lo);
+}
+
+static void cached_image_description_ready(void *data,
+        struct wp_image_description_v1 *description, uint32_t identity)
+{
+    cached_image_description_ready2(data, description, 0, identity);
+}
+
+static const struct wp_image_description_v1_listener cached_image_description_listener =
+{
+    cached_image_description_failed,
+    cached_image_description_ready,
+    cached_image_description_ready2,
+};
+
+static BOOL wayland_color_manager_cache_image_description(
+        enum wayland_image_description_color_space color_space)
+{
+    struct wayland_cached_image_description *cached =
+        &cached_image_descriptions[color_space];
+    struct wp_image_description_v1 *description = NULL;
+    BOOL supported = FALSE;
+
+    pthread_mutex_lock(&image_description_mutex);
+    if (cached->status != WAYLAND_IMAGE_DESCRIPTION_UNINITIALIZED)
+    {
+        pthread_mutex_unlock(&image_description_mutex);
+        return FALSE;
+    }
+
+    switch (color_space)
+    {
+    case WAYLAND_IMAGE_DESCRIPTION_SCRGB:
+        supported = process_wayland.supports_win_scrgb;
+        if (supported)
+            description = wp_color_manager_v1_create_windows_scrgb(
+                    process_wayland.wp_color_manager_v1);
+        break;
+    case WAYLAND_IMAGE_DESCRIPTION_BT2100:
+        supported = wayland_color_manager_can_present_bt2100();
+        if (supported)
+            description = wayland_color_manager_create_windows_bt2100();
+        break;
+    default:
+        break;
+    }
+
+    if (description)
+    {
+        cached->description = description;
+        cached->status = WAYLAND_IMAGE_DESCRIPTION_PENDING;
+        wp_image_description_v1_add_listener(
+                description, &cached_image_description_listener, cached);
+    }
+    else
+        cached->status = supported ? WAYLAND_IMAGE_DESCRIPTION_FAILED :
+                                     WAYLAND_IMAGE_DESCRIPTION_UNSUPPORTED;
+    pthread_mutex_unlock(&image_description_mutex);
+    return description != NULL;
+}
+
+enum wayland_image_description_status wayland_color_manager_get_image_description(
+        enum wayland_image_description_color_space color_space,
+        struct wp_image_description_v1 **description)
+{
+    enum wayland_image_description_status status;
+
+    if (description) *description = NULL;
+    if (color_space <= WAYLAND_IMAGE_DESCRIPTION_DEFAULT ||
+        color_space > WAYLAND_IMAGE_DESCRIPTION_BT2100)
+        return WAYLAND_IMAGE_DESCRIPTION_UNSUPPORTED;
+
+    pthread_mutex_lock(&image_description_mutex);
+    status = cached_image_descriptions[color_space].status;
+    if (description && status == WAYLAND_IMAGE_DESCRIPTION_READY)
+        *description = cached_image_descriptions[color_space].description;
+    pthread_mutex_unlock(&image_description_mutex);
+    return status;
+}
+
 static void wayland_color_manager_handle_done(void *data,
                         struct wp_color_manager_v1 *wp_color_manager_v1)
 {
+    BOOL created = FALSE;
+
+    /* Capability events precede done on this event queue. */
+    created |= wayland_color_manager_cache_image_description(
+            WAYLAND_IMAGE_DESCRIPTION_SCRGB);
+    created |= wayland_color_manager_cache_image_description(
+            WAYLAND_IMAGE_DESCRIPTION_BT2100);
+    if (created) wl_display_flush(process_wayland.wl_display);
 }
 
 static const struct wp_color_manager_v1_listener wp_color_manager_listener = {
@@ -699,7 +852,7 @@ BOOL wayland_process_init(void)
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
 
-    /* A third roundtrip to help avoid race conditions for zxdg output and color management extensions. */
+    /* Resolve zxdg output state and the cached color descriptions. */
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
 
     /* Check for required protocol globals. */
