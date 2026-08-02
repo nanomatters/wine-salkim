@@ -795,6 +795,7 @@ struct wayland_win_data
     UINT state_update_swp_flags;
     RECT state_update_rect;
     HWND state_update_foreground;
+    uint32_t configure_state_serial;
 };
 
 struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);

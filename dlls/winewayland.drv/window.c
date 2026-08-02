@@ -223,6 +223,18 @@ static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
     data->state_update_foreground = NULL;
 }
 
+static BOOL wayland_win_data_configure_state_applied(const struct wayland_win_data *data)
+{
+    const struct wayland_surface *surface = data->wayland_surface;
+
+    if (!data->configure_state_serial || !surface ||
+        surface->processing.serial != data->configure_state_serial)
+        return FALSE;
+
+    return !!(surface->processing.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) ==
+           !!(data->style & WS_MAXIMIZE);
+}
+
 static void wayland_win_data_update_restore_rect(struct wayland_win_data *data,
                                                  DWORD style,
                                                  const struct window_rects *rects)
@@ -1018,6 +1030,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         get_client_rect_in_toplevel(hwnd, root, &client_rect_in_toplevel);
     BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
+    BOOL continue_configure = FALSE;
     RECT present_rect;
     BOOL has_present_rect = fullscreen && NtUserGetPresentRect(hwnd, &present_rect, -1);
     BOOL use_layer_shell = FALSE;
@@ -1112,7 +1125,11 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         wayland_win_data_update_wayland_state(data);
     }
 
+    continue_configure = wayland_win_data_configure_state_applied(data);
+
     wayland_win_data_release(data);
+
+    if (continue_configure) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
 
     /* Size and position changes affect the effective pointer constraint. */
     if (hwnd == NtUserGetForegroundWindow()) reapply_cursor_clipping();
@@ -1132,6 +1149,7 @@ static void wayland_configure_window(HWND hwnd)
     DWORD style;
     BOOL needs_enter_size_move = FALSE;
     BOOL needs_exit_size_move = FALSE;
+    BOOL resume_state_update;
     struct wayland_win_data *data;
     RECT rect;
 
@@ -1149,15 +1167,21 @@ static void wayland_configure_window(HWND hwnd)
         return;
     }
 
-    if (!surface->queued.serial)
+    resume_state_update = surface->processing.serial &&
+                          surface->processing.serial == data->configure_state_serial;
+    if (!surface->queued.serial && !resume_state_update)
     {
         TRACE("hwnd=%p queued configure event already handled, returning\n", hwnd);
         wayland_win_data_release(data);
         return;
     }
 
-    surface->processing = surface->queued;
-    memset(&surface->queued, 0, sizeof(surface->queued));
+    if (surface->queued.serial)
+    {
+        surface->processing = surface->queued;
+        memset(&surface->queued, 0, sizeof(surface->queued));
+        resume_state_update = FALSE;
+    }
     state = surface->processing.state;
     /* Ignore size hints if we don't have a state that requires strict
      * size adherence, in order to avoid spurious resizes.
@@ -1233,7 +1257,15 @@ static void wayland_configure_window(HWND hwnd)
                  (style & WS_MAXIMIZE) && window_width && window_height)
             state_cmd = SC_RESTORE;
     }
-    if (state_cmd) wayland_win_data_queue_state_update(data, state_cmd, &rect);
+    if (state_cmd && !resume_state_update)
+    {
+        data->configure_state_serial = surface->processing.serial;
+        wayland_win_data_queue_state_update(data, state_cmd, &rect);
+    }
+    else if (!state_cmd)
+    {
+        data->configure_state_serial = 0;
+    }
 
     wayland_win_data_release(data);
 
@@ -1244,6 +1276,11 @@ static void wayland_configure_window(HWND hwnd)
 
     if (state_cmd)
     {
+        if (resume_state_update)
+        {
+            TRACE("hwnd=%p state update %#x was not applied\n", hwnd, state_cmd);
+            return;
+        }
         TRACE("hwnd=%p queueing state update %#x rect=%s\n", hwnd, state_cmd,
               wine_dbgstr_rect(&rect));
         NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
