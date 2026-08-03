@@ -403,7 +403,7 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
     pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
 
     caps->format_modifier_count = copied;
-    if (process_wayland.zwp_linux_explicit_synchronization_v1)
+    if (wayland_syncobj_available() || process_wayland.zwp_linux_explicit_synchronization_v1)
         caps->flags |= HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC;
     *format_modifier_count = count;
     return HWND_DMABUF_OK;

@@ -26,6 +26,7 @@
 #endif
 
 #include <pthread.h>
+#include <sys/types.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbregistry.h>
@@ -40,6 +41,7 @@ struct xkb_compose_table;
 #include "text-input-unstable-v3-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 #include "linux-explicit-synchronization-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -292,6 +294,8 @@ struct wayland_dmabuf_feedback
     struct wl_list pending_formats;
     uint32_t tranche_index;
     uint32_t tranche_flags;
+    dev_t main_device;
+    BOOL has_main_device;
     BOOL valid;
 };
 
@@ -308,6 +312,7 @@ struct wayland
     struct wp_viewporter *wp_viewporter;
     struct wl_subcompositor *wl_subcompositor;
     struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+    struct wp_linux_drm_syncobj_manager_v1 *wp_linux_drm_syncobj_manager_v1;
     struct zwp_linux_explicit_synchronization_v1 *zwp_linux_explicit_synchronization_v1;
     struct wayland_dmabuf_feedback dmabuf_default_feedback;
     struct wl_list dmabuf_formats;
@@ -354,6 +359,32 @@ struct wayland
     BOOL supports_bt2020_primaries;
     BOOL supports_extended_volume;
 };
+
+struct wayland_syncobj_buffer;
+struct wayland_syncobj_release;
+
+typedef void (*wayland_syncobj_release_func)(void *data, BOOL released);
+
+BOOL wayland_syncobj_init(void);
+BOOL wayland_syncobj_available(void);
+struct wayland_syncobj_buffer *wayland_syncobj_buffer_create(void);
+void wayland_syncobj_buffer_destroy_wayland(struct wayland_syncobj_buffer *buffer);
+void wayland_syncobj_buffer_destroy(struct wayland_syncobj_buffer *buffer);
+void wayland_syncobj_buffer_remove_surface(struct wayland_syncobj_buffer *buffer,
+                                           struct wl_surface *surface);
+BOOL wayland_syncobj_prepare_acquire(struct wayland_syncobj_buffer *buffer, int sync_fd,
+                                     UINT64 *point);
+struct wayland_syncobj_release *wayland_syncobj_prepare_release(
+        struct wayland_syncobj_buffer *buffer, struct wl_surface *surface,
+        wayland_syncobj_release_func callback, void *data);
+BOOL wayland_syncobj_surface_set_points(
+        struct wp_linux_drm_syncobj_surface_v1 **syncobj_surface,
+        struct wl_surface *surface, struct wayland_syncobj_buffer *buffer,
+        UINT64 acquire_point, struct wayland_syncobj_release *release);
+void wayland_syncobj_release_commit(struct wayland_syncobj_release *release);
+void wayland_syncobj_release_cancel(struct wayland_syncobj_release *release);
+BOOL wayland_dmabuf_import_sync_file(int dmabuf_fd, int sync_fd);
+BOOL wayland_sync_file_wait(int sync_fd);
 
 struct wayland_output_mode
 {

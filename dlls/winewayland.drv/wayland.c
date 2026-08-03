@@ -464,6 +464,10 @@ static void zwp_linux_dmabuf_feedback_v1_handle_format_table(void *data,
 static void zwp_linux_dmabuf_feedback_v1_handle_main_device(void *data,
         struct zwp_linux_dmabuf_feedback_v1 *feedback, struct wl_array *device)
 {
+    struct wayland_dmabuf_feedback *state = data;
+
+    state->has_main_device = device->size == sizeof(state->main_device);
+    if (state->has_main_device) memcpy(&state->main_device, device->data, device->size);
 }
 
 static void zwp_linux_dmabuf_feedback_v1_handle_tranche_done(void *data,
@@ -706,6 +710,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.zwp_linux_explicit_synchronization_v1 =
             wl_registry_bind(registry, id, &zwp_linux_explicit_synchronization_v1_interface, 1);
     }
+    else if (strcmp(interface, "wp_linux_drm_syncobj_manager_v1") == 0)
+    {
+        process_wayland.wp_linux_drm_syncobj_manager_v1 =
+            wl_registry_bind(registry, id, &wp_linux_drm_syncobj_manager_v1_interface, 1);
+    }
     else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0)
     {
         if (wayland_disable_ssd()) return;
@@ -856,6 +865,8 @@ BOOL wayland_process_init(void)
     /* Resolve zxdg output state and the cached color descriptions. */
     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
 
+    wayland_syncobj_init();
+
     /* Check for required protocol globals. */
     if (!process_wayland.wl_compositor)
     {
@@ -928,9 +939,8 @@ BOOL wayland_process_init(void)
     if (!process_wayland.zwp_linux_dmabuf_v1)
         WARN("Wayland compositor doesn't support optional zwp_linux_dmabuf_v1 (HWND dmabuf forwarding won't work)\n");
 
-    if (!process_wayland.zwp_linux_explicit_synchronization_v1)
-        TRACE("Wayland compositor doesn't support optional zwp_linux_explicit_synchronization_v1; "
-              "HWND dmabuf forwarding will wait for GPU completion\n");
+    if (!wayland_syncobj_available() && !process_wayland.zwp_linux_explicit_synchronization_v1)
+        TRACE("HWND dmabuf forwarding will wait for GPU completion\n");
 
     if (!process_wayland.zwlr_layer_shell_v1)
         WARN("Wayland compositor doesn't support optional zwlr_layer_shell_v1 (some tray menus may be misplaced)\n");
