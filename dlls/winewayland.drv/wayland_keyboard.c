@@ -931,6 +931,7 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
     /* The wl_surface user data remains valid and immutable for the whole
      * lifetime of the object, so it's safe to access without locking. */
     hwnd = wl_surface_get_user_data(wl_surface);
+    wayland_activation_set_serial(WAYLAND_ACTIVATION_SERIAL_KEYBOARD_FOCUS, hwnd, serial);
     TRACE("serial=%u hwnd=%p\n", serial, hwnd);
 
     pthread_mutex_lock(&keyboard->mutex);
@@ -982,6 +983,7 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
     /* The wl_surface user data remains valid and immutable for the whole
      * lifetime of the object, so it's safe to access without locking. */
     hwnd = wl_surface_get_user_data(wl_surface);
+    wayland_activation_clear_serial(WAYLAND_ACTIVATION_SERIAL_KEYBOARD_FOCUS, hwnd);
     TRACE("serial=%u hwnd=%p\n", serial, hwnd);
 
     pthread_mutex_lock(&keyboard->mutex);
@@ -1095,6 +1097,9 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
     InterlockedExchange(&process_wayland.input_serial, serial);
 
     if (!(hwnd = wayland_keyboard_get_focused_hwnd())) return;
+
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        wayland_activation_set_serial(WAYLAND_ACTIVATION_SERIAL_INPUT, hwnd, serial);
 
     TRACE_(key)("serial=%u hwnd=%p key=%d scan=%#x state=%#x\n", serial, hwnd, key, scan, state);
 

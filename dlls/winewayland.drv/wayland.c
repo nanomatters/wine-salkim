@@ -52,6 +52,7 @@ struct wayland process_wayland =
     .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
     .output_list = {&process_wayland.output_list, &process_wayland.output_list},
     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
+    .activation_mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
 struct wayland_cached_image_description

@@ -75,6 +75,7 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     InterlockedExchange(&process_wayland.input_serial, serial);
 
     if (!(hwnd = wl_surface_get_user_data(wl_surface))) goto err;
+    wayland_activation_set_serial(WAYLAND_ACTIVATION_SERIAL_INPUT, hwnd, serial);
     if (!(data = wayland_win_data_get(hwnd))) goto err;
     if (!(surface = data->wayland_surface)) goto err;
     if (!(point = calloc(1, sizeof(*point)))) goto err;

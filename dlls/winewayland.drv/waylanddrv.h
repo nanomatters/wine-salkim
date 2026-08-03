@@ -73,7 +73,6 @@ struct xkb_compose_table;
  *          Globals
  */
 
-extern char *process_activate_token;
 extern char *process_name;
 extern struct wayland process_wayland;
 
@@ -88,6 +87,24 @@ enum wayland_window_message
     WM_WAYLAND_SET_FOREGROUND,
     WM_WAYLAND_DMABUF_FRAME,
     WM_WAYLAND_EXPOSE,
+};
+
+#define WAYLAND_ACTIVATION_TOKEN_MAGIC 0x54434158 /* XACT */
+#define WAYLAND_ACTIVATION_TOKEN_MAX_SIZE 65536
+
+enum wayland_activation_serial_kind
+{
+    WAYLAND_ACTIVATION_SERIAL_INPUT,
+    WAYLAND_ACTIVATION_SERIAL_POINTER_FOCUS,
+    WAYLAND_ACTIVATION_SERIAL_KEYBOARD_FOCUS,
+    WAYLAND_ACTIVATION_SERIAL_COUNT,
+};
+
+struct wayland_activation_serial
+{
+    HWND hwnd;
+    uint32_t serial;
+    UINT64 generation;
 };
 
 enum wayland_surface_config_state
@@ -324,6 +341,10 @@ struct wayland
     /* Protects the output_list, output_info_array, and the wayland_output.current states. */
     pthread_mutex_t output_mutex;
     LONG input_serial;
+    pthread_mutex_t activation_mutex;
+    /* Serials remain associated with the window that received them. */
+    struct wayland_activation_serial activation_serials[WAYLAND_ACTIVATION_SERIAL_COUNT];
+    UINT64 activation_serial_generation;
     BOOL supports_parametric;
     BOOL supports_pq;
     BOOL supports_win_scrgb;
@@ -719,7 +740,17 @@ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
 void wayland_surface_assign_icon(struct wayland_surface *surface);
 void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
 void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags);
-void wayland_surface_activate(struct wayland_surface *surface, BOOL serial);
+void wayland_activation_set_serial(enum wayland_activation_serial_kind kind,
+                                   HWND hwnd, uint32_t serial);
+void wayland_activation_clear_serial(enum wayland_activation_serial_kind kind, HWND hwnd);
+uint32_t wayland_activation_get_serial(HWND hwnd);
+void wayland_request_activation(HWND target, struct wayland_surface *requester,
+                                BOOL foreground, uint32_t serial, BOOL set_app_id);
+void wayland_activation_apply_token(struct wayland_win_data *data, const char *token,
+                                    BOOL defer);
+void wayland_activation_apply_pending(struct wayland_win_data *data, BOOL foreground);
+char *wayland_take_process_activation_token(void);
+BOOL wayland_process_activation_token_pending(void);
 void wayland_surface_shortcut_control(struct wayland_surface *surface, BOOL inhibit);
 void wayland_surface_sync_alpha(struct wayland_surface *surface);
 BOOL wayland_is_popup_menu_class(HWND hwnd);
@@ -806,6 +837,7 @@ struct wayland_win_data
     RECT state_update_rect;
     HWND state_update_foreground;
     uint32_t configure_state_serial;
+    char *pending_activation_token;
 };
 
 struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);

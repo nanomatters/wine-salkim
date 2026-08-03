@@ -166,6 +166,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
     if (stashed_client) client_surface_release(&stashed_client->client);
     if (window_contents) wayland_shm_buffer_unref(window_contents);
     free(data->window_text);
+    free(data->pending_activation_token);
     free(data);
 }
 
@@ -456,7 +457,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                                                     BOOL use_layer_shell,
                                                     struct window_surface *window_surface,
                                                     UINT swp_flags,
-                                                    BOOL has_menu_popup_owner)
+                                                    BOOL has_menu_popup_owner,
+                                                    BOOL foreground)
 {
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *parent_surface, *surface;
@@ -582,6 +584,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     TRACE("hwnd=%p surface=%p=>%p\n", data->hwnd, data->wayland_surface, surface);
     data->wayland_surface = surface;
+    if (role == WAYLAND_SURFACE_ROLE_TOPLEVEL)
+        wayland_activation_apply_pending(data, foreground);
     return TRUE;
 }
 
@@ -1043,6 +1047,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL continue_configure = FALSE;
+    BOOL foreground = NtUserGetForegroundWindow() == hwnd;
     RECT present_rect;
     BOOL has_present_rect = fullscreen && NtUserGetPresentRect(hwnd, &present_rect, -1);
     BOOL use_layer_shell = FALSE;
@@ -1132,7 +1137,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
                                                      use_layer_shell, surface, swp_flags,
-                                                     menu_popup_owner != NULL))
+                                                     menu_popup_owner != NULL, foreground))
     {
         wayland_win_data_update_wayland_state(data);
     }
@@ -1423,6 +1428,29 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * window-thread lock order. */
         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
         return 0;
+    case WM_WINE_ACTIVATION_TOKEN:
+    {
+        const COPYDATASTRUCT *data = (const COPYDATASTRUCT *)lp;
+        struct wayland_win_data *win_data;
+        BOOL valid_target;
+        const char *token;
+
+        if (!data || data->dwData != WAYLAND_ACTIVATION_TOKEN_MAGIC || !data->lpData ||
+            !data->cbData || data->cbData > WAYLAND_ACTIVATION_TOKEN_MAX_SIZE)
+            return 0;
+        token = data->lpData;
+        if (token[data->cbData - 1] || strnlen(token, data->cbData) != data->cbData - 1)
+            return 0;
+        valid_target = !wp || NtUserGetForegroundWindow() == hwnd;
+        if (!valid_target) return 0;
+
+        if ((win_data = wayland_win_data_get(hwnd)))
+        {
+            wayland_activation_apply_token(win_data, token, wp != 0);
+            wayland_win_data_release(win_data);
+        }
+        return 0;
+    }
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;
@@ -1686,7 +1714,7 @@ void WAYLAND_FlashWindowEx(FLASHWINFO *info)
     if ((data = wayland_win_data_get(info->hwnd)))
     {
         if (data->wayland_surface && info->dwFlags)
-            wayland_surface_activate(data->wayland_surface, FALSE);
+            wayland_request_activation(data->hwnd, data->wayland_surface, FALSE, 0, FALSE);
         wayland_win_data_release(data);
     }
 }
@@ -1697,15 +1725,44 @@ void WAYLAND_FlashWindowEx(FLASHWINFO *info)
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
 {
     struct wayland_win_data *data;
+    BOOL foreground, set_app_id, used_token = FALSE;
+    DWORD process_id = 0, previous_thread_id;
+    uint32_t serial;
+    char *token = NULL;
 
     TRACE("hwnd=%p previous=%p\n", hwnd, previous);
 
-    if (hwnd == previous) return;
+    hwnd = NtUserGetAncestor(hwnd, GA_ROOT);
+    previous = NtUserGetAncestor(previous, GA_ROOT);
+    if (!hwnd) return;
+    foreground = NtUserGetForegroundWindow() == hwnd;
+    previous_thread_id = previous ? NtUserGetWindowThread(previous, NULL) : 0;
+    serial = previous ? wayland_activation_get_serial(previous) : 0;
+    NtUserGetWindowThread(hwnd, &process_id);
+    set_app_id = process_id == GetCurrentProcessId();
 
     if ((data = wayland_win_data_get(hwnd)))
     {
-        if (data->wayland_surface)
-            wayland_surface_activate(data->wayland_surface, TRUE);
+        if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
+            foreground)
+            token = wayland_take_process_activation_token();
+        if (token)
+        {
+            wayland_activation_apply_token(data, token, FALSE);
+            used_token = TRUE;
+        }
+        wayland_win_data_release(data);
+    }
+    free(token);
+    if (used_token || !previous || hwnd == previous) return;
+    if (process_id == GetCurrentProcessId() && wayland_process_activation_token_pending()) return;
+    /* Cross-thread requests are created by the source thread. */
+    if (previous_thread_id != GetCurrentThreadId()) return;
+
+    if ((data = wayland_win_data_get(previous)))
+    {
+        if (data->wayland_surface && data->wayland_surface->role != WAYLAND_SURFACE_ROLE_NONE)
+            wayland_request_activation(hwnd, data->wayland_surface, TRUE, serial, set_app_id);
         wayland_win_data_release(data);
     }
 }

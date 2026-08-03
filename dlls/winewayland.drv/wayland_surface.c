@@ -6349,60 +6349,169 @@ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UI
     wl_display_flush(process_wayland.wl_display);
 }
 
+struct wayland_activation_request
+{
+    HWND target;
+    BOOL require_foreground;
+};
+
+static HWND activation_root(HWND hwnd)
+{
+    HWND root = hwnd ? NtUserGetAncestor(hwnd, GA_ROOT) : NULL;
+    return root ? root : hwnd;
+}
+
+void wayland_activation_set_serial(enum wayland_activation_serial_kind kind,
+                                   HWND hwnd, uint32_t serial)
+{
+    struct wayland_activation_serial *entry;
+
+    if (kind >= WAYLAND_ACTIVATION_SERIAL_COUNT || !hwnd || !serial) return;
+    hwnd = activation_root(hwnd);
+
+    pthread_mutex_lock(&process_wayland.activation_mutex);
+    entry = &process_wayland.activation_serials[kind];
+    entry->hwnd = hwnd;
+    entry->serial = serial;
+    entry->generation = ++process_wayland.activation_serial_generation;
+    pthread_mutex_unlock(&process_wayland.activation_mutex);
+}
+
+void wayland_activation_clear_serial(enum wayland_activation_serial_kind kind, HWND hwnd)
+{
+    struct wayland_activation_serial *entry;
+
+    if (kind >= WAYLAND_ACTIVATION_SERIAL_COUNT || !hwnd) return;
+    hwnd = activation_root(hwnd);
+
+    pthread_mutex_lock(&process_wayland.activation_mutex);
+    entry = &process_wayland.activation_serials[kind];
+    if (entry->hwnd == hwnd) memset(entry, 0, sizeof(*entry));
+    pthread_mutex_unlock(&process_wayland.activation_mutex);
+}
+
+uint32_t wayland_activation_get_serial(HWND hwnd)
+{
+    UINT64 generation = 0;
+    uint32_t serial = 0;
+    unsigned int i;
+
+    hwnd = activation_root(hwnd);
+    pthread_mutex_lock(&process_wayland.activation_mutex);
+    for (i = 0; i < WAYLAND_ACTIVATION_SERIAL_COUNT; i++)
+    {
+        const struct wayland_activation_serial *entry = &process_wayland.activation_serials[i];
+        if (entry->hwnd == hwnd && entry->generation > generation)
+        {
+            serial = entry->serial;
+            generation = entry->generation;
+        }
+    }
+    pthread_mutex_unlock(&process_wayland.activation_mutex);
+    return serial;
+}
+
 static void xdg_activation_token_handle_done(void *user_data,
-                                             struct xdg_activation_token_v1 *xdg_activation_token_v1,
+                                             struct xdg_activation_token_v1 *token_proxy,
                                              const char *token)
 {
-    HWND hwnd = user_data;
-    struct wayland_win_data *data;
-    struct wayland_surface *surface;
+    struct wayland_activation_request *request = user_data;
+    size_t token_size = strlen(token) + 1;
+    COPYDATASTRUCT data = {
+        .dwData = WAYLAND_ACTIVATION_TOKEN_MAGIC,
+        .cbData = (DWORD)token_size,
+        .lpData = (void *)token,
+    };
 
-    if ((data = wayland_win_data_get(hwnd)))
-    {
-        if ((surface = data->wayland_surface))
-            xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token, surface->wl_surface);
-        wayland_win_data_release(data);
-    }
+    if (token_size <= WAYLAND_ACTIVATION_TOKEN_MAX_SIZE &&
+        (!request->require_foreground || NtUserGetForegroundWindow() == request->target) &&
+        NtUserIsWindow(request->target))
+        NtUserMessageCall(request->target, WM_WINE_ACTIVATION_TOKEN,
+                          request->require_foreground, (LPARAM)&data, NULL,
+                          NtUserSendNotifyMessage, FALSE);
 
-    if (xdg_activation_token_v1) xdg_activation_token_v1_destroy(xdg_activation_token_v1);
+    xdg_activation_token_v1_destroy(token_proxy);
+    free(request);
 }
 
 const static struct xdg_activation_token_v1_listener xdg_activation_listener = {
     xdg_activation_token_handle_done
 };
 
-void wayland_surface_activate(struct wayland_surface *surface, BOOL activate)
+void wayland_request_activation(HWND target, struct wayland_surface *requester,
+                                BOOL foreground, uint32_t serial, BOOL set_app_id)
 {
     struct wayland_seat *seat = &process_wayland.seat;
+    struct wayland_activation_request *request;
     struct xdg_activation_token_v1 *token;
-    uint32_t serial = ReadAcquire(&process_wayland.input_serial);
-    assert(surface);
 
     if (!process_wayland.xdg_activation_v1) return;
-    if (!wayland_surface_is_toplevel(surface)) return;
-
-    /* fall back to the per process activation token */
-    if (!serial && activate && process_activate_token)
-    {
-        xdg_activation_token_handle_done(surface->hwnd, NULL, process_activate_token);
-        return;
-    }
+    if (!requester || requester->role == WAYLAND_SURFACE_ROLE_NONE) return;
 
     if (!(token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1)))
     {
         ERR("Failed to create activation token!\n");
         return;
     }
+    if (!(request = calloc(1, sizeof(*request))))
+    {
+        xdg_activation_token_v1_destroy(token);
+        return;
+    }
+    request->target = target;
+    request->require_foreground = foreground;
 
     pthread_mutex_lock(&seat->mutex);
-
-    xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
-    xdg_activation_token_v1_set_surface(token, surface->wl_surface);
-    if (process_name && activate) xdg_activation_token_v1_set_app_id(token, process_name);
-    if (activate) xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
+    xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, request);
+    xdg_activation_token_v1_set_surface(token, requester->wl_surface);
+    if (foreground && set_app_id && process_name)
+        xdg_activation_token_v1_set_app_id(token, process_name);
+    if (serial && seat->wl_seat) xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
     xdg_activation_token_v1_commit(token);
-
     pthread_mutex_unlock(&seat->mutex);
+    wl_display_flush(process_wayland.wl_display);
+}
+
+void wayland_activation_apply_token(struct wayland_win_data *data, const char *token,
+                                    BOOL defer)
+{
+    struct wayland_surface *surface;
+    char *copy;
+
+    if (!token || !token[0] || !process_wayland.xdg_activation_v1) return;
+
+    surface = data->wayland_surface;
+    if (surface && wayland_surface_is_toplevel(surface))
+    {
+        free(data->pending_activation_token);
+        data->pending_activation_token = NULL;
+        xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token,
+                                   surface->wl_surface);
+        wl_display_flush(process_wayland.wl_display);
+        return;
+    }
+
+    if (!defer || !(copy = strdup(token))) return;
+    free(data->pending_activation_token);
+    data->pending_activation_token = copy;
+}
+
+void wayland_activation_apply_pending(struct wayland_win_data *data, BOOL foreground)
+{
+    char *token = data->pending_activation_token;
+
+    if (!data->wayland_surface || !wayland_surface_is_toplevel(data->wayland_surface)) return;
+    data->pending_activation_token = NULL;
+    if (!foreground)
+    {
+        free(token);
+        return;
+    }
+    if (!token) token = wayland_take_process_activation_token();
+    if (!token) return;
+
+    wayland_activation_apply_token(data, token, FALSE);
+    free(token);
 }
 
 static BOOL use_inhibit(void)

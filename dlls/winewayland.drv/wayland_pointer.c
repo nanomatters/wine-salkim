@@ -205,6 +205,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     /* The wl_surface user data remains valid and immutable for the whole
      * lifetime of the object, so it's safe to access without locking. */
     hwnd = wl_surface_get_user_data(wl_surface);
+    wayland_activation_set_serial(WAYLAND_ACTIVATION_SERIAL_POINTER_FOCUS, hwnd, serial);
 
     TRACE("hwnd=%p\n", hwnd);
 
@@ -234,6 +235,8 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
 
     if (!wl_surface) return;
 
+    wayland_activation_clear_serial(WAYLAND_ACTIVATION_SERIAL_POINTER_FOCUS,
+                                    wl_surface_get_user_data(wl_surface));
     TRACE("hwnd=%p\n", wl_surface_get_user_data(wl_surface));
 
     pthread_mutex_lock(&pointer->mutex);
@@ -253,6 +256,9 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     InterlockedExchange(&process_wayland.input_serial, serial);
 
     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+        wayland_activation_set_serial(WAYLAND_ACTIVATION_SERIAL_INPUT, hwnd, serial);
 
     input.type = INPUT_MOUSE;
 

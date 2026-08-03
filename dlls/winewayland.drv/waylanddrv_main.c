@@ -35,7 +35,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 char *process_name = NULL;
-char *process_activate_token = NULL;
+static char *process_activate_token;
 
 static BOOL WAYLAND_UseForeignGdiBridge(void)
 {
@@ -107,14 +107,35 @@ static void wayland_init_process_name(void)
 
 static void wayland_init_activation_token(void)
 {
-    char *env;
+    const char *env;
 
-    if ((env = getenv("XDG_ACTIVATION_TOKEN")))
-        process_activate_token = strdup(env);
-    else if ((env = getenv("DESKTOP_STARTUP_ID")))
-        process_activate_token = strdup(env);
+    if (!(env = getenv("XDG_ACTIVATION_TOKEN"))) env = getenv("DESKTOP_STARTUP_ID");
+    if (env) process_activate_token = strdup(env);
+    unsetenv("XDG_ACTIVATION_TOKEN");
+    unsetenv("DESKTOP_STARTUP_ID");
 
-    TRACE("activation token %s\n", debugstr_a(process_activate_token));
+    TRACE("inherited activation token %s\n", process_activate_token ? "found" : "not found");
+}
+
+char *wayland_take_process_activation_token(void)
+{
+    char *token;
+
+    pthread_mutex_lock(&process_wayland.activation_mutex);
+    token = process_activate_token;
+    process_activate_token = NULL;
+    pthread_mutex_unlock(&process_wayland.activation_mutex);
+    return token;
+}
+
+BOOL wayland_process_activation_token_pending(void)
+{
+    BOOL pending;
+
+    pthread_mutex_lock(&process_wayland.activation_mutex);
+    pending = process_activate_token != NULL;
+    pthread_mutex_unlock(&process_wayland.activation_mutex);
+    return pending;
 }
 
 static NTSTATUS waylanddrv_unix_init(void *arg)

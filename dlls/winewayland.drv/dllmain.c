@@ -104,6 +104,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 
     if (WAYLANDDRV_UNIX_CALL(init, NULL))
         return FALSE;
+    SetEnvironmentVariableW(L"XDG_ACTIVATION_TOKEN", NULL);
+    SetEnvironmentVariableW(L"DESKTOP_STARTUP_ID", NULL);
 
     /* Read wayland events from a dedicated thread. */
     CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));

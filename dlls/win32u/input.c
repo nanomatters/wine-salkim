@@ -2342,7 +2342,7 @@ BOOL WINAPI NtUserSetForegroundWindow( HWND hwnd )
 BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 {
     BOOL ret, send_msg_old = FALSE, send_msg_new = FALSE;
-    DWORD new_thread_id;
+    DWORD new_thread_id, previous_thread_id;
     HWND previous = 0;
 
     if (mouse) hwnd = get_full_window_handle( hwnd );
@@ -2365,6 +2365,17 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 
     if (ret && previous != hwnd)
     {
+        previous_thread_id = previous ? get_window_thread( previous, NULL ) : 0;
+        if (!internal && hwnd && previous_thread_id && previous_thread_id != new_thread_id)
+        {
+            /* Request the token in the thread that owns the source window. */
+            if (previous_thread_id == GetCurrentThreadId())
+                user_driver->pActivateWindow( hwnd, previous );
+            else
+                NtUserMessageCall( previous, WM_WINE_REQUESTACTIVATION, (WPARAM)hwnd, 0,
+                                   0, NtUserSendNotifyMessage, FALSE );
+        }
+
         if (send_msg_old)  /* old window belongs to other thread */
             NtUserMessageCall( previous, WM_WINE_SETACTIVEWINDOW, 0, new_thread_id,
                                0, NtUserSendNotifyMessage, FALSE );

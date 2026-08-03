@@ -719,6 +719,7 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
         break;
     }
     case WM_COPYDATA:
+    case WM_WINE_ACTIVATION_TOKEN:
     {
         COPYDATASTRUCT cds;
         if (size < sizeof(ps->cds)) return FALSE;
@@ -1106,6 +1107,7 @@ static size_t pack_message( HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         return sizeof(data->ps.wp);
     }
     case WM_COPYDATA:
+    case WM_WINE_ACTIVATION_TOKEN:
     {
         COPYDATASTRUCT *cds = (COPYDATASTRUCT *)lparam;
         data->ps.cds.cbData = cds->cbData;
@@ -2281,6 +2283,11 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case WM_WINE_SETWINDOWSURFACECLIP:
         set_window_surface_clip( hwnd, wparam );
         return 0;
+    case WM_WINE_REQUESTACTIVATION:
+        user_driver->pActivateWindow( (HWND)wparam, hwnd );
+        return 0;
+    case WM_WINE_ACTIVATION_TOKEN:
+        return user_driver->pWindowMessage( hwnd, msg, wparam, lparam );
     case WM_WINE_TRACKMOUSEEVENT:
     {
         TRACKMOUSEEVENT info;
