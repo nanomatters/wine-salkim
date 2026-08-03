@@ -384,6 +384,41 @@ void output_info_array_update(void)
     output_info_array_arrange_physical_coords(output_info_array);
 }
 
+static int scale_output_coordinate(int offset, int physical_size, int logical_size)
+{
+    return ((LONGLONG)offset * physical_size + logical_size / 2) / logical_size;
+}
+
+void WAYLAND_MapNotifyIconPoint(POINT *point)
+{
+    struct output_info *output_info;
+    POINT mapped = *point;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    wl_array_for_each(output_info, &process_wayland.output_info_array)
+    {
+        const struct wayland_output_state *output = output_info->output;
+
+        if (!output->current_mode || output->logical_w <= 0 || output->logical_h <= 0 ||
+            point->x < output->logical_x || point->x >= output->logical_x + output->logical_w ||
+            point->y < output->logical_y || point->y >= output->logical_y + output->logical_h)
+            continue;
+
+        mapped.x = output_info->x + scale_output_coordinate(point->x - output->logical_x,
+                                                             output->current_mode->width,
+                                                             output->logical_w);
+        mapped.y = output_info->y + scale_output_coordinate(point->y - output->logical_y,
+                                                             output->current_mode->height,
+                                                             output->logical_h);
+        break;
+    }
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+
+    TRACE("logical %d,%d => physical %d,%d\n",
+          point->x, point->y, mapped.x, mapped.y);
+    *point = mapped;
+}
+
 /***********************************************************************
  *      UpdateDisplayDevices (WAYLAND.@)
  */

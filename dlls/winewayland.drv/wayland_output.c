@@ -28,6 +28,7 @@
 
 #include "wine/debug.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
@@ -788,10 +789,23 @@ static struct output_info *output_info_for_rect(const RECT *window_rect,
     return best;
 }
 
+static double output_info_get_scale(const struct output_info *output_info)
+{
+    const struct wayland_output_state *output = output_info->output;
+    double scale;
+
+    if (!output->current_mode || output->logical_w <= 0 || output->logical_h <= 0)
+        return 1.0;
+
+    scale = (double)output->current_mode->width / output->logical_w;
+    return round(scale * 120.0) / 120.0;
+}
+
 /**********************************************************************
  *          wayland_output_for_rect
  */
-struct wayland_output *wayland_output_for_rect(const RECT *window_rect, RECT *output_rect)
+struct wayland_output *wayland_output_for_rect(const RECT *window_rect, RECT *output_rect,
+                                               double *output_scale)
 {
     struct wayland_output *output = NULL;
     struct output_info *output_info;
@@ -799,10 +813,12 @@ struct wayland_output *wayland_output_for_rect(const RECT *window_rect, RECT *ou
 
     TRACE("window %s\n", wine_dbgstr_rect(window_rect));
 
+    if (output_scale) *output_scale = 1.0;
     pthread_mutex_lock(&process_wayland.output_mutex);
     if ((output_info = output_info_for_rect(window_rect, output_rect, &have_outputs, TRUE)))
     {
         output = CONTAINING_RECORD(output_info->output, struct wayland_output, current);
+        if (output_scale) *output_scale = output_info_get_scale(output_info);
         wayland_output_add_ref(output);
     }
     pthread_mutex_unlock(&process_wayland.output_mutex);

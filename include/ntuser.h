@@ -657,6 +657,7 @@ enum wine_internal_message
     WM_WINE_SETWINDOWSURFACECLIP,
     WM_WINE_REQUESTACTIVATION,
     WM_WINE_ACTIVATION_TOKEN,
+    WM_WINE_MAP_NOTIFY_ICON_POINT,
     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
     WM_WINE_SETCURSOR,

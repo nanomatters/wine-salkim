@@ -2095,12 +2095,13 @@ err:
     ERR("Failed to assign popup role to wayland surface\n");
 }
 
-static struct wl_output *layer_surface_get_output(const RECT *rect, RECT *output_rect)
+static struct wl_output *layer_surface_get_output(const RECT *rect, RECT *output_rect,
+                                                  double *output_scale)
 {
     struct wayland_output *output;
     struct wl_output *wl_output = NULL;
 
-    if ((output = wayland_output_for_rect(rect, output_rect)))
+    if ((output = wayland_output_for_rect(rect, output_rect, output_scale)))
     {
         wl_output = output->wl_output;
         wayland_output_release(output);
@@ -2149,12 +2150,18 @@ static void wayland_surface_update_layer_config(struct wayland_surface *surface,
 void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect)
 {
     struct wl_output *output;
+    double initial_scale;
     RECT output_rect;
 
     TRACE("surface=%p rect=%s\n", surface, wine_dbgstr_rect(rect));
 
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_LAYER);
-    output = layer_surface_get_output(rect, &output_rect);
+    output = layer_surface_get_output(rect, &output_rect, &initial_scale);
+
+    if (surface->zwlr_layer_surface_v1 && surface->layer_output != output)
+    {
+        if (!wayland_surface_clear_role(surface)) return;
+    }
 
     if (surface->zwlr_layer_surface_v1)
     {
@@ -2179,9 +2186,9 @@ void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rec
                                        &zwlr_layer_surface_v1_listener,
                                        surface->hwnd);
 
+    wayland_surface_init_fractional_scale(surface, initial_scale);
     wayland_surface_update_layer_config(surface, rect, &output_rect);
     wayland_set_layer_menu_hwnd(surface->hwnd);
-    wayland_surface_init_fractional_scale(surface, 1.0);
     wayland_surface_sync_alpha(surface);
 
     wayland_surface_commit(surface);
@@ -2718,7 +2725,7 @@ static void wayland_surface_get_rect_in_monitor(struct wayland_surface *surface,
     struct wayland_output *output;
     RECT monitor_rect;
 
-    if (!(output = wayland_output_for_rect(&surface->window.rect, &monitor_rect)))
+    if (!(output = wayland_output_for_rect(&surface->window.rect, &monitor_rect, NULL)))
     {
         SetRectEmpty(rect);
         return;

@@ -649,7 +649,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
             struct wayland_output *output;
             struct wl_output *wl_output = NULL;
 
-            if ((output = wayland_output_for_rect(rect, NULL)))
+            if ((output = wayland_output_for_rect(rect, NULL, NULL)))
                 wl_output = output->wl_output;
 
             if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
@@ -1427,6 +1427,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* Event-thread callbacks use this for exposes that must follow the
          * window-thread lock order. */
         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+        return 0;
+    case WM_WINE_MAP_NOTIFY_ICON_POINT:
+        WAYLAND_MapNotifyIconPoint((POINT *)lp);
         return 0;
     case WM_WINE_ACTIVATION_TOKEN:
     {

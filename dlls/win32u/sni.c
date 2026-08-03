@@ -734,8 +734,15 @@ static DBusHandlerResult sni_object_handler( DBusConnection *conn, DBusMessage *
     }
     else if (!strcmp( iface, SNI_ITEM_IFACE ) && icon)
     {
+        POINT point;
         int x = 0, y = 0;
+
         p_dbus_message_get_args( msg, NULL, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INVALID );
+        point.x = x;
+        point.y = y;
+        user_driver->pWindowMessage( 0, WM_WINE_MAP_NOTIFY_ICON_POINT, 0, (LPARAM)&point );
+        x = point.x;
+        y = point.y;
         if (!strcmp( member, "Activate" ))
         {
             /* SNI sends one Activate per left-click with no double-click notion.

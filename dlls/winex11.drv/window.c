@@ -4036,6 +4036,8 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     case WM_X11DRV_ADD_TAB:
         taskbar_add_tab( hwnd );
         return 0;
+    case WM_WINE_MAP_NOTIFY_ICON_POINT:
+        return 0;
     default:
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
         return 0;

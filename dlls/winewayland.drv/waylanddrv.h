@@ -643,7 +643,8 @@ void wayland_output_release(struct wayland_output *output);
 void wayland_output_remove(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
 void wayland_output_use_image_description(struct wayland_output *output);
-struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *output_rect);
+struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *output_rect,
+                                               double *output_scale);
 BOOL wayland_output_layout_intersects_rect(const RECT *rect);
 void output_info_array_update(void);
 BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);
@@ -948,6 +949,7 @@ UINT WAYLAND_ShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp);
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);
+void WAYLAND_MapNotifyIconPoint(POINT *point);
 LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface);
