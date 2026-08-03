@@ -2594,11 +2594,16 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
     struct wayland_win_data *data;
-    DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-    HWND focused_hwnd, old_foreground = NtUserGetForegroundWindow();
+    DWORD style;
+    HWND focused_hwnd, old_foreground;
     RECT restore_rect;
     BOOL ret, restore_rect_valid, surface_focused;
 
+    /* Only drivers which defer outgoing state updates need an unlock phase. */
+    if (!state_cmd) return FALSE;
+
+    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    old_foreground = NtUserGetForegroundWindow();
     *state_cmd = *swp_flags = 0;
     *foreground = NULL;
     SetRectEmpty(rect);
