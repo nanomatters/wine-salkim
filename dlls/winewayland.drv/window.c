@@ -235,6 +235,18 @@ static BOOL wayland_win_data_configure_state_applied(const struct wayland_win_da
            !!(data->style & WS_MAXIMIZE);
 }
 
+static RECT wayland_win_data_configure_window_rect(const struct wayland_win_data *data,
+                                                   int width, int height)
+{
+    RECT rect;
+
+    /* Callers use only the frame-adjusted size. */
+    SetRect(&rect, 0, 0, width, height);
+    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
+    if (!IsRectEmpty(&rect)) rect = window_rect_from_visible(&data->rects, rect);
+    return rect;
+}
+
 static void wayland_win_data_update_restore_rect(struct wayland_win_data *data,
                                                  DWORD style,
                                                  const struct window_rects *rects)
@@ -1243,9 +1255,7 @@ static void wayland_configure_window(HWND hwnd)
 
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
     if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
-    SetRect(&rect, 0, 0, window_width, window_height);
-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
-    if (!IsRectEmpty(&rect)) rect = window_rect_from_visible(&data->rects, rect);
+    rect = wayland_win_data_configure_window_rect(data, window_width, window_height);
 
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     if (!(style & WS_MINIMIZE) &&
@@ -1593,6 +1603,42 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
     }
 
     wl_display_flush(process_wayland.wl_display);
+    return ret;
+}
+
+/***********************************************************************
+ *          WAYLAND_ShowWindow
+ */
+UINT WAYLAND_ShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp)
+{
+    struct wayland_surface *surface;
+    struct wayland_win_data *data;
+    UINT ret = ~0;
+    int width, height;
+
+    if (cmd != SW_MAXIMIZE) return ~0;
+    if (!(data = wayland_win_data_get(hwnd))) return ~0;
+
+    surface = data->wayland_surface;
+    if (surface && surface->processing.serial &&
+        surface->processing.serial == data->configure_state_serial &&
+        (surface->processing.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+    {
+        width = surface->processing.rect.right - surface->processing.rect.left;
+        height = surface->processing.rect.bottom - surface->processing.rect.top;
+        if (width > 0 && height > 0)
+        {
+            *rect = wayland_win_data_configure_window_rect(data, width, height);
+            swp &= ~SWP_NOSIZE;
+            /* Wayland configures size, not global position. */
+            swp |= SWP_NOMOVE | SWP_NOSENDCHANGING;
+            TRACE("hwnd=%p using compositor maximize rect %s\n",
+                  hwnd, wine_dbgstr_rect(rect));
+            ret = swp;
+        }
+    }
+
+    wayland_win_data_release(data);
     return ret;
 }
 
