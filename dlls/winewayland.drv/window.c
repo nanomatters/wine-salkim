@@ -1991,6 +1991,12 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         {
             committed = TRUE;
         }
+        else if (wayland_surface_has_direct_dmabuf_content(wayland_surface) &&
+                 !has_content_over_producer)
+        {
+            /* Keep cached GDI contents beneath a covering producer. */
+            committed = TRUE;
+        }
         else
         {
             current_serial = wayland_surface->current.serial;

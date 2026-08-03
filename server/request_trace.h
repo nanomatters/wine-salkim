@@ -1985,6 +1985,7 @@ static void dump_get_window_region_request( const struct get_window_region_reque
 static void dump_get_window_region_reply( const struct get_window_region_reply *req )
 {
     dump_rectangle( " visible_rect=", &req->visible_rect );
+    fprintf( stderr, ", surface_producer=%08x", req->surface_producer );
     fprintf( stderr, ", total_size=%u", req->total_size );
     dump_varargs_rectangles( ", region=", cur_size );
 }

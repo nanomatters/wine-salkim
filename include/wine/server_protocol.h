@@ -3969,9 +3969,9 @@ struct get_window_region_reply
 {
     struct reply_header __header;
     struct rectangle visible_rect;
+    user_handle_t  surface_producer;
     data_size_t    total_size;
     /* VARARG(region,rectangles); */
-    char __pad_28[4];
 };
 
 
@@ -7449,6 +7449,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 936
+#define SERVER_PROTOCOL_VERSION 937
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

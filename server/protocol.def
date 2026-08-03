@@ -2969,6 +2969,7 @@ enum coords_relative
     int            surface;       /* get the visible surface region */
 @REPLY
     struct rectangle visible_rect;/* window visible rect in screen coords */
+    user_handle_t  surface_producer; /* sole producer covering the surface */
     data_size_t    total_size;    /* total size of the resulting region */
     VARARG(region,rectangles);    /* list of rectangles for the region (in window coords) */
 @END

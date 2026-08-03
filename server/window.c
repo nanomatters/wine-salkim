@@ -1531,11 +1531,11 @@ static int add_window_coverage( struct window *win, struct region *clip,
 
 /* Walk the child tree in top-to-bottom z-order. 'covered' tracks pixels already
  * claimed by higher windows; 'holes' tracks pixels where the topmost window is
- * self-presenting and must show through the parent surface. */
+ * self-presenting. 'hole_owner' identifies the sole contributor, if any. */
 static int collect_punch_through_holes( struct window *win, struct region *parent_clip,
                                         struct region *holes, struct region *covered,
                                         struct region *transparent_above, struct region *gdi_over,
-                                        int offset_x, int offset_y )
+                                        user_handle_t *hole_owner, int offset_x, int offset_y )
 {
     struct window *ptr;
     struct region *client_clip = NULL, *visible = NULL, *tmp = NULL;
@@ -1569,6 +1569,7 @@ static int collect_punch_through_holes( struct window *win, struct region *paren
         {
             if (!collect_punch_through_holes( ptr, client_clip, holes, covered,
                                               transparent_above, gdi_over,
+                                              hole_owner,
                                               offset_x + win->client_rect.left,
                                               offset_y + win->client_rect.top ))
                 goto done;
@@ -1582,6 +1583,11 @@ static int collect_punch_through_holes( struct window *win, struct region *paren
     if (is_self_presenting_window( win ))
     {
         if (!subtract_region( tmp, client_clip, covered )) goto done;
+        if (hole_owner && !is_region_empty( tmp ))
+        {
+            if (*hole_owner == (user_handle_t)-1) *hole_owner = win->handle;
+            else if (*hole_owner != win->handle) *hole_owner = 0;
+        }
         if (!union_region( holes, holes, tmp )) goto done;
         if (transparent_above && gdi_over)
         {
@@ -1603,9 +1609,13 @@ done:
 
 
 /* compute the visible surface region of a window, in parent coordinates */
-static struct region *get_surface_region( struct window *win )
+static struct region *get_surface_region( struct window *win, user_handle_t *surface_producer )
 {
-    struct region *region, *clip = NULL, *holes = NULL, *covered = NULL;
+    struct region *region, *clip = NULL, *client_clip = NULL, *holes = NULL, *covered = NULL;
+    user_handle_t hole_owner = (user_handle_t)-1;
+    int track_producer = hwnd_dmabuf_count_frames( win ) == 1;
+
+    *surface_producer = 0;
 
     /* create a region relative to the window itself */
 
@@ -1613,24 +1623,37 @@ static struct region *get_surface_region( struct window *win )
     if (!(clip = create_empty_region())) goto error;
     if (!(holes = create_empty_region())) goto error;
     if (!(covered = create_empty_region())) goto error;
+    if (track_producer && !(client_clip = create_empty_region())) goto error;
 
     set_region_rect( region, &win->visible_rect );
     if (win->win_region && !intersect_window_region( region, win )) goto error;
 
     set_region_rect( clip, &win->visible_rect );
     if (win->win_region && !intersect_window_region( clip, win )) goto error;
+    if (track_producer &&
+        !set_window_rect_region( client_clip, win, &win->client_rect, clip, 0, 0 ))
+        goto error;
 
-    if (!collect_punch_through_holes( win, clip, holes, covered, NULL, NULL, 0, 0 )) goto error;
+    if (!collect_punch_through_holes( win, clip, holes, covered, NULL, NULL,
+                                      track_producer ? &hole_owner : NULL, 0, 0 ))
+        goto error;
     if (!subtract_region( region, region, holes )) goto error;
+
+    /* Parent contents are validated separately when selecting the producer. */
+    if (track_producer && hole_owner && hole_owner != (user_handle_t)-1 &&
+        is_region_equal( holes, client_clip ))
+        *surface_producer = hole_owner;
 
     free_region( covered );
     free_region( holes );
+    if (client_clip) free_region( client_clip );
     free_region( clip );
     return region;
 
 error:
     if (covered) free_region( covered );
     if (holes) free_region( holes );
+    if (client_clip) free_region( client_clip );
     if (clip) free_region( clip );
     free_region( region );
     return NULL;
@@ -1651,7 +1674,8 @@ static struct region *get_gdi_over_producer_region( struct window *win )
     set_region_rect( clip, &win->visible_rect );
     if (win->win_region && !intersect_window_region( clip, win )) goto error;
 
-    if (!collect_punch_through_holes( win, clip, holes, covered, transparent_above, region, 0, 0 ))
+    if (!collect_punch_through_holes( win, clip, holes, covered, transparent_above,
+                                      region, NULL, 0, 0 ))
         goto error;
 
     free_region( transparent_above );
@@ -3196,7 +3220,7 @@ DECL_HANDLER(get_window_region)
         if (req->surface == WINDOW_REGION_GDI_OVER_PRODUCER)
             region = get_gdi_over_producer_region( win );
         else
-            region = get_surface_region( win );
+            region = get_surface_region( win, &reply->surface_producer );
 
         if (region)
         {

@@ -1215,8 +1215,6 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     gdi_over_region = window_surface->gdi_over_producer_region;
     gdi_over_paint_region = window_surface->gdi_over_paint_region;
-    content_over_producer = region_has_pixels(gdi_over_region) ||
-                            region_has_pixels(window_surface->clip_region);
     if (wws->occlusion_clipped && !wws->layered)
     {
         occluded_region = create_occluded_region(&surface_rect, window_surface->clip_region);
@@ -1226,6 +1224,9 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
                                                  gdi_over_region, gdi_over_paint_region);
+    /* Slots exist only after GDI pixels have been published. */
+    content_over_producer = wws->gdi_overlay.slots_created ||
+                            region_has_pixels(window_surface->clip_region);
     if (wws->occlusion_clipped)
         wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
 

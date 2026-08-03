@@ -631,7 +631,7 @@ static void scaled_surface_set_clip( struct window_surface *window_surface, cons
 {
     struct scaled_surface *surface = get_scaled_surface( window_surface );
     HRGN hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
-    window_surface_set_clip( surface->target_surface, hrgn );
+    window_surface_set_clip( surface->target_surface, hrgn, window_surface->clip_producer );
     if (hrgn) NtGdiDeleteObjectApp( hrgn );
 }
 
@@ -1287,9 +1287,26 @@ W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORRE
     window_surface_unlock( surface );
 }
 
-W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
+static void window_surface_notify_clip( struct window_surface *surface )
 {
+    WINEREGION *data;
+
+    if (!surface->clip_region) surface->funcs->set_clip( surface, NULL, 0 );
+    else if ((data = GDI_GetObjPtr( surface->clip_region, NTGDI_OBJ_REGION )))
+    {
+        surface->funcs->set_clip( surface, data->rects, data->numRects );
+        GDI_ReleaseObj( surface->clip_region );
+    }
+}
+
+W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region,
+                                      HWND clip_producer )
+{
+    BOOL changed;
+
     window_surface_lock( surface );
+    changed = surface->clip_producer != clip_producer;
+    surface->clip_producer = clip_producer;
 
     if (!clip_region && surface->clip_region)
     {
@@ -1298,25 +1315,31 @@ W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_
 
         NtGdiDeleteObjectApp( surface->clip_region );
         surface->clip_region = 0;
-        surface->funcs->set_clip( surface, NULL, 0 );
+        changed = TRUE;
     }
     else if (clip_region && !NtGdiEqualRgn( clip_region, surface->clip_region ))
     {
-        WINEREGION *data;
-
         TRACE( "hwnd %p, surface %p %s, setting clip region %p\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), clip_region );
 
         if (!surface->clip_region) surface->clip_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
         NtGdiCombineRgn( surface->clip_region, clip_region, 0, RGN_COPY );
-
-        if ((data = GDI_GetObjPtr( clip_region, NTGDI_OBJ_REGION )))
-        {
-            surface->funcs->set_clip( surface, data->rects, data->numRects );
-            GDI_ReleaseObj( clip_region );
-        }
+        changed = TRUE;
     }
 
+    if (changed) window_surface_notify_clip( surface );
+
+    window_surface_unlock( surface );
+}
+
+W32KAPI void window_surface_clear_clip_producer( struct window_surface *surface )
+{
+    window_surface_lock( surface );
+    if (surface->clip_producer)
+    {
+        surface->clip_producer = 0;
+        window_surface_notify_clip( surface );
+    }
     window_surface_unlock( surface );
 }
 

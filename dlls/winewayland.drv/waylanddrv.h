@@ -635,6 +635,7 @@ struct wayland_surface
     enum wayland_surface_ensure_type ensured_contents;
     struct wl_list hwnd_dmabuf_surfaces;
     struct wayland_hwnd_dmabuf_surface *direct_dmabuf_surface;
+    struct wp_linux_drm_syncobj_surface_v1 *direct_dmabuf_syncobj_surface;
     /* The direct-toplevel client surface currently borrowing wl_surface for
      * external WSI presentation, if any. Role changes and destruction must
      * evict the borrower (transferring wl_surface ownership to it) first. */
@@ -647,6 +648,7 @@ struct wayland_surface
     BOOL carrier_single_pixel;
     int carrier_width, carrier_height;
     HRGN child_region;
+    HWND clip_producer;
     BOOL shaped;
     BOOL occlusion_clipped;
     struct wayland_window_config window, comitted;
@@ -724,6 +726,7 @@ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
 BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+BOOL wayland_surface_has_direct_dmabuf_content(struct wayland_surface *surface);
 BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface, DWORD exstyle);
