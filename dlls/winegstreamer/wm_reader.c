@@ -1039,85 +1039,141 @@ static ULONG WINAPI header_info_Release(IWMHeaderInfo3 *iface)
     return IUnknown_Release(reader->outer);
 }
 
+struct header_attribute
+{
+    enum
+    {
+        HEADER_ATTRIBUTE_DURATION,
+        HEADER_ATTRIBUTE_SEEKABLE,
+    } id;
+    const WCHAR *name;
+    WMT_ATTR_DATATYPE type;
+    DWORD size;
+};
+
+static const struct header_attribute header_attributes[] =
+{
+    {HEADER_ATTRIBUTE_DURATION, L"Duration", WMT_TYPE_QWORD, sizeof(QWORD)},
+    {HEADER_ATTRIBUTE_SEEKABLE, L"Seekable", WMT_TYPE_BOOL, sizeof(BOOL)},
+};
+
+static BOOL header_info_stream_is_valid(const struct wm_reader *reader, WORD stream_number, BOOL allow_global)
+{
+    if (stream_number == 0xffff) return allow_global;
+    /* Reader stream numbers are one-based. */
+    return stream_number <= reader->stream_count;
+}
+
+static const struct header_attribute *header_info_find_attribute(const WCHAR *name, WORD *index)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(header_attributes); ++i)
+    {
+        if (!wcscmp(header_attributes[i].name, name))
+        {
+            if (index) *index = i;
+            return &header_attributes[i];
+        }
+    }
+    return NULL;
+}
+
+static void header_info_read_attribute(struct wm_reader *reader,
+        const struct header_attribute *attribute, BYTE *value)
+{
+    if (attribute->id == HEADER_ATTRIBUTE_DURATION)
+    {
+        QWORD duration;
+
+        EnterCriticalSection(&reader->cs);
+        duration = wg_parser_stream_get_duration(wg_parser_get_stream(reader->wg_parser, 0));
+        LeaveCriticalSection(&reader->cs);
+        TRACE("Returning duration %s.\n", debugstr_time(duration));
+        memcpy(value, &duration, sizeof(duration));
+    }
+    else
+    {
+        const BOOL seekable = TRUE;
+
+        memcpy(value, &seekable, sizeof(seekable));
+    }
+}
+
 static HRESULT WINAPI header_info_GetAttributeCount(IWMHeaderInfo3 *iface, WORD stream_number, WORD *count)
 {
-    FIXME("iface %p, stream_number %u, count %p, stub!\n", iface, stream_number, count);
-    return E_NOTIMPL;
+    struct wm_reader *reader = impl_from_IWMHeaderInfo3(iface);
+
+    TRACE("reader %p, stream_number %u, count %p.\n", reader, stream_number, count);
+
+    if (!count || !header_info_stream_is_valid(reader, stream_number, FALSE)) return E_INVALIDARG;
+
+    *count = stream_number ? 0 : ARRAY_SIZE(header_attributes);
+    return S_OK;
 }
 
 static HRESULT WINAPI header_info_GetAttributeByIndex(IWMHeaderInfo3 *iface, WORD index, WORD *stream_number,
         WCHAR *name, WORD *name_len, WMT_ATTR_DATATYPE *type, BYTE *value, WORD *size)
 {
-    FIXME("iface %p, index %u, stream_number %p, name %p, name_len %p, type %p, value %p, size %p, stub!\n",
-            iface, index, stream_number, name, name_len, type, value, size);
-    return E_NOTIMPL;
+    struct wm_reader *reader = impl_from_IWMHeaderInfo3(iface);
+    const struct header_attribute *attribute;
+    WORD name_capacity, value_capacity, required_name;
+
+    TRACE("reader %p, index %u, stream_number %p, name %p, name_len %p, type %p, value %p, size %p.\n",
+            reader, index, stream_number, name, name_len, type, value, size);
+
+    if (!stream_number || !name_len || !type || !size) return E_INVALIDARG;
+    if (!header_info_stream_is_valid(reader, *stream_number, FALSE)) return E_INVALIDARG;
+    if (*stream_number || index >= ARRAY_SIZE(header_attributes)) return ASF_E_NOTFOUND;
+
+    attribute = &header_attributes[index];
+    name_capacity = *name_len;
+    value_capacity = *size;
+    required_name = wcslen(attribute->name) + 1;
+    *name_len = required_name;
+    *size = attribute->size;
+
+    if ((name && name_capacity < required_name) || (value && value_capacity < attribute->size))
+        return ASF_E_BUFFERTOOSMALL;
+
+    if (name) memcpy(name, attribute->name, required_name * sizeof(*name));
+    *type = attribute->type;
+    if (value) header_info_read_attribute(reader, attribute, value);
+    return S_OK;
 }
 
 static HRESULT WINAPI header_info_GetAttributeByName(IWMHeaderInfo3 *iface, WORD *stream_number,
         const WCHAR *name, WMT_ATTR_DATATYPE *type, BYTE *value, WORD *size)
 {
     struct wm_reader *reader = impl_from_IWMHeaderInfo3(iface);
-    const WORD req_size = *size;
+    const struct header_attribute *attribute;
+    WORD capacity;
 
-    TRACE("reader %p, stream_number %p, name %s, type %p, value %p, size %u.\n",
-            reader, stream_number, debugstr_w(name), type, value, *size);
+    TRACE("reader %p, stream_number %p, name %s, type %p, value %p, size %p.\n",
+            reader, stream_number, debugstr_w(name), type, value, size);
 
-    if (!stream_number)
-        return E_INVALIDARG;
+    if (!stream_number || !name || !type || !size) return E_INVALIDARG;
 
-    if (!wcscmp(name, L"Duration"))
+    if (*stream_number)
     {
-        QWORD duration;
-
-        if (*stream_number)
-        {
-            WARN("Requesting duration for stream %u, returning ASF_E_NOTFOUND.\n", *stream_number);
-            return ASF_E_NOTFOUND;
-        }
-
-        *size = sizeof(QWORD);
-        if (!value)
-        {
-            *type = WMT_TYPE_QWORD;
-            return S_OK;
-        }
-        if (req_size < *size)
-            return ASF_E_BUFFERTOOSMALL;
-
-        *type = WMT_TYPE_QWORD;
-        EnterCriticalSection(&reader->cs);
-        duration = wg_parser_stream_get_duration(wg_parser_get_stream(reader->wg_parser, 0));
-        LeaveCriticalSection(&reader->cs);
-        TRACE("Returning duration %s.\n", debugstr_time(duration));
-        memcpy(value, &duration, sizeof(QWORD));
-        return S_OK;
-    }
-    else if (!wcscmp(name, L"Seekable"))
-    {
-        if (*stream_number)
-        {
-            WARN("Requesting duration for stream %u, returning ASF_E_NOTFOUND.\n", *stream_number);
-            return ASF_E_NOTFOUND;
-        }
-
-        *size = sizeof(BOOL);
-        if (!value)
-        {
-            *type = WMT_TYPE_BOOL;
-            return S_OK;
-        }
-        if (req_size < *size)
-            return ASF_E_BUFFERTOOSMALL;
-
-        *type = WMT_TYPE_BOOL;
-        *(BOOL *)value = TRUE;
-        return S_OK;
-    }
-    else
-    {
-        FIXME("Unknown attribute %s.\n", debugstr_w(name));
+        WARN("Requesting %s for stream %u, returning ASF_E_NOTFOUND.\n",
+                debugstr_w(name), *stream_number);
         return ASF_E_NOTFOUND;
     }
+
+    if (!(attribute = header_info_find_attribute(name, NULL)))
+    {
+        WARN("Unknown attribute %s.\n", debugstr_w(name));
+        return ASF_E_NOTFOUND;
+    }
+
+    capacity = *size;
+    *size = attribute->size;
+    if (value && capacity < attribute->size) return ASF_E_BUFFERTOOSMALL;
+
+    *type = attribute->type;
+    if (value) header_info_read_attribute(reader, attribute, value);
+    return S_OK;
 }
 
 static HRESULT WINAPI header_info_SetAttribute(IWMHeaderInfo3 *iface, WORD stream_number,
@@ -1197,86 +1253,85 @@ static HRESULT WINAPI header_info_GetCodecInfo(IWMHeaderInfo3 *iface, DWORD inde
 
 static HRESULT WINAPI header_info_GetAttributeCountEx(IWMHeaderInfo3 *iface, WORD stream_number, WORD *count)
 {
-    FIXME("iface %p, stream_number %u, count %p, stub!\n", iface, stream_number, count);
-    return E_NOTIMPL;
-}
+    struct wm_reader *reader = impl_from_IWMHeaderInfo3(iface);
 
-/* made up index, just be consistent. needs a test */
-#define WMV_ATTRIBUTE_DURATION 1
+    TRACE("reader %p, stream_number %u, count %p.\n", reader, stream_number, count);
+
+    if (!count) return E_POINTER;
+    if (!header_info_stream_is_valid(reader, stream_number, TRUE)) return NS_E_INVALID_REQUEST;
+
+    *count = (!stream_number || stream_number == 0xffff) ? ARRAY_SIZE(header_attributes) : 0;
+    return S_OK;
+}
 
 static HRESULT WINAPI header_info_GetAttributeIndices(IWMHeaderInfo3 *iface, WORD stream_number,
         const WCHAR *name, WORD *lang_index, WORD *indices, WORD *count)
 {
-    FIXME("iface %p, stream_number %u, name %s, lang_index %p, indices %p, count %p, semi-stub!\n",
-            iface, stream_number, debugstr_w(name), lang_index, indices, count);
+    struct wm_reader *reader = impl_from_IWMHeaderInfo3(iface);
+    WORD capacity, found = 0;
+    unsigned int i;
 
-    if (!count) return E_INVALIDARG;
+    TRACE("reader %p, stream_number %u, name %s, lang_index %p, indices %p, count %p.\n",
+            reader, stream_number, debugstr_w(name), lang_index, indices, count);
 
-    if (lang_index) FIXME("lang_index not supported!\n");
+    if (!count) return E_POINTER;
+    if ((!name && !lang_index) || (name && lang_index)) return NS_E_INVALID_REQUEST;
+    if (!header_info_stream_is_valid(reader, stream_number, TRUE)) return NS_E_INVALID_REQUEST;
+    if (lang_index && *lang_index) return NS_E_INVALID_REQUEST;
 
-    if (stream_number)
+    capacity = *count;
+    if (!stream_number || stream_number == 0xffff)
     {
-        WARN("Requesting %s for stream %u, returning ASF_E_NOTFOUND.\n", debugstr_w(name), stream_number);
-        return ASF_E_NOTFOUND;
+        for (i = ARRAY_SIZE(header_attributes); i-- > 0;)
+            if (!name || !wcscmp(header_attributes[i].name, name)) ++found;
     }
 
-    if (!wcscmp(name, L"Duration"))
+    *count = found;
+    if (!indices) return S_OK;
+    if (capacity < found) return NS_E_SDK_BUFFERTOOSMALL;
+
+    found = 0;
+    if (!stream_number || stream_number == 0xffff)
     {
-        *count = 1;
-        if (indices) *indices = WMV_ATTRIBUTE_DURATION;
-        return S_OK;
+        for (i = ARRAY_SIZE(header_attributes); i-- > 0;)
+            if (!name || !wcscmp(header_attributes[i].name, name)) indices[found++] = i;
     }
-
-    FIXME("Unsupported attribute %s\n", debugstr_w(name));
-
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI header_info_GetAttributeByIndexEx(IWMHeaderInfo3 *iface,
         WORD stream_number, WORD index, WCHAR *name, WORD *name_len,
         WMT_ATTR_DATATYPE *type, WORD *lang_index, BYTE *value, DWORD *size)
 {
-    WORD temp_size;
-    HRESULT hr;
+    struct wm_reader *reader = impl_from_IWMHeaderInfo3(iface);
+    const struct header_attribute *attribute;
+    WORD name_capacity, required_name;
+    DWORD value_capacity;
 
-    FIXME("iface %p, stream_number %u, index %u, name %p, name_len %p,"
-            " type %p, lang_index %p, value %p, size %p, semi-stub!\n",
-            iface, stream_number, index, name, name_len, type, lang_index, value, size);
+    TRACE("reader %p, stream_number %u, index %u, name %p, name_len %p,"
+            " type %p, lang_index %p, value %p, size %p.\n",
+            reader, stream_number, index, name, name_len, type, lang_index, value, size);
 
-    if (!size || !name_len) return E_INVALIDARG;
+    if (!size || !name_len) return E_POINTER;
+    if (!header_info_stream_is_valid(reader, stream_number, TRUE)) return NS_E_INVALID_REQUEST;
+    if ((stream_number && stream_number != 0xffff) || index >= ARRAY_SIZE(header_attributes))
+        return NS_E_INVALID_REQUEST;
 
-    if (lang_index) FIXME("lang_index not supported!\n");
+    attribute = &header_attributes[index];
+    name_capacity = *name_len;
+    value_capacity = *size;
+    required_name = wcslen(attribute->name) + 1;
+    *name_len = required_name;
+    *size = attribute->size;
 
-    if (stream_number)
-    {
-        WARN("Requesting index %u for stream %u, returning ASF_E_NOTFOUND.\n", index, stream_number);
-        return ASF_E_NOTFOUND;
-    }
+    if ((name && name_capacity < required_name) || (value && value_capacity < attribute->size))
+        return NS_E_SDK_BUFFERTOOSMALL;
 
-    temp_size = *size;
-
-    switch (index)
-    {
-        case WMV_ATTRIBUTE_DURATION:
-        {
-            const WCHAR *durationW = L"Duration";
-            const int durationLen = wcslen(durationW)+1;
-
-            if (name && *name_len >= durationLen) wcscpy(name, durationW);
-            else if (name) return ASF_E_BUFFERTOOSMALL;
-
-            *name_len = durationLen;
-
-            hr = header_info_GetAttributeByName(iface, &stream_number, durationW, type, value, &temp_size);
-            *size = temp_size;
-            return hr;
-        }
-        default:
-            FIXME("Unsupported attribute index %u\n", index);
-            return E_INVALIDARG;
-    }
-
-    return E_NOTIMPL;
+    if (name) memcpy(name, attribute->name, required_name * sizeof(*name));
+    if (type) *type = attribute->type;
+    if (lang_index) *lang_index = 0;
+    if (value) header_info_read_attribute(reader, attribute, value);
+    return S_OK;
 }
 
 static HRESULT WINAPI header_info_ModifyAttribute(IWMHeaderInfo3 *iface, WORD stream_number,

@@ -653,18 +653,174 @@ static void teststream_init(struct teststream *stream, HANDLE file)
     stream->main_tid = GetCurrentThreadId();
 }
 
+static void check_reader_attribute_ex(IWMHeaderInfo3 *header_info, const WCHAR *expected_name,
+        WMT_ATTR_DATATYPE expected_type, const void *expected_value, DWORD expected_size)
+{
+    BYTE value[16];
+    WCHAR name[32];
+    WMT_ATTR_DATATYPE type;
+    WORD count, index, name_len, lang_index;
+    DWORD size;
+    HRESULT hr;
+
+    count = 0xdead;
+    hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0, expected_name, NULL, NULL, &count);
+    ok(hr == S_OK, "Got hr %#lx for %s.\n", hr, debugstr_w(expected_name));
+    ok(count == 1, "Got count %u for %s.\n", count, debugstr_w(expected_name));
+    if (hr != S_OK || count != 1) return;
+
+    count = 1;
+    index = 0xdead;
+    hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0, expected_name, NULL, &index, &count);
+    ok(hr == S_OK, "Got hr %#lx for %s.\n", hr, debugstr_w(expected_name));
+    ok(count == 1, "Got count %u for %s.\n", count, debugstr_w(expected_name));
+    if (hr != S_OK) return;
+
+    name_len = 0;
+    size = 0;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, index,
+            NULL, &name_len, NULL, NULL, NULL, &size);
+    ok(hr == S_OK, "Got hr %#lx for %s.\n", hr, debugstr_w(expected_name));
+    ok(name_len == wcslen(expected_name) + 1, "Got name length %u for %s.\n",
+            name_len, debugstr_w(expected_name));
+    ok(size == expected_size, "Got size %lu for %s.\n", size, debugstr_w(expected_name));
+
+    name_len = 1;
+    size = expected_size;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, index,
+            name, &name_len, NULL, NULL, NULL, &size);
+    ok(hr == NS_E_SDK_BUFFERTOOSMALL, "Got hr %#lx for %s.\n", hr, debugstr_w(expected_name));
+    ok(name_len == wcslen(expected_name) + 1, "Got name length %u for %s.\n",
+            name_len, debugstr_w(expected_name));
+    ok(size == expected_size, "Got size %lu for %s.\n", size, debugstr_w(expected_name));
+
+    name_len = 0;
+    size = expected_size - 1;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, index,
+            NULL, &name_len, NULL, NULL, value, &size);
+    ok(hr == NS_E_SDK_BUFFERTOOSMALL, "Got hr %#lx for %s.\n", hr, debugstr_w(expected_name));
+    ok(name_len == wcslen(expected_name) + 1, "Got name length %u for %s.\n",
+            name_len, debugstr_w(expected_name));
+    ok(size == expected_size, "Got size %lu for %s.\n", size, debugstr_w(expected_name));
+
+    name_len = ARRAY_SIZE(name);
+    size = sizeof(value);
+    type = 0xdeadbeef;
+    lang_index = 0xdead;
+    memset(value, 0xcc, sizeof(value));
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, index,
+            name, &name_len, &type, &lang_index, value, &size);
+    ok(hr == S_OK, "Got hr %#lx for %s.\n", hr, debugstr_w(expected_name));
+    ok(!wcscmp(name, expected_name), "Got name %s.\n", debugstr_w(name));
+    ok(type == expected_type, "Got type %#x for %s.\n", type, debugstr_w(expected_name));
+    ok(lang_index == 0, "Got language %u for %s.\n", lang_index, debugstr_w(expected_name));
+    ok(size == expected_size, "Got size %lu for %s.\n", size, debugstr_w(expected_name));
+    ok(!memcmp(value, expected_value, expected_size), "Unexpected value for %s.\n", debugstr_w(expected_name));
+}
+
+static void test_reader_attribute_indices(IWMHeaderInfo3 *header_info)
+{
+    WORD count, capacity, i, lang_index = 0, name_len;
+    WORD *indices;
+    DWORD size;
+    HRESULT hr;
+
+    count = 0;
+    hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0, NULL, &lang_index, NULL, &count);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(count >= 2, "Got count %u.\n", count);
+    if (hr == S_OK && count)
+    {
+        WORD index;
+
+        capacity = 1;
+        hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0,
+                NULL, &lang_index, &index, &capacity);
+        ok(hr == NS_E_SDK_BUFFERTOOSMALL, "Got hr %#lx.\n", hr);
+        ok(capacity == count, "Got count %u, expected %u.\n", capacity, count);
+
+        indices = malloc(count * sizeof(*indices));
+        ok(!!indices, "Failed to allocate indices.\n");
+        if (indices)
+        {
+            capacity = count;
+            hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0,
+                    NULL, &lang_index, indices, &capacity);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+            ok(capacity == count, "Got count %u, expected %u.\n", capacity, count);
+            for (i = 1; i < capacity; ++i)
+                ok(indices[i - 1] > indices[i], "Indices %u and %u are not descending.\n",
+                        indices[i - 1], indices[i]);
+            free(indices);
+        }
+    }
+
+    count = 0xdead;
+    hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0, NULL, NULL, NULL, &count);
+    ok(hr == NS_E_INVALID_REQUEST, "Got hr %#lx.\n", hr);
+
+    count = 0xdead;
+    hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0,
+            L"Duration", &lang_index, NULL, &count);
+    ok(hr == NS_E_INVALID_REQUEST, "Got hr %#lx.\n", hr);
+
+    count = 0xdead;
+    hr = IWMHeaderInfo3_GetAttributeCountEx(header_info, 0xffff, &count);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(count >= 2, "Got count %u.\n", count);
+
+    count = 0xdead;
+    hr = IWMHeaderInfo3_GetAttributeCountEx(header_info, 0xfffe, &count);
+    ok(hr == NS_E_INVALID_REQUEST, "Got hr %#lx.\n", hr);
+
+    name_len = 0;
+    size = 0;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0xfffe, 0,
+            NULL, &name_len, NULL, NULL, NULL, &size);
+    ok(hr == NS_E_INVALID_REQUEST, "Got hr %#lx.\n", hr);
+
+    name_len = 0;
+    size = 0;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, 0xffff,
+            NULL, &name_len, NULL, NULL, NULL, &size);
+    ok(hr == NS_E_INVALID_REQUEST, "Got hr %#lx.\n", hr);
+
+    hr = IWMHeaderInfo3_GetAttributeCountEx(header_info, 0, NULL);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+    hr = IWMHeaderInfo3_GetAttributeIndices(header_info, 0,
+            L"Duration", NULL, NULL, NULL);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+    name_len = 0;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, 0,
+            NULL, &name_len, NULL, NULL, NULL, NULL);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+    size = 0;
+    hr = IWMHeaderInfo3_GetAttributeByIndexEx(header_info, 0, 0,
+            NULL, NULL, NULL, NULL, NULL, &size);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+}
+
 static void test_reader_attributes(IWMProfile *profile)
 {
-    WORD size, stream_number, ret_stream_number;
+    BYTE *attribute_value;
+    WCHAR *attribute_name;
+    WORD size, stream_number, ret_stream_number, attribute_count, attribute_size, name_len;
+    WORD duration_index = 0xffff;
     IWMHeaderInfo *header_info;
+    IWMHeaderInfo3 *header_info3;
     IWMStreamConfig *config;
     WMT_ATTR_DATATYPE type;
+    BOOL found_duration = FALSE, found_seekable = FALSE;
     ULONG count, i;
     QWORD duration;
     DWORD dword;
     HRESULT hr;
 
     IWMProfile_QueryInterface(profile, &IID_IWMHeaderInfo, (void **)&header_info);
+    IWMProfile_QueryInterface(profile, &IID_IWMHeaderInfo3, (void **)&header_info3);
 
     hr = IWMProfile_GetStreamCount(profile, &count);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
@@ -801,6 +957,102 @@ static void test_reader_attributes(IWMProfile *profile)
     ok(dword == TRUE, "Got duration %I64u.\n", duration);
     ok(stream_number == 0, "Got stream number %u.\n", stream_number);
 
+    hr = IWMHeaderInfo_GetAttributeCount(header_info, 0, &attribute_count);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(attribute_count >= 2, "Got attribute count %u.\n", attribute_count);
+
+    for (i = 0; i < attribute_count; ++i)
+    {
+        stream_number = 0;
+        name_len = 0;
+        attribute_size = 0;
+        type = 0xdeadbeef;
+        hr = IWMHeaderInfo_GetAttributeByIndex(header_info, i, &stream_number,
+                NULL, &name_len, &type, NULL, &attribute_size);
+        ok(hr == S_OK, "Got hr %#lx for index %lu.\n", hr, i);
+        if (hr != S_OK) continue;
+
+        attribute_name = malloc(name_len * sizeof(*attribute_name));
+        attribute_value = malloc(attribute_size ? attribute_size : 1);
+        ok(!!attribute_name && !!attribute_value, "Failed to allocate attribute buffers.\n");
+        if (!attribute_name || !attribute_value)
+        {
+            free(attribute_name);
+            free(attribute_value);
+            continue;
+        }
+
+        hr = IWMHeaderInfo_GetAttributeByIndex(header_info, i, &stream_number,
+                attribute_name, &name_len, &type, attribute_value, &attribute_size);
+        ok(hr == S_OK, "Got hr %#lx for index %lu.\n", hr, i);
+        if (hr != S_OK)
+        {
+            free(attribute_name);
+            free(attribute_value);
+            continue;
+        }
+
+        if (!wcscmp(attribute_name, L"Duration"))
+        {
+            QWORD value;
+
+            ok(type == WMT_TYPE_QWORD, "Got type %#x.\n", type);
+            ok(attribute_size == sizeof(value), "Got size %u.\n", attribute_size);
+            if (attribute_size == sizeof(value))
+            {
+                memcpy(&value, attribute_value, sizeof(value));
+                ok(value == test_wmv_duration, "Got duration %I64u.\n", value);
+            }
+            found_duration = TRUE;
+            duration_index = (WORD)i;
+        }
+        else if (!wcscmp(attribute_name, L"Seekable"))
+        {
+            BOOL value;
+
+            ok(type == WMT_TYPE_BOOL, "Got type %#x.\n", type);
+            ok(attribute_size == sizeof(value), "Got size %u.\n", attribute_size);
+            if (attribute_size == sizeof(value))
+            {
+                memcpy(&value, attribute_value, sizeof(value));
+                ok(value == TRUE, "Got seekable %d.\n", value);
+            }
+            found_seekable = TRUE;
+        }
+        free(attribute_name);
+        free(attribute_value);
+    }
+    ok(found_duration, "Duration was not enumerated.\n");
+    ok(found_seekable, "Seekable was not enumerated.\n");
+
+    hr = IWMHeaderInfo_GetAttributeCount(header_info, 0xffff, &attribute_count);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+
+    if (duration_index != 0xffff)
+    {
+        WCHAR short_name[1];
+
+        stream_number = 0;
+        name_len = ARRAY_SIZE(short_name);
+        attribute_size = sizeof(duration);
+        hr = IWMHeaderInfo_GetAttributeByIndex(header_info, duration_index, &stream_number,
+                short_name, &name_len, &type, (BYTE *)&duration, &attribute_size);
+        ok(hr == ASF_E_BUFFERTOOSMALL, "Got hr %#lx.\n", hr);
+        ok(name_len == ARRAY_SIZE(L"Duration"), "Got name length %u.\n", name_len);
+        ok(attribute_size == sizeof(duration), "Got size %u.\n", attribute_size);
+    }
+
+    hr = IWMHeaderInfo3_GetAttributeCountEx(header_info3, 0, &attribute_count);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(attribute_count >= 2, "Got attribute count %u.\n", attribute_count);
+
+    duration = test_wmv_duration;
+    check_reader_attribute_ex(header_info3, L"Duration", WMT_TYPE_QWORD, &duration, sizeof(duration));
+    dword = TRUE;
+    check_reader_attribute_ex(header_info3, L"Seekable", WMT_TYPE_BOOL, &dword, sizeof(dword));
+    test_reader_attribute_indices(header_info3);
+
+    IWMHeaderInfo3_Release(header_info3);
     IWMHeaderInfo_Release(header_info);
 }
 
