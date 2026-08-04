@@ -138,7 +138,10 @@ static HRESULT WINAPI memory_buffer_QueryInterface(IMFMediaBuffer *iface, REFIID
         return S_OK;
     }
 
-    WARN("Unsupported %s.\n", debugstr_guid(riid));
+    if (IsEqualIID(riid, &IID_IMF2DBuffer2))
+        TRACE("Unsupported %s.\n", debugstr_guid(riid));
+    else
+        WARN("Unsupported %s.\n", debugstr_guid(riid));
     *out = NULL;
     return E_NOINTERFACE;
 }
