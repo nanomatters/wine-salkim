@@ -389,12 +389,10 @@ static int scale_output_coordinate(int offset, int physical_size, int logical_si
     return ((LONGLONG)offset * physical_size + logical_size / 2) / logical_size;
 }
 
-void WAYLAND_MapNotifyIconPoint(POINT *point)
+static BOOL map_logical_notify_icon_point(const POINT *point, POINT *mapped)
 {
     struct output_info *output_info;
-    POINT mapped = *point;
 
-    pthread_mutex_lock(&process_wayland.output_mutex);
     wl_array_for_each(output_info, &process_wayland.output_info_array)
     {
         const struct wayland_output_state *output = output_info->output;
@@ -404,17 +402,78 @@ void WAYLAND_MapNotifyIconPoint(POINT *point)
             point->y < output->logical_y || point->y >= output->logical_y + output->logical_h)
             continue;
 
-        mapped.x = output_info->x + scale_output_coordinate(point->x - output->logical_x,
-                                                             output->current_mode->width,
-                                                             output->logical_w);
-        mapped.y = output_info->y + scale_output_coordinate(point->y - output->logical_y,
-                                                             output->current_mode->height,
-                                                             output->logical_h);
-        break;
+        mapped->x = output_info->x + scale_output_coordinate(point->x - output->logical_x,
+                                                              output->current_mode->width,
+                                                              output->logical_w);
+        mapped->y = output_info->y + scale_output_coordinate(point->y - output->logical_y,
+                                                              output->current_mode->height,
+                                                              output->logical_h);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL map_device_local_notify_icon_point(const POINT *point, POINT *mapped)
+{
+    struct output_info *output_info, *best = NULL;
+    LONGLONG best_distance = 0;
+
+    wl_array_for_each(output_info, &process_wayland.output_info_array)
+    {
+        const struct wayland_output_state *output = output_info->output;
+        LONGLONG local_x, local_y, distance;
+
+        if (!output->current_mode || output->logical_w <= 0 || output->logical_h <= 0)
+            continue;
+
+        local_x = (LONGLONG)point->x - output->logical_x;
+        local_y = (LONGLONG)point->y - output->logical_y;
+        if (local_x < 0 || local_x >= output->current_mode->width ||
+            local_y < 0 || local_y >= output->current_mode->height)
+            continue;
+
+        distance = 0;
+        if (local_x >= output->logical_w) distance += local_x - output->logical_w + 1;
+        if (local_y >= output->logical_h) distance += local_y - output->logical_h + 1;
+        if (best && distance >= best_distance) continue;
+
+        best = output_info;
+        best_distance = distance;
+    }
+
+    if (!best) return FALSE;
+    mapped->x = best->x + point->x - best->output->logical_x;
+    mapped->y = best->y + point->y - best->output->logical_y;
+    return TRUE;
+}
+
+void WAYLAND_MapNotifyIconPoint(POINT *point)
+{
+    static BOOL device_local_coordinates;
+    const char *mapping = NULL;
+    POINT mapped = *point;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    if (device_local_coordinates)
+    {
+        if (map_device_local_notify_icon_point(point, &mapped))
+            mapping = "device-local";
+        else if (map_logical_notify_icon_point(point, &mapped))
+            mapping = "logical-fallback";
+    }
+    else if (map_logical_notify_icon_point(point, &mapped))
+    {
+        mapping = "logical";
+    }
+    else if (map_device_local_notify_icon_point(point, &mapped))
+    {
+        /* The host coordinate convention remains stable across output changes. */
+        device_local_coordinates = TRUE;
+        mapping = "device-local";
     }
     pthread_mutex_unlock(&process_wayland.output_mutex);
 
-    TRACE("logical %d,%d => physical %d,%d\n",
+    TRACE("%s %d,%d => physical %d,%d\n", mapping ? mapping : "unmapped",
           point->x, point->y, mapped.x, mapped.y);
     *point = mapped;
 }
