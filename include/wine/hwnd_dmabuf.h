@@ -1,4 +1,5 @@
-/* Wine-internal HWND dmabuf bridge helpers. */
+/* Wine-internal HWND buffer bridge helpers. The historical channel name also
+ * carries CPU-backed SHM frames. */
 
 #ifndef __WINE_HWND_DMABUF_H
 #define __WINE_HWND_DMABUF_H

@@ -4637,8 +4637,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         struct wine_managed_swapchain *managed = NULL;
         hwnd_dmabuf_host_caps_t probe_caps = {0};
         UINT probe_count = 0;
+        UINT probe_status;
 
-        if (hwnd_dmabuf_get_caps( surface->hwnd, &probe_caps, NULL, 0, &probe_count ) == HWND_DMABUF_OK && probe_count)
+        probe_status = hwnd_dmabuf_get_caps( surface->hwnd, &probe_caps, NULL, 0, &probe_count );
+        if (probe_status == HWND_DMABUF_OK && probe_count)
         {
             /* Use the host-clamped extents so the dmabuf size matches the window. */
             VkSwapchainCreateInfoKHR managed_info = *create_info;
@@ -4667,8 +4669,18 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             TRACE( "managed swapchain build failed (res %d) for hwnd %p, using host swapchain\n",
                    res, surface->hwnd );
         }
+        else
+        {
+            TRACE( "managed dmabuf unavailable for hwnd %p (status %u, formats %u), using host swapchain\n",
+                   surface->hwnd, probe_status, probe_count );
+        }
     }
-
+    else
+    {
+        TRACE( "managed dmabuf unavailable for hwnd %p (modifier %u, external memory %u), using host swapchain\n",
+               surface->hwnd, device->extensions.has_VK_EXT_image_drm_format_modifier,
+               device->extensions.has_VK_EXT_external_memory_dma_buf );
+    }
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
     {

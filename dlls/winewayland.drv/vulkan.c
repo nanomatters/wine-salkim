@@ -356,7 +356,10 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
     if (!caps || !format_modifier_count || (max_format_modifiers && !format_modifiers))
         return HWND_DMABUF_INVALID_ARGS;
     if (!process_wayland.zwp_linux_dmabuf_v1)
+    {
+        TRACE("hwnd %p has no linux-dmabuf transport\n", hwnd);
         return HWND_DMABUF_NOT_FOUND;
+    }
 
     /* Most local top-levels should present directly through Vulkan WSI. If the
      * top-level's client content cannot be represented as a rectangular Wayland

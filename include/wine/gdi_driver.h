@@ -392,6 +392,9 @@ struct gdi_device_manager
 #define WINE_SWP_RESIZABLE  0x40000000
 #define WINE_SWP_TRAY_MENU  0x20000000
 
+/* CPU transports for GDI targeting a window owned by another process. */
+#define WINE_GDI_FOREIGN_SURFACE_SHM 0x00000001
+
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;
 
@@ -466,7 +469,7 @@ struct user_driver_funcs
     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
-    BOOL    (*pUseForeignGdiBridge)(void);
+    UINT    (*pGetForeignGdiSurfaceCaps)(void);
     /* system parameters */
     BOOL    (*pSystemParametersInfo)(UINT,UINT,void*,UINT);
     /* wintab support */

@@ -37,9 +37,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 char *process_name = NULL;
 static char *process_activate_token;
 
-static BOOL WAYLAND_UseForeignGdiBridge(void)
+static UINT WAYLAND_GetForeignGdiSurfaceCaps(void)
 {
-    return TRUE;
+    return process_wayland.wl_shm ? WINE_GDI_FOREIGN_SURFACE_SHM : 0;
 }
 
 static const struct user_driver_funcs waylanddrv_funcs =
@@ -68,7 +68,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
     .pWindowPosChanged = WAYLAND_WindowPosChanged,
     .pWindowPosChanging = WAYLAND_WindowPosChanging,
     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
-    .pUseForeignGdiBridge = WAYLAND_UseForeignGdiBridge,
+    .pGetForeignGdiSurfaceCaps = WAYLAND_GetForeignGdiSurfaceCaps,
     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
     .pGetWindowStateUpdates = WAYLAND_GetWindowStateUpdates,
     .pGetWindowMaxTrackSize = WAYLAND_GetWindowMaxTrackSize,

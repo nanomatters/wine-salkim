@@ -68,9 +68,10 @@ struct foreign_gdi_slot
     HANDLE section;
     void *bits;
     int fd;
+    RECT damage;
     UINT64 release_token;
     unsigned int image_id;
-    BOOL busy;
+    BOOL busy, initialized, has_damage;
 };
 
 struct foreign_gdi_surface
@@ -273,18 +274,57 @@ static struct foreign_gdi_slot *foreign_gdi_surface_get_free_slot( struct foreig
     return NULL;
 }
 
+static void foreign_gdi_slot_add_damage( struct foreign_gdi_slot *slot, const RECT *damage )
+{
+    /* Stable slots may lag behind while the consumer owns them. */
+    if (!slot->initialized) return;
+    if (!slot->has_damage)
+    {
+        slot->damage = *damage;
+        slot->has_damage = TRUE;
+        return;
+    }
+
+    slot->damage.left = min( slot->damage.left, damage->left );
+    slot->damage.top = min( slot->damage.top, damage->top );
+    slot->damage.right = max( slot->damage.right, damage->right );
+    slot->damage.bottom = max( slot->damage.bottom, damage->bottom );
+}
+
+static void foreign_gdi_surface_add_damage( struct foreign_gdi_surface *surface, const RECT *dirty )
+{
+    RECT bounds = {0, 0, surface->width, surface->height}, damage;
+    unsigned int i;
+
+    if (!intersect_rect( &damage, dirty, &bounds )) return;
+    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
+        foreign_gdi_slot_add_damage( &surface->slots[i], &damage );
+}
+
 static void foreign_gdi_copy_frame( struct foreign_gdi_surface *surface, struct foreign_gdi_slot *slot,
-                                    const BITMAPINFO *color_info, const void *color_bits )
+                                    const BITMAPINFO *color_info, const void *color_bits,
+                                    const RECT *damage )
 {
     int height = abs( color_info->bmiHeader.biHeight );
-    int src_stride = color_info->bmiHeader.biSizeImage / max( 1, height );
-    int copy_stride = min( src_stride, surface->stride );
+    int width = abs( color_info->bmiHeader.biWidth );
+    int src_stride, left, right, top, bottom;
     const char *src = color_bits;
     char *dst = slot->bits;
-    int y, rows = min( height, surface->height );
+    int y;
 
-    for (y = 0; y < rows; y++)
-        memcpy( dst + y * surface->stride, src + y * src_stride, copy_stride );
+    if (!height || !width) return;
+    src_stride = color_info->bmiHeader.biSizeImage / height;
+    if (src_stride <= 0) return;
+
+    left = max( 0, damage->left );
+    top = max( 0, damage->top );
+    right = min( min( min( surface->width, width ), src_stride / 4 ), damage->right );
+    bottom = min( min( surface->height, height ), damage->bottom );
+    if (left >= right || top >= bottom) return;
+
+    for (y = top; y < bottom; y++)
+        memcpy( dst + y * surface->stride + left * 4,
+                src + y * src_stride + left * 4, (right - left) * 4 );
 }
 
 static UINT64 foreign_gdi_surface_next_release_token( struct foreign_gdi_surface *surface )
@@ -322,6 +362,7 @@ static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, co
 
     if (surface->lost) return TRUE;
     if (!foreign_gdi_surface_ensure_slots( surface )) return FALSE;
+    foreign_gdi_surface_add_damage( surface, dirty );
     if (!foreign_gdi_surface_ensure_channel( surface )) return TRUE;
     if (!(slot = foreign_gdi_surface_get_free_slot( surface )))
     {
@@ -330,7 +371,17 @@ static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, co
         return FALSE;
     }
 
-    foreign_gdi_copy_frame( surface, slot, color_info, color_bits );
+    if (!slot->initialized)
+    {
+        RECT full = {0, 0, surface->width, surface->height};
+        foreign_gdi_copy_frame( surface, slot, color_info, color_bits, &full );
+    }
+    else if (slot->has_damage)
+    {
+        foreign_gdi_copy_frame( surface, slot, color_info, color_bits, &slot->damage );
+    }
+    slot->initialized = TRUE;
+    slot->has_damage = FALSE;
 
     memset( &desc, 0, sizeof(desc) );
     desc.version = HWND_DMABUF_DESC_VERSION_V1;
@@ -441,7 +492,7 @@ static struct foreign_gdi_surface *foreign_gdi_surface_create( HWND hwnd, int wi
     for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
         surface->slots[i].fd = -1;
 
-    TRACE( "foreign_gdi hwnd=%p created producer surface %p size=%dx%d\n",
+    TRACE( "foreign_gdi hwnd=%p using cpu-shm surface %p size=%dx%d\n",
            hwnd, surface, width, height );
     return surface;
 }
@@ -1601,7 +1652,7 @@ static void update_visible_region( struct dce *dce )
         RECT window_rect, toplevel_rect;
         UINT dpi;
 
-        if (foreign && user_driver->pUseForeignGdiBridge())
+        if (foreign && (user_driver->pGetForeignGdiSurfaceCaps() & WINE_GDI_FOREIGN_SURFACE_SHM))
             foreign_surface = foreign_gdi_surface_get( dce->hwnd, &win_rect );
 
         if (foreign_surface)

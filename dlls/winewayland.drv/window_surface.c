@@ -56,9 +56,10 @@ struct wayland_gdi_overlay_slot
     HANDLE section;
     void *bits;
     int fd;
+    RECT damage;
     UINT64 release_token;
     unsigned int image_id;
-    BOOL busy;
+    BOOL busy, initialized, has_damage;
 };
 
 struct wayland_gdi_overlay_producer
@@ -400,6 +401,54 @@ static BOOL wayland_gdi_overlay_master_copy_region(struct wayland_gdi_overlay_pr
     return copied;
 }
 
+static void wayland_gdi_overlay_slot_add_damage(struct wayland_gdi_overlay_slot *slot,
+                                                const RECT *damage)
+{
+    /* Stable slots may lag behind while the consumer owns them. */
+    if (!slot->initialized) return;
+    if (!slot->has_damage)
+    {
+        slot->damage = *damage;
+        slot->has_damage = TRUE;
+        return;
+    }
+
+    slot->damage.left = min(slot->damage.left, damage->left);
+    slot->damage.top = min(slot->damage.top, damage->top);
+    slot->damage.right = max(slot->damage.right, damage->right);
+    slot->damage.bottom = max(slot->damage.bottom, damage->bottom);
+}
+
+static void wayland_gdi_overlay_add_slot_damage(struct wayland_gdi_overlay_producer *producer,
+                                                HRGN region)
+{
+    RECT bounds = {0, 0, producer->width, producer->height}, damage;
+    unsigned int i;
+    int type;
+
+    if (!region || (type = NtGdiGetRgnBox(region, &damage)) == ERROR)
+        damage = bounds;
+    else if (type == NULLREGION || !intersect_rect(&damage, &damage, &bounds))
+        return;
+
+    for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
+        wayland_gdi_overlay_slot_add_damage(&producer->slots[i], &damage);
+}
+
+static void wayland_gdi_overlay_copy_slot(struct wayland_gdi_overlay_producer *producer,
+                                          struct wayland_gdi_overlay_slot *slot,
+                                          const RECT *damage)
+{
+    RECT bounds = {0, 0, producer->width, producer->height}, rect;
+    int y;
+
+    if (!intersect_rect(&rect, damage, &bounds)) return;
+    for (y = rect.top; y < rect.bottom; y++)
+        memcpy((char *)slot->bits + (size_t)y * producer->stride + (size_t)rect.left * 4,
+               (char *)producer->master_bits + (size_t)y * producer->stride + (size_t)rect.left * 4,
+               (size_t)(rect.right - rect.left) * 4);
+}
+
 static void wayland_gdi_overlay_master_clear_region(struct wayland_gdi_overlay_producer *producer,
                                                     HRGN region)
 {
@@ -536,15 +585,26 @@ static BOOL wayland_gdi_overlay_publish(HWND hwnd, struct wayland_gdi_overlay_pr
     struct wayland_gdi_overlay_slot *slot;
     int ret;
 
-    if (!wayland_gdi_overlay_ensure_channel(hwnd, producer)) return TRUE;
     if (!producer->slots_created) return FALSE;
+    wayland_gdi_overlay_add_slot_damage(producer, dirty_region);
+    if (!wayland_gdi_overlay_ensure_channel(hwnd, producer)) return TRUE;
     if (!(slot = wayland_gdi_overlay_get_free_slot(hwnd, producer)))
     {
         TRACE("gdi_overlay hwnd=%p no free shm slot\n", hwnd);
         return FALSE;
     }
 
-    memcpy(slot->bits, producer->master_bits, producer->size);
+    if (!slot->initialized)
+    {
+        RECT full = {0, 0, producer->width, producer->height};
+        wayland_gdi_overlay_copy_slot(producer, slot, &full);
+    }
+    else if (slot->has_damage)
+    {
+        wayland_gdi_overlay_copy_slot(producer, slot, &slot->damage);
+    }
+    slot->initialized = TRUE;
+    slot->has_damage = FALSE;
 
     memset(&desc, 0, sizeof(desc));
     desc.version = HWND_DMABUF_DESC_VERSION_V1;
