@@ -130,6 +130,7 @@ struct wayland_gl_drawable
 {
     struct opengl_drawable base;
     struct wl_egl_window *wl_egl_window;
+    BOOL swap_interval_initialized;
 };
 
 static struct wayland_gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
@@ -236,13 +237,16 @@ static void wayland_gl_frame_done(void *data, struct wl_callback *wl_callback, u
 {
     struct client_surface *client = data;
     struct wayland_client_surface *surface = impl_from_client_surface(client);
+    BOOL current;
 
-    if (surface->wl_callback != wl_callback) return;
+    current = InterlockedCompareExchangePointer((void **)&surface->wl_callback, NULL,
+                                                wl_callback) == wl_callback;
+    if (!current) return;
+    wl_callback_destroy(wl_callback);
 
     TRACE("\n");
 
     if (surface->throttle) NtSetEvent(surface->throttle, NULL);
-    surface->wl_callback = NULL;
 }
 
 static const struct wl_callback_listener gl_throttle_listener =
@@ -252,16 +256,21 @@ static const struct wl_callback_listener gl_throttle_listener =
 
 static BOOL wayland_drawable_swap(struct opengl_drawable *base)
 {
-    static int once;
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
     struct wayland_client_surface *surface = impl_from_client_surface(base->client);
+    struct wl_callback *callback;
 
     client_surface_present(base->client);
-    /* ensure that swap interval is zero before swapping */
-    if (!InterlockedCompareExchange(&once, 1, 0)) funcs->p_eglSwapInterval(egl->display, 0);
+    if (!gl->swap_interval_initialized)
+    {
+        if (funcs->p_eglSwapInterval(egl->display, 0))
+            gl->swap_interval_initialized = TRUE;
+        else
+            WARN("Failed to disable the EGL swap interval.\n");
+    }
+
     if (abs(base->interval))
     {
-        /* 1 second, relative */
         const LARGE_INTEGER timeout = { .QuadPart = -10000 * 1000 };
         NTSTATUS status;
 
@@ -270,12 +279,15 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
             status = NtWaitForSingleObject(surface->throttle, FALSE, &timeout);
             if (status == STATUS_TIMEOUT) WARN("Present timed out!\n");
         }
-       /* Currently, EGL is implemented using frame callbacks, so replicate that here.
-        * although it would be better to use fifo + commit timing
-        * (that way swap interval > 1 can be implemented),
-        * that's not something easily done from the wine side. */
-        surface->wl_callback = wl_surface_frame(surface->wl_surface);
-        wl_callback_add_listener(surface->wl_callback, &gl_throttle_listener, base->client);
+
+        /* wp_fifo with commit timing could support intervals greater than one. */
+        if (!ReadPointerAcquire((void * const volatile *)&surface->wl_callback))
+        {
+            if (surface->throttle) NtResetEvent(surface->throttle, NULL);
+            callback = wl_surface_frame(surface->wl_surface);
+            wl_callback_add_listener(callback, &gl_throttle_listener, base->client);
+            InterlockedExchangePointer((void **)&surface->wl_callback, callback);
+        }
     }
     funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
 

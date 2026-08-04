@@ -5473,6 +5473,7 @@ static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *sur
 static void wayland_client_surface_destroy(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wl_callback *callback;
     struct wayland_win_data *data;
 
     TRACE("%s\n", debugstr_client_surface(client));
@@ -5488,8 +5489,8 @@ static void wayland_client_surface_destroy(struct client_surface *client)
         }
     }
 
-    if (surface->wl_callback)
-        wl_callback_destroy(surface->wl_callback);
+    if ((callback = InterlockedExchangePointer((void **)&surface->wl_callback, NULL)))
+        wl_callback_destroy(callback);
     if (surface->throttle)
         NtClose(surface->throttle);
     if (surface->wp_color_management_surface_v1)
