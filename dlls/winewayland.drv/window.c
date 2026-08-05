@@ -517,7 +517,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     surface->ensured_contents = WAYLAND_SURFACE_NOT_ENSURED;
 
-    if (!data->is_fullscreen &&
+    if (!wayland_win_data_is_fullscreen(data, style) &&
         !EqualRect(&data->rects.visible, &data->rects.window)
         && !data->frameless
         && is_decoration_enabled(style, exstyle))
