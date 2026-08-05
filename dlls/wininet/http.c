@@ -61,6 +61,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(wininet);
 #define HTTP_ADDHDR_FLAG_REQ				0x02000000
 
 #define COLLECT_TIME 60000
+#define CONN_LIMIT_STALL_TIMEOUT 5000
 
 struct HttpAuthInfo
 {
@@ -131,8 +132,66 @@ static CRITICAL_SECTION_DEBUG connection_pool_debug =
       0, 0, { (DWORD_PTR)(__FILE__ ": connection_pool_cs") }
 };
 static CRITICAL_SECTION connection_pool_cs = { &connection_pool_debug, -1, 0, 0, 0, 0 };
+static CONDITION_VARIABLE connection_pool_cv = CONDITION_VARIABLE_INIT;
 
 static struct list connection_pool = LIST_INIT(connection_pool);
+static ULONG max_connections = 2;
+
+ULONG HTTP_GetMaxConnections(void)
+{
+    ULONG ret;
+
+    EnterCriticalSection(&connection_pool_cs);
+    ret = max_connections;
+    LeaveCriticalSection(&connection_pool_cs);
+
+    return ret;
+}
+
+void HTTP_SetMaxConnections(ULONG value)
+{
+    server_t *server;
+
+    EnterCriticalSection(&connection_pool_cs);
+    max_connections = value;
+    LIST_FOR_EACH_ENTRY(server, &connection_pool, server_t, entry)
+        server->conn_limit_bypass_until = 0;
+    LeaveCriticalSection(&connection_pool_cs);
+    WakeAllConditionVariable(&connection_pool_cv);
+}
+
+static void release_server_slot(server_t *server)
+{
+    EnterCriticalSection(&connection_pool_cs);
+    if(server->conn_count)
+        server->conn_count--;
+    else
+        ERR("connection count underflow for %s\n", debugstr_w(server->name));
+    server->conn_limit_bypass_until = 0;
+    LeaveCriticalSection(&connection_pool_cs);
+    WakeAllConditionVariable(&connection_pool_cv);
+}
+
+void release_netconn_slot(netconn_t *netconn)
+{
+    BOOL wake = FALSE;
+
+    EnterCriticalSection(&connection_pool_cs);
+    if(netconn->slot_reserved) {
+        if(netconn->origin->conn_count)
+            netconn->origin->conn_count--;
+        else
+            ERR("connection count underflow for %s\n", debugstr_w(netconn->origin->name));
+        netconn->origin->conn_limit_bypass_until = 0;
+        netconn->slot_reserved = FALSE;
+        wake = TRUE;
+    }
+    LeaveCriticalSection(&connection_pool_cs);
+
+    if(wake)
+        WakeAllConditionVariable(&connection_pool_cv);
+}
+
 static BOOL collector_running;
 
 void server_addref(server_t *server)
@@ -216,7 +275,7 @@ server_t *get_server(substr_t name, INTERNET_PORT port, BOOL is_https, BOOL do_c
     return server;
 }
 
-BOOL collect_connections(collect_type_t collect_type)
+static BOOL collect_connections_locked(collect_type_t collect_type)
 {
     netconn_t *netconn, *netconn_safe;
     server_t *server, *server_safe;
@@ -224,7 +283,6 @@ BOOL collect_connections(collect_type_t collect_type)
     DWORD64 now;
 
     now = GetTickCount64();
-
     LIST_FOR_EACH_ENTRY_SAFE(server, server_safe, &connection_pool, server_t, entry) {
         LIST_FOR_EACH_ENTRY_SAFE(netconn, netconn_safe, &server->conn_pool, netconn_t, pool_entry) {
             if(collect_type > COLLECT_TIMEOUT || netconn->keep_until < now) {
@@ -246,6 +304,16 @@ BOOL collect_connections(collect_type_t collect_type)
     return remaining;
 }
 
+BOOL collect_connections(collect_type_t collect_type)
+{
+    BOOL ret;
+
+    EnterCriticalSection(&connection_pool_cs);
+    ret = collect_connections_locked(collect_type);
+    LeaveCriticalSection(&connection_pool_cs);
+    return ret;
+}
+
 static DWORD WINAPI collect_connections_proc(void *arg)
 {
     BOOL remaining_conns;
@@ -256,11 +324,9 @@ static DWORD WINAPI collect_connections_proc(void *arg)
         Sleep(5000);
 
         EnterCriticalSection(&connection_pool_cs);
-
-        remaining_conns = collect_connections(COLLECT_TIMEOUT);
+        remaining_conns = collect_connections_locked(COLLECT_TIMEOUT);
         if(!remaining_conns)
             collector_running = FALSE;
-
         LeaveCriticalSection(&connection_pool_cs);
     }while(remaining_conns);
 
@@ -1842,6 +1908,10 @@ static void HTTPREQ_Destroy(object_header_t *hdr)
 
     destroy_authinfo(request->authInfo);
     destroy_authinfo(request->proxyAuthInfo);
+    destroy_data_stream(request->data_stream);
+
+    if(request->netconn)
+        free_netconn(request->netconn);
 
     if(request->server)
         server_release(request->server);
@@ -1858,7 +1928,6 @@ static void HTTPREQ_Destroy(object_header_t *hdr)
         free(request->custHeaders[i].lpszField);
         free(request->custHeaders[i].lpszValue);
     }
-    destroy_data_stream(request->data_stream);
     free(request->custHeaders);
 }
 
@@ -1866,22 +1935,28 @@ static void http_release_netconn(http_request_t *req, BOOL reuse)
 {
     TRACE("%p %p %x\n",req, req->netconn, reuse);
 
-    if(!is_valid_netconn(req->netconn))
+    if(!req->netconn)
         return;
+    if(!is_valid_netconn(req->netconn)) {
+        release_netconn_slot(req->netconn);
+        return;
+    }
 
     if(reuse && req->netconn->keep_alive) {
         BOOL run_collector;
 
         EnterCriticalSection(&connection_pool_cs);
 
-        list_add_head(&req->netconn->server->conn_pool, &req->netconn->pool_entry);
+        list_add_head(&req->netconn->origin->conn_pool, &req->netconn->pool_entry);
         req->netconn->keep_until = GetTickCount64() + COLLECT_TIME;
+        req->netconn->origin->conn_limit_bypass_until = 0;
         req->netconn = NULL;
 
         run_collector = !collector_running;
         collector_running = TRUE;
 
         LeaveCriticalSection(&connection_pool_cs);
+        WakeAllConditionVariable(&connection_pool_cv);
 
         if(run_collector) {
             HANDLE thread = NULL;
@@ -1908,6 +1983,7 @@ static void http_release_netconn(http_request_t *req, BOOL reuse)
                           INTERNET_STATUS_CLOSING_CONNECTION, 0, 0);
 
     close_netconn(req->netconn);
+    release_netconn_slot(req->netconn);
 
     INTERNET_SendCallback(&req->hdr, req->hdr.dwContext,
                           INTERNET_STATUS_CONNECTION_CLOSED, 0, 0);
@@ -4886,13 +4962,14 @@ static void http_process_keep_alive(http_request_t *req)
 
 static DWORD open_http_connection(http_request_t *request, BOOL *reusing)
 {
-    server_t *server;
-    netconn_t *netconn = NULL;
+    server_t *endpoint = request->proxy ? request->proxy : request->server;
+    netconn_t *netconn = NULL, *iter, *iter_safe;
     DWORD res;
 
     if (request->netconn)
     {
-        if (NETCON_is_alive(request->netconn) && drain_content(request, TRUE) == ERROR_SUCCESS)
+        if (request->netconn->origin == request->server && request->netconn->endpoint == endpoint
+                && NETCON_is_alive(request->netconn) && drain_content(request, TRUE) == ERROR_SUCCESS)
         {
             reset_data_stream(request);
             *reusing = TRUE;
@@ -4912,16 +4989,46 @@ static DWORD open_http_connection(http_request_t *request, BOOL *reusing)
 
     EnterCriticalSection(&connection_pool_cs);
 
-    while(!list_empty(&request->server->conn_pool)) {
-        netconn = LIST_ENTRY(list_head(&request->server->conn_pool), netconn_t, pool_entry);
-        list_remove(&netconn->pool_entry);
+    for(;;) {
+        DWORD64 now = GetTickCount64();
 
-        if(is_valid_netconn(netconn) && NETCON_is_alive(netconn))
+        LIST_FOR_EACH_ENTRY_SAFE(iter, iter_safe, &request->server->conn_pool, netconn_t, pool_entry) {
+            if(iter->endpoint != endpoint)
+                continue;
+
+            list_remove(&iter->pool_entry);
+
+            if(is_valid_netconn(iter) && NETCON_is_alive(iter)) {
+                netconn = iter;
+                break;
+            }
+
+            TRACE("connection %p closed during idle\n", iter);
+            free_netconn(iter);
+        }
+        if(netconn)
             break;
 
-        TRACE("connection %p closed during idle\n", netconn);
-        free_netconn(netconn);
-        netconn = NULL;
+        if(request->server->conn_count < max_connections || now < request->server->conn_limit_bypass_until) {
+            request->server->conn_count++;
+            break;
+        }
+
+        TRACE("connection limit reached for %s, waiting\n", debugstr_w(request->server->name));
+        if(!SleepConditionVariableCS(&connection_pool_cv, &connection_pool_cs, CONN_LIMIT_STALL_TIMEOUT)) {
+            res = GetLastError();
+            if(res == ERROR_TIMEOUT) {
+                now = GetTickCount64();
+                /* A stalled origin must not block unrelated requests indefinitely. */
+                request->server->conn_limit_bypass_until = now + CONN_LIMIT_STALL_TIMEOUT;
+                WARN("connection limit stalled for %s, temporarily bypassing it\n",
+                     debugstr_w(request->server->name));
+                WakeAllConditionVariable(&connection_pool_cv);
+                continue;
+            }
+            LeaveCriticalSection(&connection_pool_cs);
+            return res;
+        }
     }
 
     LeaveCriticalSection(&connection_pool_cs);
@@ -4935,13 +5042,14 @@ static DWORD open_http_connection(http_request_t *request, BOOL *reusing)
 
     TRACE("connecting to %s, proxy %s\n", debugstr_w(request->server->name),
           request->proxy ? debugstr_w(request->proxy->name) : "(null)");
-    server = request->proxy ? request->proxy : request->server;
-    assert(server->addr);
-    res = create_netconn(server, &request->hdr, request->hdr.dwContext, request->security_flags,
+    assert(endpoint->addr);
+    res = create_netconn(endpoint, request->server, &request->hdr, request->hdr.dwContext,
+                         request->security_flags,
                          (request->hdr.ErrorMask & INTERNET_ERROR_MASK_COMBINED_SEC_CERT) != 0,
                          request->hdr.connect_timeout, &netconn);
     if(res != ERROR_SUCCESS) {
         ERR("create_netconn failed: %lu\n", res);
+        release_server_slot(request->server);
         return res;
     }
 
@@ -5137,9 +5245,9 @@ static DWORD HTTP_HttpSendRequestW(http_request_t *request, LPCWSTR lpszHeaders,
         free(ascii_req);
         if(res != ERROR_SUCCESS) {
             TRACE("send failed: %lu\n", res);
+            http_release_netconn(request, FALSE);
             if(!reusing_connection)
                 break;
-            http_release_netconn(request, FALSE);
             loop_next = TRUE;
             continue;
         }

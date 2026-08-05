@@ -304,8 +304,8 @@ static DWORD create_netconn_socket(server_t *server, object_header_t *hdr, DWORD
     return ERROR_SUCCESS;
 }
 
-DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD_PTR callback_context, DWORD security_flags,
-                     BOOL mask_errors, DWORD timeout, netconn_t **ret)
+DWORD create_netconn(server_t *server, server_t *origin, object_header_t *hdr, DWORD_PTR callback_context,
+                     DWORD security_flags, BOOL mask_errors, DWORD timeout, netconn_t **ret)
 {
     netconn_t *netconn;
     int result;
@@ -328,6 +328,11 @@ DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD_PTR callback_
 
     server_addref(server);
     netconn->server = server;
+    server_addref(server);
+    netconn->endpoint = server;
+    server_addref(origin);
+    netconn->origin = origin;
+    netconn->slot_reserved = TRUE;
     *ret = netconn;
     return result;
 }
@@ -345,6 +350,9 @@ void close_netconn(netconn_t *netconn)
 
 void free_netconn(netconn_t *netconn)
 {
+    release_netconn_slot(netconn);
+    server_release(netconn->origin);
+    server_release(netconn->endpoint);
     server_release(netconn->server);
 
     if (netconn->secure) {

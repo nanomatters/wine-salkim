@@ -55,6 +55,8 @@ typedef struct {
 
     struct list entry;
     struct list conn_pool;
+    ULONG conn_count;
+    DWORD64 conn_limit_bypass_until;
 } server_t;
 
 void server_addref(server_t*);
@@ -75,7 +77,10 @@ typedef struct
     BOOL is_blocking;
     CtxtHandle ssl_ctx;
     SecPkgContext_StreamSizes ssl_sizes;
-    server_t *server;
+    server_t *server;   /* current protocol identity */
+    server_t *endpoint; /* physical peer */
+    server_t *origin;   /* pool and quota owner */
+    BOOL slot_reserved;
     char *ssl_buf;
     char *extra_buf;
     size_t extra_len;
@@ -92,6 +97,10 @@ typedef struct
 
 BOOL is_valid_netconn(netconn_t *);
 void close_netconn(netconn_t *);
+void release_netconn_slot(netconn_t *);
+
+ULONG HTTP_GetMaxConnections(void);
+void HTTP_SetMaxConnections(ULONG);
 
 static inline WCHAR *strndupW(const WCHAR *str, UINT max_len)
 {
@@ -401,7 +410,7 @@ VOID INTERNET_SendCallback(object_header_t *hdr, DWORD_PTR dwContext,
                            DWORD dwStatusInfoLength);
 WCHAR *INTERNET_FindProxyForProtocol(LPCWSTR szProxy, LPCWSTR proto);
 
-DWORD create_netconn(server_t*,object_header_t*,DWORD_PTR,DWORD,BOOL,DWORD,netconn_t**);
+DWORD create_netconn(server_t*,server_t*,object_header_t*,DWORD_PTR,DWORD,BOOL,DWORD,netconn_t**);
 void free_netconn(netconn_t*);
 void NETCON_unload(void);
 DWORD NETCON_secure_connect(netconn_t*,server_t*);

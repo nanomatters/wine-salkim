@@ -104,7 +104,7 @@ typedef struct {
     /* DWORD unk[8]; set to 0 */
 } connection_settings;
 
-static ULONG max_conns = 2, max_1_0_conns = 4;
+static ULONG max_1_0_conns = 4;
 static ULONG connect_timeout = 60000;
 static ULONG send_timeout = 60000;
 static ULONG receive_timeout = 60000;
@@ -2963,7 +2963,7 @@ static DWORD query_global_option(DWORD option, void *buffer, DWORD *size, BOOL u
         if (*size < sizeof(ULONG))
             return ERROR_INSUFFICIENT_BUFFER;
 
-        *(ULONG*)buffer = max_conns;
+        *(ULONG*)buffer = HTTP_GetMaxConnections();
         *size = sizeof(ULONG);
 
         return ERROR_SUCCESS;
@@ -3344,12 +3344,12 @@ static DWORD set_global_option(DWORD option, void *buf, DWORD size)
     case INTERNET_OPTION_MAX_CONNS_PER_SERVER:
         TRACE("INTERNET_OPTION_MAX_CONNS_PER_SERVER\n");
 
-        if(size != sizeof(max_conns))
+        if(size != sizeof(ULONG))
             return ERROR_INTERNET_BAD_OPTION_LENGTH;
         if(!*(ULONG*)buf)
             return ERROR_BAD_ARGUMENTS;
 
-        max_conns = *(ULONG*)buf;
+        HTTP_SetMaxConnections(*(ULONG*)buf);
         return ERROR_SUCCESS;
 
     case INTERNET_OPTION_MAX_CONNS_PER_1_0_SERVER:

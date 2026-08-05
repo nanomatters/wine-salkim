@@ -2906,6 +2906,293 @@ static DWORD CALLBACK server_thread(LPVOID param)
     return 0;
 }
 
+#define CONN_LIMIT_REQUEST_COUNT 5
+
+struct conn_limit_server
+{
+    HANDLE ready_event;
+    HANDLE accepted_event;
+    SOCKET clients[CONN_LIMIT_REQUEST_COUNT];
+    LONG accepted_count;
+    LONG release_count;
+    LONG stop;
+    int port;
+    int error;
+};
+
+struct conn_limit_request
+{
+    HINTERNET connection;
+    HINTERNET request;
+    BOOL result;
+    DWORD error;
+};
+
+static DWORD CALLBACK conn_limit_server_thread(void *param)
+{
+    static const char response[] = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    struct conn_limit_server *server = param;
+    struct sockaddr_in addr = {0};
+    int addr_len = sizeof(addr), responded = 0;
+    SOCKET listener = INVALID_SOCKET;
+    WSADATA wsa_data;
+    u_long nonblocking = 1;
+
+    if((server->error = WSAStartup(MAKEWORD(1, 1), &wsa_data)))
+    {
+        SetEvent(server->ready_event);
+        return 1;
+    }
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if(listener == INVALID_SOCKET)
+        goto failed;
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+    if(bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR ||
+       listen(listener, SOMAXCONN) == SOCKET_ERROR ||
+       getsockname(listener, (struct sockaddr *)&addr, &addr_len) == SOCKET_ERROR ||
+       ioctlsocket(listener, FIONBIO, &nonblocking) == SOCKET_ERROR)
+        goto failed;
+
+    server->port = ntohs(addr.sin_port);
+    SetEvent(server->ready_event);
+
+    while(!InterlockedCompareExchange(&server->stop, 0, 0))
+    {
+        LONG accepted = InterlockedCompareExchange(&server->accepted_count, 0, 0);
+        LONG release = InterlockedCompareExchange(&server->release_count, 0, 0);
+
+        while(responded < accepted && responded < release)
+        {
+            send(server->clients[responded], response, sizeof(response) - 1, 0);
+            shutdown(server->clients[responded], SD_BOTH);
+            closesocket(server->clients[responded]);
+            server->clients[responded++] = INVALID_SOCKET;
+        }
+
+        if(accepted < CONN_LIMIT_REQUEST_COUNT)
+        {
+            fd_set read_set;
+            struct timeval timeout = {0, 20000};
+            SOCKET client;
+
+            FD_ZERO(&read_set);
+            FD_SET(listener, &read_set);
+            if(select(0, &read_set, NULL, NULL, &timeout) > 0 &&
+               (client = accept(listener, NULL, NULL)) != INVALID_SOCKET)
+            {
+                char request[1024];
+                int offset = 0, ret;
+
+                while(offset < (int)sizeof(request) - 1 &&
+                      (ret = recv(client, request + offset, sizeof(request) - 1 - offset, 0)) > 0)
+                {
+                    offset += ret;
+                    request[offset] = 0;
+                    if(strstr(request, "\r\n\r\n"))
+                        break;
+                }
+
+                server->clients[accepted] = client;
+                InterlockedIncrement(&server->accepted_count);
+                SetEvent(server->accepted_event);
+            }
+        }
+        else
+            Sleep(20);
+    }
+
+    for(; responded < InterlockedCompareExchange(&server->accepted_count, 0, 0); responded++)
+    {
+        shutdown(server->clients[responded], SD_BOTH);
+        closesocket(server->clients[responded]);
+    }
+    closesocket(listener);
+    WSACleanup();
+    return 0;
+
+failed:
+    server->error = WSAGetLastError();
+    SetEvent(server->ready_event);
+    if(listener != INVALID_SOCKET)
+        closesocket(listener);
+    WSACleanup();
+    return 1;
+}
+
+static DWORD CALLBACK conn_limit_request_thread(void *param)
+{
+    struct conn_limit_request *request = param;
+
+    SetLastError(0xdeadbeef);
+    request->result = HttpSendRequestA(request->request, NULL, 0, NULL, 0);
+    request->error = GetLastError();
+    return 0;
+}
+
+static BOOL wait_for_accepted_connections(struct conn_limit_server *server, LONG count, DWORD timeout)
+{
+    DWORD start = GetTickCount();
+
+    while(InterlockedCompareExchange(&server->accepted_count, 0, 0) < count)
+    {
+        DWORD elapsed = GetTickCount() - start;
+
+        if(elapsed >= timeout || WaitForSingleObject(server->accepted_event, timeout - elapsed) != WAIT_OBJECT_0)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static void test_max_connections(void)
+{
+    struct conn_limit_request requests[CONN_LIMIT_REQUEST_COUNT] = {0};
+    struct conn_limit_server server = {0};
+    HANDLE server_thread = NULL, threads[CONN_LIMIT_REQUEST_COUNT] = {0};
+    DWORD old_max, size = sizeof(old_max), ret;
+    BOOL have_old_max = FALSE;
+    HINTERNET session = NULL;
+    ULONG max;
+    int i;
+
+    for(i = 0; i < ARRAY_SIZE(server.clients); i++)
+        server.clients[i] = INVALID_SOCKET;
+    server.ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    server.accepted_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(server.ready_event != NULL && server.accepted_event != NULL, "failed to create server events\n");
+    if(!server.ready_event || !server.accepted_event)
+        goto done;
+    server_thread = CreateThread(NULL, 0, conn_limit_server_thread, &server, 0, NULL);
+    ok(server_thread != NULL, "failed to create server thread\n");
+    if(!server_thread)
+        goto done;
+    ret = WaitForSingleObject(server.ready_event, 5000);
+    ok(ret == WAIT_OBJECT_0 && !server.error, "failed to start server: %d\n", server.error);
+    if(ret != WAIT_OBJECT_0 || server.error)
+        goto done;
+
+    ret = InternetQueryOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &old_max, &size);
+    ok(ret, "failed to query connection limit: %lu\n", GetLastError());
+    have_old_max = ret;
+    if(!ret)
+        goto done;
+
+    session = InternetOpenA("winetest", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    ok(session != NULL, "InternetOpenA failed: %lu\n", GetLastError());
+    if(!session)
+        goto done;
+
+    for(i = 0; i < ARRAY_SIZE(requests); i++)
+    {
+        requests[i].connection = InternetConnectA(session, "127.0.0.1", server.port, NULL, NULL,
+                                                   INTERNET_SERVICE_HTTP, 0, 0);
+        ok(requests[i].connection != NULL, "InternetConnectA failed: %lu\n", GetLastError());
+        if(!requests[i].connection)
+            goto done;
+        requests[i].request = HttpOpenRequestA(requests[i].connection, "GET", "/", NULL, NULL, NULL,
+                                               INTERNET_FLAG_NO_CACHE_WRITE, 0);
+        ok(requests[i].request != NULL, "HttpOpenRequestA failed: %lu\n", GetLastError());
+        if(!requests[i].request)
+            goto done;
+    }
+
+    max = 2;
+    ret = InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &max, sizeof(max));
+    ok(ret, "failed to set connection limit: %lu\n", GetLastError());
+    if(!ret)
+        goto done;
+    for(i = 0; i < 3; i++)
+    {
+        threads[i] = CreateThread(NULL, 0, conn_limit_request_thread, &requests[i], 0, NULL);
+        ok(threads[i] != NULL, "failed to create request thread\n");
+        if(!threads[i])
+            goto done;
+    }
+
+    ok(wait_for_accepted_connections(&server, 2, 5000), "expected two connections, got %ld\n",
+       InterlockedCompareExchange(&server.accepted_count, 0, 0));
+    ResetEvent(server.accepted_event);
+    ret = WaitForSingleObject(server.accepted_event, 300);
+    ok(ret == WAIT_TIMEOUT && InterlockedCompareExchange(&server.accepted_count, 0, 0) == 2,
+       "connection limit was not enforced, got %ld connections\n",
+       InterlockedCompareExchange(&server.accepted_count, 0, 0));
+
+    max = 3;
+    ret = InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &max, sizeof(max));
+    ok(ret, "failed to raise connection limit: %lu\n", GetLastError());
+    if(!ret)
+        goto done;
+    ok(wait_for_accepted_connections(&server, 3, 5000), "limit change did not wake a request\n");
+    InterlockedExchange(&server.release_count, 3);
+    ret = WaitForMultipleObjects(3, threads, TRUE, 5000);
+    ok(ret == WAIT_OBJECT_0, "requests did not complete: %#lx\n", ret);
+
+    max = 1;
+    ret = InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &max, sizeof(max));
+    ok(ret, "failed to lower connection limit: %lu\n", GetLastError());
+    if(!ret)
+        goto done;
+    threads[3] = CreateThread(NULL, 0, conn_limit_request_thread, &requests[3], 0, NULL);
+    ok(threads[3] != NULL, "failed to create request thread\n");
+    if(!threads[3])
+        goto done;
+    ok(wait_for_accepted_connections(&server, 4, 5000), "expected the fourth connection\n");
+    threads[4] = CreateThread(NULL, 0, conn_limit_request_thread, &requests[4], 0, NULL);
+    ok(threads[4] != NULL, "failed to create request thread\n");
+    if(!threads[4])
+        goto done;
+    ResetEvent(server.accepted_event);
+    ret = WaitForSingleObject(server.accepted_event, 300);
+    ok(ret == WAIT_TIMEOUT && InterlockedCompareExchange(&server.accepted_count, 0, 0) == 4,
+       "lowered connection limit was not enforced\n");
+
+    InterlockedExchange(&server.release_count, 4);
+    ret = WaitForSingleObject(threads[3], 5000);
+    ok(ret == WAIT_OBJECT_0, "fourth request did not complete: %#lx\n", ret);
+    ok(wait_for_accepted_connections(&server, 5, 5000), "closing a connection did not release its slot\n");
+    InterlockedExchange(&server.release_count, 5);
+    ret = WaitForSingleObject(threads[4], 5000);
+    ok(ret == WAIT_OBJECT_0, "fifth request did not complete: %#lx\n", ret);
+
+    for(i = 0; i < ARRAY_SIZE(requests); i++)
+        ok(requests[i].result, "request %d failed: %lu\n", i, requests[i].error);
+
+done:
+    if(have_old_max)
+    {
+        max = 32;
+        InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &max, sizeof(max));
+    }
+    InterlockedExchange(&server.release_count, CONN_LIMIT_REQUEST_COUNT);
+    for(i = 0; i < ARRAY_SIZE(threads); i++)
+    {
+        if(threads[i])
+        {
+            WaitForSingleObject(threads[i], 5000);
+            CloseHandle(threads[i]);
+        }
+        if(requests[i].request)
+            InternetCloseHandle(requests[i].request);
+        if(requests[i].connection)
+            InternetCloseHandle(requests[i].connection);
+    }
+    if(session)
+        InternetCloseHandle(session);
+    if(have_old_max)
+        InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &old_max, sizeof(old_max));
+    InterlockedExchange(&server.stop, TRUE);
+    if(server_thread)
+    {
+        WaitForSingleObject(server_thread, 5000);
+        CloseHandle(server_thread);
+    }
+    if(server.ready_event)
+        CloseHandle(server.ready_event);
+    if(server.accepted_event)
+        CloseHandle(server.accepted_event);
+}
+
 static void test_basic_request(int port, const char *verb, const char *url)
 {
     test_request_t req;
@@ -8647,6 +8934,7 @@ START_TEST(http)
     InternetOpenUrlA_test();
     HttpHeaders_test();
     test_http_connection();
+    test_max_connections();
     test_user_agent_header();
     test_bogus_accept_types_array();
     InternetReadFile_chunked_test();
