@@ -1599,7 +1599,8 @@ static HRESULT start_binding(IMoniker *mon, Binding *binding_ctx, IUri *uri, IBi
     while(!(binding->bindf & BINDF_ASYNCHRONOUS) &&
           !(binding->state & BINDING_STOPPED)) {
         MsgWaitForMultipleObjects(0, NULL, FALSE, 5000, QS_POSTMESSAGE);
-        while (PeekMessageW(&msg, binding->notif_hwnd, WM_USER, WM_USER+117, PM_REMOVE|PM_NOYIELD)) {
+        while (PeekMessageW(&msg, NULL, WM_USER, WM_WINE_FIRST_DRIVER_MSG - 1,
+                            PM_REMOVE|PM_NOYIELD)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
