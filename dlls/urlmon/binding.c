@@ -19,6 +19,7 @@
 #include "urlmon_main.h"
 #include "winreg.h"
 #include "shlwapi.h"
+#include "ntuser.h"
 
 #include "wine/debug.h"
 
@@ -1601,6 +1602,10 @@ static HRESULT start_binding(IMoniker *mon, Binding *binding_ctx, IUri *uri, IBi
         while (PeekMessageW(&msg, binding->notif_hwnd, WM_USER, WM_USER+117, PM_REMOVE|PM_NOYIELD)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        while (PeekMessageW(&msg, NULL, WM_WINE_FIRST_DRIVER_MSG, WM_WINE_LAST_DRIVER_MSG,
+                            PM_REMOVE|PM_NOYIELD)) {
+            DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
         }
     }
 
