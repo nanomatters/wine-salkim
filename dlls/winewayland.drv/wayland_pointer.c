@@ -1002,29 +1002,12 @@ static void wayland_surface_calc_confine(struct wayland_surface *surface,
     *confine = map_rect_to_surface(surface, window_clip);
 }
 
-/**********************************************************************
- *          wayland_surface_client_covers_vscreen
- *
- * Whether a surface window client area covers the whole virtual screen.
- */
-static BOOL wayland_surface_client_covers_vscreen(struct wayland_surface *surface)
+static BOOL wayland_clip_covers_vscreen(const RECT *clip)
 {
-    RECT vscreen_rect, rect;
+    RECT vscreen = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
 
-    /* Get individual system metrics to get coords in thread dpi
-     * (NtUserGetVirtualScreenRect would return values in system dpi). */
-    vscreen_rect.left = NtUserGetSystemMetrics(SM_XVIRTUALSCREEN);
-    vscreen_rect.top = NtUserGetSystemMetrics(SM_YVIRTUALSCREEN);
-    vscreen_rect.right = vscreen_rect.left +
-                         NtUserGetSystemMetrics(SM_CXVIRTUALSCREEN);
-    vscreen_rect.bottom = vscreen_rect.top +
-                          NtUserGetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-    /* FIXME: surface->window.client_rect is in window dpi, whereas
-     * vscreen_rect is in thread dpi. */
-    intersect_rect(&rect, &surface->window.client_rect, &vscreen_rect);
-
-    return EqualRect(&vscreen_rect, &rect);
+    return clip->left <= vscreen.left && clip->top <= vscreen.top &&
+           clip->right >= vscreen.right && clip->bottom >= vscreen.bottom;
 }
 
 /***********************************************************************
@@ -1044,7 +1027,7 @@ static BOOL wayland_pointer_needs_lock(struct wayland_pointer *pointer,
 }
 
 static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
-                                              RECT *confine_rect,
+                                              const RECT *confine_rect,
                                               BOOL covers_vscreen,
                                               BOOL force_lock)
 {
@@ -1209,7 +1192,8 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     struct wayland_surface *surface = NULL;
     struct wayland_win_data *data;
     BOOL commit_position_hint = FALSE, covers_vscreen = FALSE;
-    RECT confine_rect;
+    const RECT *confine_rect = NULL;
+    RECT surface_clip;
     POINT cursor_pos, warp;
 
     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
@@ -1226,8 +1210,13 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     if ((surface = data->wayland_surface))
     {
         wl_surface = surface->wl_surface;
-        if (clip) wayland_surface_calc_confine(surface, clip, &confine_rect);
-        covers_vscreen = wayland_surface_client_covers_vscreen(surface);
+        if (clip && !wayland_clip_covers_vscreen(clip))
+        {
+            wayland_surface_calc_confine(surface, clip, &surface_clip);
+            confine_rect = &surface_clip;
+        }
+        covers_vscreen = wayland_win_data_is_fullscreen(data) &&
+                          wayland_win_data_covers_virtual_screen(data);
         warp.x = cursor_pos.x - surface->window.rect.left;
         warp.y = cursor_pos.y - surface->window.rect.top;
         warp = map_point_to_surface(surface, warp);
@@ -1264,7 +1253,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
                 wl_fixed_from_int(warp.y));
         commit_position_hint =
                 !wayland_pointer_needs_lock(pointer, wl_surface,
-                                            (clip && wl_surface) ? &confine_rect : NULL,
+                                            confine_rect,
                                             covers_vscreen, FALSE);
     }
     pthread_mutex_unlock(&pointer->mutex);
@@ -1290,10 +1279,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     /* Since we are running in the context of the foreground thread we know
     * that the wl_surface of the foreground HWND will not be invalidated,
     * so we can access it without having the win data lock. */
-    wayland_pointer_update_constraint(wl_surface,
-                                      (clip && wl_surface) ? &confine_rect : NULL,
-                                      covers_vscreen,
-                                      FALSE);
+    wayland_pointer_update_constraint(wl_surface, confine_rect, covers_vscreen, FALSE);
     pthread_mutex_unlock(&pointer->mutex);
 
     wl_display_flush(process_wayland.wl_display);

@@ -881,6 +881,8 @@ void wayland_win_data_lock(void);
 void wayland_win_data_unlock(void);
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
+BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data);
+BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);

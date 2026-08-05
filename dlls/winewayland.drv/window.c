@@ -261,9 +261,10 @@ static void wayland_win_data_update_restore_rect(struct wayland_win_data *data,
     data->restore_rect_valid = TRUE;
 }
 
-static BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data,
-                                           DWORD style)
+BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
 {
+    DWORD style = data->style;
+
     if (!data->is_fullscreen) return FALSE;
     if (!(style & WS_POPUP) &&
         (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
@@ -274,12 +275,20 @@ static BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data,
     return (style & WS_POPUP) && !(style & WS_MAXIMIZE);
 }
 
+BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
+{
+    RECT intersection, virtual_screen = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
+
+    intersect_rect(&intersection, &data->rects.client, &virtual_screen);
+    return EqualRect(&intersection, &virtual_screen);
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
     enum wayland_surface_config_state window_state = 0;
     DWORD style = data->style, exstyle = data->exstyle;
-    BOOL fullscreen = wayland_win_data_is_fullscreen(data, style);
+    BOOL fullscreen = wayland_win_data_is_fullscreen(data);
 
     conf->minimized = style & WS_MINIMIZE;
     /* The Win32 iconic rect is not compositor geometry. */
@@ -517,7 +526,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     surface->ensured_contents = WAYLAND_SURFACE_NOT_ENSURED;
 
-    if (!wayland_win_data_is_fullscreen(data, style) &&
+    if (!wayland_win_data_is_fullscreen(data) &&
         !EqualRect(&data->rects.visible, &data->rects.window)
         && !data->frameless
         && is_decoration_enabled(style, exstyle))
