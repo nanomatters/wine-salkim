@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 #define COBJMACROS
+#include <limits.h>
 #include <stdarg.h>
 
 #include "windef.h"
@@ -493,6 +494,157 @@ done:
     ok( ref == 1, "got ref %ld.\n", ref );
 }
 
+static ICalendar *activate_calendar( IActivationFactory *factory )
+{
+    IInspectable *inspectable;
+    ICalendar *calendar = NULL;
+    HRESULT hr;
+
+    hr = IActivationFactory_ActivateInstance( factory, &inspectable );
+    ok( hr == S_OK, "ActivateInstance failed, hr %#lx.\n", hr );
+    if (FAILED(hr)) return NULL;
+
+    hr = IInspectable_QueryInterface( inspectable, &IID_ICalendar, (void **)&calendar );
+    ok( hr == S_OK, "QueryInterface(ICalendar) failed, hr %#lx.\n", hr );
+    IInspectable_Release( inspectable );
+    return calendar;
+}
+
+static void test_Calendar(void)
+{
+    static const WCHAR arabic_12W[] = {0x0661, 0x0662, 0};
+    ITimeZoneOnCalendar *source_timezone = NULL;
+    IActivationFactory *factory = NULL;
+    ICalendar *source = NULL, *destination = NULL;
+    DateTime source_time, destination_time, before;
+    HSTRING class_name = NULL, string = NULL;
+    const WCHAR *value;
+    INT32 year;
+    HRESULT hr;
+
+    hr = WindowsCreateString( RuntimeClass_Windows_Globalization_Calendar,
+                              wcslen(RuntimeClass_Windows_Globalization_Calendar), &class_name );
+    ok( hr == S_OK, "WindowsCreateString failed, hr %#lx.\n", hr );
+    hr = RoGetActivationFactory( class_name, &IID_IActivationFactory, (void **)&factory );
+    ok( hr == S_OK || broken( hr == REGDB_E_CLASSNOTREG ), "got hr %#lx.\n", hr );
+    WindowsDeleteString( class_name );
+    if (FAILED(hr))
+    {
+        win_skip( "Calendar runtimeclass not found.\n" );
+        return;
+    }
+
+    check_interface( factory, &IID_ICalendarFactory );
+    check_interface( factory, &IID_ICalendarFactory2 );
+    source = activate_calendar( factory );
+    destination = activate_calendar( factory );
+    if (!source || !destination) goto done;
+
+    check_interface( source, &IID_ITimeZoneOnCalendar );
+    hr = ICalendar_QueryInterface( source, &IID_ITimeZoneOnCalendar, (void **)&source_timezone );
+    ok( hr == S_OK, "QueryInterface(ITimeZoneOnCalendar) failed, hr %#lx.\n", hr );
+
+    hr = WindowsCreateString( L"America/Los_Angeles", 19, &string );
+    ok( hr == S_OK, "WindowsCreateString failed, hr %#lx.\n", hr );
+    hr = ITimeZoneOnCalendar_ChangeTimeZone( source_timezone, string );
+    ok( hr == S_OK, "ChangeTimeZone failed, hr %#lx.\n", hr );
+    WindowsDeleteString( string );
+    string = NULL;
+
+    hr = ITimeZoneOnCalendar_GetTimeZone( source_timezone, &string );
+    ok( hr == S_OK, "GetTimeZone failed, hr %#lx.\n", hr );
+    value = WindowsGetStringRawBuffer( string, NULL );
+    ok( !wcscmp( value, L"America/Los_Angeles" ), "got time zone %s.\n", wine_dbgstr_w(value) );
+    WindowsDeleteString( string );
+    string = NULL;
+
+    hr = ICalendar_SetToMin( source );
+    ok( hr == S_OK, "SetToMin failed, hr %#lx.\n", hr );
+    hr = ICalendar_get_Year( source, &year );
+    ok( hr == S_OK && year == 1, "got hr %#lx, year %d.\n", hr, year );
+    hr = ICalendar_GetDateTime( source, &source_time );
+    ok( hr == S_OK && source_time.UniversalTime < 0,
+        "got hr %#lx, time %I64d.\n", hr, source_time.UniversalTime );
+    hr = ICalendar_SetDateTime( source, source_time );
+    ok( hr == S_OK, "SetDateTime failed, hr %#lx.\n", hr );
+
+    hr = ICalendar_put_Day( source, 12 );
+    ok( hr == S_OK, "put_Day failed, hr %#lx.\n", hr );
+    hr = WindowsCreateString( L"Arab", 4, &string );
+    ok( hr == S_OK, "WindowsCreateString failed, hr %#lx.\n", hr );
+    hr = ICalendar_put_NumeralSystem( source, string );
+    ok( hr == S_OK, "put_NumeralSystem failed, hr %#lx.\n", hr );
+    WindowsDeleteString( string );
+    string = NULL;
+    hr = ICalendar_DayAsString( source, &string );
+    ok( hr == S_OK, "DayAsString failed, hr %#lx.\n", hr );
+    value = WindowsGetStringRawBuffer( string, NULL );
+    ok( !wcscmp( value, arabic_12W ), "got day %s.\n", wine_dbgstr_w(value) );
+    WindowsDeleteString( string );
+    string = NULL;
+
+    hr = WindowsCreateString( L"Unsupported", 11, &string );
+    ok( hr == S_OK, "WindowsCreateString failed, hr %#lx.\n", hr );
+    hr = ICalendar_put_NumeralSystem( source, string );
+    ok( FAILED(hr), "unsupported numeral system was accepted.\n" );
+    WindowsDeleteString( string );
+    string = NULL;
+
+    hr = ICalendar_SetToNow( destination );
+    ok( hr == S_OK, "SetToNow failed, hr %#lx.\n", hr );
+    hr = ICalendar_GetDateTime( source, &source_time );
+    ok( hr == S_OK, "GetDateTime failed, hr %#lx.\n", hr );
+    hr = ICalendar_CopyTo( destination, source );
+    ok( hr == S_OK, "CopyTo failed, hr %#lx.\n", hr );
+    hr = ICalendar_GetDateTime( destination, &destination_time );
+    ok( hr == S_OK && destination_time.UniversalTime == source_time.UniversalTime,
+        "got hr %#lx, time %I64d, expected %I64d.\n", hr, destination_time.UniversalTime,
+        source_time.UniversalTime );
+    hr = ICalendar_get_NumeralSystem( destination, &string );
+    ok( hr == S_OK, "get_NumeralSystem failed, hr %#lx.\n", hr );
+    value = WindowsGetStringRawBuffer( string, NULL );
+    ok( !wcscmp( value, L"Arab" ), "got numeral system %s.\n", wine_dbgstr_w(value) );
+    WindowsDeleteString( string );
+    string = NULL;
+
+    before = destination_time;
+    hr = ICalendar_AddDays( destination, INT_MAX );
+    ok( FAILED(hr), "AddDays unexpectedly succeeded.\n" );
+    hr = ICalendar_GetDateTime( destination, &destination_time );
+    ok( hr == S_OK && destination_time.UniversalTime == before.UniversalTime,
+        "got hr %#lx, time changed to %I64d.\n", hr, destination_time.UniversalTime );
+    hr = ICalendar_AddEras( destination, 1 );
+    ok( FAILED(hr), "AddEras unexpectedly succeeded.\n" );
+    hr = ICalendar_YearAsTruncatedString( destination, 0, &string );
+    ok( FAILED(hr), "YearAsTruncatedString unexpectedly succeeded.\n" );
+
+    hr = WindowsCreateString( L"Latn", 4, &string );
+    ok( hr == S_OK, "WindowsCreateString failed, hr %#lx.\n", hr );
+    hr = ICalendar_put_NumeralSystem( destination, string );
+    ok( hr == S_OK, "put_NumeralSystem failed, hr %#lx.\n", hr );
+    WindowsDeleteString( string );
+    string = NULL;
+    hr = ICalendar_put_Year( destination, 2002 );
+    ok( hr == S_OK, "put_Year failed, hr %#lx.\n", hr );
+    hr = ICalendar_YearAsTruncatedString( destination, 2, &string );
+    ok( hr == S_OK, "YearAsTruncatedString failed, hr %#lx.\n", hr );
+    value = WindowsGetStringRawBuffer( string, NULL );
+    ok( !wcscmp( value, L"02" ), "got year %s.\n", wine_dbgstr_w(value) );
+    WindowsDeleteString( string );
+    string = NULL;
+    hr = ICalendar_YearAsTruncatedString( destination, 6, &string );
+    ok( hr == S_OK, "YearAsTruncatedString failed, hr %#lx.\n", hr );
+    value = WindowsGetStringRawBuffer( string, NULL );
+    ok( !wcscmp( value, L"2002" ), "got year %s.\n", wine_dbgstr_w(value) );
+
+done:
+    WindowsDeleteString( string );
+    if (source_timezone) ITimeZoneOnCalendar_Release( source_timezone );
+    if (destination) ICalendar_Release( destination );
+    if (source) ICalendar_Release( source );
+    if (factory) IActivationFactory_Release( factory );
+}
+
 START_TEST(globalization)
 {
     HMODULE kernel32;
@@ -508,6 +660,7 @@ START_TEST(globalization)
     test_Language();
     test_GeographicRegion();
     test_ApplicationLanguages();
+    test_Calendar();
 
     RoUninitialize();
 }
