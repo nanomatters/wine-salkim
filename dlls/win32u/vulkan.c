@@ -314,8 +314,9 @@ static const char *debugstr_vkextent2d( const VkExtent2D *ext )
 #define WINE_VK_DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
 #define WINE_VK_MANAGED_MAX_IMAGES     8
 #define WINE_VK_MANAGED_MAX_MODIFIERS  64
-/* Recreate after this long with no drained release. Stays above the consumer
- * dmabuf grace window so a briefly paused but alive consumer is not falsely lost. */
+#define WINE_VK_MANAGED_REANNOUNCE_MIN_MS  100
+#define WINE_VK_MANAGED_REANNOUNCE_MAX_MS  4000
+/* Allow brief pauses beyond the consumer's dmabuf grace period. */
 #define WINE_VK_MANAGED_STALL_MS       2000
 
 static pthread_mutex_t nvidia_wayland_instance_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -326,6 +327,28 @@ static pthread_mutex_t nvidia_wayland_instance_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list delayed_nvidia_wayland_host_instances = LIST_INIT( delayed_nvidia_wayland_host_instances );
 static unsigned int nvidia_wayland_instance_count;
 static LONGLONG managed_next_producer_id;
+
+enum wine_managed_consumer_state
+{
+    WINE_MANAGED_CONSUMER_UNKNOWN,
+    WINE_MANAGED_CONSUMER_ACTIVE,
+    WINE_MANAGED_CONSUMER_SUSPENDED,
+};
+
+/* The server reuses one channel while swapchains overlap during recreation. */
+struct wine_managed_consumer
+{
+    struct list entry;
+    HWND hwnd;
+    unsigned int refcount;
+    LONG state;
+    LONG reannounce_pending;
+    LONG last_reannounce_ms;
+    LONG reannounce_delay_ms;
+};
+
+static pthread_mutex_t managed_consumers_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list managed_consumers = LIST_INIT( managed_consumers );
 
 struct wine_managed_image
 {
@@ -358,16 +381,16 @@ struct wine_managed_swapchain
     /* ring / publish state */
     uint32_t next_acquire;
     UINT64 next_release_token;
-    UINT64 pending_release_token;   /* one-frame-deferred release */
     UINT64 present_id;              /* monotonic frame_seq counter */
     UINT64 producer_unique_id;      /* unique across managed swapchain recreates */
     unsigned int ring_generation;
-    DWORD last_progress_ms;         /* NtGetTickCount of the last drained release (liveness clock) */
+    DWORD ring_full_since_ms;
 
     struct vulkan_queue *signal_queue; /* queue used for empty acquire-signal submits */
     int channel_fd;                 /* producer end of the per-hwnd socket or -1 */
     pthread_mutex_t lock;
     BOOL lost;                      /* consumer channel died, force swapchain recreate */
+    struct wine_managed_consumer *consumer;
     VkFence present_fence;          /* per-frame render-complete fence (export gate) */
     PFN_vkWaitForFences p_vkWaitForFences;
     PFN_vkResetFences p_vkResetFences;
@@ -3660,6 +3683,83 @@ static BOOL managed_image_completion_ready( struct wine_managed_image *image )
     return TRUE;
 }
 
+static struct wine_managed_consumer *managed_consumer_get( HWND hwnd )
+{
+    struct wine_managed_consumer *consumer;
+
+    pthread_mutex_lock( &managed_consumers_lock );
+    LIST_FOR_EACH_ENTRY( consumer, &managed_consumers, struct wine_managed_consumer, entry )
+    {
+        if (consumer->hwnd != hwnd) continue;
+        consumer->refcount++;
+        pthread_mutex_unlock( &managed_consumers_lock );
+        return consumer;
+    }
+
+    if ((consumer = calloc( 1, sizeof(*consumer) )))
+    {
+        consumer->hwnd = hwnd;
+        consumer->refcount = 1;
+        list_add_tail( &managed_consumers, &consumer->entry );
+    }
+    pthread_mutex_unlock( &managed_consumers_lock );
+    return consumer;
+}
+
+static void managed_consumer_put( struct wine_managed_consumer *consumer )
+{
+    if (!consumer) return;
+
+    pthread_mutex_lock( &managed_consumers_lock );
+    if (!--consumer->refcount)
+    {
+        list_remove( &consumer->entry );
+        free( consumer );
+    }
+    pthread_mutex_unlock( &managed_consumers_lock );
+}
+
+static enum wine_managed_consumer_state managed_consumer_state( struct wine_managed_swapchain *managed )
+{
+    return ReadAcquire( &managed->consumer->state );
+}
+
+static void managed_consumer_set_state( struct wine_managed_swapchain *managed,
+                                        enum wine_managed_consumer_state state )
+{
+    InterlockedExchange( &managed->consumer->state, state );
+    InterlockedExchange( &managed->consumer->reannounce_pending, FALSE );
+    InterlockedExchange( &managed->consumer->reannounce_delay_ms, 0 );
+}
+
+static void managed_consumer_request_state( struct wine_managed_swapchain *managed )
+{
+    struct wine_managed_consumer *consumer = managed->consumer;
+    LONG delay, last, now = NtGetTickCount();
+
+    if (managed_consumer_state( managed ) != WINE_MANAGED_CONSUMER_UNKNOWN) return;
+    if (!InterlockedExchange( &consumer->reannounce_pending, TRUE ))
+    {
+        InterlockedExchange( &consumer->last_reannounce_ms, now );
+        InterlockedExchange( &consumer->reannounce_delay_ms,
+                             WINE_VK_MANAGED_REANNOUNCE_MIN_MS );
+        hwnd_dmabuf_post_wake( managed->hwnd, HWND_DMABUF_WAKE_REANNOUNCE );
+        return;
+    }
+
+    delay = ReadAcquire( &consumer->reannounce_delay_ms );
+    if (delay < WINE_VK_MANAGED_REANNOUNCE_MIN_MS)
+        delay = WINE_VK_MANAGED_REANNOUNCE_MIN_MS;
+    last = ReadAcquire( &consumer->last_reannounce_ms );
+    if ((DWORD)(now - last) < delay) return;
+    if (InterlockedCompareExchange( &consumer->last_reannounce_ms, now, last ) == last)
+    {
+        delay = min( delay * 2, WINE_VK_MANAGED_REANNOUNCE_MAX_MS );
+        InterlockedExchange( &consumer->reannounce_delay_ms, delay );
+        hwnd_dmabuf_post_wake( managed->hwnd, HWND_DMABUF_WAKE_REANNOUNCE );
+    }
+}
+
 static void managed_destroy_image( struct vulkan_device *device, struct wine_managed_image *image )
 {
     managed_wait_image_completion( image );
@@ -3685,6 +3785,7 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
         hwnd_dmabuf_release_channel( managed->hwnd );
     if (managed->pending_registered)
         hwnd_dmabuf_set_pending( managed->hwnd, FALSE );
+    managed_consumer_put( managed->consumer );
     pthread_mutex_destroy( &managed->lock );
     free( managed );
 }
@@ -3916,6 +4017,13 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     pthread_mutex_init( &managed->lock, NULL );
     managed->channel_fd = -1;
     managed->hwnd = surface->hwnd;
+    if (!(managed->consumer = managed_consumer_get( managed->hwnd )))
+    {
+        managed_free( device, managed );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (!(caps_flags & HWND_DMABUF_HOST_CAP_CONSUMER_STATE))
+        managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
     managed->format = create_info->imageFormat;
     managed->fourcc = fourcc;
     managed->has_color_space =
@@ -3942,7 +4050,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     }
     managed->pending_registered = TRUE;
 
-    /* At least 3 images for fire-and-forget publishing (no FIFO pacing). */
+    /* Keep enough images available for asynchronous consumer release. */
     count = max( create_info->minImageCount, 3u );
     if (count > WINE_VK_MANAGED_MAX_IMAGES) count = WINE_VK_MANAGED_MAX_IMAGES;
 
@@ -3986,7 +4094,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     }
     managed->channel_registered = TRUE;
     managed->pending_registered = FALSE;
-    managed->last_progress_ms = NtGetTickCount();
+    managed_consumer_request_state( managed );
     TRACE( "managed swapchain %p hwnd %p socket channel fd %d\n", managed, surface->hwnd, managed->channel_fd );
 
     *out = managed;
@@ -3996,10 +4104,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     return VK_SUCCESS;
 }
 
-/* Signal the app's binary acquire semaphore and/or fence via an empty submit on
- * a host queue. There is no host swapchain to do it for us. A binary semaphore
- * is re-signaled only after the consuming present waited on it (deferred release
- * plus WaitIdle leaves it unsignaled). This is always valid. */
+/* A managed swapchain has no host acquire operation to signal these objects. */
 static VkResult managed_signal_acquire( struct vulkan_device *device, struct wine_managed_swapchain *managed,
                                         VkSemaphore host_semaphore, VkFence host_fence )
 {
@@ -4024,15 +4129,17 @@ static VkResult managed_signal_acquire( struct vulkan_device *device, struct win
 static void managed_drain_releases( struct wine_managed_swapchain *managed );
 static void managed_mark_lost( struct wine_managed_swapchain *managed );
 
-/* Find a free slot for AcquireNextImage. managed_present paces the ring so one is normally free. */
+/* Window changes may call into this thread; return VK_NOT_READY instead of waiting. */
 static VkResult managed_acquire( struct vulkan_device *device, struct swapchain *swapchain,
-                                 VkSemaphore host_semaphore, VkFence host_fence, uint32_t *image_index )
+                                 VkSemaphore host_semaphore, VkFence host_fence,
+                                 uint32_t *image_index )
 {
     struct wine_managed_swapchain *managed = swapchain->managed;
     struct surface *surface = swapchain->surface;
-    uint32_t i, slot = ~0u;
     RECT client_rect;
     VkResult res = VK_SUCCESS;
+    BOOL busy_any = FALSE, valid_any = FALSE, waiting_gpu = FALSE;
+    uint32_t i, slot = ~0u;
 
     pthread_mutex_lock( &managed->lock );
     managed_drain_releases( managed );
@@ -4041,33 +4148,59 @@ static VkResult managed_acquire( struct vulkan_device *device, struct swapchain 
         pthread_mutex_unlock( &managed->lock );
         return VK_ERROR_OUT_OF_DATE_KHR;
     }
+
     for (i = 0; i < managed->image_count; i++)
     {
         uint32_t idx = (managed->next_acquire + i) % managed->image_count;
         struct wine_managed_image *image = &managed->images[idx];
-        if (image->valid && !image->acquired && !image->busy &&
-            managed_image_completion_ready( image ))
+
+        if (!image->valid) continue;
+        valid_any = TRUE;
+        if (image->busy)
+        {
+            busy_any = TRUE;
+            if (!managed_image_completion_ready( image )) waiting_gpu = TRUE;
+            continue;
+        }
+        if (image->acquired)
+            continue;
+        if (managed_image_completion_ready( image ))
         {
             slot = idx;
             break;
         }
-    }
-    if (slot == ~0u)
-    {
-        /* Ring full: the consumer is not releasing. If it has made no progress for
-         * the stall window it is wedged (alive but not draining). Force recreate
-         * rather than spin on VK_NOT_READY forever. */
-        VkResult ret = VK_NOT_READY;
-        if ((DWORD)(NtGetTickCount() - managed->last_progress_ms) >= WINE_VK_MANAGED_STALL_MS)
-        {
-            WARN( "managed dmabuf channel stalled, forcing recreate\n" );
-            managed_mark_lost( managed );
-            ret = VK_ERROR_OUT_OF_DATE_KHR;
-        }
-        pthread_mutex_unlock( &managed->lock );
-        return ret;
+        waiting_gpu = TRUE;
     }
 
+    if (slot == ~0u)
+    {
+        if (!valid_any)
+            res = VK_ERROR_OUT_OF_DATE_KHR;
+        else
+        {
+            res = VK_NOT_READY;
+            if (busy_any && !waiting_gpu)
+            {
+                DWORD now = NtGetTickCount();
+
+                if (!managed->ring_full_since_ms)
+                    managed->ring_full_since_ms = now;
+                else if ((DWORD)(now - managed->ring_full_since_ms) >=
+                         WINE_VK_MANAGED_STALL_MS)
+                {
+                    WARN( "managed dmabuf consumer stopped releasing frames\n" );
+                    managed_mark_lost( managed );
+                    res = VK_ERROR_OUT_OF_DATE_KHR;
+                }
+            }
+            else
+                managed->ring_full_since_ms = 0;
+        }
+        pthread_mutex_unlock( &managed->lock );
+        return res;
+    }
+
+    managed->ring_full_since_ms = 0;
     managed->images[slot].acquired = TRUE;
     managed->next_acquire = (slot + 1) % managed->image_count;
     *image_index = slot;
@@ -4102,6 +4235,7 @@ static void managed_release_token( struct wine_managed_swapchain *managed, UINT6
         image->busy = FALSE;
         image->release_token = 0;
         if (failed) image->valid = FALSE;
+        managed->ring_full_since_ms = 0;
         return;
     }
 }
@@ -4111,13 +4245,8 @@ static void managed_mark_lost( struct wine_managed_swapchain *managed )
 {
     uint32_t i;
 
-    if (managed->channel_fd >= 0)
-    {
-        close( managed->channel_fd );
-        managed->channel_fd = -1;
-    }
     managed->lost = TRUE;
-    managed->pending_release_token = 0;
+    managed->ring_full_since_ms = 0;
     for (i = 0; i < managed->image_count; i++)
     {
         managed->images[i].busy = FALSE;
@@ -4135,6 +4264,7 @@ static BOOL dmabuf_send_error_is_fatal( int err )
 static void managed_drain_releases( struct wine_managed_swapchain *managed )
 {
     hwnd_dmabuf_release_t rel;
+    BOOL received = FALSE;
     ssize_t ret;
 
     if (managed->channel_fd < 0) return;
@@ -4145,7 +4275,27 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
         {
             struct wine_managed_image *image;
 
+            received = TRUE;
+            /* Zero-token records update the channel's consumer state. */
+            if (!rel.release_token)
+            {
+                if (rel.flags & HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED)
+                {
+                    TRACE( "hwnd %p consumer suspended\n", managed->hwnd );
+                    managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_SUSPENDED );
+                }
+                else if (rel.flags & HWND_DMABUF_RELEASE_CONSUMER_ACTIVE)
+                {
+                    TRACE( "hwnd %p consumer active\n", managed->hwnd );
+                    managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
+                }
+                continue;
+            }
+
             if (rel.producer_unique_id != managed->producer_unique_id) continue;
+            /* A release must not resume a suspended consumer. */
+            if (managed_consumer_state( managed ) == WINE_MANAGED_CONSUMER_UNKNOWN)
+                managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
             if (rel.ring_generation != managed->ring_generation) continue;
             if (rel.image_id >= managed->image_count) continue;
 
@@ -4156,10 +4306,16 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
             image->busy = FALSE;
             image->release_token = 0;
             image->consumer_cached = !!(rel.flags & HWND_DMABUF_RELEASE_CACHED);
-            managed->last_progress_ms = NtGetTickCount();
+            managed->ring_full_since_ms = 0;
         }
         else if (ret < 0 && errno == EINTR) continue;
         else break;
+    }
+
+    if (received && managed_consumer_state( managed ) == WINE_MANAGED_CONSUMER_UNKNOWN)
+    {
+        InterlockedExchange( &managed->consumer->reannounce_pending, FALSE );
+        InterlockedExchange( &managed->consumer->reannounce_delay_ms, 0 );
     }
 
     if (ret == 0 || (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
@@ -4176,9 +4332,10 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     struct surface *surface = swapchain->surface;
     struct wine_managed_image *image;
     hwnd_dmabuf_frame_desc_t desc;
-    UINT64 release_token;
+    UINT64 release_token = 0;
     int channel_fd_dup = -1, send_sync_fd = -1;
-    BOOL had_channel, send_fd = FALSE;
+    enum wine_managed_consumer_state consumer_state;
+    BOOL send_frame = FALSE, send_fd = FALSE;
     RECT client_rect;
     VkResult res = VK_SUCCESS;
 
@@ -4227,8 +4384,10 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
         return res;
     }
 
-    had_channel = managed->channel_fd >= 0;
-    send_fd = had_channel && !image->consumer_cached;
+    /* Unsent frames remain producer-owned and need no release token. */
+    consumer_state = managed_consumer_state( managed );
+    send_frame = consumer_state == WINE_MANAGED_CONSUMER_ACTIVE && managed->channel_fd >= 0;
+    send_fd = send_frame && !image->consumer_cached;
     if (send_fd && (channel_fd_dup = dup( image->dmabuf_fd )) < 0)
     {
         image->completion_fd = sync_fd;
@@ -4238,38 +4397,42 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
         if (!present_waits_consumed) vulkan_device_unlock_queues( device );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (sync_fd >= 0 && had_channel && (send_sync_fd = dup( sync_fd )) < 0)
+    if (send_frame && sync_fd >= 0 && (send_sync_fd = dup( sync_fd )) < 0)
     {
         if (channel_fd_dup >= 0) close( channel_fd_dup );
         image->completion_fd = sync_fd;
         image->acquired = FALSE;
+        sync_fd = -1;
         pthread_mutex_unlock( &managed->lock );
         if (!present_waits_consumed) vulkan_device_unlock_queues( device );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
-    /* Assign a fresh release token (never 0: consumer rejects token 0). */
-    release_token = ++managed->next_release_token;
-    if (!release_token) release_token = ++managed->next_release_token;
-    image->release_token = release_token;
+    managed->present_id++;
+    if (send_frame)
+    {
+        /* Assign a fresh release token (never 0: consumer rejects token 0). */
+        release_token = ++managed->next_release_token;
+        if (!release_token) release_token = ++managed->next_release_token;
+        image->release_token = release_token;
 
-    desc = image->desc;
-    desc.producer_unique_id = managed->producer_unique_id;
-    desc.image_id = image_index;
-    desc.ring_generation = managed->ring_generation;
-    desc.frame_seq = (unsigned int)(++managed->present_id);
-    desc.release_token = release_token;
-    desc.sync_fd_kind = sync_fd >= 0 ? HWND_DMABUF_SYNC_FILE : HWND_DMABUF_SYNC_NONE;
+        desc = image->desc;
+        desc.producer_unique_id = managed->producer_unique_id;
+        desc.image_id = image_index;
+        desc.ring_generation = managed->ring_generation;
+        desc.frame_seq = (unsigned int)managed->present_id;
+        desc.release_token = release_token;
+        desc.sync_fd_kind = sync_fd >= 0 ? HWND_DMABUF_SYNC_FILE : HWND_DMABUF_SYNC_NONE;
+        image->busy = TRUE;
+    }
     assert(image->completion_fd < 0);
     image->completion_fd = sync_fd;
     sync_fd = -1;
     image->acquired = FALSE;
-    image->busy = TRUE;
     pthread_mutex_unlock( &managed->lock );
     if (!present_waits_consumed) vulkan_device_unlock_queues( device );
 
-    /* Reclaim undelivered frames. Fatal channel errors force recreate. */
-    if (had_channel)
+    if (send_frame)
     {
         int serr = hwnd_dmabuf_channel_send( managed->channel_fd, &desc,
                                              channel_fd_dup, send_sync_fd );
@@ -4283,64 +4446,10 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
             pthread_mutex_unlock( &managed->lock );
             if (fatal) return VK_ERROR_OUT_OF_DATE_KHR;
         }
-        else hwnd_dmabuf_post_wake( surface->hwnd );
+        else hwnd_dmabuf_post_wake( surface->hwnd, 0 );
     }
-
-    /* Keep one old frame in flight. Repeated stalls force recreate. */
-    if (had_channel)
-    {
-        for (;;)
-        {
-            struct pollfd pfd = { .fd = -1, .events = POLLIN, .revents = 0 };
-            BOOL channel_closed, lost;
-            uint32_t busy = 0, j;
-            int pret;
-
-            pthread_mutex_lock( &managed->lock );
-            managed_drain_releases( managed );
-            for (j = 0; j < managed->image_count; j++)
-                if (managed->images[j].busy) busy++;
-            lost = managed->lost;
-            channel_closed = managed->channel_fd < 0;
-            pfd.fd = managed->channel_fd;
-            pthread_mutex_unlock( &managed->lock );
-
-            if (lost) res = VK_ERROR_OUT_OF_DATE_KHR;
-            if (busy <= 1 || channel_closed) break;
-
-            pret = poll( &pfd, 1, 50 );
-            if (pret < 0 && errno == EINTR) continue;
-            if (pret <= 0)
-            {
-                pthread_mutex_lock( &managed->lock );
-                if ((DWORD)(NtGetTickCount() - managed->last_progress_ms) >= WINE_VK_MANAGED_STALL_MS)
-                {
-                    WARN( "managed dmabuf channel stopped releasing frames\n" );
-                    managed_mark_lost( managed );
-                    res = VK_ERROR_OUT_OF_DATE_KHR;
-                }
-                pthread_mutex_unlock( &managed->lock );
-                break;
-            }
-            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
-            {
-                pthread_mutex_lock( &managed->lock );
-                managed_drain_releases( managed );
-                if (!managed->lost) managed_mark_lost( managed );
-                pthread_mutex_unlock( &managed->lock );
-                res = VK_ERROR_OUT_OF_DATE_KHR;
-                break;
-            }
-        }
-    }
-    else
-    {
-        pthread_mutex_lock( &managed->lock );
-        if (managed->pending_release_token)
-            managed_release_token( managed, managed->pending_release_token, FALSE );
-        managed->pending_release_token = release_token;
-        pthread_mutex_unlock( &managed->lock );
-    }
+    else if (consumer_state == WINE_MANAGED_CONSUMER_UNKNOWN)
+        managed_consumer_request_state( managed );
 
     if (res >= VK_SUCCESS && !IsRectEmpty( &client_rect ) && !extents_equals( &managed->extents, &client_rect ))
         res = VK_SUBOPTIMAL_KHR;
@@ -5125,6 +5234,7 @@ static VkResult managed_release_swapchain_images( struct swapchain *swapchain,
                 break;
             }
             managed->images[image_index].acquired = FALSE;
+            managed->ring_full_since_ms = 0;
         }
     }
     pthread_mutex_unlock( &managed->lock );

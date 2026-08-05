@@ -21,6 +21,12 @@
 #define HWND_DMABUF_SYNC_FILE                  1
 
 #define HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC     0x00000001
+#define HWND_DMABUF_HOST_CAP_CONSUMER_STATE    0x00000002
+
+enum hwnd_dmabuf_wake_flags
+{
+    HWND_DMABUF_WAKE_REANNOUNCE = 0x00000001,
+};
 
 /* DRM fourcc values carried in hwnd_dmabuf_frame_desc_t.fourcc when
  * HWND_DMABUF_FLAG_SHM is set. Consumers translate them to native shm

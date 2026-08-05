@@ -253,6 +253,13 @@ struct wayland_hwnd_dmabuf_slice
     BOOL geometry_valid;
 };
 
+enum wayland_hwnd_dmabuf_consumer_state
+{
+    WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN,
+    WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE,
+    WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED,
+};
+
 struct wayland_hwnd_dmabuf_surface
 {
     struct wl_list link;
@@ -282,6 +289,7 @@ struct wayland_hwnd_dmabuf_surface
     unsigned long long last_seen_ms; /* tick when last present in the producer list */
     int committed_width, committed_height;
     int channel_fd;                 /* consumer end of the producer socket, or -1 */
+    enum wayland_hwnd_dmabuf_consumer_state consumer_state;
     struct wl_surface *stack_bottom;
     struct wl_surface *slice_layout_sibling;
     struct wayland_visual_constraint visual_constraint;
@@ -552,6 +560,15 @@ static int wayland_hwnd_dmabuf_channel_send_release(int channel_fd, const hwnd_d
     do n = send(channel_fd, rel, sizeof(*rel), MSG_DONTWAIT | MSG_NOSIGNAL);
     while (n < 0 && errno == EINTR);
     return n == sizeof(*rel) ? 0 : n < 0 ? errno : EMSGSIZE;
+}
+
+static int wayland_hwnd_dmabuf_surface_send_consumer_state(
+        struct wayland_hwnd_dmabuf_surface *surface, unsigned int flag)
+{
+    hwnd_dmabuf_release_t rel = { 0, 0, flag, 0, 0, 0 };
+
+    if (surface->channel_fd < 0) return ENOTCONN;
+    return wayland_hwnd_dmabuf_channel_send_release(surface->channel_fd, &rel);
 }
 
 static void wayland_hwnd_dmabuf_buffer_send_release(struct wayland_hwnd_dmabuf_buffer *buffer,
@@ -1251,6 +1268,10 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
     wayland_hwnd_dmabuf_surface_reset_color(surface);
     if (!surface->direct && surface->wp_viewport) wp_viewport_destroy(surface->wp_viewport);
     if (!surface->direct && surface->wl_surface) wl_surface_destroy(surface->wl_surface);
+    if (surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
+        !wayland_hwnd_dmabuf_surface_send_consumer_state(surface,
+                HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
+        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
     if (surface->channel_fd >= 0) close(surface->channel_fd);
     free(surface);
 }
@@ -4217,6 +4238,10 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
 retry:
     wayland_hwnd_dmabuf_surface_claim_channel(surface);
     if (surface->channel_fd < 0) return surface->current;
+    if (surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE &&
+        !wayland_hwnd_dmabuf_surface_send_consumer_state(surface,
+                HWND_DMABUF_RELEASE_CONSUMER_ACTIVE))
+        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE;
 
     while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc,
                                                       &fd, &sync_fd)) > 0)
@@ -4260,6 +4285,7 @@ retry:
     {
         close(surface->channel_fd);
         surface->channel_fd = -1;
+        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
         if (!have_pending && !retried)
         {
             retried = TRUE;
@@ -4713,6 +4739,34 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
     return ret;
 }
 
+void wayland_surface_reannounce_hwnd_dmabuf_consumers(struct wayland_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+
+    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+        dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
+    if (surface->direct_dmabuf_surface)
+        surface->direct_dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
+}
+
+/* Stop publishing while this surface cannot import producer frames. */
+static void wayland_surface_suspend_hwnd_dmabuf_consumers(struct wayland_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+
+    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+        if (dmabuf_surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
+            !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
+                    HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
+            dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
+
+    if ((dmabuf_surface = surface->direct_dmabuf_surface) &&
+        dmabuf_surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
+        !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
+                HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
+        dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
+}
+
 void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
 {
     hwnd_dmabuf_frame_info_t stack_frames[16], *frames = stack_frames;
@@ -4728,9 +4782,15 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     /* Producer children are composited for primary surfaces. */
     if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface) &&
         !wayland_surface_is_layer(surface))
+    {
+        wayland_surface_suspend_hwnd_dmabuf_consumers(surface);
         return;
+    }
     if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
+    {
+        wayland_surface_suspend_hwnd_dmabuf_consumers(surface);
         return;
+    }
 
     /* Import is driven by producer wakes (WM_WAYLAND_DMABUF_FRAME) at the producer's
      * self-paced rate, regardless of whether our toplevel is presented. We do not pace

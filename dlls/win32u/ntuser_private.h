@@ -250,7 +250,7 @@ extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabu
 extern int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc,
                                         int dmabuf_fd, int sync_fd );
 extern int hwnd_dmabuf_channel_recv_release( int channel_fd, void *release );
-extern void hwnd_dmabuf_post_wake( HWND hwnd );
+extern void hwnd_dmabuf_post_wake( HWND hwnd, unsigned int flags );
 
 /* window.c */
 HANDLE alloc_user_handle( void *ptr, unsigned short type );

@@ -34,6 +34,7 @@
 #include "waylanddrv.h"
 
 #include "wine/debug.h"
+#include "wine/hwnd_dmabuf.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -280,22 +281,25 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     DWORD style = data->style, exstyle = data->exstyle;
     BOOL fullscreen = wayland_win_data_is_fullscreen(data, style);
 
-    conf->rect = data->rects.visible;
-    conf->window_rect = data->rects.window;
-    conf->client_rect = data->rects.client;
-
-    /* A framed borderless window is fullscreen because its client area covers
-     * the monitor. Keep its non-client extents out of the Wayland geometry. */
-    if (fullscreen && (style & (WS_CAPTION | WS_THICKFRAME)))
+    conf->minimized = style & WS_MINIMIZE;
+    /* The Win32 iconic rect is not compositor geometry. */
+    if (!conf->minimized)
     {
-        conf->rect = data->rects.client;
-        conf->window_rect = data->rects.client;
+        conf->rect = data->rects.visible;
+        conf->window_rect = data->rects.window;
         conf->client_rect = data->rects.client;
+
+        /* Keep framed fullscreen extents out of the Wayland geometry. */
+        if (fullscreen && (style & (WS_CAPTION | WS_THICKFRAME)))
+        {
+            conf->rect = data->rects.client;
+            conf->window_rect = data->rects.client;
+            conf->client_rect = data->rects.client;
+        }
     }
 
     TRACE("window=%s style=%#x exstyle=%#x\n", wine_dbgstr_rect(&conf->rect), style, exstyle);
 
-    conf->minimized = style & WS_MINIMIZE;
     if (conf->minimized)
     {
         window_state = 0;
@@ -358,17 +362,6 @@ static void detach_client_surfaces_for_toplevel(HWND toplevel)
         if (data->client_surface && data->client_surface->toplevel == toplevel)
             wayland_client_surface_attach(data->client_surface, NULL);
     }
-}
-
-static BOOL reset_minimized_toplevel(struct wayland_win_data *data, DWORD style)
-{
-    struct wayland_surface *surface = data->wayland_surface;
-
-    if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return TRUE;
-    if (!surface->comitted.minimized || (style & WS_MINIMIZE)) return TRUE;
-
-    if (data->client_surface) wayland_client_surface_attach(data->client_surface, NULL);
-    return wayland_surface_clear_role(surface);
 }
 
 /* The caller holds win_data_mutex. Direct WSI can borrow a toplevel only when
@@ -545,10 +538,6 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     surface->window.visible = visible;
     wayland_win_data_get_config(data, &surface->window);
 
-    if (role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
-        !reset_minimized_toplevel(data, style))
-        return FALSE;
-
     /* If the window is a visible toplevel make it a wayland
      * xdg_toplevel. Otherwise keep it role-less to avoid polluting the
      * compositor with empty xdg_toplevels. */
@@ -612,6 +601,9 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
     /* update the parent here as well to ensure that its not stale if the owner is updated
      * with no new contents comitted or state change */
     wayland_surface_update_toplevel_parent(surface);
+
+    /* set_minimized is a one-shot request. */
+    if (!window->minimized) surface->comitted.minimized = FALSE;
 
     /* If we are not processing a compositor configure, use the latest Win32
      * window state to update the Wayland state. */
@@ -680,8 +672,6 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         }
         if (window->minimized && !surface->comitted.minimized)
         {
-            /* xdg_toplevel.set_minimized has no matching unset request. Keep
-             * this set until the role is recreated. */
             xdg_toplevel_set_minimized(surface->xdg_toplevel);
             surface->comitted.minimized = TRUE;
         }
@@ -1016,11 +1006,6 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 
     if (!data && !(data = wayland_win_data_create(hwnd, rects))) return FALSE;
     wayland_win_data_update_restore_rect(data, style, rects);
-    if (!reset_minimized_toplevel(data, style))
-    {
-        wayland_win_data_release(data);
-        return FALSE;
-    }
 
     wayland_win_data_release(data);
 
@@ -1409,9 +1394,19 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_WAYLAND_DMABUF_FRAME:
     {
         BOOL had_dmabuf_content = FALSE;
+        struct wayland_win_data *data;
 
         if (window_surface_has_queued_configure(hwnd))
             wayland_configure_window(hwnd);
+
+        if ((wp & HWND_DMABUF_WAKE_REANNOUNCE) &&
+            (data = wayland_win_data_get(hwnd)))
+        {
+            if (data->wayland_surface)
+                wayland_surface_reannounce_hwnd_dmabuf_consumers(data->wayland_surface);
+            wayland_win_data_release(data);
+        }
+
         if (window_surface_configure_blocks_dmabuf(hwnd))
             return 0;
 

@@ -279,6 +279,9 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_RELEASE_ORPHANED      0x00000008
 #define HWND_DMABUF_RELEASE_CACHED        0x00000010
 
+#define HWND_DMABUF_RELEASE_CONSUMER_ACTIVE    0x00000020
+#define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
+
 
 /* image_id names a dmabuf slot whose backing store stays valid until its release
  * token returns. The consumer may cache and reuse the wl_buffer for that slot.

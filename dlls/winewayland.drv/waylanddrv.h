@@ -733,6 +733,7 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
 BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
 void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
 void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+void wayland_surface_reannounce_hwnd_dmabuf_consumers(struct wayland_surface *surface);
 void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
 void wayland_surface_coords_from_window(struct wayland_surface *surface,
                                         int window_x, int window_y,

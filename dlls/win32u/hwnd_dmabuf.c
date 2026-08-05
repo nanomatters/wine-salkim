@@ -17,11 +17,11 @@
 #define WM_WINE_HWND_DMABUF_FRAME (WM_WINE_FIRST_DRIVER_MSG + 3)
 
 /* Wake the toplevel so winewayland recomposites dmabuf children. */
-void hwnd_dmabuf_post_wake( HWND hwnd )
+void hwnd_dmabuf_post_wake( HWND hwnd, unsigned int flags )
 {
     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
 
-    if (toplevel) NtUserPostMessage( toplevel, WM_WINE_HWND_DMABUF_FRAME, 0, 0 );
+    if (toplevel) NtUserPostMessage( toplevel, WM_WINE_HWND_DMABUF_FRAME, flags, 0 );
 }
 
 unsigned int hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
@@ -151,7 +151,7 @@ int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc,
     }
 
     ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd, send_sync_fd );
-    if (!ret) hwnd_dmabuf_post_wake( hwnd );
+    if (!ret) hwnd_dmabuf_post_wake( hwnd, 0 );
     return ret ? hwnd_dmabuf_channel_result_from_errno( ret ) : HWND_DMABUF_CHANNEL_OK;
 }
 
