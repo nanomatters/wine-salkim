@@ -4350,6 +4350,7 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
     if (!wayland_surface_is_toplevel(surface)) return FALSE;
     if (frames[0].opened & HWND_DMABUF_FRAME_GDI_OVERLAY) return FALSE;
     if (!data || data->client_surface) return FALSE;
+    if (data->window_contents) return FALSE;
     if (data->content_over_producer) return FALSE;
     if (surface->shaped ||
         (surface->occlusion_clipped &&

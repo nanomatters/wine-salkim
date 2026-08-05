@@ -1963,15 +1963,26 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
     content_over_changed = data->content_over_producer != has_content_over_producer;
     data->content_over_producer = has_content_over_producer;
 
-    if ((wayland_surface = data->wayland_surface))
+    wayland_surface = data->wayland_surface;
+    if (wayland_surface && wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+        wayland_surface->window.minimized)
     {
-        if (wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
-            wayland_surface->window.minimized)
-        {
-            wayland_win_data_release(data);
-            return TRUE;
-        }
+        wayland_win_data_release(data);
+        return TRUE;
+    }
 
+    /* Direct parent presentation must see the current parent buffer. */
+    if (data->window_contents)
+        wayland_shm_buffer_unref(data->window_contents);
+    data->window_contents = NULL;
+    if (shm_buffer)
+    {
+        wayland_shm_buffer_ref(shm_buffer);
+        data->window_contents = shm_buffer;
+    }
+
+    if (wayland_surface)
+    {
         if (wayland_surface_has_external_commit_owner(wayland_surface))
         {
             if (has_content_over_producer) invalidate_direct_toplevel(wayland_surface);
@@ -1985,10 +1996,8 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         {
             committed = TRUE;
         }
-        else if (wayland_surface_has_direct_dmabuf_content(wayland_surface) &&
-                 !has_content_over_producer)
+        else if (!shm_buffer && wayland_surface_has_direct_dmabuf_content(wayland_surface))
         {
-            /* Keep cached GDI contents beneath a covering producer. */
             committed = TRUE;
         }
         else
@@ -2029,18 +2038,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                 TRACE("Wayland surface not configured yet, not flushing\n");
             }
         }
-    }
-
-    /* Update the latest window buffer for the wayland surface. Note that we
-     * only care whether the buffer contains the latest window contents,
-     * it's irrelevant if it was actually committed or not. */
-    if (data->window_contents)
-        wayland_shm_buffer_unref(data->window_contents);
-    data->window_contents = NULL;
-    if (shm_buffer)
-    {
-        wayland_shm_buffer_ref(shm_buffer);
-        data->window_contents = shm_buffer;
     }
 
     /* Reclassify when parent content over the producer changes. */
