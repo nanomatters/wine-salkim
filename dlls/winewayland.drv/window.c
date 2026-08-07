@@ -264,6 +264,11 @@ static void wayland_win_data_update_restore_rect(struct wayland_win_data *data,
 BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
 {
     DWORD style = data->style;
+    RECT rect;
+
+    if (data->client_surface &&
+        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect))
+        return TRUE;
 
     if (!data->is_fullscreen) return FALSE;
     if (!(style & WS_POPUP) &&
@@ -278,8 +283,12 @@ BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
 BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
 {
     RECT intersection, virtual_screen = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
+    RECT rect = data->rects.client;
 
-    intersect_rect(&intersection, &data->rects.client, &virtual_screen);
+    if (data->client_surface)
+        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect);
+
+    intersect_rect(&intersection, &rect, &virtual_screen);
     return EqualRect(&intersection, &virtual_screen);
 }
 
@@ -288,18 +297,32 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
 {
     enum wayland_surface_config_state window_state = 0;
     DWORD style = data->style, exstyle = data->exstyle;
+    RECT fullscreen_rect;
+    BOOL explicit_fullscreen = data->client_surface &&
+        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE,
+                                                   &fullscreen_rect);
     BOOL fullscreen = wayland_win_data_is_fullscreen(data);
 
     conf->minimized = style & WS_MINIMIZE;
     /* The Win32 iconic rect is not compositor geometry. */
     if (!conf->minimized)
     {
-        conf->rect = data->rects.visible;
-        conf->window_rect = data->rects.window;
-        conf->client_rect = data->rects.client;
+        if (explicit_fullscreen)
+        {
+            conf->rect = fullscreen_rect;
+            conf->window_rect = fullscreen_rect;
+            conf->client_rect = fullscreen_rect;
+        }
+        else
+        {
+            conf->rect = data->rects.visible;
+            conf->window_rect = data->rects.window;
+            conf->client_rect = data->rects.client;
+        }
 
         /* Keep framed fullscreen extents out of the Wayland geometry. */
-        if (fullscreen && (style & (WS_CAPTION | WS_THICKFRAME)))
+        if (!explicit_fullscreen && fullscreen &&
+            (style & (WS_CAPTION | WS_THICKFRAME)))
         {
             conf->rect = data->rects.client;
             conf->window_rect = data->rects.client;
@@ -714,6 +737,13 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
     wl_display_flush(process_wayland.wl_display);
 }
 
+void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data)
+{
+    if (!data->wayland_surface) return;
+    wayland_win_data_get_config(data, &data->wayland_surface->window);
+    wayland_win_data_update_wayland_state(data);
+}
+
 static BOOL is_managed(HWND hwnd)
 {
     struct wayland_win_data *data = wayland_win_data_get(hwnd);
@@ -1102,6 +1132,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->has_present_rect = has_present_rect;
     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
     data->managed = managed;
+    if (data->client_surface)
+        wayland_client_surface_update_fullscreen_target(data->client_surface,
+                                                        &new_rects->client);
     wayland_win_data_update_restore_rect(data, style, new_rects);
 
     if (!surface)

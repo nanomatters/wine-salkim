@@ -94,7 +94,6 @@ UNSUPPORTED_EXTENSIONS = [
 
     # Device extensions
     "VK_AMD_display_native_hdr",
-    "VK_EXT_full_screen_exclusive",
     "VK_GOOGLE_display_timing",
     # Relates to external_semaphore and needs type conversions in bitflags.
     "VK_KHR_maintenance7", # Causes infinity recursion in struct convert code
@@ -198,6 +197,7 @@ USER_DRIVER_FUNCS = {
     "vkDestroySurfaceKHR",
     "vkDestroySwapchainKHR",
     "vkFreeMemory",
+    "vkGetDeviceGroupSurfacePresentModes2EXT",
     "vkGetDeviceBufferMemoryRequirements",
     "vkGetDeviceBufferMemoryRequirementsKHR",
     "vkGetDeviceImageMemoryRequirements",
@@ -224,6 +224,7 @@ USER_DRIVER_FUNCS = {
     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
     "vkGetPhysicalDeviceSurfaceFormats2KHR",
     "vkGetPhysicalDeviceSurfaceFormatsKHR",
+    "vkGetPhysicalDeviceSurfacePresentModes2EXT",
     "vkGetPhysicalDeviceWin32PresentationSupportKHR",
     "vkGetPastPresentationTimingEXT",
     "vkGetLatencyTimingsNV",
@@ -236,6 +237,8 @@ USER_DRIVER_FUNCS = {
     "vkMapMemory",
     "vkMapMemory2KHR",
     "vkQueuePresentKHR",
+    "vkAcquireFullScreenExclusiveModeEXT",
+    "vkReleaseFullScreenExclusiveModeEXT",
     "vkQueueSubmit",
     "vkQueueSubmit2",
     "vkQueueSubmit2KHR",

@@ -49,14 +49,6 @@ static LPARAM map_point_vscreen(double x, double y)
     return MAKELPARAM(v_x, v_y);
 }
 
-static void wayland_touch_point_to_window(struct wayland_surface *surface,
-                                          double surface_x, double surface_y,
-                                          double *window_x, double *window_y)
-{
-    *window_x = surface_x * surface->window.scale + surface->window.rect.left;
-    *window_y = surface_y * surface->window.scale + surface->window.rect.top;
-}
-
 static void touch_handle_down(void *private, struct wl_touch *wl_touch,
 		                      uint32_t serial, uint32_t time,
 					          struct wl_surface *wl_surface, int32_t id,
@@ -83,9 +75,8 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     point->id = id;
     point->focused_hwnd = hwnd;
     wl_list_init(&point->link);
-    wayland_touch_point_to_window(surface, wl_fixed_to_double(x),
-                                  wl_fixed_to_double(y),
-                                  &touch_x, &touch_y);
+    wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(x),
+                                     wl_fixed_to_double(y), &touch_x, &touch_y);
     point->xy = map_point_vscreen(touch_x, touch_y);
     wayland_win_data_release(data);
 
@@ -170,9 +161,8 @@ static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
         wayland_win_data_release(data);
         return;
     }
-    wayland_touch_point_to_window(surface, wl_fixed_to_double(x),
-                                  wl_fixed_to_double(y),
-                                  &touch_x, &touch_y);
+    wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(x),
+                                     wl_fixed_to_double(y), &touch_x, &touch_y);
     point->xy = map_point_vscreen(touch_x, touch_y);
     wayland_win_data_release(data);
 

@@ -5464,6 +5464,66 @@ POINT map_point_from_surface(struct wayland_surface *surface, POINT point)
     return point;
 }
 
+RECT wayland_surface_get_input_rect(struct wayland_surface *surface,
+                                    const struct wayland_win_data *data)
+{
+    RECT fullscreen_rect;
+
+    if (data && data->client_surface &&
+        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE,
+                                                   &fullscreen_rect) &&
+        !IsRectEmpty(&data->rects.client))
+        return data->rects.client;
+
+    return surface->window.rect;
+}
+
+void wayland_surface_coords_to_screen(struct wayland_surface *surface,
+                                      const struct wayland_win_data *data,
+                                      double surface_x, double surface_y,
+                                      double *screen_x, double *screen_y)
+{
+    RECT input_rect = wayland_surface_get_input_rect(surface, data);
+    LONG host_width = surface->window.rect.right - surface->window.rect.left;
+    LONG host_height = surface->window.rect.bottom - surface->window.rect.top;
+    LONG input_width = input_rect.right - input_rect.left;
+    LONG input_height = input_rect.bottom - input_rect.top;
+
+    surface_x *= surface->window.scale;
+    surface_y *= surface->window.scale;
+    if (host_width > 0 && host_height > 0 && input_width > 0 && input_height > 0)
+    {
+        surface_x *= (double)input_width / host_width;
+        surface_y *= (double)input_height / host_height;
+    }
+
+    *screen_x = input_rect.left + surface_x;
+    *screen_y = input_rect.top + surface_y;
+}
+
+void wayland_surface_coords_from_screen(struct wayland_surface *surface,
+                                        const struct wayland_win_data *data,
+                                        double screen_x, double screen_y,
+                                        double *surface_x, double *surface_y)
+{
+    RECT input_rect = wayland_surface_get_input_rect(surface, data);
+    LONG host_width = surface->window.rect.right - surface->window.rect.left;
+    LONG host_height = surface->window.rect.bottom - surface->window.rect.top;
+    LONG input_width = input_rect.right - input_rect.left;
+    LONG input_height = input_rect.bottom - input_rect.top;
+
+    screen_x -= input_rect.left;
+    screen_y -= input_rect.top;
+    if (host_width > 0 && host_height > 0 && input_width > 0 && input_height > 0)
+    {
+        screen_x *= (double)host_width / input_width;
+        screen_y *= (double)host_height / input_height;
+    }
+
+    *surface_x = screen_x / surface->window.scale;
+    *surface_y = screen_y / surface->window.scale;
+}
+
 void wayland_surface_coords_from_window(struct wayland_surface *surface,
                                         int window_x, int window_y,
                                         int *surface_x, int *surface_y)
@@ -5489,6 +5549,74 @@ void wayland_surface_coords_to_window(struct wayland_surface *surface,
 struct wayland_client_surface *impl_from_client_surface(struct client_surface *client)
 {
     return CONTAINING_RECORD(client, struct wayland_client_surface, client);
+}
+
+BOOL wayland_client_surface_get_fullscreen_rect(struct wayland_client_surface *client,
+                                                BOOL active, RECT *rect)
+{
+    struct wayland_fullscreen_request *request;
+
+    if (list_empty(&client->fullscreen_requests)) return FALSE;
+    if (!active)
+    {
+        request = LIST_ENTRY(list_tail(&client->fullscreen_requests),
+                             struct wayland_fullscreen_request, entry);
+        *rect = request->rect;
+        return TRUE;
+    }
+    if (!client->fullscreen_active_owner) return FALSE;
+
+    LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
+                        struct wayland_fullscreen_request, entry)
+    {
+        if (request->owner != client->fullscreen_active_owner) continue;
+        *rect = request->rect;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surface *client,
+                                                     const RECT *window_rect)
+{
+    struct wayland_fullscreen_request *request;
+    struct wayland_output *output;
+    RECT target_rect;
+    BOOL changed = FALSE, follows_window = FALSE;
+
+    if (IsRectEmpty(window_rect)) return FALSE;
+
+    LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
+                        struct wayland_fullscreen_request, entry)
+    {
+        if (request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW)
+        {
+            follows_window = TRUE;
+            break;
+        }
+    }
+    if (!follows_window) return FALSE;
+
+    if (!(output = wayland_output_for_rect(window_rect, &target_rect, NULL)))
+        return FALSE;
+    wayland_output_release(output);
+
+    LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
+                        struct wayland_fullscreen_request, entry)
+    {
+        if (request->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW ||
+            EqualRect(&request->rect, &target_rect))
+            continue;
+
+        TRACE("fullscreen owner %s follows window %s: %s -> %s\n",
+              wine_dbgstr_longlong(request->owner), wine_dbgstr_rect(window_rect),
+              wine_dbgstr_rect(&request->rect), wine_dbgstr_rect(&target_rect));
+        request->rect = target_rect;
+        changed = TRUE;
+    }
+
+    if (changed) client_surface_invalidate_presentation(&client->client);
+    return changed;
 }
 
 static void wayland_client_surface_reset_opaque_region(struct wayland_client_surface *surface)
@@ -5534,6 +5662,7 @@ static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *sur
 static void wayland_client_surface_destroy(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_fullscreen_request *request, *next;
     struct wl_callback *callback;
     struct wayland_win_data *data;
 
@@ -5571,6 +5700,12 @@ static void wayland_client_surface_destroy(struct client_surface *client)
     for (unsigned int i = 0; i < surface->retired_wl_surface_count; i++)
         wl_surface_destroy(surface->retired_wl_surfaces[i].wl_surface);
     free(surface->retired_wl_surfaces);
+    LIST_FOR_EACH_ENTRY_SAFE(request, next, &surface->fullscreen_requests,
+                             struct wayland_fullscreen_request, entry)
+    {
+        list_remove(&request->entry);
+        free(request);
+    }
 
     wayland_win_data_unlock();
 }
@@ -5762,6 +5897,7 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     struct wayland_surface *toplevel_surface;
     struct wayland_win_data *data;
+    RECT fullscreen_rect;
     BOOL ret = FALSE;
 
     if (!ReadAcquire(&surface->direct_toplevel)) return FALSE;
@@ -5771,10 +5907,20 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
         toplevel_surface->direct_client == surface &&
         surface->direct_wl_surface == toplevel_surface->wl_surface)
     {
-        *host = toplevel_surface->window.rect;
-        *dst = toplevel_surface->window.client_rect;
-        OffsetRect(dst, -host->left, -host->top);
-        OffsetRect(host, -host->left, -host->top);
+        if (wayland_client_surface_get_fullscreen_rect(surface, FALSE,
+                                                       &fullscreen_rect))
+        {
+            SetRect(host, 0, 0, fullscreen_rect.right - fullscreen_rect.left,
+                    fullscreen_rect.bottom - fullscreen_rect.top);
+            *dst = *host;
+        }
+        else
+        {
+            *host = toplevel_surface->window.rect;
+            *dst = toplevel_surface->window.client_rect;
+            OffsetRect(dst, -host->left, -host->top);
+            OffsetRect(host, -host->left, -host->top);
+        }
         ret = !IsRectEmpty(host) && !IsRectEmpty(dst);
     }
 
@@ -5869,6 +6015,8 @@ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
 
     if (!(client = client_surface_create(sizeof(*client), &wayland_client_surface_funcs, hwnd))) return NULL;
 
+    list_init(&client->fullscreen_requests);
+
     client->wl_surface =
         wl_compositor_create_surface(process_wayland.wl_compositor);
     if (!client->wl_surface)
@@ -5923,8 +6071,13 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
                                                             struct wayland_client_surface *expected_client)
 {
     struct wayland_surface *surface = data->wayland_surface;
+    RECT fullscreen_rect;
+    BOOL explicit_fullscreen = expected_client &&
+        wayland_client_surface_get_fullscreen_rect(expected_client, FALSE,
+                                                   &fullscreen_rect);
 
-    if (!direct_toplevel_enabled()) return "direct toplevel not enabled by environment";
+    if (!explicit_fullscreen && !direct_toplevel_enabled())
+        return "direct toplevel not enabled by environment";
     if (!surface) return "no Wayland surface";
     if (!wayland_surface_is_toplevel(surface)) return "surface is not a live toplevel";
     if (surface->window.minimized) return "the toplevel is minimized";
@@ -5941,9 +6094,9 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     if (surface->direct_client && surface->direct_client != expected_client)
         return "a previous direct WSI surface is still retiring";
     if (surface->shaped) return "the window is shaped";
-    if (!wayland_surface_client_fills_window(surface))
+    if (!explicit_fullscreen && !wayland_surface_client_fills_window(surface))
         return "the client does not fill the toplevel";
-    if (!wayland_surface_client_covers_presentation(surface))
+    if (!explicit_fullscreen && !wayland_surface_client_covers_presentation(surface))
         return "the client does not cover the presentation surface";
     return NULL;
 }
@@ -5954,10 +6107,14 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     struct wayland_win_data *data;
     struct wayland_surface *toplevel;
     const char *failure = NULL;
+    RECT fullscreen_rect;
+    BOOL explicit_fullscreen;
 
     if (!(data = wayland_win_data_get(hwnd))) return "no Wayland window data";
 
     toplevel = data->wayland_surface;
+    explicit_fullscreen = wayland_client_surface_get_fullscreen_rect(
+        surface, FALSE, &fullscreen_rect);
     if (!toplevel) failure = "no Wayland surface";
     else if (toplevel->wl_surface != surface->wl_surface)
         failure = "the toplevel wl_surface was replaced";
@@ -5967,10 +6124,10 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (toplevel->shaped) failure = "the window is shaped";
     /* Minimize detaches the direct client and uses an iconic window rectangle.
      * Keep the borrowed toplevel alive until the window is restored. */
-    else if (!toplevel->window.minimized &&
+    else if (!explicit_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_fills_window(toplevel))
         failure = "the client does not fill the toplevel";
-    else if (!toplevel->window.minimized &&
+    else if (!explicit_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_covers_presentation(toplevel))
         failure = "the client does not cover the presentation surface";
 

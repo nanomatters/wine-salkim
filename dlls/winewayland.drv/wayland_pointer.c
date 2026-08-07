@@ -137,9 +137,10 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
     struct wayland_pointer_frame *frame = &pointer->frame;
-    RECT *window_rect;
+    double screen_x, screen_y;
+    RECT input_rect;
     HWND hwnd;
-    POINT screen = { wl_fixed_to_double(sx), wl_fixed_to_double(sy) };
+    POINT screen;
     struct wayland_surface *surface;
     struct wayland_win_data *data;
 
@@ -151,17 +152,17 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
         return;
     }
 
-    window_rect = &surface->window.rect;
-
-    screen = map_point_from_surface(surface, screen);
-    screen.x += window_rect->left;
-    screen.y += window_rect->top;
+    input_rect = wayland_surface_get_input_rect(surface, data);
+    wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(sx),
+                                     wl_fixed_to_double(sy), &screen_x, &screen_y);
+    screen.x = round(screen_x);
+    screen.y = round(screen_y);
     /* Sometimes, due to rounding, we may end up with pointer coordinates
      * slightly outside the target window, so bring them within bounds. */
-    if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
-    else if (screen.x < window_rect->left) screen.x = window_rect->left;
-    if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
-    else if (screen.y < window_rect->top) screen.y = window_rect->top;
+    if (screen.x >= input_rect.right) screen.x = input_rect.right - 1;
+    else if (screen.x < input_rect.left) screen.x = input_rect.left;
+    if (screen.y >= input_rect.bottom) screen.y = input_rect.bottom - 1;
+    else if (screen.y < input_rect.top) screen.y = input_rect.top;
 
     wayland_win_data_release(data);
 
@@ -981,25 +982,32 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
  * for the specified clip rectangle (in screen coords using thread dpi).
  */
 static void wayland_surface_calc_confine(struct wayland_surface *surface,
+                                         const struct wayland_win_data *data,
                                          const RECT *clip, RECT *confine)
 {
-    RECT window_clip;
+    double left, top, right, bottom;
+    RECT input_rect, window_clip;
 
-    TRACE("hwnd=%p clip=%s window=%s\n",
+    input_rect = wayland_surface_get_input_rect(surface, data);
+
+    TRACE("hwnd=%p clip=%s input=%s\n",
           surface->hwnd, wine_dbgstr_rect(clip),
-          wine_dbgstr_rect(&surface->window.rect));
+          wine_dbgstr_rect(&input_rect));
 
     /* FIXME: surface->window.(client_)rect is in window dpi, whereas
      * clip is in thread dpi. */
 
-    if (!intersect_rect(&window_clip, clip, &surface->window.rect))
+    if (!intersect_rect(&window_clip, clip, &input_rect))
     {
         SetRectEmpty(confine);
         return;
     }
 
-    OffsetRect(&window_clip, -surface->window.rect.left, -surface->window.rect.top);
-    *confine = map_rect_to_surface(surface, window_clip);
+    wayland_surface_coords_from_screen(surface, data, window_clip.left,
+                                       window_clip.top, &left, &top);
+    wayland_surface_coords_from_screen(surface, data, window_clip.right,
+                                       window_clip.bottom, &right, &bottom);
+    SetRect(confine, round(left), round(top), round(right), round(bottom));
 }
 
 static BOOL wayland_clip_covers_vscreen(const RECT *clip)
@@ -1195,6 +1203,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     const RECT *confine_rect = NULL;
     RECT surface_clip;
     POINT cursor_pos, warp;
+    double warp_x, warp_y;
 
     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
 
@@ -1212,14 +1221,15 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
         wl_surface = surface->wl_surface;
         if (clip && !wayland_clip_covers_vscreen(clip))
         {
-            wayland_surface_calc_confine(surface, clip, &surface_clip);
+            wayland_surface_calc_confine(surface, data, clip, &surface_clip);
             confine_rect = &surface_clip;
         }
         covers_vscreen = wayland_win_data_is_fullscreen(data) &&
                           wayland_win_data_covers_virtual_screen(data);
-        warp.x = cursor_pos.x - surface->window.rect.left;
-        warp.y = cursor_pos.y - surface->window.rect.top;
-        warp = map_point_to_surface(surface, warp);
+        wayland_surface_coords_from_screen(surface, data, cursor_pos.x,
+                                           cursor_pos.y, &warp_x, &warp_y);
+        warp.x = round(warp_x);
+        warp.y = round(warp_y);
     }
     wayland_win_data_release(data);
 

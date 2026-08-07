@@ -77,6 +77,39 @@ static BOOL is_available_device_function(VkDevice device, const char *name)
     return UNIX_CALL(is_available_device_function, &params);
 }
 
+static void *get_full_screen_exclusive_device_proc_addr(const char *name)
+{
+    if (!strcmp(name, "vkAcquireFullScreenExclusiveModeEXT"))
+        return vkAcquireFullScreenExclusiveModeEXT;
+    if (!strcmp(name, "vkGetDeviceGroupSurfacePresentModes2EXT"))
+        return vkGetDeviceGroupSurfacePresentModes2EXT;
+    if (!strcmp(name, "vkReleaseFullScreenExclusiveModeEXT"))
+        return vkReleaseFullScreenExclusiveModeEXT;
+    return NULL;
+}
+
+static void *get_full_screen_exclusive_instance_proc_addr(const char *name)
+{
+    void *func;
+
+    if ((func = get_full_screen_exclusive_device_proc_addr(name))) return func;
+    if (!strcmp(name, "vkGetPhysicalDeviceSurfacePresentModes2EXT"))
+        return vkGetPhysicalDeviceSurfacePresentModes2EXT;
+    return NULL;
+}
+
+static BOOL instance_supports_full_screen_exclusive(VkInstance instance)
+{
+    unsigned int i;
+
+    for (i = 0; i < instance->physical_device_count; i++)
+    {
+        if (instance->physical_device[i].extensions.has_VK_EXT_full_screen_exclusive)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static void *vulkan_client_object_create(size_t size)
 {
     struct vulkan_client_object *object = calloc(1, size);
@@ -114,6 +147,10 @@ PFN_vkVoidFunction WINAPI vkGetInstanceProcAddr(VkInstance instance, const char 
         if (!strcmp(name, "vkGetPhysicalDeviceWin32PresentationSupportKHR"))
             return (PFN_vkVoidFunction)vkGetPhysicalDeviceWin32PresentationSupportKHR;
     }
+
+    if (instance_supports_full_screen_exclusive(instance)
+            && (func = get_full_screen_exclusive_instance_proc_addr(name)))
+        return func;
 
     if (!is_available_instance_function(instance, name))
         return NULL;
@@ -164,6 +201,10 @@ PFN_vkVoidFunction WINAPI vkGetDeviceProcAddr(VkDevice device, const char *name)
         if (!strcmp(name, "vkImportFenceWin32HandleKHR"))
             return (PFN_vkVoidFunction)vkImportFenceWin32HandleKHR;
     }
+
+    if (device->extensions.has_VK_EXT_full_screen_exclusive
+            && (func = get_full_screen_exclusive_device_proc_addr(name)))
+        return func;
 
     /* Per the spec, we are only supposed to return device functions as in functions
      * for which the first parameter is vkDevice or a child of vkDevice like a
@@ -587,6 +628,13 @@ VkResult WINAPI vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physical_d
         static const VkExtensionProperties VK_KHR_external_semaphore_win32 = {VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_SPEC_VERSION};
         TRACE("  - VK_KHR_external_semaphore_win32\n");
         if (len++ < capacity && properties) properties[len - 1] = VK_KHR_external_semaphore_win32;
+    }
+    if (physical_device->extensions.has_VK_EXT_full_screen_exclusive)
+    {
+        static const VkExtensionProperties VK_EXT_full_screen_exclusive =
+            {VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME, VK_EXT_FULL_SCREEN_EXCLUSIVE_SPEC_VERSION};
+        TRACE("  - VK_EXT_full_screen_exclusive\n");
+        if (len++ < capacity && properties) properties[len - 1] = VK_EXT_full_screen_exclusive;
     }
     if (physical_device->extensions.has_VK_KHR_win32_keyed_mutex)
     {

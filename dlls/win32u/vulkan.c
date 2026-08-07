@@ -199,11 +199,13 @@ struct surface
     struct client_surface *client;
     struct swapchain *swapchain;
     HWND hwnd;
-    /* Protects host state. Driver callbacks may take win_data_mutex. */
     pthread_mutex_t host_lock;
+    /* Fullscreen state callbacks use this lock, never host_lock. */
+    pthread_mutex_t fullscreen_lock;
     struct list host_surfaces;
     struct surface_host *active_host;
     UINT alpha_swapchain_count;
+    LONGLONG DECLSPEC_ALIGN(8) fullscreen_active_owner;
 };
 
 static struct surface *surface_from_handle( VkSurfaceKHR handle )
@@ -332,6 +334,7 @@ static pthread_mutex_t nvidia_wayland_instance_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list delayed_nvidia_wayland_host_instances = LIST_INIT( delayed_nvidia_wayland_host_instances );
 static unsigned int nvidia_wayland_instance_count;
 static LONGLONG managed_next_producer_id;
+static LONGLONG fullscreen_next_owner;
 
 enum wine_managed_consumer_state
 {
@@ -418,6 +421,9 @@ struct swapchain
     BOOL compositor_scaling;
     VkColorSpaceKHR color_space;
     BOOL uses_color_description;
+    VkFullScreenExclusiveEXT fullscreen_policy;
+    UINT64 fullscreen_owner;
+    LONG fullscreen_acquired;
 
     /* fs hack data below */
     struct fs_hack_config fshack;
@@ -919,6 +925,9 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     }
 
     driver_funcs->p_map_device_extensions( &extensions );
+    extensions.has_VK_EXT_full_screen_exclusive =
+        driver_funcs->p_vulkan_surface_fullscreen_supported &&
+        driver_funcs->p_vulkan_surface_fullscreen;
     if (extensions.has_VK_KHR_external_memory_win32 && zero_bits && !physical_device->map_placed_align)
     {
         WARN( "Cannot export WOW64 memory without VK_EXT_map_memory_placed\n" );
@@ -1220,7 +1229,10 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
         device->extensions.has_VK_KHR_external_semaphore = 1;
     }
 
+    device->full_screen_exclusive_enabled =
+        device->extensions.has_VK_EXT_full_screen_exclusive;
     driver_funcs->p_map_device_extensions( &device->extensions );
+    device->extensions.has_VK_EXT_full_screen_exclusive = 0;
     device->extensions.has_VK_KHR_win32_keyed_mutex = 0;
     device->extensions.has_VK_KHR_external_memory_win32 = 0;
     device->extensions.has_VK_KHR_external_fence_win32 = 0;
@@ -2156,6 +2168,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
 
     if (!(surface = calloc( 1, sizeof(*surface) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_init( &surface->host_lock, NULL );
+    pthread_mutex_init( &surface->fullscreen_lock, NULL );
     list_init( &surface->host_surfaces );
 
     /* Windows allows surfaces to be created with no HWND, they return VK_ERROR_SURFACE_LOST_KHR later */
@@ -2173,6 +2186,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
                                                       &host_surface, &surface->client )))
     {
         if (dummy) NtUserDestroyWindow( dummy );
+        pthread_mutex_destroy( &surface->fullscreen_lock );
         pthread_mutex_destroy( &surface->host_lock );
         free( surface );
         return res;
@@ -2182,6 +2196,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
         instance->p_vkDestroySurfaceKHR( instance->host.instance, host_surface, NULL /* allocator */ );
         client_surface_release( surface->client );
         if (dummy) NtUserDestroyWindow( dummy );
+        pthread_mutex_destroy( &surface->fullscreen_lock );
         pthread_mutex_destroy( &surface->host_lock );
         free( surface );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -2222,6 +2237,7 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
 
     instance->p_remove_object( instance, &surface->obj.obj );
 
+    pthread_mutex_destroy( &surface->fullscreen_lock );
     pthread_mutex_destroy( &surface->host_lock );
     free( surface );
 }
@@ -2281,30 +2297,103 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevi
     return res;
 }
 
+static void *find_vk_struct( void *s, VkStructureType t );
+static BOOL get_fullscreen_monitor_rect( HMONITOR monitor, RECT *rect );
+
+static BOOL has_non_fullscreen_surface_info( const void *chain )
+{
+    const VkBaseInStructure *header;
+
+    for (header = chain; header; header = header->pNext)
+        if (header->sType != VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT &&
+            header->sType != VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT)
+            return TRUE;
+    return FALSE;
+}
+
+static BOOL get_surface_fullscreen_info( struct surface *surface, const void *chain,
+                                         struct vulkan_surface_fullscreen_info *driver_info )
+{
+    const VkSurfaceFullScreenExclusiveWin32InfoEXT *win32_info;
+    const VkSurfaceFullScreenExclusiveInfoEXT *fullscreen_info;
+    VkFullScreenExclusiveEXT policy;
+    HMONITOR monitor;
+
+    fullscreen_info = find_vk_struct( (void *)chain,
+                                      VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT );
+    win32_info = find_vk_struct( (void *)chain,
+                                VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT );
+    policy = fullscreen_info ? fullscreen_info->fullScreenExclusive
+                             : VK_FULL_SCREEN_EXCLUSIVE_DEFAULT_EXT;
+    switch (policy)
+    {
+    case VK_FULL_SCREEN_EXCLUSIVE_DEFAULT_EXT:
+    case VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT:
+        break;
+    case VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT:
+        if (win32_info) break;
+        /* fall through */
+    default:
+        return FALSE;
+    }
+
+    monitor = win32_info ? win32_info->hmonitor :
+                           NtUserMonitorFromWindow( surface->hwnd, MONITOR_DEFAULTTONEAREST );
+    if (!get_fullscreen_monitor_rect( monitor, &driver_info->rect )) return FALSE;
+    driver_info->target = win32_info ? VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED
+                                     : VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW;
+    return TRUE;
+}
+
 static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDevice client_physical_device, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
                                                                    VkSurfaceCapabilities2KHR *capabilities )
 {
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct surface *surface = surface_from_handle( surface_info->surface );
     VkPhysicalDeviceSurfaceInfo2KHR surface_info_host = *surface_info;
+    VkSurfaceCapabilitiesFullScreenExclusiveEXT *fullscreen_capabilities;
+    struct vulkan_surface_fullscreen_info fullscreen_info_driver;
     struct vulkan_instance *instance = physical_device->instance;
+    VkBool32 fullscreen_supported = VK_FALSE;
     VkResult res;
+
+    fullscreen_capabilities = (VkSurfaceCapabilitiesFullScreenExclusiveEXT *)
+        find_vk_struct( capabilities->pNext,
+                        VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT );
+
+    if (!surface || !NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
+    if (fullscreen_capabilities && surface->client &&
+        driver_funcs->p_vulkan_surface_fullscreen_supported &&
+        get_surface_fullscreen_info( surface, surface_info->pNext, &fullscreen_info_driver ))
+        fullscreen_supported = driver_funcs->p_vulkan_surface_fullscreen_supported(
+            surface->client, &fullscreen_info_driver );
 
     if (!instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR)
     {
         /* Until the loader version exporting this function is common, emulate it using the older non-2 version. */
-        if (surface_info->pNext || capabilities->pNext) FIXME( "Emulating vkGetPhysicalDeviceSurfaceCapabilities2KHR, ignoring pNext.\n" );
-        return win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( client_physical_device, surface_info->surface,
+        VkBaseOutStructure *header;
+
+        for (header = capabilities->pNext; header; header = header->pNext)
+            if (header->sType != VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT)
+                break;
+        if (has_non_fullscreen_surface_info( surface_info_host.pNext ) || header)
+            FIXME( "Emulating vkGetPhysicalDeviceSurfaceCapabilities2KHR, ignoring pNext.\n" );
+        res = win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( client_physical_device,
+                                                                 surface_info->surface,
                                                                  &capabilities->surfaceCapabilities );
+        goto done;
     }
 
-    if (!NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
     pthread_mutex_lock( &surface->host_lock );
     surface_info_host.surface = surface_host_handle( surface );
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR( physical_device->host.physical_device,
                                                                      &surface_info_host, capabilities );
     pthread_mutex_unlock( &surface->host_lock );
     if (!res) adjust_surface_capabilities( instance, surface, &capabilities->surfaceCapabilities );
+
+done:
+    if (!res && fullscreen_capabilities)
+        fullscreen_capabilities->fullScreenExclusiveSupported = fullscreen_supported;
     return res;
 }
 
@@ -2341,6 +2430,42 @@ static void *find_vk_struct( void *s, VkStructureType t )
     }
 
     return NULL;
+}
+
+static BOOL get_fullscreen_monitor_rect( HMONITOR monitor, RECT *rect )
+{
+    MONITORINFO info = {.cbSize = sizeof(info)};
+
+    if (!monitor || !NtUserCallTwoParam( HandleToUlong(monitor), (ULONG_PTR)&info,
+                                         NtUserCallTwoParam_GetMonitorInfo ))
+        return FALSE;
+
+    *rect = map_rect_virt_to_raw( info.rcMonitor, get_thread_dpi() );
+    return !IsRectEmpty( rect );
+}
+
+static BOOL get_automatic_fullscreen_rect( struct vulkan_device *device,
+                                           struct surface *surface,
+                                           VkFullScreenExclusiveEXT policy,
+                                           const VkSurfaceFullScreenExclusiveWin32InfoEXT *win32_info,
+                                           RECT *rect )
+{
+    DWORD style;
+    HMONITOR monitor;
+
+    if (!device->full_screen_exclusive_enabled ||
+        (policy != VK_FULL_SCREEN_EXCLUSIVE_DEFAULT_EXT &&
+         policy != VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT))
+        return FALSE;
+
+    style = NtUserGetWindowLongW( surface->hwnd, GWL_STYLE );
+    if (NtUserGetAncestor( surface->hwnd, GA_ROOT ) != surface->hwnd ||
+        (style & (WS_POPUP | WS_CHILD | WS_CAPTION | WS_THICKFRAME)) != WS_POPUP)
+        return FALSE;
+
+    monitor = win32_info ? win32_info->hmonitor :
+                           NtUserMonitorFromWindow( surface->hwnd, MONITOR_DEFAULTTONEAREST );
+    return get_fullscreen_monitor_rect( monitor, rect );
 }
 
 static void fixup_device_id_vulkan( UINT *vendor_id, UINT *device_id )
@@ -2466,7 +2591,8 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
         UINT i;
 
         /* Until the loader version exporting this function is common, emulate it using the older non-2 version. */
-        if (surface_info->pNext) FIXME( "Emulating vkGetPhysicalDeviceSurfaceFormats2KHR, ignoring pNext.\n" );
+        if (has_non_fullscreen_surface_info( surface_info_host.pNext ))
+            FIXME( "Emulating vkGetPhysicalDeviceSurfaceFormats2KHR, ignoring pNext.\n" );
         if (!formats) return win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device, surface_info->surface, format_count, NULL );
 
         surface_formats = calloc( *format_count, sizeof(*surface_formats) );
@@ -2483,6 +2609,55 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
     surface_info_host.surface = surface_host_handle( surface );
     res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
                                                              &surface_info_host, format_count, formats );
+    pthread_mutex_unlock( &surface->host_lock );
+    return res;
+}
+
+static VkResult win32u_vkGetPhysicalDeviceSurfacePresentModes2EXT(
+        VkPhysicalDevice client_physical_device,
+        const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
+        uint32_t *present_mode_count, VkPresentModeKHR *present_modes )
+{
+    struct vulkan_physical_device *physical_device =
+        vulkan_physical_device_from_handle( client_physical_device );
+    struct surface *surface = surface_from_handle( surface_info->surface );
+    struct vulkan_instance *instance = physical_device->instance;
+    VkResult res;
+
+    /* Emulated fullscreen does not change host presentation modes. */
+    if (!surface || !NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
+    if (has_non_fullscreen_surface_info( surface_info->pNext ))
+        FIXME( "Emulating vkGetPhysicalDeviceSurfacePresentModes2EXT, ignoring pNext.\n" );
+
+    pthread_mutex_lock( &surface->host_lock );
+    res = instance->p_vkGetPhysicalDeviceSurfacePresentModesKHR(
+        physical_device->host.physical_device, surface_host_handle( surface ),
+        present_mode_count, present_modes );
+    pthread_mutex_unlock( &surface->host_lock );
+    return res;
+}
+
+static VkResult win32u_vkGetDeviceGroupSurfacePresentModes2EXT(
+        VkDevice client_device, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
+        VkDeviceGroupPresentModeFlagsKHR *modes )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    struct surface *surface = surface_from_handle( surface_info->surface );
+    VkResult res;
+
+    if (!surface || !NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
+    if (has_non_fullscreen_surface_info( surface_info->pNext ))
+        FIXME( "Emulating vkGetDeviceGroupSurfacePresentModes2EXT, ignoring pNext.\n" );
+
+    if (!device->p_vkGetDeviceGroupSurfacePresentModesKHR)
+    {
+        *modes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
+        return VK_SUCCESS;
+    }
+
+    pthread_mutex_lock( &surface->host_lock );
+    res = device->p_vkGetDeviceGroupSurfacePresentModesKHR(
+        device->host.device, surface_host_handle( surface ), modes );
     pthread_mutex_unlock( &surface->host_lock );
     return res;
 }
@@ -4553,6 +4728,86 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     return res;
 }
 
+static void clear_fullscreen_owner( struct surface *surface, UINT64 owner )
+{
+    if (!owner || !driver_funcs->p_vulkan_surface_fullscreen) return;
+    pthread_mutex_lock( &surface->fullscreen_lock );
+    InterlockedCompareExchange64( &surface->fullscreen_active_owner, 0,
+                                  (LONGLONG)owner );
+    driver_funcs->p_vulkan_surface_fullscreen( surface->client, owner,
+                                               VULKAN_SURFACE_FULLSCREEN_CLEAR, NULL );
+    pthread_mutex_unlock( &surface->fullscreen_lock );
+}
+
+static BOOL swapchain_owns_fullscreen( struct swapchain *swapchain )
+{
+    LONGLONG active_owner;
+
+    if (!swapchain->fullscreen_owner ||
+        !ReadAcquire( &swapchain->fullscreen_acquired ))
+        return FALSE;
+
+    active_owner = InterlockedCompareExchange64(
+        &swapchain->surface->fullscreen_active_owner, 0, 0 );
+    return active_owner == (LONGLONG)swapchain->fullscreen_owner;
+}
+
+static BOOL swapchain_can_present( struct swapchain *swapchain )
+{
+    /* An ownership transition may reject one concurrent present. */
+    if (!ReadAcquire( &swapchain->fullscreen_acquired )) return TRUE;
+    return swapchain_owns_fullscreen( swapchain );
+}
+
+static LONGLONG exchange_fullscreen_owner( struct surface *surface, LONGLONG owner )
+{
+    LONGLONG current, previous;
+
+    /* InterlockedExchange64 is unavailable in 32-bit builds. */
+    previous = InterlockedCompareExchange64( &surface->fullscreen_active_owner, 0, 0 );
+    while ((current = InterlockedCompareExchange64( &surface->fullscreen_active_owner,
+                                                     owner, previous )) != previous)
+        previous = current;
+    return previous;
+}
+
+static VkResult acquire_swapchain_fullscreen( struct swapchain *swapchain )
+{
+    LONGLONG previous_owner;
+    VkResult res;
+
+    if (!swapchain->fullscreen_owner) return VK_ERROR_INITIALIZATION_FAILED;
+
+    pthread_mutex_lock( &swapchain->surface->fullscreen_lock );
+    if (swapchain_is_out_of_date( swapchain ))
+    {
+        pthread_mutex_unlock( &swapchain->surface->fullscreen_lock );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (swapchain_owns_fullscreen( swapchain ))
+    {
+        pthread_mutex_unlock( &swapchain->surface->fullscreen_lock );
+        return VK_SUCCESS;
+    }
+
+    previous_owner = exchange_fullscreen_owner( swapchain->surface, 0 );
+    res = driver_funcs->p_vulkan_surface_fullscreen(
+        swapchain->surface->client, swapchain->fullscreen_owner,
+        VULKAN_SURFACE_FULLSCREEN_ACQUIRE, NULL );
+    if (!res)
+    {
+        exchange_fullscreen_owner( swapchain->surface,
+                                   (LONGLONG)swapchain->fullscreen_owner );
+        InterlockedExchange( &swapchain->fullscreen_acquired, TRUE );
+        TRACE( "swapchain %p acquired fullscreen owner %s\n", swapchain,
+               wine_dbgstr_longlong( swapchain->fullscreen_owner ) );
+    }
+    else
+        exchange_fullscreen_owner( swapchain->surface, previous_owner );
+    pthread_mutex_unlock( &swapchain->surface->fullscreen_lock );
+    return res;
+}
+
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
@@ -4563,6 +4818,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     struct vulkan_physical_device *physical_device = device->physical_device;
     struct vulkan_instance *instance = physical_device->instance;
     VkSwapchainCreateInfoKHR create_info_host = *create_info;
+    const VkSurfaceFullScreenExclusiveWin32InfoEXT *fullscreen_win32_info;
+    const VkSurfaceFullScreenExclusiveInfoEXT *fullscreen_info;
+    VkFullScreenExclusiveEXT fullscreen_policy;
+    struct vulkan_surface_fullscreen_info fullscreen_info_driver;
     struct surface_host *updated_host = NULL;
     LONG generation_before_update;
     VkSurfaceCapabilitiesKHR capabilities;
@@ -4570,9 +4829,11 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkColorSpaceKHR mapped_color_space;
     uint32_t format_count = 0;
     VkSurfaceFormatKHR *formats;
-    RECT client_rect;
+    RECT client_rect, fullscreen_rect;
+    UINT64 fullscreen_owner = 0;
     VkResult res;
     BOOL topology_updated = FALSE;
+    BOOL automatic_fullscreen = FALSE;
     BOOL compositor_scaling;
     BOOL use_fshack;
     BOOL lite;
@@ -4584,10 +4845,71 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    generation_before_update = ReadAcquire( &surface->client->presentation_generation );
-
     if (surface->client && !(updated_host = surface_host_create( VK_NULL_HANDLE )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    fullscreen_info = find_vk_struct( (void *)create_info->pNext,
+                                      VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT );
+    fullscreen_win32_info = find_vk_struct(
+        (void *)create_info->pNext,
+        VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT );
+    fullscreen_policy = fullscreen_info ? fullscreen_info->fullScreenExclusive
+                                        : VK_FULL_SCREEN_EXCLUSIVE_DEFAULT_EXT;
+    TRACE( "surface %p fullscreen policy %u monitor %p\n", surface,
+           fullscreen_policy,
+           fullscreen_win32_info ? fullscreen_win32_info->hmonitor : NULL );
+    if (fullscreen_policy == VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT)
+    {
+        if (!driver_funcs->p_vulkan_surface_fullscreen)
+        {
+            free( updated_host );
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        if (!fullscreen_win32_info ||
+            !get_fullscreen_monitor_rect( fullscreen_win32_info->hmonitor, &fullscreen_rect ))
+        {
+            free( updated_host );
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+    else
+    {
+        automatic_fullscreen = get_automatic_fullscreen_rect(
+            device, surface, fullscreen_policy, fullscreen_win32_info,
+            &fullscreen_rect );
+    }
+
+    if (fullscreen_policy == VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT ||
+        automatic_fullscreen)
+    {
+        fullscreen_info_driver.rect = fullscreen_rect;
+        fullscreen_info_driver.target = automatic_fullscreen && !fullscreen_win32_info
+                                        ? VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW
+                                        : VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED;
+        fullscreen_owner = InterlockedIncrement64( &fullscreen_next_owner );
+        if (!fullscreen_owner)
+            fullscreen_owner = InterlockedIncrement64( &fullscreen_next_owner );
+        pthread_mutex_lock( &surface->fullscreen_lock );
+        res = driver_funcs->p_vulkan_surface_fullscreen(
+            surface->client, fullscreen_owner, VULKAN_SURFACE_FULLSCREEN_PREPARE,
+            &fullscreen_info_driver );
+        pthread_mutex_unlock( &surface->fullscreen_lock );
+        if (res)
+        {
+            free( updated_host );
+            return res;
+        }
+        TRACE( "surface %p prepared %s fullscreen owner %s for monitor %s\n",
+               surface, automatic_fullscreen ? "automatic" : "application-controlled",
+               wine_dbgstr_longlong( fullscreen_owner ), wine_dbgstr_rect( &fullscreen_rect ) );
+    }
+    else if (old_swapchain && old_swapchain->surface == surface &&
+             old_swapchain->fullscreen_owner)
+    {
+        clear_fullscreen_owner( surface, old_swapchain->fullscreen_owner );
+    }
+
+    generation_before_update = ReadAcquire( &surface->client->presentation_generation );
 
     pthread_mutex_lock( &surface->host_lock );
 
@@ -4617,6 +4939,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             pthread_mutex_unlock( &surface->host_lock );
             free( updated_host );
+            clear_fullscreen_owner( surface, fullscreen_owner );
             return res;
         }
 
@@ -4635,6 +4958,20 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         else free( updated_host );
     }
 
+    if (fullscreen_owner)
+    {
+        RECT host_rect, dst_rect;
+
+        if (!surface->client->funcs->get_presentation_rects ||
+            !surface->client->funcs->get_presentation_rects(
+                surface->client, &host_rect, &dst_rect ))
+        {
+            pthread_mutex_unlock( &surface->host_lock );
+            clear_fullscreen_owner( surface, fullscreen_owner );
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+
     if (surface) create_info_host.surface = surface_host_handle( surface );
     create_info_host.oldSwapchain = old_swapchain && old_swapchain->host_surface == surface->active_host
                                     ? old_swapchain->obj.host.swapchain : VK_NULL_HANDLE;
@@ -4644,6 +4981,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     if (res)
     {
         pthread_mutex_unlock( &surface->host_lock );
+        clear_fullscreen_owner( surface, fullscreen_owner );
         return res;
     }
 
@@ -4665,15 +5003,19 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
     {
         scaling.scalingBehavior = VK_PRESENT_SCALING_STRETCH_BIT_EXT;
+        scaling.pNext = create_info_host.pNext;
         create_info_host.pNext = &scaling;
     }
 
     if (!(swapchain = calloc( 1, sizeof(*swapchain) )))
     {
         pthread_mutex_unlock( &surface->host_lock );
+        clear_fullscreen_owner( surface, fullscreen_owner );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
+    swapchain->fullscreen_policy = fullscreen_policy;
+    swapchain->fullscreen_owner = fullscreen_owner;
     swapchain->color_space = create_info->imageColorSpace;
     swapchain->uses_color_description =
         mapped_color_space != create_info->imageColorSpace;
@@ -4742,6 +5084,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                      create_info->imageColorSpace );
                 pthread_mutex_unlock( &surface->host_lock );
                 free( swapchain );
+                clear_fullscreen_owner( surface, fullscreen_owner );
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
         }
@@ -4759,6 +5102,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             ERR( "Cannot preserve format %u for fullscreen scaling\n", create_info->imageFormat );
             pthread_mutex_unlock( &surface->host_lock );
             free( swapchain );
+            clear_fullscreen_owner( surface, fullscreen_owner );
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         if (swapchain->upscaler.color_mode == FS_HACK_COLOR_RAW &&
@@ -4782,6 +5126,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             pthread_mutex_unlock( &surface->host_lock );
             free( swapchain );
+            clear_fullscreen_owner( surface, fullscreen_owner );
             return res;
         }
 
@@ -4789,6 +5134,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             pthread_mutex_unlock( &surface->host_lock );
             free( swapchain );
+            clear_fullscreen_owner( surface, fullscreen_owner );
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
 
@@ -4799,6 +5145,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             pthread_mutex_unlock( &surface->host_lock );
             free( formats );
             free( swapchain );
+            clear_fullscreen_owner( surface, fullscreen_owner );
             return res;
         }
 
@@ -4863,11 +5210,18 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                         surface, topology_updated, generation_before_update );
                 instance->p_insert_object( instance, &swapchain->obj.obj );
                 set_window_pixel_format( surface->hwnd, -1, TRUE );
-
-                *ret = swapchain->obj.client.swapchain;
                 TRACE( "hwnd %p -> wine-managed swapchain %p (cross-process dmabuf producer)\n",
                        surface->hwnd, swapchain );
                 pthread_mutex_unlock( &surface->host_lock );
+
+                if (automatic_fullscreen && (res = acquire_swapchain_fullscreen( swapchain )))
+                {
+                    win32u_vkDestroySwapchainKHR( client_device,
+                                                  swapchain->obj.client.swapchain, NULL );
+                    return res;
+                }
+
+                *ret = swapchain->obj.client.swapchain;
                 return VK_SUCCESS;
             }
             /* Any failure -> fall through to the host swapchain path (never fail). */
@@ -4898,6 +5252,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         pthread_mutex_unlock( &surface->host_lock );
         InterlockedDecrement( &surface->client->busy_ref );
         free( swapchain );
+        clear_fullscreen_owner( surface, fullscreen_owner );
         return res;
     }
 
@@ -4933,6 +5288,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
               debugstr_vkextent2d(&swapchain->host_extents) );
     }
 
+    if (automatic_fullscreen && (res = acquire_swapchain_fullscreen( swapchain )))
+    {
+        win32u_vkDestroySwapchainKHR( client_device, swapchain->obj.client.swapchain, NULL );
+        return res;
+    }
+
     set_window_pixel_format( surface->hwnd, -1, TRUE );
 
     *ret = swapchain->obj.client.swapchain;
@@ -4949,6 +5310,8 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
+
+    clear_fullscreen_owner( swapchain->surface, swapchain->fullscreen_owner );
 
     if (swapchain->fshack.enabled && !swapchain->managed)
     {
@@ -5013,6 +5376,57 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     free( swapchain );
 }
 
+static VkResult win32u_vkAcquireFullScreenExclusiveModeEXT( VkDevice,
+                                                             VkSwapchainKHR client_swapchain )
+{
+    struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+    VkResult res;
+
+    if (!swapchain || swapchain_is_out_of_date( swapchain ) ||
+        swapchain->fullscreen_policy != VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT ||
+        !swapchain->fullscreen_owner)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    res = acquire_swapchain_fullscreen( swapchain );
+    if (res == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+        res = VK_ERROR_INITIALIZATION_FAILED;
+    return res;
+}
+
+static VkResult win32u_vkReleaseFullScreenExclusiveModeEXT( VkDevice,
+                                                             VkSwapchainKHR client_swapchain )
+{
+    struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+    VkResult res;
+
+    if (!swapchain || swapchain->fullscreen_policy !=
+                      VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT ||
+        !swapchain->fullscreen_owner)
+        return VK_ERROR_SURFACE_LOST_KHR;
+
+    pthread_mutex_lock( &swapchain->surface->fullscreen_lock );
+    if (!swapchain_owns_fullscreen( swapchain ))
+    {
+        pthread_mutex_unlock( &swapchain->surface->fullscreen_lock );
+        return VK_SUCCESS;
+    }
+
+    InterlockedExchange( &swapchain->fullscreen_acquired, FALSE );
+    InterlockedCompareExchange64( &swapchain->surface->fullscreen_active_owner,
+                                  0, (LONGLONG)swapchain->fullscreen_owner );
+
+    res = driver_funcs->p_vulkan_surface_fullscreen(
+        swapchain->surface->client, swapchain->fullscreen_owner,
+        VULKAN_SURFACE_FULLSCREEN_RELEASE, NULL );
+    if (res == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+        res = VK_ERROR_SURFACE_LOST_KHR;
+    if (!res)
+        TRACE( "swapchain %p released fullscreen owner %s\n", swapchain,
+               wine_dbgstr_longlong( swapchain->fullscreen_owner ) );
+    pthread_mutex_unlock( &swapchain->surface->fullscreen_lock );
+    return res;
+}
+
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
                                                uint32_t *image_index )
 {
@@ -5026,6 +5440,8 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     VkResult res;
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!swapchain_can_present( swapchain ))
+        return VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
 
     surface = swapchain->surface;
 
@@ -5070,6 +5486,8 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     VkResult res;
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!swapchain_can_present( swapchain ))
+        return VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
 
     surface = swapchain->surface;
 
@@ -6103,6 +6521,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     uint32_t blit_count = 0;
     VkSemaphore blit_sema;
     int managed_sync_fd = -1;
+    BOOL fullscreen_lost = FALSE;
     BOOL out_of_date = FALSE;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
@@ -6133,6 +6552,13 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             present_swapchains[i] = NULL;
             present_results[i] = VK_ERROR_OUT_OF_DATE_KHR;
             out_of_date = TRUE;
+            continue;
+        }
+        if (!swapchain_can_present( swapchain ))
+        {
+            present_swapchains[i] = NULL;
+            present_results[i] = VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
+            fullscreen_lost = TRUE;
             continue;
         }
         if (swapchain->managed) continue;
@@ -6247,7 +6673,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pWaitSemaphores = &blit_sema;
     }
 
-    res = out_of_date ? VK_ERROR_OUT_OF_DATE_KHR : VK_SUCCESS;
+    res = fullscreen_lost ? VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT :
+          out_of_date ? VK_ERROR_OUT_OF_DATE_KHR : VK_SUCCESS;
 
     if (first_managed && all_managed_explicit &&
         !queue->managed_present_sync_unavailable)
@@ -7366,6 +7793,7 @@ static void win32u_vkGetPhysicalDeviceExternalFencePropertiesKHR( VkPhysicalDevi
 
 static struct vulkan_funcs vulkan_funcs =
 {
+    .p_vkAcquireFullScreenExclusiveModeEXT = win32u_vkAcquireFullScreenExclusiveModeEXT,
     .p_vkAcquireNextImage2KHR = win32u_vkAcquireNextImage2KHR,
     .p_vkAcquireNextImageKHR = win32u_vkAcquireNextImageKHR,
     .p_vkAllocateMemory = win32u_vkAllocateMemory,
@@ -7384,6 +7812,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkDestroySurfaceKHR = win32u_vkDestroySurfaceKHR,
     .p_vkDestroySwapchainKHR = win32u_vkDestroySwapchainKHR,
     .p_vkFreeMemory = win32u_vkFreeMemory,
+    .p_vkGetDeviceGroupSurfacePresentModes2EXT = win32u_vkGetDeviceGroupSurfacePresentModes2EXT,
     .p_vkGetDeviceBufferMemoryRequirements = win32u_vkGetDeviceBufferMemoryRequirements,
     .p_vkGetDeviceBufferMemoryRequirementsKHR = win32u_vkGetDeviceBufferMemoryRequirements,
     .p_vkGetDeviceImageMemoryRequirements = win32u_vkGetDeviceImageMemoryRequirements,
@@ -7408,6 +7837,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
     .p_vkGetPhysicalDeviceSurfaceFormats2KHR = win32u_vkGetPhysicalDeviceSurfaceFormats2KHR,
     .p_vkGetPhysicalDeviceSurfaceFormatsKHR = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR,
+    .p_vkGetPhysicalDeviceSurfacePresentModes2EXT = win32u_vkGetPhysicalDeviceSurfacePresentModes2EXT,
     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR,
     .p_vkGetPastPresentationTimingEXT = win32u_vkGetPastPresentationTimingEXT,
     .p_vkGetLatencyTimingsNV = win32u_vkGetLatencyTimingsNV,
@@ -7420,6 +7850,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkMapMemory = win32u_vkMapMemory,
     .p_vkMapMemory2KHR = win32u_vkMapMemory2KHR,
     .p_vkQueuePresentKHR = win32u_vkQueuePresentKHR,
+    .p_vkReleaseFullScreenExclusiveModeEXT = win32u_vkReleaseFullScreenExclusiveModeEXT,
     .p_vkReleaseSwapchainImagesEXT = win32u_vkReleaseSwapchainImagesEXT,
     .p_vkReleaseSwapchainImagesKHR = win32u_vkReleaseSwapchainImagesKHR,
     .p_vkSetHdrMetadataEXT = win32u_vkSetHdrMetadataEXT,

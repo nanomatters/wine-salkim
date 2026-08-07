@@ -65,6 +65,7 @@ struct xkb_compose_table;
 #include "wine/gdi_driver.h"
 #include "wine/list.h"
 #include "wine/rbtree.h"
+#include "wine/vulkan_driver.h"
 
 #include "unixlib.h"
 
@@ -527,6 +528,14 @@ struct wayland_image_description_state
     const struct wl_surface *wl_surface;
 };
 
+struct wayland_fullscreen_request
+{
+    struct list entry;
+    UINT64 owner;
+    RECT rect;
+    enum vulkan_surface_fullscreen_target target;
+};
+
 struct wayland_client_surface
 {
     struct client_surface client;
@@ -562,6 +571,8 @@ struct wayland_client_surface
     LONG presentation_scaling;
     LONG attachment_generation;
     LONG updated_attachment_generation;
+    struct list fullscreen_requests;
+    UINT64 fullscreen_active_owner;
     struct wayland_visual_constraint visual_constraint;
 };
 
@@ -724,6 +735,16 @@ RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_to_surface(struct wayland_surface *surface, POINT point);
 RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
+RECT wayland_surface_get_input_rect(struct wayland_surface *surface,
+                                    const struct wayland_win_data *data);
+void wayland_surface_coords_to_screen(struct wayland_surface *surface,
+                                      const struct wayland_win_data *data,
+                                      double surface_x, double surface_y,
+                                      double *screen_x, double *screen_y);
+void wayland_surface_coords_from_screen(struct wayland_surface *surface,
+                                        const struct wayland_win_data *data,
+                                        double screen_x, double screen_y,
+                                        double *surface_x, double *surface_y);
 BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
 BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
 BOOL wayland_surface_has_direct_dmabuf_content(struct wayland_surface *surface);
@@ -770,6 +791,10 @@ BOOL wayland_client_surface_set_image_description(
         enum wayland_image_description_color_space color_space);
 struct wayland_client_surface *impl_from_client_surface(struct client_surface *client);
 void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha);
+BOOL wayland_client_surface_get_fullscreen_rect(struct wayland_client_surface *client,
+                                                BOOL active, RECT *rect);
+BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surface *client,
+                                                     const RECT *window_rect);
 void wayland_surface_ensure_contents(struct wayland_surface *surface,
                                      struct wayland_client_surface *client);
 void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
@@ -883,6 +908,7 @@ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
 BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data);
 BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data);
+void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);

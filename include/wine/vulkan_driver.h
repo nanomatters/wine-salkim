@@ -94,7 +94,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 49
+#define WINE_VULKAN_DRIVER_VERSION 50
 
 struct vulkan_object
 {
@@ -226,6 +226,7 @@ struct vulkan_device
     uint64_t queue_count;
     struct vulkan_queue *queues;
     VkQueueFamilyProperties *queue_props;
+    BOOL full_screen_exclusive_enabled;
     BOOL low_latency_enabled;
 };
 
@@ -332,6 +333,7 @@ struct vulkan_funcs
      * needs to provide. Other function calls will be provided indirectly by dispatch
      * tables part of dispatchable Vulkan objects such as VkInstance or vkDevice.
      */
+    PFN_vkAcquireFullScreenExclusiveModeEXT p_vkAcquireFullScreenExclusiveModeEXT;
     PFN_vkAcquireNextImage2KHR p_vkAcquireNextImage2KHR;
     PFN_vkAcquireNextImageKHR p_vkAcquireNextImageKHR;
     PFN_vkAllocateMemory p_vkAllocateMemory;
@@ -350,6 +352,7 @@ struct vulkan_funcs
     PFN_vkDestroySurfaceKHR p_vkDestroySurfaceKHR;
     PFN_vkDestroySwapchainKHR p_vkDestroySwapchainKHR;
     PFN_vkFreeMemory p_vkFreeMemory;
+    PFN_vkGetDeviceGroupSurfacePresentModes2EXT p_vkGetDeviceGroupSurfacePresentModes2EXT;
     PFN_vkGetDeviceBufferMemoryRequirements p_vkGetDeviceBufferMemoryRequirements;
     PFN_vkGetDeviceBufferMemoryRequirementsKHR p_vkGetDeviceBufferMemoryRequirementsKHR;
     PFN_vkGetDeviceImageMemoryRequirements p_vkGetDeviceImageMemoryRequirements;
@@ -376,6 +379,7 @@ struct vulkan_funcs
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
     PFN_vkGetPhysicalDeviceSurfaceFormats2KHR p_vkGetPhysicalDeviceSurfaceFormats2KHR;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR p_vkGetPhysicalDeviceSurfaceFormatsKHR;
+    PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT p_vkGetPhysicalDeviceSurfacePresentModes2EXT;
     PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR p_vkGetPhysicalDeviceWin32PresentationSupportKHR;
     PFN_vkGetPastPresentationTimingEXT p_vkGetPastPresentationTimingEXT;
     PFN_vkGetLatencyTimingsNV p_vkGetLatencyTimingsNV;
@@ -388,6 +392,7 @@ struct vulkan_funcs
     PFN_vkMapMemory p_vkMapMemory;
     PFN_vkMapMemory2KHR p_vkMapMemory2KHR;
     PFN_vkQueuePresentKHR p_vkQueuePresentKHR;
+    PFN_vkReleaseFullScreenExclusiveModeEXT p_vkReleaseFullScreenExclusiveModeEXT;
     PFN_vkReleaseSwapchainImagesEXT p_vkReleaseSwapchainImagesEXT;
     PFN_vkReleaseSwapchainImagesKHR p_vkReleaseSwapchainImagesKHR;
     PFN_vkSetHdrMetadataEXT p_vkSetHdrMetadataEXT;
@@ -405,6 +410,26 @@ struct vulkan_funcs
 
 /* interface between win32u and the user drivers */
 struct client_surface;
+enum vulkan_surface_fullscreen_action
+{
+    VULKAN_SURFACE_FULLSCREEN_PREPARE,
+    VULKAN_SURFACE_FULLSCREEN_ACQUIRE,
+    VULKAN_SURFACE_FULLSCREEN_RELEASE,
+    VULKAN_SURFACE_FULLSCREEN_CLEAR,
+};
+
+enum vulkan_surface_fullscreen_target
+{
+    VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED,
+    VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW,
+};
+
+struct vulkan_surface_fullscreen_info
+{
+    RECT rect;
+    enum vulkan_surface_fullscreen_target target;
+};
+
 struct vulkan_driver_funcs
 {
     VkResult (*p_vulkan_surface_create)(HWND, BOOL, const struct vulkan_instance *, VkSurfaceKHR *, struct client_surface **);
@@ -415,6 +440,11 @@ struct vulkan_driver_funcs
     void (*p_vulkan_surface_set_color_description)( VkColorSpaceKHR, BOOL,
                                                     struct client_surface * );
     void (*p_vulkan_surface_set_alpha)( VkCompositeAlphaFlagBitsKHR, struct client_surface * );
+    VkBool32 (*p_vulkan_surface_fullscreen_supported)( struct client_surface *,
+                                                       const struct vulkan_surface_fullscreen_info * );
+    VkResult (*p_vulkan_surface_fullscreen)( struct client_surface *, UINT64,
+                                             enum vulkan_surface_fullscreen_action,
+                                             const struct vulkan_surface_fullscreen_info * );
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
     UINT (*p_vulkan_get_hwnd_dmabuf_caps)( HWND, void *, void *, UINT, UINT * );
     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );
