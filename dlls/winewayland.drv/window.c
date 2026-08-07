@@ -348,7 +348,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         window_state = WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
     }
 
-    conf->resizeable = data->resizeable;
+    conf->resizeable = (style & WS_THICKFRAME) && !fullscreen;
     conf->state = window_state;
     conf->managed = data->managed;
 }
@@ -1130,7 +1130,6 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->client_rect_in_toplevel_valid = client_rect_in_toplevel_valid;
     data->is_fullscreen = fullscreen;
     data->has_present_rect = has_present_rect;
-    data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
     data->managed = managed;
     if (data->client_surface)
         wayland_client_surface_update_fullscreen_target(data->client_surface,

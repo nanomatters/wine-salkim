@@ -881,7 +881,6 @@ struct wayland_win_data
     struct window_rects rects;
     BOOL is_fullscreen;
     BOOL has_present_rect;
-    BOOL resizeable;
     BOOL managed;
     BOOL frameless;
     RECT restore_rect;
