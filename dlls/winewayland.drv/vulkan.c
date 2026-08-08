@@ -261,19 +261,31 @@ static struct wayland_fullscreen_request *find_fullscreen_request(
     return NULL;
 }
 
+static BOOL resolve_fullscreen_rect(
+        const struct vulkan_surface_fullscreen_info *info, RECT *rect)
+{
+    struct wayland_output *output;
+
+    if (!info || IsRectEmpty(&info->rect) ||
+        (info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED &&
+         info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW))
+        return FALSE;
+
+    if (!(output = wayland_output_for_rect(&info->rect, rect, NULL))) return FALSE;
+    wayland_output_release(output);
+    return TRUE;
+}
+
 static VkBool32 wayland_vulkan_surface_fullscreen_supported(
         struct client_surface *client_surface,
         const struct vulkan_surface_fullscreen_info *info)
 {
     struct wayland_client_surface *client;
-    struct wayland_output *output;
     struct wayland_win_data *data;
     RECT output_rect;
     BOOL valid;
 
-    if (!client_surface || !info || IsRectEmpty(&info->rect) ||
-        (info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED &&
-         info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW))
+    if (!client_surface || !resolve_fullscreen_rect(info, &output_rect))
         return VK_FALSE;
 
     client = impl_from_client_surface(client_surface);
@@ -281,12 +293,7 @@ static VkBool32 wayland_vulkan_surface_fullscreen_supported(
     data = wayland_win_data_get_nolock(client_surface->hwnd);
     valid = data && data->client_surface == client;
     wayland_win_data_unlock();
-    if (!valid) return VK_FALSE;
-
-    if (!(output = wayland_output_for_rect(&info->rect, &output_rect, NULL)))
-        return VK_FALSE;
-    wayland_output_release(output);
-    return EqualRect(&info->rect, &output_rect);
+    return valid;
 }
 
 static VkResult wayland_vulkan_surface_fullscreen(
@@ -297,19 +304,17 @@ static VkResult wayland_vulkan_surface_fullscreen(
     struct wayland_client_surface *client = impl_from_client_surface(client_surface);
     struct wayland_fullscreen_request *request, *new_request = NULL, *latest;
     struct wayland_win_data *data;
-    RECT active_before, active_after;
+    RECT active_before, active_after, target_rect;
     BOOL had_active, has_active, refresh;
     VkResult res = VK_SUCCESS;
 
     if (action == VULKAN_SURFACE_FULLSCREEN_PREPARE)
     {
-        if (!info || IsRectEmpty(&info->rect) ||
-            (info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED &&
-             info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW))
+        if (!resolve_fullscreen_rect(info, &target_rect))
             return VK_ERROR_INITIALIZATION_FAILED;
         if (!(new_request = calloc(1, sizeof(*new_request)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
         new_request->owner = owner;
-        new_request->rect = info->rect;
+        new_request->rect = target_rect;
         new_request->target = info->target;
     }
 

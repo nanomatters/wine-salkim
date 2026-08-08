@@ -5624,7 +5624,7 @@ static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapch
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
     uint32_t i;
 
-    if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!swapchain) return VK_ERROR_UNKNOWN;
 
     if (swapchain->managed)
     {
