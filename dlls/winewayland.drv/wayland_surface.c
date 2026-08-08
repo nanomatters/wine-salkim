@@ -1299,6 +1299,13 @@ static const struct wayland_surface_config *wayland_surface_latest_config(struct
     return NULL;
 }
 
+static BOOL wayland_surface_repaint_suspended(struct wayland_surface *surface)
+{
+    const struct wayland_surface_config *config = wayland_surface_latest_config(surface);
+
+    return config && (config->state & WAYLAND_SURFACE_CONFIG_STATE_SUSPENDED);
+}
+
 static void wayland_surface_config_inherit_caps_and_bounds(struct wayland_surface_config *config,
                                                            struct wayland_surface *surface)
 {
@@ -1414,6 +1421,9 @@ static void xdg_toplevel_handle_configure(void *private,
         case XDG_TOPLEVEL_STATE_FULLSCREEN:
             config_state |= WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
             break;
+        case XDG_TOPLEVEL_STATE_SUSPENDED:
+            config_state |= WAYLAND_SURFACE_CONFIG_STATE_SUSPENDED;
+            break;
         default:
             break;
         }
@@ -1434,7 +1444,8 @@ static void xdg_toplevel_handle_configure(void *private,
 
     wayland_win_data_release(data);
 
-    TRACE("hwnd=%p %s,%#x\n", hwnd, wine_dbgstr_rect(&rect), config_state);
+    TRACE("hwnd=%p %s,%#x suspended=%u\n", hwnd, wine_dbgstr_rect(&rect), config_state,
+          !!(config_state & WAYLAND_SURFACE_CONFIG_STATE_SUSPENDED));
 }
 
 static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_toplevel)
@@ -4694,7 +4705,7 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
         struct wayland_surface *surface = data->wayland_surface;
 
         if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
-            surface->window.minimized)
+            (surface->window.minimized || wayland_surface_repaint_suspended(surface)))
         {
             wayland_win_data_release(data);
             return FALSE;
@@ -4756,7 +4767,7 @@ void wayland_surface_reannounce_hwnd_dmabuf_consumers(struct wayland_surface *su
         surface->direct_dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
 }
 
-/* Stop publishing while this surface cannot import producer frames. */
+/* Stop producer updates while new frames cannot be displayed. */
 static void wayland_surface_suspend_hwnd_dmabuf_consumers(struct wayland_surface *surface)
 {
     struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
@@ -4772,6 +4783,23 @@ static void wayland_surface_suspend_hwnd_dmabuf_consumers(struct wayland_surface
         !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
                 HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
         dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
+}
+
+static void wayland_surface_activate_hwnd_dmabuf_consumers(struct wayland_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+
+    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+        if (dmabuf_surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE &&
+            !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
+                    HWND_DMABUF_RELEASE_CONSUMER_ACTIVE))
+            dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE;
+
+    if ((dmabuf_surface = surface->direct_dmabuf_surface) &&
+        dmabuf_surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE &&
+        !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
+                HWND_DMABUF_RELEASE_CONSUMER_ACTIVE))
+        dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE;
 }
 
 void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
@@ -4793,10 +4821,14 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         wayland_surface_suspend_hwnd_dmabuf_consumers(surface);
         return;
     }
-    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
+    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL)
     {
-        wayland_surface_suspend_hwnd_dmabuf_consumers(surface);
-        return;
+        if (surface->window.minimized || wayland_surface_repaint_suspended(surface))
+        {
+            wayland_surface_suspend_hwnd_dmabuf_consumers(surface);
+            return;
+        }
+        wayland_surface_activate_hwnd_dmabuf_consumers(surface);
     }
 
     /* Import is driven by producer wakes (WM_WAYLAND_DMABUF_FRAME) at the producer's

@@ -591,9 +591,10 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     }
     else if (strcmp(interface, "xdg_wm_base") == 0)
     {
-        /* version 3 is required for xdg_popup::reposition */
+        /* Version 3 provides popup repositioning; version 6 adds suspension. */
         if (version < 3) return;
-        process_wayland.xdg_wm_base = wl_registry_bind(registry, id, &xdg_wm_base_interface, 3);
+        process_wayland.xdg_wm_base =
+            wl_registry_bind(registry, id, &xdg_wm_base_interface, version < 6 ? version : 6);
         xdg_wm_base_add_listener(process_wayland.xdg_wm_base, &xdg_wm_base_listener, NULL);
     }
     else if (strcmp(interface, "wl_shm") == 0)

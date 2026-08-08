@@ -1224,9 +1224,9 @@ static void wayland_configure_window(HWND hwnd)
      * their sizes cannot change while we are still processing the new config.
      * This allows us to respect the size hint on transitions of maximized/tiled
      * to a stateless regular window. */
-    if (state || surface->current.state &
-        (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
-               WAYLAND_SURFACE_CONFIG_STATE_TILED))
+    if ((state & ~WAYLAND_SURFACE_CONFIG_STATE_SUSPENDED) ||
+        (surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                                   WAYLAND_SURFACE_CONFIG_STATE_TILED)))
     {
         width = surface->processing.rect.right - surface->processing.rect.left;
         height = surface->processing.rect.bottom - surface->processing.rect.top;
