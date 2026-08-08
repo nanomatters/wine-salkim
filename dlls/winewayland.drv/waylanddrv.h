@@ -720,6 +720,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
                                 struct wayland_surface *owner);
 void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect);
 BOOL wayland_surface_clear_role(struct wayland_surface *surface);
+BOOL wayland_surface_unmap(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
@@ -864,6 +865,7 @@ struct wayland_win_data
     HWND owner;
     WCHAR *window_text;
     BOOL visible;
+    BOOL explicitly_hidden;
     DWORD style;
     DWORD exstyle;
     RECT client_rect_in_toplevel;

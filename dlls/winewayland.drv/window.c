@@ -361,11 +361,12 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
-static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface,
-                                                  DWORD style)
+static BOOL should_keep_toplevel_mapped(struct wayland_surface *surface,
+                                        DWORD style, BOOL explicitly_hidden)
 {
     if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
-    if (!(style & WS_MINIMIZE)) return FALSE;
+    if (explicitly_hidden) return FALSE;
+    if (!(style & WS_MINIMIZE)) return !(style & WS_VISIBLE);
 
     return !surface->current.caps ||
            (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
@@ -379,17 +380,6 @@ static BOOL window_or_root_minimized(struct wayland_win_data *data)
     if (!data->toplevel || data->toplevel == data->hwnd) return FALSE;
     root_data = wayland_win_data_get_nolock(data->toplevel);
     return root_data && (root_data->style & WS_MINIMIZE);
-}
-
-static void detach_client_surfaces_for_toplevel(HWND toplevel)
-{
-    struct wayland_win_data *data;
-
-    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
-    {
-        if (data->client_surface && data->client_surface->toplevel == toplevel)
-            wayland_client_surface_attach(data->client_surface, NULL);
-    }
 }
 
 /* The caller holds win_data_mutex. Direct WSI can borrow a toplevel only when
@@ -483,7 +473,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *parent_surface, *surface;
     enum wayland_surface_role role;
-    BOOL visible, layer_set, server_decor = FALSE;
+    BOOL visible, layer_set, keep_toplevel_mapped, server_decor = FALSE;
     DWORD exstyle = data->exstyle;
     DWORD style = data->style;
 
@@ -492,16 +482,22 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     surface = data->wayland_surface;
 
     layer_set = !(exstyle & WS_EX_LAYERED) || data->layered_attribs_set;
-    visible = ((style & WS_VISIBLE) == WS_VISIBLE);
+    visible = !data->explicitly_hidden && ((style & WS_VISIBLE) == WS_VISIBLE);
 
     /* if a window is layered and visible but doesn't have attributes set,
      * that only delays when it gets mapped: it doesn't cause the window to get unmapped. */
     if (!surface || !surface->window.visible)
         visible = visible && layer_set;
 
+    keep_toplevel_mapped = !owner_surface && !use_layer_shell && !toplevel_surface &&
+                           should_keep_toplevel_mapped(surface, style,
+                                                       data->explicitly_hidden);
+    if (keep_toplevel_mapped)
+        visible = TRUE;
+
     if (visible && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !wayland_output_layout_intersects_rect(&data->rects.window) &&
-        !should_keep_minimized_toplevel_mapped(surface, style))
+        !keep_toplevel_mapped)
         visible = FALSE;
 
     /* If the toplevel has no observable area, make it roleless. */
@@ -566,7 +562,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     switch (role)
     {
     case WAYLAND_SURFACE_ROLE_NONE:
-        if (surface->role && !wayland_surface_clear_role(surface)) return FALSE;
+        if (surface->role && !wayland_surface_unmap(surface)) return FALSE;
         break;
     case WAYLAND_SURFACE_ROLE_POPUP:
         wayland_surface_make_popup(surface, owner_surface);
@@ -585,12 +581,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     if (client)
     {
-        if (role != WAYLAND_SURFACE_ROLE_NONE && !window_or_root_minimized(data))
+        if (role == WAYLAND_SURFACE_ROLE_NONE)
+            wayland_client_surface_attach(client, NULL);
+        else if (!window_or_root_minimized(data))
             wayland_client_surface_attach(client, data->hwnd);
-        else wayland_client_surface_attach(client, NULL);
     }
-    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
-        detach_client_surfaces_for_toplevel(data->hwnd);
     wayland_surface_sync_window_regions(surface, window_surface, data->exstyle);
 
     TRACE("hwnd=%p surface=%p=>%p\n", data->hwnd, data->wayland_surface, surface);
@@ -1118,6 +1113,13 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         ERR("hwnd=%p parent=%p forms a cycle!\n", hwnd, toplevel);
         toplevel_surface = NULL;
     }
+
+    /* Keep explicit hide intent across later position-only updates. */
+    if (swp_flags & SWP_HIDEWINDOW)
+        data->explicitly_hidden = TRUE;
+    else if ((swp_flags & SWP_SHOWWINDOW) || visible)
+        data->explicitly_hidden = FALSE;
+    visible = visible && !data->explicitly_hidden;
 
     data->rects = *new_rects;
     data->toplevel = root;

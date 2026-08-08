@@ -2741,6 +2741,12 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
     return TRUE;
 }
 
+BOOL wayland_surface_unmap(struct wayland_surface *surface)
+{
+    wayland_surface_clear_input_state(surface);
+    return wayland_surface_clear_role(surface);
+}
+
 /**********************************************************************
  *          wayland_surface_attach_shm
  *
@@ -5725,15 +5731,42 @@ static void wayland_client_surface_detach(struct client_surface *client)
     }
 }
 
-static BOOL is_client_visible(HWND hwnd)
-{
-    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-    RECT dummy;
+static BOOL wayland_surface_has_live_role(struct wayland_surface *surface);
 
-    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) return FALSE;
-    if (root && root != hwnd && (NtUserGetWindowLongW(root, GWL_STYLE) & WS_MINIMIZE))
-        return FALSE;
-    return NtUserIsWindowVisible(hwnd) || NtUserGetPresentRect(hwnd, &dummy, -1);
+enum client_surface_attachment
+{
+    CLIENT_SURFACE_DETACH,
+    CLIENT_SURFACE_KEEP,
+    CLIENT_SURFACE_ATTACH,
+};
+
+static enum client_surface_attachment client_surface_attachment_for_window(
+        struct wayland_win_data *data, struct wayland_client_surface *client,
+        HWND toplevel)
+{
+    struct wayland_win_data *toplevel_data;
+    struct wayland_surface *surface;
+
+    if (!toplevel || data->explicitly_hidden) return CLIENT_SURFACE_DETACH;
+    /* A kept toplevel remains mapped while WS_VISIBLE is transiently clear. */
+    if (data->hwnd != toplevel && !data->visible && !data->has_present_rect)
+        return CLIENT_SURFACE_DETACH;
+
+    toplevel_data = data->hwnd == toplevel ? data : wayland_win_data_get_nolock(toplevel);
+    if (!toplevel_data || toplevel_data->explicitly_hidden ||
+        !(surface = toplevel_data->wayland_surface) ||
+        !surface->window.visible || !wayland_surface_has_live_role(surface))
+        return CLIENT_SURFACE_DETACH;
+
+    if ((data->style & WS_MINIMIZE) || (toplevel_data->style & WS_MINIMIZE))
+    {
+        if (client->toplevel == toplevel &&
+            client->toplevel_wl_surface == surface->wl_surface)
+            return CLIENT_SURFACE_KEEP;
+        return CLIENT_SURFACE_DETACH;
+    }
+
+    return CLIENT_SURFACE_ATTACH;
 }
 
 static void wayland_client_surface_update(struct client_surface *client)
@@ -5755,8 +5788,6 @@ static void wayland_client_surface_update(struct client_surface *client)
     surface->updated_attachment_generation =
         ReadAcquire(&surface->attachment_generation);
 }
-
-static BOOL wayland_surface_has_live_role(struct wayland_surface *surface);
 
 static BOOL wayland_visual_constraint_equal(const struct wayland_visual_constraint *a,
                                             const struct wayland_visual_constraint *b)
@@ -5952,8 +5983,8 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_client_surface *old_client;
+    enum client_surface_attachment attachment;
     struct wayland_win_data *data;
-    BOOL visible = is_client_visible(hwnd);
 
     /* ownership is shared with the callers, the last caller to release
      * its reference will also destroy it and clear our pointer. */
@@ -5975,9 +6006,11 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 
     if (data->client_surface)
     {
-        if (toplevel && visible)
+        attachment = client_surface_attachment_for_window(data, data->client_surface,
+                                                          toplevel);
+        if (attachment == CLIENT_SURFACE_ATTACH)
             wayland_client_surface_attach(data->client_surface, toplevel);
-        else
+        else if (attachment == CLIENT_SURFACE_DETACH)
             wayland_client_surface_attach(data->client_surface, NULL);
     }
 
@@ -6122,8 +6155,7 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (data->client_surface != surface) failure = "the window has a different client surface";
     else if (toplevel->direct_client != surface) failure = "the toplevel has a different direct client";
     else if (toplevel->shaped) failure = "the window is shaped";
-    /* Minimize detaches the direct client and uses an iconic window rectangle.
-     * Keep the borrowed toplevel alive until the window is restored. */
+    /* Ignore the iconic window rectangle until the toplevel is restored. */
     else if (!explicit_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_fills_window(toplevel))
         failure = "the client does not fill the toplevel";
@@ -6552,8 +6584,11 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
     }
     if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
     {
+        BOOL attached = client->toplevel == toplevel &&
+                        client->toplevel_wl_surface == surface->wl_surface;
+
         wayland_win_data_release(toplevel_data);
-        wayland_client_surface_attach_internal(client, NULL);
+        if (!attached) wayland_client_surface_attach_internal(client, NULL);
         return;
     }
 
