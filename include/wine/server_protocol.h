@@ -281,6 +281,7 @@ enum hwnd_dmabuf_status
 
 #define HWND_DMABUF_RELEASE_CONSUMER_ACTIVE    0x00000020
 #define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
+#define HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER 0x00000080
 
 
 /* image_id names a dmabuf slot whose backing store stays valid until its release
@@ -294,8 +295,16 @@ enum hwnd_dmabuf_status
 
 #define HWND_DMABUF_FLAG_COLOR_SPACE      0x00000008
 
+#define HWND_DMABUF_FLAG_HOST_SURFACE     0x00000010
+
+#define HWND_DMABUF_FLAG_LAYERED_COMPOSITE 0x00000020
+
+#define HWND_DMABUF_FLAG_ALPHA_MODIFIER    0x00000040
+
 #define HWND_DMABUF_FRAME_OPENED          0x00000001
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
+#define HWND_DMABUF_FRAME_HOST_SURFACE    0x00000004
+#define HWND_DMABUF_FRAME_FULLY_VISIBLE   0x00000008
 
 #define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
 
@@ -336,6 +345,7 @@ typedef struct
     unsigned int style;
     unsigned int ex_style;
     unsigned int dpi;
+    unsigned int alpha;
     unsigned int frame_seq;
     unsigned int opened;
 } hwnd_dmabuf_frame_info_t;
@@ -7452,6 +7462,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 937
+#define SERVER_PROTOCOL_VERSION 938
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

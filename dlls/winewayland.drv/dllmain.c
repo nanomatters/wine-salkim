@@ -29,11 +29,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 static DWORD WINAPI wayland_read_events_thread(void *arg)
 {
-    WAYLANDDRV_UNIX_CALL(read_events, NULL);
+    NTSTATUS status = WAYLANDDRV_UNIX_CALL(read_events, NULL);
+
     /* This thread terminates only if an unrecoverable error occurred
      * during event reading (e.g., the connection to the Wayland
      * compositor is broken). */
-    ERR("Failed to read events from the compositor, terminating process\n");
+    ERR("Failed to read events from the compositor, status %#lx, terminating process\n", status);
     TerminateProcess(GetCurrentProcess(), 1);
     return 0;
 }

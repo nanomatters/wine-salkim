@@ -22,6 +22,7 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 
 #include "ntstatus.h"
@@ -1332,6 +1333,44 @@ static inline struct window *get_top_clipping_window( struct window *win )
     return win;
 }
 
+static struct region *get_visible_region( struct window *win, unsigned int flags );
+
+/* Keep in sync with winewayland's wayland_hwnd_dmabuf_visible_region_flags. */
+static unsigned int hwnd_dmabuf_visible_region_flags( struct window *win )
+{
+    struct window *parent = win->parent;
+    unsigned int flags = 0;
+
+    if (win->style & WS_CLIPSIBLINGS) flags |= DCX_CLIPSIBLINGS;
+    if (win->class && (get_class_style( win->class ) & CS_PARENTDC)) flags |= DCX_PARENTCLIP;
+    if ((win->style & WS_CLIPCHILDREN) && !(win->style & WS_MINIMIZE))
+        flags |= DCX_CLIPCHILDREN;
+    if (!parent || is_desktop_window( parent ))
+        flags = (flags & ~DCX_PARENTCLIP) | DCX_CLIPSIBLINGS;
+    if (flags & (DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN)) flags &= ~DCX_PARENTCLIP;
+    if ((flags & DCX_PARENTCLIP) && (win->style & WS_VISIBLE) &&
+        (parent->style & WS_VISIBLE))
+    {
+        flags &= ~DCX_CLIPCHILDREN;
+        if (parent->style & WS_CLIPSIBLINGS) flags |= DCX_CLIPSIBLINGS;
+    }
+    if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
+    return flags;
+}
+
+static int hwnd_dmabuf_is_fully_visible( struct window *win )
+{
+    struct rectangle client = win->client_rect;
+    struct region *region;
+    int ret;
+
+    offset_rect( &client, -win->window_rect.left, -win->window_rect.top );
+    if (!(region = get_visible_region( win, hwnd_dmabuf_visible_region_flags( win ) ))) return 0;
+    ret = is_region_rect( region, &client );
+    free_region( region );
+    return ret;
+}
+
 static void hwnd_dmabuf_host_client_origin( struct window *host, int *x, int *y )
 {
     *x = *y = 0;
@@ -1339,6 +1378,7 @@ static void hwnd_dmabuf_host_client_origin( struct window *host, int *x, int *y 
 }
 
 static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct window *win,
+                                                int host_surface,
                                                 hwnd_dmabuf_frame_info_t *info )
 {
     int host_x, host_y;
@@ -1356,8 +1396,12 @@ static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct wind
     info->style = win->style;
     info->ex_style = win->ex_style;
     info->dpi = get_window_dpi( win );
+    info->alpha = 255;
+    if ((win->ex_style & WS_EX_LAYERED) && win->is_layered && (win->layered_flags & LWA_ALPHA))
+        info->alpha = win->alpha & 0xff;
     if (win->dmabuf_producer_count) info->opened |= HWND_DMABUF_FRAME_OPENED;
     if (win->gdi_overlay_producer_count) info->opened |= HWND_DMABUF_FRAME_GDI_OVERLAY;
+    if (host_surface) info->opened |= HWND_DMABUF_FRAME_HOST_SURFACE;
 }
 
 static void hwnd_dmabuf_release_server_channel( struct window *win )
@@ -1396,31 +1440,151 @@ static int hwnd_dmabuf_is_listed( struct window *win )
     return win->dmabuf_producer_count || win->dmabuf_pending_count || win->gdi_overlay_producer_count;
 }
 
-static unsigned int hwnd_dmabuf_count_frames( struct window *win )
+static struct window *hwnd_dmabuf_get_owner( struct window *win )
 {
-    struct window *child;
-    unsigned int count = 0;
+    struct window *owner;
 
-    if (hwnd_dmabuf_is_listed( win ) && is_visible( win )) count++;
-    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        count += hwnd_dmabuf_count_frames( child );
-    return count;
+    if (!win->owner || !(owner = get_user_object( win->owner, NTUSER_OBJ_WINDOW ))) return NULL;
+    while (owner->parent && !is_desktop_window( owner->parent )) owner = owner->parent;
+    return owner;
 }
 
-static void hwnd_dmabuf_fill_frame_info( struct window *host, struct window *win,
-                                         hwnd_dmabuf_frame_info_t *frames,
-                                         unsigned int max_count, unsigned int *count )
+static int hwnd_dmabuf_owned_tree_is_ready( struct window *win )
 {
-    struct window *child;
+    return !(win->ex_style & WS_EX_LAYERED) || win->gdi_overlay_producer_count ||
+           win->dmabuf_producer_count;
+}
 
+static int hwnd_dmabuf_owned_tree_is_candidate( struct window *win, struct window *host,
+                                                 int external_tree )
+{
+    return win->thread && host->thread &&
+           (external_tree || win->thread->process != host->thread->process) &&
+           is_visible( win ) && hwnd_dmabuf_owned_tree_is_ready( win );
+}
+
+/* Layered roots must export pixels before their owned trees can be represented.
+ * GDI overlays always provide a carrier; dmabufs do so only for layered roots. */
+static int hwnd_dmabuf_owned_tree_is_carrier( struct window *win )
+{
+    return win->gdi_overlay_producer_count ||
+           ((win->ex_style & WS_EX_LAYERED) && win->dmabuf_producer_count);
+}
+
+struct hwnd_dmabuf_frame_collector
+{
+    struct window *root;
+    struct window *owners[32];
+    hwnd_dmabuf_frame_info_t *frames;
+    unsigned int count;
+    unsigned int capacity;
+    unsigned int max_count;
+};
+
+static int hwnd_dmabuf_collect_frame( struct window *host, struct window *win,
+                                      int host_surface,
+                                      struct hwnd_dmabuf_frame_collector *collector )
+{
     if (hwnd_dmabuf_is_listed( win ) && is_visible( win ))
     {
-        if (*count < max_count)
-            hwnd_dmabuf_frame_info_from_window( host, win, &frames[*count] );
-        (*count)++;
+        if (collector->count < collector->max_count &&
+            collector->count == collector->capacity)
+        {
+            hwnd_dmabuf_frame_info_t *frames;
+            unsigned int capacity = collector->capacity ? collector->capacity * 2 : 8;
+
+            if (capacity < collector->capacity || capacity > collector->max_count)
+                capacity = collector->max_count;
+            if (!(frames = realloc( collector->frames, capacity * sizeof(*frames) ))) return 0;
+            collector->frames = frames;
+            collector->capacity = capacity;
+        }
+        if (collector->count < collector->max_count)
+        {
+            hwnd_dmabuf_frame_info_from_window( host, win, host_surface,
+                                                &collector->frames[collector->count] );
+            if (host != collector->root && !host_surface && hwnd_dmabuf_is_fully_visible( win ))
+                collector->frames[collector->count].opened |= HWND_DMABUF_FRAME_FULLY_VISIBLE;
+        }
+        collector->count++;
     }
-    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        hwnd_dmabuf_fill_frame_info( host, child, frames, max_count, count );
+    return 1;
+}
+
+static struct window *hwnd_dmabuf_next_tree_window( struct window *root,
+                                                     struct window *win )
+{
+    struct window *next;
+
+    if ((next = get_first_child( win ))) return next;
+    while (win != root)
+    {
+        if ((next = get_next_window( win ))) return next;
+        win = win->parent;
+    }
+    return NULL;
+}
+
+static int hwnd_dmabuf_collect_frame_tree( struct window *host, struct window *root,
+                                           int host_surface,
+                                           struct hwnd_dmabuf_frame_collector *collector )
+{
+    struct window *win;
+
+    for (win = root; win; win = hwnd_dmabuf_next_tree_window( root, win ))
+    {
+        if (!hwnd_dmabuf_collect_frame( host, win, host_surface, collector )) return 0;
+        host_surface = 0;
+    }
+    return 1;
+}
+
+/* Producer attribution applies to the host's child tree, not to foreign owned
+ * trees which are exported separately for Wayland-side hosting. */
+static int hwnd_dmabuf_has_single_local_frame( struct window *root )
+{
+    struct window *win;
+    unsigned int count = 0;
+
+    for (win = root; win; win = hwnd_dmabuf_next_tree_window( root, win ))
+        if (hwnd_dmabuf_is_listed( win ) && is_visible( win ) && ++count > 1) return 0;
+    return count == 1;
+}
+
+/* Stop at same-process toplevels. After crossing a process boundary, retain
+ * the complete foreign owner tree below its exported carrier. */
+static int hwnd_dmabuf_collect_owned_frames( struct window *host, struct window *owner,
+                                             int external_tree, unsigned int depth,
+                                             struct hwnd_dmabuf_frame_collector *collector )
+{
+    struct window *win, *child;
+    unsigned int i;
+
+    if (depth == ARRAY_SIZE(collector->owners)) return 1;
+    if (!host->desktop || !host->desktop->top_window) return 1;
+    collector->owners[depth] = owner;
+    LIST_FOR_EACH_ENTRY( win, &host->desktop->top_window->children, struct window, entry )
+    {
+        int carrier;
+
+        if (hwnd_dmabuf_get_owner( win ) != owner ||
+            !hwnd_dmabuf_owned_tree_is_candidate( win, host, external_tree ))
+            continue;
+        for (i = 0; i <= depth; i++) if (collector->owners[i] == win) break;
+        if (i <= depth) continue;
+        carrier = hwnd_dmabuf_owned_tree_is_carrier( win );
+        if (carrier)
+        {
+            if (!hwnd_dmabuf_collect_frame( host, win, 1, collector )) return 0;
+            for (child = get_first_child( win ); child; child = get_next_window( child ))
+                if (!hwnd_dmabuf_collect_frame_tree( win, child, 0, collector )) return 0;
+        }
+        else if (!hwnd_dmabuf_collect_frame_tree( host, win, 0, collector )) return 0;
+        if (!hwnd_dmabuf_collect_owned_frames( carrier ? win : host, win, 1,
+                                               depth + 1, collector ))
+            return 0;
+    }
+    return 1;
 }
 
 
@@ -1613,7 +1777,7 @@ static struct region *get_surface_region( struct window *win, user_handle_t *sur
 {
     struct region *region, *clip = NULL, *client_clip = NULL, *holes = NULL, *covered = NULL;
     user_handle_t hole_owner = (user_handle_t)-1;
-    int track_producer = hwnd_dmabuf_count_frames( win ) == 1;
+    int track_producer = hwnd_dmabuf_has_single_local_frame( win );
 
     *surface_producer = 0;
 
@@ -3273,27 +3437,34 @@ DECL_HANDLER(set_window_region)
 DECL_HANDLER(hwnd_list_dmabuf_frames)
 {
     struct window *host = get_window( req->host_hwnd );
-    hwnd_dmabuf_frame_info_t *frames;
-    unsigned int count, copied = 0, max_count;
+    struct hwnd_dmabuf_frame_collector collector = {0};
 
     reply->status = HWND_DMABUF_NOT_FOUND;
     reply->count = 0;
 
-    if (!host)
-        return;
+    if (!host) return;
 
-    count = hwnd_dmabuf_count_frames( host );
-    reply->count = count;
+    collector.root = host;
+    collector.max_count = get_reply_max_size() / sizeof(*collector.frames);
+    if (!hwnd_dmabuf_collect_frame_tree( host, host, 0, &collector ))
+    {
+        free( collector.frames );
+        return;
+    }
+    if (!hwnd_dmabuf_collect_owned_frames( host, host, 0, 0, &collector ))
+    {
+        free( collector.frames );
+        return;
+    }
+
+    reply->count = collector.count;
     reply->status = HWND_DMABUF_OK;
-    if (!count)
-        return;
-
-    max_count = min( count, get_reply_max_size() / sizeof(*frames) );
-    if (!max_count)
-        return;
-    if (!(frames = set_reply_data_size( max_count * sizeof(*frames) )))
-        return;
-    hwnd_dmabuf_fill_frame_info( host, host, frames, max_count, &copied );
+    if (collector.count && collector.frames)
+        set_reply_data_ptr( collector.frames,
+                            min( collector.count, collector.max_count ) *
+                            sizeof(*collector.frames) );
+    else
+        free( collector.frames );
 }
 
 

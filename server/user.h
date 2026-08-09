@@ -151,6 +151,7 @@ extern struct rectangle *get_region_data_and_free( struct region *region, data_s
                                                    data_size_t *total_size );
 extern int is_region_empty( const struct region *region );
 extern int is_region_equal( const struct region *region1, const struct region *region2 );
+extern int is_region_rect( const struct region *region, const struct rectangle *rect );
 extern void get_region_extents( const struct region *region, struct rectangle *rect );
 extern void offset_region( struct region *region, int x, int y );
 extern void mirror_region( const struct rectangle *client_rect, struct region *region );

@@ -58,6 +58,8 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     struct wayland_touch_point *point = NULL;
     struct wayland_win_data *data = NULL;
     struct wayland_surface *surface;
+    RECT input_rect;
+    POINT screen;
     double touch_x, touch_y;
     INPUT input = {0};
     HWND hwnd;
@@ -68,17 +70,31 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
 
     if (!(hwnd = wl_surface_get_user_data(wl_surface))) goto err;
     wayland_activation_set_serial(WAYLAND_ACTIVATION_SERIAL_INPUT, hwnd, serial);
-    if (!(data = wayland_win_data_get(hwnd))) goto err;
-    if (!(surface = data->wayland_surface)) goto err;
     if (!(point = calloc(1, sizeof(*point)))) goto err;
+
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        if (!(surface = data->wayland_surface)) goto err;
+        wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(x),
+                                         wl_fixed_to_double(y), &touch_x, &touch_y);
+        wayland_win_data_release(data);
+        data = NULL;
+    }
+    else
+    {
+        if (!wayland_hwnd_dmabuf_surface_coords_to_screen(
+                    wl_surface, wl_fixed_to_double(x), wl_fixed_to_double(y),
+                    &screen, &input_rect))
+            goto err;
+        touch_x = screen.x;
+        touch_y = screen.y;
+    }
 
     point->id = id;
     point->focused_hwnd = hwnd;
+    point->focused_wl_surface = wl_surface;
     wl_list_init(&point->link);
-    wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(x),
-                                     wl_fixed_to_double(y), &touch_x, &touch_y);
     point->xy = map_point_vscreen(touch_x, touch_y);
-    wayland_win_data_release(data);
 
     TRACE("hwnd=%p id=%d pos=(%lf,%lf)\n", hwnd, id, touch_x, touch_y);
 
@@ -95,6 +111,7 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     return;
 err:
     if (data) wayland_win_data_release(data);
+    free(point);
 }
 
 static struct wayland_touch_point *find_touch_point(int32_t id)
@@ -143,6 +160,8 @@ static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     struct wayland_touch_point *point;
+    RECT input_rect;
+    POINT screen;
     double touch_x, touch_y;
     LPARAM old_xy;
     INPUT input = {0};
@@ -155,16 +174,27 @@ static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
 
     old_xy = point->xy;
 
-    if (!(data = wayland_win_data_get(point->focused_hwnd))) return;
-    if (!(surface = data->wayland_surface))
+    if ((data = wayland_win_data_get(point->focused_hwnd)))
     {
+        if (!(surface = data->wayland_surface))
+        {
+            wayland_win_data_release(data);
+            return;
+        }
+        wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(x),
+                                         wl_fixed_to_double(y), &touch_x, &touch_y);
         wayland_win_data_release(data);
-        return;
     }
-    wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(x),
-                                     wl_fixed_to_double(y), &touch_x, &touch_y);
+    else
+    {
+        if (!wayland_hwnd_dmabuf_surface_coords_to_screen(
+                    point->focused_wl_surface, wl_fixed_to_double(x),
+                    wl_fixed_to_double(y), &screen, &input_rect))
+            return;
+        touch_x = screen.x;
+        touch_y = screen.y;
+    }
     point->xy = map_point_vscreen(touch_x, touch_y);
-    wayland_win_data_release(data);
 
     if (old_xy != point->xy) return;
 

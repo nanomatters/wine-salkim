@@ -297,6 +297,7 @@ enum hwnd_dmabuf_status
 /* Consumer state records use release_token 0 and apply to the channel. */
 #define HWND_DMABUF_RELEASE_CONSUMER_ACTIVE    0x00000020
 #define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
+#define HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER 0x00000080
 
 /* hwnd_dmabuf_frame_desc_t.flags bits */
 /* image_id names a dmabuf slot whose backing store stays valid until its release
@@ -309,9 +310,17 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
 /* color_space describes the frame encoding. */
 #define HWND_DMABUF_FLAG_COLOR_SPACE      0x00000008
+/* GDI frame was produced as the carrier for an externally hosted toplevel. */
+#define HWND_DMABUF_FLAG_HOST_SURFACE     0x00000010
+/* Host pixels already contain the layered composition of producer children. */
+#define HWND_DMABUF_FLAG_LAYERED_COMPOSITE 0x00000020
+/* Global alpha is left for the consumer to apply. */
+#define HWND_DMABUF_FLAG_ALPHA_MODIFIER    0x00000040
 
 #define HWND_DMABUF_FRAME_OPENED          0x00000001
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
+#define HWND_DMABUF_FRAME_HOST_SURFACE    0x00000004
+#define HWND_DMABUF_FRAME_FULLY_VISIBLE   0x00000008
 
 #define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
 
@@ -352,6 +361,7 @@ typedef struct
     unsigned int style;
     unsigned int ex_style;
     unsigned int dpi;
+    unsigned int alpha;
     unsigned int frame_seq;
     unsigned int opened;
 } hwnd_dmabuf_frame_info_t;

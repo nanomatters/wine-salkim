@@ -110,16 +110,22 @@ static const struct
     {riched20_cursors, {'r','i','c','h','e','d','2','0','.','d','l','l',0}}
 };
 
-static HWND wayland_pointer_get_focused_hwnd(void)
+static HWND wayland_pointer_get_focus(struct wl_surface **wl_surface)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
     HWND hwnd;
 
     pthread_mutex_lock(&pointer->mutex);
     hwnd = pointer->focused_hwnd;
+    if (wl_surface) *wl_surface = pointer->focused_wl_surface;
     pthread_mutex_unlock(&pointer->mutex);
 
     return hwnd;
+}
+
+static HWND wayland_pointer_get_focused_hwnd(void)
+{
+    return wayland_pointer_get_focus(NULL);
 }
 
 static void wayland_pointer_reset_frame(void)
@@ -141,30 +147,37 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
     RECT input_rect;
     HWND hwnd;
     POINT screen;
+    struct wl_surface *focused_wl_surface;
     struct wayland_surface *surface;
     struct wayland_win_data *data;
 
-    if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
-    if (!(data = wayland_win_data_get(hwnd))) return;
-    if (!(surface = data->wayland_surface))
+    if (!(hwnd = wayland_pointer_get_focus(&focused_wl_surface))) return;
+    if ((data = wayland_win_data_get(hwnd)))
     {
-        wayland_win_data_release(data);
-        return;
-    }
+        if (!(surface = data->wayland_surface))
+        {
+            wayland_win_data_release(data);
+            return;
+        }
 
-    input_rect = wayland_surface_get_input_rect(surface, data);
-    wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(sx),
-                                     wl_fixed_to_double(sy), &screen_x, &screen_y);
-    screen.x = round(screen_x);
-    screen.y = round(screen_y);
+        input_rect = wayland_surface_get_input_rect(surface, data);
+        wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(sx),
+                                         wl_fixed_to_double(sy), &screen_x, &screen_y);
+        screen.x = round(screen_x);
+        screen.y = round(screen_y);
+        wayland_win_data_release(data);
+    }
+    else if (!wayland_hwnd_dmabuf_surface_coords_to_screen(
+                     focused_wl_surface, wl_fixed_to_double(sx),
+                     wl_fixed_to_double(sy), &screen, &input_rect))
+        return;
+
     /* Sometimes, due to rounding, we may end up with pointer coordinates
      * slightly outside the target window, so bring them within bounds. */
     if (screen.x >= input_rect.right) screen.x = input_rect.right - 1;
     else if (screen.x < input_rect.left) screen.x = input_rect.left;
     if (screen.y >= input_rect.bottom) screen.y = input_rect.bottom - 1;
     else if (screen.y < input_rect.top) screen.y = input_rect.top;
-
-    wayland_win_data_release(data);
 
     pthread_mutex_lock(&pointer->mutex);
 
@@ -211,6 +224,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     TRACE("hwnd=%p\n", hwnd);
 
     pthread_mutex_lock(&pointer->mutex);
+    pointer->focused_wl_surface = wl_surface;
     pointer->focused_hwnd = hwnd;
     pointer->enter_serial = serial;
     wayland_pointer_reset_frame();
@@ -241,8 +255,12 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
     TRACE("hwnd=%p\n", wl_surface_get_user_data(wl_surface));
 
     pthread_mutex_lock(&pointer->mutex);
-    pointer->focused_hwnd = NULL;
-    pointer->enter_serial = 0;
+    if (pointer->focused_wl_surface == wl_surface)
+    {
+        pointer->focused_wl_surface = NULL;
+        pointer->focused_hwnd = NULL;
+        pointer->enter_serial = 0;
+    }
     pthread_mutex_unlock(&pointer->mutex);
 }
 
@@ -561,6 +579,7 @@ void wayland_pointer_init(struct wl_pointer *wl_pointer)
 
     pthread_mutex_lock(&pointer->mutex);
     pointer->wl_pointer = wl_pointer;
+    pointer->focused_wl_surface = NULL;
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
     if (process_wayland.zwp_relative_pointer_manager_v1)
@@ -608,6 +627,7 @@ void wayland_pointer_deinit(void)
     }
     wl_pointer_release(pointer->wl_pointer);
     pointer->wl_pointer = NULL;
+    pointer->focused_wl_surface = NULL;
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
     pthread_mutex_unlock(&pointer->mutex);

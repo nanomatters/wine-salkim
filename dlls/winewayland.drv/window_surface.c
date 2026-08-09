@@ -72,7 +72,13 @@ struct wayland_gdi_overlay_producer
     int width, height, stride, size;
     void *master_bits;
     HRGN region;
+    HRGN host_overlay_region;
     HRGN pending_region;
+    HWND host;
+    BYTE host_alpha;
+    BOOL consumer_alpha_modifier;
+    BOOL alpha_mode_dirty;
+    BOOL layered_composite;
     BOOL lost, slots_created;
     struct wayland_gdi_overlay_slot slots[GDI_OVERLAY_RING_SIZE];
 };
@@ -82,6 +88,8 @@ struct wayland_window_surface
     struct window_surface header;
     struct wayland_buffer_queue *wayland_buffer_queue;
     struct wayland_gdi_overlay_producer gdi_overlay;
+    HWND external_host;
+    LONG volatile host_dirty;
     BOOL layered;
     BOOL occlusion_clipped;
 };
@@ -125,6 +133,11 @@ static void wayland_gdi_overlay_clear_region(struct wayland_gdi_overlay_producer
     {
         NtGdiDeleteObjectApp(producer->region);
         producer->region = 0;
+    }
+    if (producer->host_overlay_region)
+    {
+        NtGdiDeleteObjectApp(producer->host_overlay_region);
+        producer->host_overlay_region = 0;
     }
 }
 
@@ -213,6 +226,26 @@ static void wayland_gdi_overlay_close_channel(HWND hwnd, struct wayland_gdi_over
         producer->channel_fd = -1;
         wine_hwnd_dmabuf_release_gdi_overlay_channel(hwnd);
     }
+    if (producer->consumer_alpha_modifier)
+    {
+        producer->consumer_alpha_modifier = FALSE;
+        producer->alpha_mode_dirty = TRUE;
+    }
+}
+
+static void wayland_gdi_overlay_reset(HWND hwnd, struct wayland_gdi_overlay_producer *producer)
+{
+    HWND host = producer->host;
+
+    wayland_gdi_overlay_close_channel(hwnd, producer);
+    wayland_gdi_overlay_destroy_slots(producer);
+    wayland_gdi_overlay_clear_region(producer);
+    producer->host = NULL;
+    producer->consumer_alpha_modifier = FALSE;
+    producer->alpha_mode_dirty = FALSE;
+    producer->layered_composite = FALSE;
+    producer->lost = FALSE;
+    if (host) NtUserPostMessage(host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
 }
 
 static BOOL wayland_gdi_overlay_ensure_channel(HWND hwnd, struct wayland_gdi_overlay_producer *producer)
@@ -318,7 +351,8 @@ static int wayland_gdi_overlay_channel_recv_release(int channel_fd, hwnd_dmabuf_
     return n < 0 ? wayland_gdi_overlay_channel_result_from_errno(errno) : HWND_DMABUF_CHANNEL_ERROR;
 }
 
-static void wayland_gdi_overlay_drain_releases(HWND hwnd, struct wayland_gdi_overlay_producer *producer)
+static void wayland_gdi_overlay_drain_releases(HWND hwnd,
+                                               struct wayland_gdi_overlay_producer *producer)
 {
     hwnd_dmabuf_release_t rel;
     int ret;
@@ -328,6 +362,19 @@ static void wayland_gdi_overlay_drain_releases(HWND hwnd, struct wayland_gdi_ove
     {
         struct wayland_gdi_overlay_slot *slot;
 
+        if (!rel.release_token &&
+            (rel.flags & (HWND_DMABUF_RELEASE_CONSUMER_ACTIVE |
+                          HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED)))
+        {
+            BOOL alpha_modifier = (rel.flags & HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER) != 0;
+
+            if (producer->consumer_alpha_modifier != alpha_modifier)
+            {
+                producer->consumer_alpha_modifier = alpha_modifier;
+                producer->alpha_mode_dirty = TRUE;
+            }
+            continue;
+        }
         if (rel.producer_unique_id != producer->producer_unique_id) continue;
         if (rel.ring_generation != producer->ring_generation) continue;
         if (rel.image_id >= GDI_OVERLAY_RING_SIZE) continue;
@@ -368,7 +415,8 @@ static UINT64 wayland_gdi_overlay_next_release_token(struct wayland_gdi_overlay_
 }
 
 static BOOL wayland_gdi_overlay_master_copy_region(struct wayland_gdi_overlay_producer *producer,
-                                                   struct wayland_shm_buffer *src, HRGN region)
+                                                   struct wayland_shm_buffer *src, HRGN region,
+                                                   BYTE alpha)
 {
     RECT buffer_rect = {0, 0, src->width, src->height};
     RECT *rgn_rect, *rgn_rect_end;
@@ -384,16 +432,28 @@ static BOOL wayland_gdi_overlay_master_copy_region(struct wayland_gdi_overlay_pr
     for (; rgn_rect < rgn_rect_end; rgn_rect++)
     {
         RECT rect;
-        int y;
+        int x, y;
 
         if (!intersect_rect(&rect, rgn_rect, &buffer_rect)) continue;
         for (y = rect.top; y < rect.bottom; y++)
         {
-            const char *src_row = (const char *)src->map_data + (size_t)y * src->width * 4;
-            char *dst_row = (char *)producer->master_bits + (size_t)y * producer->stride;
+            const BYTE *src_pixel = (const BYTE *)src->map_data +
+                                    ((size_t)y * src->width + rect.left) * 4;
+            BYTE *dst_pixel = (BYTE *)producer->master_bits + (size_t)y * producer->stride +
+                              (size_t)rect.left * 4;
 
-            memcpy(dst_row + (size_t)rect.left * 4, src_row + (size_t)rect.left * 4,
-                   (size_t)(rect.right - rect.left) * 4);
+            if (alpha == 0xff)
+                memcpy(dst_pixel, src_pixel, (size_t)(rect.right - rect.left) * 4);
+            else
+            {
+                for (x = rect.left; x < rect.right; x++, src_pixel += 4, dst_pixel += 4)
+                {
+                    dst_pixel[0] = ((unsigned int)src_pixel[0] * alpha + 127) / 255;
+                    dst_pixel[1] = ((unsigned int)src_pixel[1] * alpha + 127) / 255;
+                    dst_pixel[2] = ((unsigned int)src_pixel[2] * alpha + 127) / 255;
+                    dst_pixel[3] = ((unsigned int)src_pixel[3] * alpha + 127) / 255;
+                }
+            }
             copied = TRUE;
         }
     }
@@ -489,7 +549,7 @@ static void wayland_gdi_overlay_union_pending(struct wayland_gdi_overlay_produce
 static BOOL wayland_gdi_overlay_update_region(struct wayland_gdi_overlay_producer *producer,
                                               HRGN region)
 {
-    HRGN old_region = 0, removed_region = 0;
+    HRGN removed_region = 0;
     int type;
 
     if (!region)
@@ -504,18 +564,15 @@ static BOOL wayland_gdi_overlay_update_region(struct wayland_gdi_overlay_produce
         producer->region = NtGdiCreateRectRgn(0, 0, 0, 0);
     if (!producer->region) return FALSE;
 
-    if ((old_region = NtGdiCreateRectRgn(0, 0, 0, 0)) &&
-        (removed_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+    if ((removed_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
     {
-        NtGdiCombineRgn(old_region, producer->region, 0, RGN_COPY);
-        type = NtGdiCombineRgn(removed_region, old_region, region, RGN_DIFF);
+        type = NtGdiCombineRgn(removed_region, producer->region, region, RGN_DIFF);
         if (type != ERROR && type != NULLREGION && producer->master_bits)
         {
             wayland_gdi_overlay_master_clear_region(producer, removed_region);
             wayland_gdi_overlay_union_pending(producer, removed_region);
         }
     }
-    if (old_region) NtGdiDeleteObjectApp(old_region);
     if (removed_region) NtGdiDeleteObjectApp(removed_region);
 
     NtGdiCombineRgn(producer->region, region, 0, RGN_COPY);
@@ -579,7 +636,8 @@ static void wayland_gdi_overlay_fill_region_dirty(hwnd_dmabuf_frame_desc_t *desc
 }
 
 static BOOL wayland_gdi_overlay_publish(HWND hwnd, struct wayland_gdi_overlay_producer *producer,
-                                        HRGN dirty_region)
+                                        HRGN dirty_region, unsigned int frame_flags,
+                                        HWND notify_host)
 {
     hwnd_dmabuf_frame_desc_t desc;
     struct wayland_gdi_overlay_slot *slot;
@@ -608,7 +666,7 @@ static BOOL wayland_gdi_overlay_publish(HWND hwnd, struct wayland_gdi_overlay_pr
 
     memset(&desc, 0, sizeof(desc));
     desc.version = HWND_DMABUF_DESC_VERSION_V1;
-    desc.flags = HWND_DMABUF_FLAG_SHM | HWND_DMABUF_FLAG_STABLE_SLOT | HWND_DMABUF_FLAG_GDI_OVERLAY;
+    desc.flags = HWND_DMABUF_FLAG_SHM | HWND_DMABUF_FLAG_STABLE_SLOT | frame_flags;
     desc.width = producer->width;
     desc.height = producer->height;
     desc.fourcc = HWND_DMABUF_SHM_FORMAT_ARGB8888;
@@ -631,6 +689,8 @@ static BOOL wayland_gdi_overlay_publish(HWND hwnd, struct wayland_gdi_overlay_pr
     if (ret == HWND_DMABUF_CHANNEL_OK)
     {
         RECT box = {0};
+
+        if (notify_host) NtUserPostMessage(notify_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
         if (dirty_region) NtGdiGetRgnBox(dirty_region, &box);
         TRACE("gdi_overlay hwnd=%p published shm slot=%u seq=%u size=%ux%u region=%s token=%s\n",
               hwnd, slot->image_id, desc.frame_seq, desc.width, desc.height,
@@ -655,8 +715,13 @@ static BOOL wayland_gdi_overlay_update(HWND hwnd, struct wayland_gdi_overlay_pro
                                        struct wayland_shm_buffer *src, const RECT *dirty,
                                        HRGN gdi_over_producer_region, HRGN gdi_over_paint_region)
 {
-    HRGN dirty_region, copy_region;
+    HRGN copy_region;
     int type;
+
+    if (producer->host)
+    {
+        wayland_gdi_overlay_reset(hwnd, producer);
+    }
 
     if (!gdi_over_producer_region)
     {
@@ -674,30 +739,26 @@ static BOOL wayland_gdi_overlay_update(HWND hwnd, struct wayland_gdi_overlay_pro
     wayland_gdi_overlay_update_region(producer, gdi_over_producer_region);
     if (!gdi_over_paint_region && !producer->pending_region) return TRUE;
 
-    if (!(dirty_region = NtGdiCreateRectRgn(dirty->left, dirty->top, dirty->right, dirty->bottom)))
+    if (!(copy_region = NtGdiCreateRectRgn(dirty->left, dirty->top,
+                                           dirty->right, dirty->bottom)))
         return !gdi_over_paint_region;
-    if (!(copy_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
-    {
-        NtGdiDeleteObjectApp(dirty_region);
-        return !gdi_over_paint_region;
-    }
 
     if (gdi_over_paint_region)
     {
-        type = NtGdiCombineRgn(copy_region, dirty_region, gdi_over_producer_region, RGN_AND);
+        type = NtGdiCombineRgn(copy_region, copy_region, gdi_over_producer_region, RGN_AND);
         if (type != ERROR && type != NULLREGION)
             type = NtGdiCombineRgn(copy_region, copy_region, gdi_over_paint_region, RGN_AND);
         if (type != ERROR && type != NULLREGION &&
-            wayland_gdi_overlay_master_copy_region(producer, src, copy_region))
+            wayland_gdi_overlay_master_copy_region(producer, src, copy_region, 0xff))
             wayland_gdi_overlay_union_pending(producer, copy_region);
     }
 
     if (producer->pending_region)
     {
-        if (!wayland_gdi_overlay_publish(hwnd, producer, producer->pending_region))
+        if (!wayland_gdi_overlay_publish(hwnd, producer, producer->pending_region,
+                                         HWND_DMABUF_FLAG_GDI_OVERLAY, NULL))
         {
             NtGdiDeleteObjectApp(copy_region);
-            NtGdiDeleteObjectApp(dirty_region);
             return FALSE;
         }
         NtGdiDeleteObjectApp(producer->pending_region);
@@ -705,8 +766,118 @@ static BOOL wayland_gdi_overlay_update(HWND hwnd, struct wayland_gdi_overlay_pro
     }
 
     NtGdiDeleteObjectApp(copy_region);
-    NtGdiDeleteObjectApp(dirty_region);
     return TRUE;
+}
+
+static BOOL wayland_host_surface_update(
+        HWND hwnd, struct wayland_gdi_overlay_producer *producer,
+        struct wayland_shm_buffer *src, HRGN damage, HRGN clip_region,
+        HRGN gdi_over_producer_region, HRGN gdi_over_paint_region, HWND host,
+        BYTE alpha, BOOL layered_composite)
+{
+    HRGN visible_region = 0, copy_region = 0;
+    BOOL alpha_changed, alpha_mode_changed, composite_changed, new_slots, ret = FALSE;
+    int type;
+
+    if (producer->host != host)
+    {
+        wayland_gdi_overlay_reset(hwnd, producer);
+        producer->host = host;
+    }
+    new_slots = !producer->slots_created || producer->width != src->width ||
+                producer->height != src->height;
+
+    if (!wayland_gdi_overlay_ensure_slots(producer, src->width, src->height)) return FALSE;
+    wayland_gdi_overlay_drain_releases(hwnd, producer);
+    alpha_mode_changed = producer->alpha_mode_dirty;
+    producer->alpha_mode_dirty = FALSE;
+    if (alpha_mode_changed) NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
+    if (!(visible_region = NtGdiCreateRectRgn(0, 0, 0, 0)) ||
+        !(copy_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
+        goto done;
+
+    composite_changed = producer->layered_composite != layered_composite;
+    producer->layered_composite = layered_composite;
+
+    if (layered_composite)
+    {
+        NtGdiSetRectRgn(visible_region, 0, 0, src->width, src->height);
+        if (producer->host_overlay_region)
+            NtGdiSetRectRgn(producer->host_overlay_region, 0, 0, 0, 0);
+    }
+    else
+    {
+        /* Keep uncovered pixels and GDI painted above producer children. */
+        if (clip_region)
+            NtGdiCombineRgn(visible_region, clip_region, 0, RGN_COPY);
+        else
+            NtGdiSetRectRgn(visible_region, 0, 0, src->width, src->height);
+
+        if (!producer->host_overlay_region)
+            producer->host_overlay_region = NtGdiCreateRectRgn(0, 0, 0, 0);
+        if (!producer->host_overlay_region) goto done;
+
+        if (gdi_over_producer_region)
+            NtGdiCombineRgn(producer->host_overlay_region, producer->host_overlay_region,
+                            gdi_over_producer_region, RGN_AND);
+        else
+            NtGdiSetRectRgn(producer->host_overlay_region, 0, 0, 0, 0);
+
+        if (gdi_over_producer_region && gdi_over_paint_region)
+        {
+            type = NtGdiCombineRgn(copy_region, gdi_over_paint_region,
+                                   gdi_over_producer_region, RGN_AND);
+            if (type != ERROR && type != NULLREGION)
+            {
+                type = NtGdiCombineRgn(copy_region, copy_region, damage, RGN_AND);
+                if (type != ERROR && type != NULLREGION)
+                    NtGdiCombineRgn(producer->host_overlay_region,
+                                    producer->host_overlay_region, copy_region, RGN_OR);
+            }
+        }
+        NtGdiCombineRgn(visible_region, visible_region,
+                        producer->host_overlay_region, RGN_OR);
+    }
+    wayland_gdi_overlay_update_region(producer, visible_region);
+
+    alpha_changed = alpha_mode_changed ||
+                    (!producer->consumer_alpha_modifier &&
+                     (new_slots || producer->host_alpha != alpha));
+    producer->host_alpha = alpha;
+
+    if (new_slots || alpha_changed || composite_changed)
+        NtGdiCombineRgn(copy_region, visible_region, 0, RGN_COPY);
+    else
+        NtGdiCombineRgn(copy_region, damage, visible_region, RGN_AND);
+
+    if (wayland_gdi_overlay_master_copy_region(
+            producer, src, copy_region,
+            producer->consumer_alpha_modifier ? 0xff : alpha))
+    {
+        wayland_gdi_overlay_union_pending(producer, copy_region);
+    }
+    if (!producer->pending_region)
+    {
+        ret = TRUE;
+        goto done;
+    }
+
+    if (!wayland_gdi_overlay_publish(hwnd, producer, producer->pending_region,
+                                     HWND_DMABUF_FLAG_GDI_OVERLAY |
+                                     HWND_DMABUF_FLAG_HOST_SURFACE |
+                                     (producer->consumer_alpha_modifier ?
+                                      HWND_DMABUF_FLAG_ALPHA_MODIFIER : 0) |
+                                     (layered_composite ?
+                                      HWND_DMABUF_FLAG_LAYERED_COMPOSITE : 0), host))
+        goto done;
+    NtGdiDeleteObjectApp(producer->pending_region);
+    producer->pending_region = 0;
+    ret = TRUE;
+
+done:
+    if (copy_region) NtGdiDeleteObjectApp(copy_region);
+    if (visible_region) NtGdiDeleteObjectApp(visible_region);
+    return ret;
 }
 
 static BOOL window_surface_has_occlusion_clip(struct window_surface *window_surface)
@@ -890,15 +1061,18 @@ static void wayland_window_surface_set_clip(struct window_surface *window_surfac
                                             const RECT *rects, UINT count)
 {
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+    BOOL host_surface = ReadPointerAcquire((void *const volatile *)&wws->external_host) != NULL ||
+                        wws->gdi_overlay.host != NULL;
     BOOL occlusion_clipped;
 
     TRACE("hwnd=%p rects=%p count=%u\n", window_surface->hwnd, rects, count);
 
     occlusion_clipped = window_surface_has_occlusion_clip(window_surface);
 
-    if (wws->occlusion_clipped || occlusion_clipped)
+    if (host_surface) InterlockedExchange(&wws->host_dirty, TRUE);
+    if (host_surface || wws->occlusion_clipped || occlusion_clipped)
     {
-        /* Repaint the full surface when the compositor-visible region changes. */
+        /* Refresh the full surface when its visible region changes. */
         window_surface->bounds = window_surface->rect;
         NtUserPostMessage(window_surface->hwnd, WM_WAYLAND_EXPOSE, 0, 0);
     }
@@ -1177,6 +1351,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer = NULL;
+    RECT full_dirty = {0, 0, surface_rect.right, surface_rect.bottom};
+    const RECT *effective_dirty;
     BOOL flushed = FALSE;
     BOOL overlay_flushed;
     HRGN surface_damage_region = NULL;
@@ -1185,9 +1361,35 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     HRGN gdi_over_region, gdi_over_paint_region;
     HRGN copy_from_window_region = NULL;
     BOOL content_over_producer = FALSE;
+    HWND external_host = ReadPointerAcquire((void *const volatile *)&wws->external_host);
+    BOOL externally_hosted = external_host != NULL;
+    BOOL host_dirty = InterlockedExchange(&wws->host_dirty, FALSE) != 0;
+    BYTE host_alpha = 0xff;
+    BOOL host_layered_composite = externally_hosted && window_surface->alpha_mask;
+    BOOL host_ready = !externally_hosted || host_layered_composite ||
+                      wayland_window_get_effective_alpha(window_surface->hwnd, &host_alpha);
+    BOOL host_alpha_changed = externally_hosted &&
+                              !wws->gdi_overlay.consumer_alpha_modifier &&
+                              (wws->gdi_overlay.host != external_host ||
+                               wws->gdi_overlay.host_alpha != host_alpha);
+    BOOL host_composite_changed = externally_hosted &&
+                                  wws->gdi_overlay.layered_composite !=
+                                  host_layered_composite;
+    BOOL refresh_host = host_dirty ||
+                        (externally_hosted && (shape_changed || host_alpha_changed ||
+                                               host_composite_changed));
     uint32_t buffer_format;
 
-    if (!window_surface->app_painted_full && !window_surface->app_painted_region)
+    if (!host_ready)
+    {
+        wayland_gdi_overlay_reset(window_surface->hwnd, &wws->gdi_overlay);
+        InterlockedExchange(&wws->host_dirty, TRUE);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE);
+        wl_display_flush(process_wayland.wl_display);
+        goto done;
+    }
+
+    if (!window_surface->app_painted_full && !window_surface->app_painted_region && !refresh_host)
     {
         if (shape_changed) wayland_window_surface_sync_regions(window_surface);
         flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE);
@@ -1195,26 +1397,30 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         goto done;
     }
 
-    surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
-                                               rect->left + dirty->right, rect->top + dirty->bottom);
+    effective_dirty = refresh_host ? &full_dirty : dirty;
+    surface_damage_region = NtGdiCreateRectRgn(rect->left + effective_dirty->left,
+                                               rect->top + effective_dirty->top,
+                                               rect->left + effective_dirty->right,
+                                               rect->top + effective_dirty->bottom);
     if (!surface_damage_region)
     {
         ERR("failed to create surface damage region\n");
         goto done;
     }
-    if (window_surface->app_painted_full)
+    if (window_surface->app_painted_full || refresh_host)
         copy_from_window_region = surface_damage_region;
     else if (!(copy_from_window_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
     {
         ERR("failed to create copy_from_window region\n");
         goto done;
     }
-    if (!window_surface->app_painted_full &&
+    if (!window_surface->app_painted_full && !refresh_host &&
         NtGdiCombineRgn(copy_from_window_region, surface_damage_region,
                         window_surface->app_painted_region, RGN_AND) == ERROR)
         goto done;
 
-    buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered) ?
+    buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered ||
+                     externally_hosted) ?
                     WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
     if (wws->wayland_buffer_queue->format != buffer_format)
     {
@@ -1270,7 +1476,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     }
 
     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
-                                 (shape_bits || wws->occlusion_clipped) && !wws->layered);
+                                 (shape_bits || wws->occlusion_clipped || externally_hosted) &&
+                                 !wws->layered);
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
 
     gdi_over_region = window_surface->gdi_over_producer_region;
@@ -1282,13 +1489,22 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         gdi_over_region = merged_gdi_over_region;
     }
 
-    overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
-                                                 gdi_over_region, gdi_over_paint_region);
+    if (externally_hosted)
+        overlay_flushed = wayland_host_surface_update(
+                window_surface->hwnd, &wws->gdi_overlay, shm_buffer,
+                surface_damage_region, window_surface->clip_region,
+                gdi_over_region, gdi_over_paint_region, external_host,
+                host_alpha, host_layered_composite);
+    else
+        overlay_flushed = wayland_gdi_overlay_update(
+                window_surface->hwnd, &wws->gdi_overlay, shm_buffer,
+                effective_dirty, gdi_over_region, gdi_over_paint_region);
     /* Slots exist only after GDI pixels have been published. */
     content_over_producer = wws->gdi_overlay.slots_created ||
                             region_has_pixels(window_surface->clip_region);
-    if (wws->occlusion_clipped)
-        wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
+    if (wws->occlusion_clipped && !externally_hosted)
+        wayland_shm_buffer_clear_outside_clip(shm_buffer, effective_dirty,
+                                              window_surface->clip_region);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
 
@@ -1303,6 +1519,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     wl_display_flush(process_wayland.wl_display);
 
 done:
+    if (refresh_host && !flushed) InterlockedExchange(&wws->host_dirty, TRUE);
     if (merged_gdi_over_region && merged_gdi_over_region != window_surface->gdi_over_producer_region &&
         merged_gdi_over_region != occluded_region)
         NtGdiDeleteObjectApp(merged_gdi_over_region);
@@ -1322,9 +1539,7 @@ static void wayland_window_surface_destroy(struct window_surface *window_surface
 
     TRACE("surface=%p\n", wws);
 
-    wayland_gdi_overlay_close_channel(window_surface->hwnd, &wws->gdi_overlay);
-    wayland_gdi_overlay_destroy_slots(&wws->gdi_overlay);
-    wayland_gdi_overlay_clear_region(&wws->gdi_overlay);
+    wayland_gdi_overlay_reset(window_surface->hwnd, &wws->gdi_overlay);
     wayland_buffer_queue_destroy(wws->wayland_buffer_queue);
 }
 
@@ -1334,6 +1549,19 @@ static const struct window_surface_funcs wayland_window_surface_funcs =
     wayland_window_surface_flush,
     wayland_window_surface_destroy
 };
+
+void wayland_window_surface_set_external_host(struct window_surface *window_surface, HWND host)
+{
+    struct wayland_window_surface *wws;
+    HWND previous;
+
+    if (!window_surface || window_surface->funcs != &wayland_window_surface_funcs) return;
+    wws = wayland_window_surface_cast(window_surface);
+    previous = InterlockedExchangePointer((void **)&wws->external_host, host);
+    if (previous == host) return;
+    InterlockedExchange(&wws->host_dirty, TRUE);
+    NtUserPostMessage(window_surface->hwnd, WM_WAYLAND_EXPOSE, 0, 0);
+}
 
 /***********************************************************************
  *           wayland_window_surface_create
@@ -1372,6 +1600,11 @@ static struct window_surface *wayland_window_surface_create(HWND hwnd, const REC
         for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
             wws->gdi_overlay.slots[i].fd = -1;
         wws->layered = layered;
+        if (wayland_window_is_externally_hosted(hwnd, &wws->external_host))
+        {
+            wws->host_dirty = TRUE;
+            NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
+        }
     }
 
     return window_surface;

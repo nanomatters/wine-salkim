@@ -122,13 +122,14 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     data->layered_attribs_set = NtUserGetLayeredWindowAttributes(
         hwnd, NULL, &data->layered_alpha, &data->layered_flags);
     if (!data->layered_attribs_set) data->layered_flags = 0;
+    data->alpha_multiplier = wayland_alpha_multiplier(data->layered_alpha,
+                                                       data->layered_flags);
     data->client_rect_in_toplevel_valid =
         get_client_rect_in_toplevel(hwnd, data->toplevel,
                                     &data->client_rect_in_toplevel);
     data->rects = *rects;
     data->ime_enabled = FALSE;
     data->num_ime_children = 0;
-    data->alpha_multiplier = UINT32_MAX;
 
     pthread_mutex_lock(&win_data_mutex);
 
@@ -462,12 +463,65 @@ static BOOL should_defer_unanchored_menu_popup(DWORD style, DWORD exstyle,
     return is_menu_popup_candidate_style(style, exstyle);
 }
 
+/* Bind positioned layered windows to their owner's surface tree. */
+static HWND get_owned_overlay_owner(HWND hwnd, HWND owner, DWORD style, DWORD exstyle)
+{
+    HWND host = owner;
+
+    if (!host || host == hwnd || host == NtUserGetDesktopWindow()) return NULL;
+    if (!(style & WS_POPUP) || (style & WS_CAPTION) == WS_CAPTION ||
+        !(style & WS_SYSMENU))
+        return NULL;
+    if (!(exstyle & WS_EX_LAYERED) || (exstyle & WS_EX_APPWINDOW))
+        return NULL;
+
+    host = NtUserGetAncestor(host, GA_ROOT);
+    if (!host || host == hwnd || host == NtUserGetDesktopWindow()) return NULL;
+    if ((DWORD)(ULONG_PTR)NtUserQueryWindow(host, WindowProcess) != GetCurrentProcessId())
+        return NULL;
+    return host;
+}
+
+/* Caller holds win_data_mutex. */
+static void refresh_owned_overlays(HWND owner, BOOL wake_unbound)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        struct wayland_surface *surface;
+
+        if (data->overlay_owner != owner) continue;
+        data->client_rect_in_toplevel_valid =
+            get_client_rect_in_toplevel(data->hwnd, owner,
+                                        &data->client_rect_in_toplevel);
+        surface = data->wayland_surface;
+        if (surface && surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
+            wayland_surface_reconfigure(surface);
+        else if (wake_unbound)
+            NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+    }
+}
+
+/* Caller holds win_data_mutex. */
+static void queue_owned_overlay_updates(HWND owner)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->overlay_owner == owner)
+            NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+    }
+}
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
                                                     struct wayland_surface *owner_surface,
                                                     BOOL use_layer_shell,
                                                     struct window_surface *window_surface,
                                                     BOOL has_menu_popup_owner,
+                                                    BOOL owned_overlay,
                                                     BOOL foreground)
 {
     struct wayland_client_surface *client = data->client_surface;
@@ -481,6 +535,17 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     surface = data->wayland_surface;
 
+    if (data->external_host)
+    {
+        if (client) wayland_client_surface_attach(client, NULL);
+        if (surface)
+        {
+            data->wayland_surface = NULL;
+            wayland_surface_destroy(surface);
+        }
+        return TRUE;
+    }
+
     layer_set = !(exstyle & WS_EX_LAYERED) || data->layered_attribs_set;
     visible = !data->explicitly_hidden && ((style & WS_VISIBLE) == WS_VISIBLE);
 
@@ -489,19 +554,19 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     if (!surface || !surface->window.visible)
         visible = visible && layer_set;
 
-    keep_toplevel_mapped = !owner_surface && !use_layer_shell && !toplevel_surface &&
-                           should_keep_toplevel_mapped(surface, style,
-                                                       data->explicitly_hidden);
+    keep_toplevel_mapped = !owned_overlay && !owner_surface && !use_layer_shell &&
+                           !toplevel_surface && should_keep_toplevel_mapped(
+                                   surface, style, data->explicitly_hidden);
     if (keep_toplevel_mapped)
         visible = TRUE;
 
-    if (visible && !owner_surface && !use_layer_shell && !toplevel_surface &&
+    if (visible && !owned_overlay && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !wayland_output_layout_intersects_rect(&data->rects.window) &&
         !keep_toplevel_mapped)
         visible = FALSE;
 
     /* If the toplevel has no observable area, make it roleless. */
-    if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+    if (!visible || (owned_overlay && !toplevel_surface)) role = WAYLAND_SURFACE_ROLE_NONE;
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (use_layer_shell && !IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_LAYER;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
@@ -714,6 +779,8 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
 static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
 {
     struct wayland_surface *surface = data->wayland_surface;
+
+    if (!surface) return;
 
     switch (surface->role)
     {
@@ -1005,17 +1072,58 @@ static BOOL is_window_managed(HWND hwnd, HWND menu_popup_owner, UINT swp_flags, 
     return FALSE;
 }
 
+BOOL wayland_window_is_externally_hosted(HWND hwnd, HWND *host)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT), owner;
+    DWORD process = GetCurrentProcessId(), owner_process;
+
+    if (host) *host = NULL;
+    while (root && (owner = NtUserGetWindowRelative(root, GW_OWNER)))
+    {
+        owner = NtUserGetAncestor(owner, GA_ROOT);
+        if (!owner || owner == root || owner == NtUserGetDesktopWindow()) break;
+        owner_process = (DWORD)(ULONG_PTR)NtUserQueryWindow(owner, WindowProcess);
+        if (!owner_process) break;
+        if (owner_process != process)
+        {
+            if (host) *host = owner;
+            return TRUE;
+        }
+        root = owner;
+    }
+    return FALSE;
+}
+
+BOOL wayland_window_get_effective_alpha(HWND hwnd, BYTE *alpha)
+{
+    struct wayland_win_data *data;
+    BOOL ret;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    *alpha = 0xff;
+    ret = !(data->exstyle & WS_EX_LAYERED) || data->layered_attribs_set;
+    if (ret && (data->exstyle & WS_EX_LAYERED) && (data->layered_flags & LWA_ALPHA))
+        *alpha = data->layered_alpha;
+    wayland_win_data_release(data);
+    return ret;
+}
+
 /***********************************************************************
  *           WAYLAND_DestroyWindow
  */
 void WAYLAND_DestroyWindow(HWND hwnd)
 {
     struct wayland_win_data *data;
+    HWND host;
 
     TRACE("%p\n", hwnd);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
+    queue_owned_overlay_updates(hwnd);
+    host = data->external_host;
     wayland_win_data_destroy(data);
+
+    if (host) NtUserPostMessage(host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
 }
 
 /***********************************************************************
@@ -1051,12 +1159,16 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     DWORD exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
     BOOL frameless = NtUserGetProp(hwnd, frameless_window_prop) != NULL;
-    BOOL client_rect_in_toplevel_valid =
-        get_client_rect_in_toplevel(hwnd, root, &client_rect_in_toplevel);
+    BOOL client_rect_in_toplevel_valid;
     BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL continue_configure = FALSE;
     BOOL foreground = NtUserGetForegroundWindow() == hwnd;
+    HWND previous_host = NULL;
+    HWND external_host = NULL;
+    HWND overlay_owner = get_owned_overlay_owner(hwnd, window_owner, style, exstyle);
+    BOOL owned_overlay = overlay_owner != NULL;
+    BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
     RECT present_rect;
     BOOL has_present_rect = fullscreen && NtUserGetPresentRect(hwnd, &present_rect, -1);
     BOOL use_layer_shell = FALSE;
@@ -1066,7 +1178,12 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * acquire the lock itself internally. */
     menu_popup_owner = wayland_is_menu_popup_candidate(hwnd) ? get_menu_popup_owner(hwnd, owner_hint) : NULL;
     managed = is_window_managed(hwnd, menu_popup_owner, swp_flags, fullscreen);
-    if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
+    if (owned_overlay)
+    {
+        managed = FALSE;
+        toplevel = overlay_owner;
+    }
+    else if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
     {
         managed = FALSE;
         toplevel = NULL;
@@ -1080,11 +1197,17 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                           is_layer_shell_menu_popup(hwnd);
     }
 
-    TRACE("hwnd %p toplevel %p owner %p owner_hint %p menu_owner %p new_rects %s after %p flags %08x\n",
-          hwnd, toplevel, owner, owner_hint, menu_popup_owner, debugstr_window_rects(new_rects),
-          insert_after, swp_flags);
+    client_rect_in_toplevel_valid =
+        get_client_rect_in_toplevel(hwnd, owned_overlay ? overlay_owner : root,
+                                    &client_rect_in_toplevel);
+
+    TRACE("hwnd %p toplevel %p window_owner %p role_owner %p owner_hint %p menu_owner %p "
+          "new_rects %s after %p flags %08x\n",
+          hwnd, toplevel, window_owner, owner, owner_hint, menu_popup_owner,
+          debugstr_window_rects(new_rects), insert_after, swp_flags);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
+    previous_host = data->external_host;
     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
     owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
@@ -1122,8 +1245,10 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     visible = visible && !data->explicitly_hidden;
 
     data->rects = *new_rects;
-    data->toplevel = root;
+    data->toplevel = owned_overlay ? overlay_owner : root;
     data->owner = window_owner;
+    data->overlay_owner = overlay_owner;
+    data->external_host = external_host;
     data->visible = visible;
     data->style = style;
     data->exstyle = exstyle;
@@ -1133,6 +1258,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->is_fullscreen = fullscreen;
     data->has_present_rect = has_present_rect;
     data->managed = managed;
+    if (surface) wayland_window_surface_set_external_host(surface, external_host);
     if (data->client_surface)
         wayland_client_surface_update_fullscreen_target(data->client_surface,
                                                         &new_rects->client);
@@ -1155,14 +1281,23 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
                                                      use_layer_shell, surface,
-                                                     menu_popup_owner != NULL, foreground))
+                                                     menu_popup_owner != NULL, owned_overlay,
+                                                     foreground))
     {
         wayland_win_data_update_wayland_state(data);
     }
 
+    if (overlay_owner) refresh_owned_overlays(overlay_owner, FALSE);
+    refresh_owned_overlays(hwnd, TRUE);
+
     continue_configure = wayland_win_data_configure_state_applied(data);
 
     wayland_win_data_release(data);
+
+    if (previous_host && previous_host != external_host)
+        NtUserPostMessage(previous_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
+    if (externally_hosted)
+        NtUserPostMessage(external_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
 
     if (continue_configure) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
 
@@ -1428,6 +1563,18 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         BOOL had_dmabuf_content = FALSE;
         struct wayland_win_data *data;
+        HWND external_host = NULL;
+
+        if ((data = wayland_win_data_get(hwnd)))
+        {
+            external_host = data->external_host;
+            wayland_win_data_release(data);
+        }
+        if (external_host)
+        {
+            NtUserPostMessage(external_host, WM_WAYLAND_DMABUF_FRAME, wp, lp);
+            return 0;
+        }
 
         if (window_surface_has_queued_configure(hwnd))
             wayland_configure_window(hwnd);
@@ -1503,16 +1650,24 @@ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWO
 {
     struct wayland_win_data *data;
     struct wayland_surface *surface;
+    HWND external_host;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
 
+    external_host = data->external_host;
     if ((surface = data->wayland_surface))
         wayland_surface_set_opacity(surface, alpha, flags);
     data->layered_attribs_set = TRUE;
     data->layered_alpha = alpha;
     data->layered_flags = flags;
+    data->alpha_multiplier = wayland_alpha_multiplier(alpha, flags);
 
     wayland_win_data_release(data);
+    if (external_host)
+    {
+        NtUserPostMessage(external_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
+        NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
+    }
 }
 
 static enum xdg_toplevel_resize_edge hittest_to_resize_edge(WPARAM hittest)
@@ -1564,14 +1719,22 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     DWORD changed = style->styleNew ^ style->styleOld;
+    BOOL refresh_external_host = FALSE;
+    BOOL refresh_overlay = FALSE;
 
     if (hwnd == NtUserGetDesktopWindow()) return;
     if (!(data = wayland_win_data_get(hwnd))) return;
 
     if (offset == GWL_STYLE)
+    {
         data->style = style->styleNew;
+        refresh_overlay = changed & (WS_POPUP | WS_CAPTION | WS_SYSMENU);
+    }
     else if (offset == GWL_EXSTYLE)
+    {
         data->exstyle = style->styleNew;
+        refresh_overlay = changed & (WS_EX_LAYERED | WS_EX_APPWINDOW);
+    }
 
     /* Changing WS_EX_LAYERED resets attributes */
     if (offset == GWL_EXSTYLE && (changed & WS_EX_LAYERED))
@@ -1581,9 +1744,14 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
         data->layered_attribs_set = FALSE;
         data->layered_alpha = 0;
         data->layered_flags = 0;
+        data->alpha_multiplier = UINT32_MAX;
+        refresh_external_host = data->external_host != NULL;
     }
 
     wayland_win_data_release(data);
+    if (refresh_overlay)
+        NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+    if (refresh_external_host) NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
 }
 
 /*****************************************************************
@@ -1708,13 +1876,17 @@ void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)
 {
     struct wayland_win_data *data;
     struct wayland_surface *surface;
+    BOOL externally_hosted;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
 
+    externally_hosted = data->external_host != NULL;
     if ((surface = data->wayland_surface))
         wayland_surface_set_opacity(surface, alpha, flags);
+    data->alpha_multiplier = wayland_alpha_multiplier(alpha, flags);
 
     wayland_win_data_release(data);
+    if (externally_hosted) NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
 }
 
 /***********************************************************************
@@ -2009,13 +2181,17 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
     if (data->window_contents)
         wayland_shm_buffer_unref(data->window_contents);
     data->window_contents = NULL;
-    if (shm_buffer)
+    if (shm_buffer && !data->external_host)
     {
         wayland_shm_buffer_ref(shm_buffer);
         data->window_contents = shm_buffer;
     }
 
-    if (wayland_surface)
+    if (data->external_host)
+    {
+        committed = TRUE;
+    }
+    else if (wayland_surface)
     {
         if (wayland_surface_has_external_commit_owner(wayland_surface))
         {

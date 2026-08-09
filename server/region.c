@@ -700,6 +700,11 @@ int is_region_equal( const struct region *region1, const struct region *region2 
     return 1;
 }
 
+int is_region_rect( const struct region *region, const struct rectangle *rect )
+{
+    return region->num_rects == 1 && is_rect_equal( &region->extents, rect );
+}
+
 
 /* get the extents rect of a region */
 void get_region_extents( const struct region *region, struct rectangle *rect )

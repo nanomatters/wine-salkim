@@ -194,6 +194,7 @@ struct wayland_pointer
     struct zwp_locked_pointer_v1 *zwp_locked_pointer_v1;
     struct zwp_relative_pointer_v1 *zwp_relative_pointer_v1;
     struct wp_cursor_shape_device_v1 *wp_cursor_shape_device_v1;
+    struct wl_surface *focused_wl_surface;
     HWND focused_hwnd;
     HWND constraint_hwnd;
     BOOL pending_warp;
@@ -212,6 +213,7 @@ struct wayland_pointer
 struct wayland_touch_point
 {
     struct wl_list link;
+    struct wl_surface *focused_wl_surface;
     LPARAM xy;
     HWND focused_hwnd;
     int32_t id;
@@ -743,6 +745,9 @@ void wayland_surface_coords_to_screen(struct wayland_surface *surface,
                                       const struct wayland_win_data *data,
                                       double surface_x, double surface_y,
                                       double *screen_x, double *screen_y);
+BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
+                                                   double surface_x, double surface_y,
+                                                   POINT *screen, RECT *input_rect);
 void wayland_surface_coords_from_screen(struct wayland_surface *surface,
                                         const struct wayland_win_data *data,
                                         double screen_x, double screen_y,
@@ -803,6 +808,7 @@ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
 void wayland_surface_assign_icon(struct wayland_surface *surface);
 void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
 void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags);
+UINT32 wayland_alpha_multiplier(BYTE alpha, UINT flags);
 void wayland_activation_set_serial(enum wayland_activation_serial_kind kind,
                                    HWND hwnd, uint32_t serial);
 void wayland_activation_clear_serial(enum wayland_activation_serial_kind kind, HWND hwnd);
@@ -819,6 +825,9 @@ void wayland_surface_sync_alpha(struct wayland_surface *surface);
 BOOL wayland_is_popup_menu_class(HWND hwnd);
 BOOL wayland_is_menu_popup_candidate(HWND hwnd);
 BOOL wayland_is_menu_popup(HWND hwnd);
+BOOL wayland_window_is_externally_hosted(HWND hwnd, HWND *host);
+BOOL wayland_window_get_effective_alpha(HWND hwnd, BYTE *alpha);
+void wayland_window_surface_set_external_host(struct window_surface *surface, HWND host);
 BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
 void wayland_set_layer_menu_hwnd(HWND hwnd);
 void wayland_clear_layer_menu_hwnd(HWND hwnd);
@@ -864,6 +873,8 @@ struct wayland_win_data
     /* Win32 state cached before taking win_data_mutex. */
     HWND toplevel;
     HWND owner;
+    HWND overlay_owner;
+    HWND external_host;
     WCHAR *window_text;
     BOOL visible;
     BOOL explicitly_hidden;
