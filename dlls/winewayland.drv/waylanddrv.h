@@ -507,6 +507,7 @@ struct wayland_retired_wl_surface
 {
     UINT64 host_surface;
     struct wl_surface *wl_surface;
+    struct wl_subsurface *handoff_subsurface;
 };
 
 enum wayland_image_description_color_space

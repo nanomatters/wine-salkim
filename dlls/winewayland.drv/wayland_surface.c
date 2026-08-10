@@ -2499,8 +2499,53 @@ static BOOL wayland_client_surface_retire_wl_surface(struct wayland_client_surfa
     if (!retired) return FALSE;
     retired[client->retired_wl_surface_count].host_surface = host_surface;
     retired[client->retired_wl_surface_count++].wl_surface = wl_surface;
+    retired[client->retired_wl_surface_count - 1].handoff_subsurface = NULL;
     client->retired_wl_surfaces = retired;
     return TRUE;
+}
+
+static void wayland_client_surface_remove_retired_wl_surface(
+        struct wayland_client_surface *client, unsigned int index)
+{
+    struct wayland_retired_wl_surface *retired = &client->retired_wl_surfaces[index];
+
+    if (retired->handoff_subsurface)
+        wl_subsurface_destroy(retired->handoff_subsurface);
+    wl_surface_destroy(retired->wl_surface);
+    memmove(retired, retired + 1,
+            (client->retired_wl_surface_count - index - 1) * sizeof(*retired));
+    if (!--client->retired_wl_surface_count)
+    {
+        free(client->retired_wl_surfaces);
+        client->retired_wl_surfaces = NULL;
+    }
+}
+
+static BOOL wayland_client_surface_finish_direct_handoff(
+        struct wayland_client_surface *client)
+{
+    unsigned int i = 0;
+    BOOL changed = FALSE;
+
+    while (i < client->retired_wl_surface_count)
+    {
+        struct wayland_retired_wl_surface *retired = &client->retired_wl_surfaces[i];
+
+        if (!retired->handoff_subsurface)
+        {
+            i++;
+            continue;
+        }
+
+        wl_subsurface_destroy(retired->handoff_subsurface);
+        retired->handoff_subsurface = NULL;
+        changed = TRUE;
+        if (!retired->host_surface)
+            wayland_client_surface_remove_retired_wl_surface(client, i);
+        else
+            i++;
+    }
+    return changed;
 }
 
 static BOOL wayland_client_surface_has_retired_wl_surface(struct wayland_client_surface *client,
@@ -2608,15 +2653,13 @@ void wayland_client_surface_release_vulkan_surface(struct client_surface *client
             client->direct_wl_surface = NULL;
             client->owns_direct_wl_surface = FALSE;
         }
-        wl_surface_destroy(retired_wl_surface);
-        memmove(client->retired_wl_surfaces + i, client->retired_wl_surfaces + i + 1,
-                (client->retired_wl_surface_count - i - 1) * sizeof(*client->retired_wl_surfaces));
-        client->retired_wl_surface_count--;
-        if (!client->retired_wl_surface_count)
+        if (client->retired_wl_surfaces[i].handoff_subsurface)
         {
-            free(client->retired_wl_surfaces);
-            client->retired_wl_surfaces = NULL;
+            client->retired_wl_surfaces[i].host_surface = 0;
+            i++;
         }
+        else
+            wayland_client_surface_remove_retired_wl_surface(client, i);
     }
 
     if (client->direct_host_surface == host_surface)
@@ -2630,17 +2673,17 @@ void wayland_client_surface_release_vulkan_surface(struct client_surface *client
         }
         if (data)
         {
-            /* End the direct presentation, or the post-demotion transitional
-             * stacking, once the direct host surface is gone: restore the GDI
-             * contents on the root so the child subsurface shows through,
-             * instead of the last (now stale) frame of the dead swapchain. */
+            /* A live direct toplevel keeps its last frame until a new WSI or
+             * GDI commit replaces it. Complete only post-demotion stacking. */
             surface = data->wayland_surface;
             if (surface && surface->direct_client == client)
             {
-                if (!ReadAcquire(&client->direct_toplevel)) surface->direct_client = NULL;
-                wayland_surface_restore_gdi_shm_contents(surface, data->window_contents);
                 if (!ReadAcquire(&client->direct_toplevel))
+                {
+                    surface->direct_client = NULL;
+                    wayland_surface_restore_gdi_shm_contents(surface, data->window_contents);
                     wayland_client_surface_attach(client, data->hwnd);
+                }
             }
         }
         client->direct_wl_surface = NULL;
@@ -2677,6 +2720,7 @@ static BOOL wayland_surface_evict_direct_client(struct wayland_surface *surface)
     TRACE("surface=%p hwnd=%p handing borrowed wl_surface=%p to %s\n",
           surface, surface->hwnd, surface->wl_surface, debugstr_client_surface(&client->client));
 
+    wayland_client_surface_finish_direct_handoff(client);
     wayland_surface_orphan_direct_client(surface);
 
     /* Per-surface objects targeting the borrowed wl_surface. */
@@ -6432,9 +6476,8 @@ static void wayland_client_surface_destroy(struct client_surface *client)
         surface->direct_wl_surface != surface->wl_surface &&
         !wayland_client_surface_has_retired_wl_surface(surface, surface->direct_wl_surface))
         wl_surface_destroy(surface->direct_wl_surface);
-    for (unsigned int i = 0; i < surface->retired_wl_surface_count; i++)
-        wl_surface_destroy(surface->retired_wl_surfaces[i].wl_surface);
-    free(surface->retired_wl_surfaces);
+    while (surface->retired_wl_surface_count)
+        wayland_client_surface_remove_retired_wl_surface(surface, 0);
     LIST_FOR_EACH_ENTRY_SAFE(request, next, &surface->fullscreen_requests,
                              struct wayland_fullscreen_request, entry)
     {
@@ -6621,11 +6664,14 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
 
     if (ReadAcquire(&surface->direct_toplevel))
     {
-        if (!ReadAcquire(&surface->has_presented) && (data = wayland_win_data_get(toplevel)))
+        if (!ReadAcquire(&surface->has_presented) &&
+            (data = wayland_win_data_get(toplevel)))
         {
+            first_present = !InterlockedExchange(&surface->has_presented, TRUE);
+            if (first_present && wayland_client_surface_finish_direct_handoff(surface))
+                wl_display_flush(process_wayland.wl_display);
             wayland_win_data_release(data);
         }
-        InterlockedExchange(&surface->has_presented, TRUE);
         return;
     }
 
@@ -6825,10 +6871,8 @@ static BOOL direct_toplevel_enabled(void)
     return env && atoi(env);
 }
 
-/* Shared direct-toplevel eligibility checks. The caller holds the win_data
- * lock. expected_client is the client surface that must currently be attached
- * to the window (NULL if none must be). Returns NULL when eligible, or the
- * failure reason. */
+/* Shared checks for retaining a direct toplevel. Hidden window geometry is
+ * not presentation state; new promotions add their visibility requirement. */
 static const char *wayland_surface_check_direct_eligibility(struct wayland_win_data *data,
                                                             struct wayland_client_surface *expected_client)
 {
@@ -6856,11 +6900,20 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     if (surface->direct_client && surface->direct_client != expected_client)
         return "a previous direct WSI surface is still retiring";
     if (surface->shaped) return "the window is shaped";
-    if (!explicit_fullscreen && !wayland_surface_client_fills_window(surface))
+    if (data->visible && !explicit_fullscreen &&
+        !wayland_surface_client_fills_window(surface))
         return "the client does not fill the toplevel";
-    if (!explicit_fullscreen && !wayland_surface_client_covers_presentation(surface))
+    if (data->visible && !explicit_fullscreen &&
+        !wayland_surface_client_covers_presentation(surface))
         return "the client does not cover the presentation surface";
     return NULL;
+}
+
+static const char *wayland_surface_check_direct_promotion(
+        struct wayland_win_data *data, struct wayland_client_surface *client)
+{
+    if (!data->visible) return "the window is not visible";
+    return wayland_surface_check_direct_eligibility(data, client);
 }
 
 static const char *wayland_client_surface_direct_toplevel_failure(
@@ -6884,11 +6937,11 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (data->client_surface != surface) failure = "the window has a different client surface";
     else if (toplevel->direct_client != surface) failure = "the toplevel has a different direct client";
     else if (toplevel->shaped) failure = "the window is shaped";
-    /* Ignore the iconic window rectangle until the toplevel is restored. */
-    else if (!explicit_fullscreen && !toplevel->window.minimized &&
+    /* Hidden and iconic window rectangles are not presentation geometry. */
+    else if (data->visible && !explicit_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_fills_window(toplevel))
         failure = "the client does not fill the toplevel";
-    else if (!explicit_fullscreen && !toplevel->window.minimized &&
+    else if (data->visible && !explicit_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_covers_presentation(toplevel))
         failure = "the client does not cover the presentation surface";
 
@@ -6929,7 +6982,7 @@ struct wl_surface *wayland_client_surface_prepare_direct_promotion(struct client
     else if (surface->direct_host_surface)
         failure = "a previous direct host surface is still retiring";
     else
-        failure = wayland_surface_check_direct_eligibility(data, surface);
+        failure = wayland_surface_check_direct_promotion(data, surface);
 
     if (!failure)
     {
@@ -6965,7 +7018,7 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
         return FALSE;
     }
 
-    if (!(failure = wayland_surface_check_direct_eligibility(data, surface)) &&
+    if (!(failure = wayland_surface_check_direct_promotion(data, surface)) &&
         data->wayland_surface->wl_surface != toplevel_wl_surface)
         failure = "the toplevel surface changed during promotion";
 
@@ -6983,10 +7036,11 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
         return FALSE;
     }
 
-    /* Unmap the retired child before borrowing the toplevel. */
+    /* Keep the old child mapped until the first root present has been queued. */
     if (surface->wl_subsurface)
     {
-        wl_subsurface_destroy(surface->wl_subsurface);
+        surface->retired_wl_surfaces[surface->retired_wl_surface_count - 1].handoff_subsurface =
+                surface->wl_subsurface;
         surface->wl_subsurface = NULL;
     }
     /* Per-surface objects targeting the retired wl_surface; the direct path
@@ -7018,10 +7072,8 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     /* The external producer replaces any Wine root buffer. */
     data->wayland_surface->carrier_attached = FALSE;
 
-    /* Latch the subsurface removal. The external WSI has not attached to the
-     * toplevel yet, so this commits no foreign state. */
-    wayland_surface_commit(data->wayland_surface);
-    wl_display_flush(process_wayland.wl_display);
+    /* The first WSI commit applies the pending root state before the retained
+     * child is removed, keeping the previous frame visible through handoff. */
 
     TRACE("promoted %s to borrowed toplevel wl_surface=%p for hwnd=%p scale=%.3f dest=%dx%d client=%s\n",
           debugstr_client_surface(client), toplevel_wl_surface, hwnd,
@@ -7174,6 +7226,7 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
         return FALSE;
     }
     surface->direct_host_surface = old_host_surface;
+    wayland_client_surface_finish_direct_handoff(surface);
 
     /* Release the borrowed toplevel wl_surface. */
     if (surface->owns_wl_surface)

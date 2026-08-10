@@ -1264,17 +1264,6 @@ static HRGN create_occluded_region(const RECT *surface_rect, HRGN clip_region)
     return occluded_region;
 }
 
-static BOOL region_has_pixels(HRGN region)
-{
-    RECT box;
-    int type;
-
-    if (!region) return FALSE;
-    type = NtGdiGetRgnBox(region, &box);
-    if (type == ERROR) return TRUE;
-    return type != NULLREGION;
-}
-
 static HRGN union_regions(HRGN a, HRGN b)
 {
     HRGN region;
@@ -1501,7 +1490,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
                 effective_dirty, gdi_over_region, gdi_over_paint_region);
     /* Slots exist only after GDI pixels have been published. */
     content_over_producer = wws->gdi_overlay.slots_created ||
-                            region_has_pixels(window_surface->clip_region);
+                            (window_surface->clip_region &&
+                             NtGdiRectInRegion(window_surface->clip_region, &surface_rect));
     if (wws->occlusion_clipped && !externally_hosted)
         wayland_shm_buffer_clear_outside_clip(shm_buffer, effective_dirty,
                                               window_surface->clip_region);
