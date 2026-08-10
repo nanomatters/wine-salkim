@@ -2230,7 +2230,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                 {
                     wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
                     wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
-                    wayland_surface->carrier_attached = FALSE;
                     wayland_surface_commit(wayland_surface);
                     wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
                     wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;

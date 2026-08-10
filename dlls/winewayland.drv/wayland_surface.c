@@ -2750,6 +2750,18 @@ static BOOL wayland_surface_evict_direct_client(struct wayland_surface *surface)
     return TRUE;
 }
 
+static void wayland_surface_clear_carrier(struct wayland_surface *surface)
+{
+    /* wl_surface state survives buffer replacement. */
+    if (surface->carrier_attached && surface->carrier_opaque)
+        wl_surface_set_opaque_region(surface->wl_surface, NULL);
+
+    surface->carrier_attached = FALSE;
+    surface->carrier_opaque = FALSE;
+    surface->carrier_single_pixel = FALSE;
+    surface->carrier_width = surface->carrier_height = 0;
+}
+
 BOOL wayland_surface_clear_role(struct wayland_surface *surface)
 {
     TRACE("surface=%p\n", surface);
@@ -2762,10 +2774,7 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
     /* Keep input state across role churn; it follows wl_surface enter/leave. */
     wayland_surface_clear_child_surfaces(surface);
     wayland_hwnd_dmabuf_destroy_syncobj_surface(&surface->direct_dmabuf_syncobj_surface);
-    surface->carrier_attached = FALSE;
-    surface->carrier_opaque = FALSE;
-    surface->carrier_single_pixel = FALSE;
-    surface->carrier_width = surface->carrier_height = 0;
+    wayland_surface_clear_carrier(surface);
 
     /* some objects are shared between several roles */
 
@@ -2920,9 +2929,9 @@ static void wayland_surface_damage_shm_buffer(struct wl_surface *wl_surface, HRG
     }
 }
 
-void wayland_surface_attach_shm(struct wayland_surface *surface,
-                                struct wayland_shm_buffer *shm_buffer,
-                                HRGN surface_damage_region)
+static void wayland_surface_attach_shm_buffer(struct wayland_surface *surface,
+                                              struct wayland_shm_buffer *shm_buffer,
+                                              HRGN surface_damage_region)
 {
     int win_width, win_height;
 
@@ -2979,6 +2988,14 @@ static void wayland_surface_unset_viewport_source(struct wayland_surface *surfac
     wp_viewport_set_source(surface->wp_viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                            wl_fixed_from_int(-1), wl_fixed_from_int(-1));
     wayland_surface_mark_pending_commit(surface);
+}
+
+void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                struct wayland_shm_buffer *shm_buffer,
+                                HRGN surface_damage_region)
+{
+    wayland_surface_clear_carrier(surface);
+    wayland_surface_attach_shm_buffer(surface, shm_buffer, surface_damage_region);
 }
 
 static void wayland_shm_buffer_clone_release(void *data, struct wl_buffer *buffer)
@@ -5001,7 +5018,6 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
     wl_surface_set_opaque_region(surface->wl_surface, NULL);
     wayland_surface_attach_shm(surface, data->window_contents,
                                data->window_contents->damage_region);
-    surface->carrier_attached = FALSE;
     wayland_surface_commit(surface);
     wayland_hwnd_dmabuf_surface_destroy(direct);
     return TRUE;
@@ -5063,7 +5079,7 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
         wl_region_destroy(region);
     }
     else wl_surface_set_opaque_region(surface->wl_surface, NULL);
-    wayland_surface_attach_shm(surface, shm_buffer, shm_buffer->damage_region);
+    wayland_surface_attach_shm_buffer(surface, shm_buffer, shm_buffer->damage_region);
     wayland_surface_commit(surface);
     wayland_shm_buffer_unref(shm_buffer);
     surface->carrier_attached = TRUE;
@@ -5253,7 +5269,7 @@ commit_current:
         have_commit_sync = TRUE;
         wayland_hwnd_dmabuf_attach_current(direct);
     }
-    surface->carrier_attached = FALSE;
+    wayland_surface_clear_carrier(surface);
     wayland_hwnd_dmabuf_surface_set_opaque(direct, width, height);
     wayland_hwnd_dmabuf_color_surface_sync(
         &direct->color_surface, surface->wl_surface, &direct->current->desc);
@@ -6433,7 +6449,6 @@ static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *sur
     }
     wl_surface_set_opaque_region(surface->wl_surface, NULL);
     wayland_surface_attach_shm(surface, clone, clone->damage_region);
-    surface->carrier_attached = FALSE;
     wayland_surface_commit(surface);
     wayland_shm_buffer_unref(clone);
 }
@@ -7070,7 +7085,8 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     wayland_client_surface_set_content_type(surface);
     data->wayland_surface->direct_client = surface;
     /* The external producer replaces any Wine root buffer. */
-    data->wayland_surface->carrier_attached = FALSE;
+    wayland_surface_clear_carrier(data->wayland_surface);
+    wayland_client_surface_set_opaque_region(surface, !ReadAcquire(&surface->has_alpha));
 
     /* The first WSI commit applies the pending root state before the retained
      * child is removed, keeping the previous frame visible through handoff. */
@@ -7120,7 +7136,8 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
     if (data->wayland_surface)
     {
         data->wayland_surface->direct_client = surface;
-        data->wayland_surface->carrier_attached = FALSE;
+        wayland_surface_clear_carrier(data->wayland_surface);
+        wayland_client_surface_set_opaque_region(surface, !ReadAcquire(&surface->has_alpha));
     }
 
     wayland_surface_commit(data->wayland_surface);
