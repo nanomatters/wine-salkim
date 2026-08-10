@@ -31,6 +31,10 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#endif
 #ifdef HAVE_SYS_EVENTFD_H
 #include <sys/eventfd.h>
 #endif
@@ -343,6 +347,12 @@ enum wine_managed_consumer_state
     WINE_MANAGED_CONSUMER_SUSPENDED,
 };
 
+enum wine_managed_image_layout
+{
+    WINE_MANAGED_IMAGE_LAYOUT_MODIFIER,
+    WINE_MANAGED_IMAGE_LAYOUT_LINEAR,
+};
+
 /* The server reuses one channel while swapchains overlap during recreation. */
 struct wine_managed_consumer
 {
@@ -384,6 +394,7 @@ struct wine_managed_swapchain
     VkFormat format;
     VkExtent2D extents;
     VkImageUsageFlags usage;
+    enum wine_managed_image_layout layout;
     BOOL has_color_space;
 
     /* ring / publish state */
@@ -1273,22 +1284,24 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
      * interpose a managed swapchain even when the app did not request them.
      * Only meaningful for swapchain devices. */
     if (device->extensions.has_VK_KHR_swapchain &&
-        physical_device->extensions.has_VK_EXT_image_drm_format_modifier &&
         physical_device->extensions.has_VK_EXT_external_memory_dma_buf)
     {
-        device->extensions.has_VK_EXT_image_drm_format_modifier = 1;
         device->extensions.has_VK_EXT_external_memory_dma_buf = 1;
         device->extensions.has_VK_KHR_external_memory_fd = 1;
         device->extensions.has_VK_KHR_external_memory = 1;
-        /* VK_EXT_image_drm_format_modifier requires VK_KHR_image_format_list +
-         * VK_KHR_bind_memory2 + VK_KHR_sampler_ycbcr_conversion (1.1 core).
-         * Enable the KHR aliases defensively when the host advertises them. */
-        if (physical_device->extensions.has_VK_KHR_image_format_list)
-            device->extensions.has_VK_KHR_image_format_list = 1;
-        if (physical_device->extensions.has_VK_KHR_bind_memory2)
-            device->extensions.has_VK_KHR_bind_memory2 = 1;
-        if (physical_device->extensions.has_VK_KHR_sampler_ycbcr_conversion)
-            device->extensions.has_VK_KHR_sampler_ycbcr_conversion = 1;
+        if (physical_device->extensions.has_VK_EXT_image_drm_format_modifier)
+        {
+            device->extensions.has_VK_EXT_image_drm_format_modifier = 1;
+            /* VK_EXT_image_drm_format_modifier requires VK_KHR_image_format_list +
+             * VK_KHR_bind_memory2 + VK_KHR_sampler_ycbcr_conversion (1.1 core).
+             * Enable the KHR aliases defensively when the host advertises them. */
+            if (physical_device->extensions.has_VK_KHR_image_format_list)
+                device->extensions.has_VK_KHR_image_format_list = 1;
+            if (physical_device->extensions.has_VK_KHR_bind_memory2)
+                device->extensions.has_VK_KHR_bind_memory2 = 1;
+            if (physical_device->extensions.has_VK_KHR_sampler_ycbcr_conversion)
+                device->extensions.has_VK_KHR_sampler_ycbcr_conversion = 1;
+        }
         if (physical_device->extensions.has_VK_KHR_external_semaphore_fd)
         {
             device->extensions.has_VK_KHR_external_semaphore_fd = 1;
@@ -3667,24 +3680,18 @@ static uint32_t vk_modifier_plane_count( struct vulkan_device *device, VkFormat 
     return count;
 }
 
-/* Query whether the host can export an image of (format, modifier) as a
- * DMA_BUF with the requested usage. Multi-plane modifiers are fine. */
-static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat format,
-                                         VkImageUsageFlags usage, uint64_t modifier )
+static BOOL vk_host_image_exportable( struct vulkan_device *device, VkFormat format,
+                                      VkImageUsageFlags usage, VkImageTiling tiling,
+                                      const void *tiling_info,
+                                      VkExternalMemoryHandleTypeFlagBits handle_type )
 {
     struct vulkan_physical_device *physical_device = device->physical_device;
     struct vulkan_instance *instance = physical_device->instance;
-    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info =
-    {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-        .drmFormatModifier = modifier,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    };
     VkPhysicalDeviceExternalImageFormatInfo external_info =
     {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-        .pNext = &mod_info,
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .pNext = tiling_info,
+        .handleType = handle_type,
     };
     VkPhysicalDeviceImageFormatInfo2 format_info =
     {
@@ -3692,7 +3699,7 @@ static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat 
         .pNext = &external_info,
         .format = format,
         .type = VK_IMAGE_TYPE_2D,
-        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .tiling = tiling,
         .usage = usage,
     };
     VkExternalImageFormatProperties external_props =
@@ -3714,10 +3721,35 @@ static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat 
     return TRUE;
 }
 
+/* Query whether the host can export an image of (format, modifier) as a
+ * DMA_BUF with the requested usage. Multi-plane modifiers are fine. */
+static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat format,
+                                         VkImageUsageFlags usage, uint64_t modifier )
+{
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        .drmFormatModifier = modifier,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    return vk_host_image_exportable( device, format, usage,
+                                     VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, &mod_info,
+                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT );
+}
+
+static BOOL vk_host_linear_exportable( struct vulkan_device *device, VkFormat format,
+                                       VkImageUsageFlags usage )
+{
+    return vk_host_image_exportable( device, format, usage, VK_IMAGE_TILING_LINEAR, NULL,
+                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT );
+}
+
 static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFormat format,
                                               VkImageUsageFlags usage,
                                               const hwnd_dmabuf_format_modifier_t *caps_mods,
                                               UINT caps_count, unsigned int fourcc,
+                                              enum wine_managed_image_layout layout,
                                               uint64_t *out_mods, uint64_t *out_wire_mods,
                                               uint32_t max_out )
 {
@@ -3730,9 +3762,16 @@ static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFo
         uint64_t modifier = wire_modifier;
 
         if (caps_mods[i].fourcc != fourcc) continue;
-        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
-            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
-        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+        if (layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR)
+        {
+            if (wire_modifier != 0 /* DRM_FORMAT_MOD_LINEAR */) continue;
+        }
+        else
+        {
+            if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
+                modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
+            if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+        }
         if (caps_mods[i].tranche_index < best_tranche)
             best_tranche = caps_mods[i].tranche_index;
     }
@@ -3746,10 +3785,17 @@ static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFo
 
         if (caps_mods[i].fourcc != fourcc || caps_mods[i].tranche_index != best_tranche)
             continue;
-        /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
-        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
-            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
-        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+        if (layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR)
+        {
+            if (wire_modifier != 0 /* DRM_FORMAT_MOD_LINEAR */) continue;
+        }
+        else
+        {
+            /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
+            if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
+                modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
+            if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+        }
         /* dedupe */
         {
             uint32_t j;
@@ -3771,6 +3817,7 @@ static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFo
  * out_mods. 0 means no intersection -> caller falls back to the host swapchain. */
 static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND hwnd, VkFormat format,
                                              VkImageUsageFlags usage, BOOL opaque, unsigned int *fourcc_out,
+                                             enum wine_managed_image_layout layout,
                                              uint64_t *out_mods, uint64_t *out_wire_mods, uint32_t max_out,
                                              unsigned int *caps_flags )
 {
@@ -3784,8 +3831,13 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
     /* The fourcc must match compositeAlpha: opaque swapchains use the X-variant
      * (compositor ignores alpha), blended ones the A-variant. Try the matching
      * variant first, then the other. */
+    if (layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR &&
+        !vk_host_linear_exportable( device, format, usage ))
+        return 0;
+
     fourcc_first = vk_format_to_drm_fourcc( format, opaque );
-    fourcc_second = vk_format_to_drm_fourcc( format, !opaque );
+    fourcc_second = layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR ? 0 :
+                    vk_format_to_drm_fourcc( format, !opaque );
     if (!fourcc_first && !fourcc_second) return 0;
 
     /* The compositor can advertise hundreds of (fourcc, modifier) pairs. Query
@@ -3812,13 +3864,13 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND 
     if (fourcc_first)
     {
         out_count = vk_collect_managed_modifiers( device, format, usage, caps_mods, caps_count,
-                                                  fourcc_first, out_mods, out_wire_mods, max_out );
+                                                  fourcc_first, layout, out_mods, out_wire_mods, max_out );
         if (out_count) *fourcc_out = fourcc_first;
     }
     if (!out_count && fourcc_second)
     {
         out_count = vk_collect_managed_modifiers( device, format, usage, caps_mods, caps_count,
-                                                  fourcc_second, out_mods, out_wire_mods, max_out );
+                                                  fourcc_second, layout, out_mods, out_wire_mods, max_out );
         if (out_count) *fourcc_out = fourcc_second;
     }
 
@@ -3972,8 +4024,19 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
     free( managed );
 }
 
-/* Create one exportable DRM-modifier image + dedicated exportable memory, export
- * its dmabuf fd and cache the realized modifier + per-plane layouts. */
+static BOOL managed_fd_is_dmabuf( int fd )
+{
+#if defined(__linux__) && defined(DMA_BUF_SET_NAME)
+    const char name[] = "wine-managed-linear";
+
+    return ioctl( fd, DMA_BUF_SET_NAME, name ) == 0;
+#else
+    return FALSE;
+#endif
+}
+
+/* Create one exportable image + dedicated exportable memory, export its dmabuf
+ * fd and cache the realized modifier + per-plane layouts. */
 static VkResult managed_create_image( struct vulkan_device *device, struct wine_managed_swapchain *managed,
                                       const uint64_t *modifiers, const uint64_t *wire_modifiers,
                                       uint32_t modifier_count,
@@ -3988,7 +4051,6 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     VkExternalMemoryImageCreateInfo external_image =
     {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        .pNext = &mod_list,
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     VkImageCreateInfo image_info =
@@ -4001,7 +4063,6 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         .usage = managed->usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -4021,16 +4082,23 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     VkMemoryAllocateInfo alloc_info = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export_mem };
     VkImageDrmFormatModifierPropertiesEXT mod_props = { .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT };
     VkMemoryGetFdInfoKHR get_fd = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
-    VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT };
+    VkImageSubresource subresource = {0};
     struct vulkan_physical_device *physical_device = device->physical_device;
     VkSubresourceLayout layout = {0};
     uint32_t mem_type_index = ~0u, plane_count, i;
-    uint64_t wire_modifier;
+    uint64_t wire_modifier = 0;
+    BOOL linear = managed->layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR;
+    VkExternalMemoryHandleTypeFlagBits handle_type = linear ?
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT : VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     int fd = -1;
     VkResult res;
 
     image->dmabuf_fd = -1;
     image->completion_fd = -1;
+    external_image.pNext = linear ? NULL : &mod_list;
+    external_image.handleTypes = handle_type;
+    image_info.tiling = linear ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    export_mem.handleTypes = handle_type;
 
     if ((res = device->p_vkCreateImage( device->host.device, &image_info, NULL, &image->image )))
     {
@@ -4072,7 +4140,7 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     }
 
     get_fd.memory = image->memory;
-    get_fd.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    get_fd.handleType = handle_type;
     if ((res = device->p_vkGetMemoryFdKHR( device->host.device, &get_fd, &fd )) || fd < 0)
     {
         WARN( "managed vkGetMemoryFdKHR failed, res %d\n", res );
@@ -4080,35 +4148,51 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
         goto failed;
     }
     image->dmabuf_fd = fd;
-
-    if ((res = device->p_vkGetImageDrmFormatModifierPropertiesEXT( device->host.device, image->image, &mod_props )))
+    if (linear && !managed_fd_is_dmabuf( fd ))
     {
-        WARN( "managed vkGetImageDrmFormatModifierPropertiesEXT failed, res %d\n", res );
+        WARN( "managed linear opaque fd is not a dma-buf, error %d\n", errno );
+        res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
         goto failed;
     }
-    /* Record the swapchain-level realized modifier from the first image. Each
-     * image still publishes its own modifier/stride/offset below in case the
-     * host picks differently per image. */
-    managed->realized_modifier = mod_props.drmFormatModifier;
-    wire_modifier = mod_props.drmFormatModifier;
-    for (i = 0; i < modifier_count; i++)
+
+    if (linear)
     {
-        if (modifiers[i] == mod_props.drmFormatModifier)
+        managed->realized_modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
+        wire_modifier = wire_modifiers[0];
+        plane_count = 1;
+    }
+    else
+    {
+        if ((res = device->p_vkGetImageDrmFormatModifierPropertiesEXT( device->host.device,
+                                                                       image->image, &mod_props )))
         {
-            wire_modifier = wire_modifiers[i];
-            break;
+            WARN( "managed vkGetImageDrmFormatModifierPropertiesEXT failed, res %d\n", res );
+            goto failed;
         }
-    }
+        /* Record the swapchain-level realized modifier from the first image. Each
+         * image still publishes its own modifier/stride/offset below in case the
+         * host picks differently per image. */
+        managed->realized_modifier = mod_props.drmFormatModifier;
+        wire_modifier = mod_props.drmFormatModifier;
+        for (i = 0; i < modifier_count; i++)
+        {
+            if (modifiers[i] == mod_props.drmFormatModifier)
+            {
+                wire_modifier = wire_modifiers[i];
+                break;
+            }
+        }
 
-    /* Publish every plane of the realized modifier. A missing auxiliary plane
-     * (e.g. AMD DCC) makes the consumer-side dmabuf import fail fatally. */
-    plane_count = vk_modifier_plane_count( device, managed->format, mod_props.drmFormatModifier );
-    if (!plane_count || plane_count > HWND_DMABUF_MAX_PLANES)
-    {
-        WARN( "managed image modifier 0x%s has unsupported plane count %u\n",
-              wine_dbgstr_longlong(mod_props.drmFormatModifier), plane_count );
-        res = VK_ERROR_FORMAT_NOT_SUPPORTED;
-        goto failed;
+        /* Publish every plane of the realized modifier. A missing auxiliary plane
+         * (e.g. AMD DCC) makes the consumer-side dmabuf import fail fatally. */
+        plane_count = vk_modifier_plane_count( device, managed->format, mod_props.drmFormatModifier );
+        if (!plane_count || plane_count > HWND_DMABUF_MAX_PLANES)
+        {
+            WARN( "managed image modifier 0x%s has unsupported plane count %u\n",
+                  wine_dbgstr_longlong(mod_props.drmFormatModifier), plane_count );
+            res = VK_ERROR_FORMAT_NOT_SUPPORTED;
+            goto failed;
+        }
     }
 
     /* Cache the per-image frame descriptor (filled with the per-frame fields at
@@ -4123,9 +4207,16 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
             VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT,
             VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT,
         };
-        subresource.aspectMask = plane_aspects[i];
+        subresource.aspectMask = linear ? VK_IMAGE_ASPECT_COLOR_BIT : plane_aspects[i];
         memset( &layout, 0, sizeof(layout) );
         device->p_vkGetImageSubresourceLayout( device->host.device, image->image, &subresource, &layout );
+        if (linear && (!layout.rowPitch || layout.offset > UINT_MAX || layout.rowPitch > UINT_MAX))
+        {
+            WARN( "managed linear image has unsupported offset/stride %s/%s\n",
+                  wine_dbgstr_longlong(layout.offset), wine_dbgstr_longlong(layout.rowPitch) );
+            res = VK_ERROR_FORMAT_NOT_SUPPORTED;
+            goto failed;
+        }
         image->desc.plane_offsets[i] = (unsigned int)layout.offset;
         image->desc.plane_strides[i] = (unsigned int)layout.rowPitch;
     }
@@ -4171,6 +4262,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     struct wine_managed_swapchain *managed;
     BOOL opaque_alpha;
     unsigned int fourcc = 0;
+    enum wine_managed_image_layout layout;
     uint32_t modifier_count, count, i;
     unsigned int caps_flags;
     VkImageUsageFlags usage;
@@ -4181,17 +4273,27 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
 
     opaque_alpha = create_info->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     usage = create_info->imageUsage;
+    layout = device->extensions.has_VK_EXT_image_drm_format_modifier ?
+             WINE_MANAGED_IMAGE_LAYOUT_MODIFIER : WINE_MANAGED_IMAGE_LAYOUT_LINEAR;
 
+    if (layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR &&
+        (create_info->imageFormat != VK_FORMAT_R8G8B8A8_UNORM || !opaque_alpha))
+    {
+        TRACE( "linear managed fallback does not support format %u alpha %#x for hwnd %p\n",
+               create_info->imageFormat, create_info->compositeAlpha, surface->hwnd );
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
     /* Intersect the compositor's advertised (fourcc, modifier) caps with what the
      * host can export as a single-plane dmabuf, against the realized usage. */
     modifier_count = vk_select_managed_modifiers( device, surface->hwnd, create_info->imageFormat,
                                                   usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, opaque_alpha,
-                                                  &fourcc, modifiers, wire_modifiers, ARRAY_SIZE(modifiers),
+                                                  &fourcc, layout, modifiers, wire_modifiers, ARRAY_SIZE(modifiers),
                                                   &caps_flags );
     if (!modifier_count)
     {
-        TRACE( "no host-exportable modifier intersection for hwnd %p format %u, falling back to host swapchain\n",
-               surface->hwnd, create_info->imageFormat );
+        TRACE( "no host-exportable %s layout for hwnd %p format %u usage %#x, falling back to host swapchain\n",
+               layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR ? "linear" : "modifier",
+               surface->hwnd, create_info->imageFormat, usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT );
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
 
@@ -4209,6 +4311,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
         managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
     managed->format = create_info->imageFormat;
     managed->fourcc = fourcc;
+    managed->layout = layout;
     managed->has_color_space =
         managed_color_space_from_vulkan( create_info->imageColorSpace, &managed->color_space );
     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
@@ -4292,9 +4395,10 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     TRACE( "managed swapchain %p hwnd %p socket channel fd %d\n", managed, surface->hwnd, managed->channel_fd );
 
     *out = managed;
-    TRACE( "created managed swapchain %p: %u images %ux%u fourcc %#x modifier 0x%s\n",
+    TRACE( "created managed swapchain %p: %u images %ux%u fourcc %#x layout %s modifier 0x%s\n",
            managed, managed->image_count, managed->extents.width, managed->extents.height,
-           managed->fourcc, wine_dbgstr_longlong( managed->realized_modifier ) );
+           managed->fourcc, managed->layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR ? "linear" : "modifier",
+           wine_dbgstr_longlong( managed->realized_modifier ) );
     return VK_SUCCESS;
 }
 
@@ -5181,10 +5285,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     /* Interpose a managed cross-process producer only when the window advertises
      * HWND dmabuf caps (an off-screen child whose toplevel has no wl_surface) and
-     * the host supports the DRM-modifier and dmabuf external-memory extensions.
-     * On-screen windows return no caps and use the host swapchain path below. */
-    if (device->extensions.has_VK_EXT_image_drm_format_modifier &&
-        device->extensions.has_VK_EXT_external_memory_dma_buf)
+     * the host supports dmabuf external memory. On-screen windows return no caps
+     * and use the host swapchain path below. */
+    if (device->extensions.has_VK_EXT_external_memory_dma_buf)
     {
         struct wine_managed_swapchain *managed = NULL;
         hwnd_dmabuf_host_caps_t probe_caps = {0};
@@ -5236,9 +5339,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     }
     else
     {
-        TRACE( "managed dmabuf unavailable for hwnd %p (modifier %u, external memory %u), using host swapchain\n",
-               surface->hwnd, device->extensions.has_VK_EXT_image_drm_format_modifier,
-               device->extensions.has_VK_EXT_external_memory_dma_buf );
+        TRACE( "managed dmabuf unavailable for hwnd %p (external memory %u), using host swapchain\n",
+               surface->hwnd, device->extensions.has_VK_EXT_external_memory_dma_buf );
     }
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
