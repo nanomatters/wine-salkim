@@ -1574,6 +1574,66 @@ static BOOL CALLBACK find_primary_mon(HMONITOR hmon, HDC hdc, LPRECT rc, LPARAM 
     return TRUE;
 }
 
+static BOOL CALLBACK test_monitor_window_placement(HMONITOR monitor, HDC hdc, RECT *rect, LPARAM param)
+{
+    static const DWORD ex_styles[] = {0, WS_EX_TOOLWINDOW};
+    WINDOWPLACEMENT placement = {sizeof(placement)};
+    RECT screen_rect, expected;
+    MONITORINFO info = {sizeof(info)};
+    HWND hwnd;
+    BOOL ret;
+    unsigned int i;
+
+    ret = GetMonitorInfoW(monitor, &info);
+    ok(ret, "GetMonitorInfoW failed, error %lu.\n", GetLastError());
+    if (!ret) return TRUE;
+
+    for (i = 0; i < ARRAY_SIZE(ex_styles); ++i)
+    {
+        hwnd = CreateWindowExA(ex_styles[i], "static", NULL, WS_OVERLAPPEDWINDOW,
+                info.rcWork.left + 100, info.rcWork.top + 100, 150, 100, NULL, NULL, NULL, NULL);
+        ok(!!hwnd, "CreateWindowExA failed, error %lu.\n", GetLastError());
+        if (!hwnd) continue;
+
+        ret = GetWindowRect(hwnd, &screen_rect);
+        ok(ret, "GetWindowRect failed, error %lu.\n", GetLastError());
+        expected = screen_rect;
+        if (!ex_styles[i])
+            OffsetRect(&expected, info.rcMonitor.left - info.rcWork.left,
+                    info.rcMonitor.top - info.rcWork.top);
+
+        ret = GetWindowPlacement(hwnd, &placement);
+        ok(ret, "GetWindowPlacement failed, error %lu.\n", GetLastError());
+        ok(EqualRect(&placement.rcNormalPosition, &expected),
+                "Monitor %s, ex_style %#lx: expected placement %s, got %s.\n",
+                wine_dbgstr_rect(&info.rcMonitor), ex_styles[i], wine_dbgstr_rect(&expected),
+                wine_dbgstr_rect(&placement.rcNormalPosition));
+        ok(placement.ptMinPosition.x == -1 && placement.ptMinPosition.y == -1,
+                "Unexpected minimized position %s.\n", wine_dbgstr_point(&placement.ptMinPosition));
+        ok(placement.ptMaxPosition.x == -1 && placement.ptMaxPosition.y == -1,
+                "Unexpected maximized position %s.\n", wine_dbgstr_point(&placement.ptMaxPosition));
+
+        OffsetRect(&placement.rcNormalPosition, 10, 20);
+        OffsetRect(&screen_rect, 10, 20);
+        ret = SetWindowPlacement(hwnd, &placement);
+        ok(ret, "SetWindowPlacement failed, error %lu.\n", GetLastError());
+        ret = GetWindowRect(hwnd, &expected);
+        ok(ret, "GetWindowRect failed, error %lu.\n", GetLastError());
+        ok(EqualRect(&expected, &screen_rect), "Expected screen rect %s, got %s.\n",
+                wine_dbgstr_rect(&screen_rect), wine_dbgstr_rect(&expected));
+
+        ret = GetWindowPlacement(hwnd, &placement);
+        ok(ret, "GetWindowPlacement failed, error %lu.\n", GetLastError());
+        if (!ex_styles[i])
+            OffsetRect(&screen_rect, info.rcMonitor.left - info.rcWork.left,
+                    info.rcMonitor.top - info.rcWork.top);
+        ok(EqualRect(&placement.rcNormalPosition, &screen_rect), "Expected placement %s, got %s.\n",
+                wine_dbgstr_rect(&screen_rect), wine_dbgstr_rect(&placement.rcNormalPosition));
+        DestroyWindow(hwnd);
+    }
+    return TRUE;
+}
+
 static void test_work_area(void)
 {
     HMONITOR hmon;
@@ -1613,11 +1673,7 @@ static void test_work_area(void)
     trace("min: %ld,%ld max %ld,%ld normal %s\n", wp.ptMinPosition.x, wp.ptMinPosition.y,
           wp.ptMaxPosition.x, wp.ptMaxPosition.y, wine_dbgstr_rect(&wp.rcNormalPosition));
     OffsetRect(&wp.rcNormalPosition, rc_work.left, rc_work.top);
-    todo_wine_if (mi.rcMonitor.left != mi.rcWork.left ||
-        mi.rcMonitor.top != mi.rcWork.top)  /* FIXME: remove once Wine is fixed */
-    {
-        ok(EqualRect(&rc_normal, &wp.rcNormalPosition), "normal pos is different\n");
-    }
+    ok(EqualRect(&rc_normal, &wp.rcNormalPosition), "normal pos is different\n");
 
     SetWindowLongA(hwnd, GWL_EXSTYLE, WS_EX_TOOLWINDOW);
 
@@ -1629,6 +1685,9 @@ static void test_work_area(void)
     ok(EqualRect(&rc_normal, &wp.rcNormalPosition), "normal pos is different\n");
 
     DestroyWindow(hwnd);
+
+    ret = EnumDisplayMonitors(NULL, NULL, test_monitor_window_placement, 0);
+    ok(ret, "EnumDisplayMonitors failed, error %lu.\n", GetLastError());
 }
 
 static void test_GetDisplayConfigBufferSizes(void)
