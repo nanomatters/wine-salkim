@@ -494,6 +494,8 @@ struct wayland_window_config
     RECT rect;
     RECT window_rect;
     RECT client_rect;
+    /* Window-surface buffer pixels presented by the parent wl_surface. */
+    RECT shm_source;
     enum wayland_surface_config_state state;
     /* The scale (i.e., normalized dpi) the window is rendering at. */
     double scale;

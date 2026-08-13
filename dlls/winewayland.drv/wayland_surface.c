@@ -2931,9 +2931,11 @@ static void wayland_surface_damage_shm_buffer(struct wl_surface *wl_surface, HRG
 
 static void wayland_surface_attach_shm_buffer(struct wayland_surface *surface,
                                               struct wayland_shm_buffer *shm_buffer,
-                                              HRGN surface_damage_region)
+                                              HRGN surface_damage_region,
+                                              const RECT *source_rect)
 {
-    int win_width, win_height;
+    RECT source = {0, 0, shm_buffer->width, shm_buffer->height};
+    int source_width, source_height;
 
     TRACE("surface=%p shm_buffer=%p (%dx%d)\n",
           surface, shm_buffer, shm_buffer->width, shm_buffer->height);
@@ -2944,21 +2946,24 @@ static void wayland_surface_attach_shm_buffer(struct wayland_surface *surface,
     wl_surface_attach(surface->wl_surface, shm_buffer->wl_buffer, 0, 0);
     wayland_surface_damage_shm_buffer(surface->wl_surface, surface_damage_region);
 
-    win_width = surface->window.rect.right - surface->window.rect.left;
-    win_height = surface->window.rect.bottom - surface->window.rect.top;
+    if (source_rect) source = *source_rect;
+    /* A viewport source must be non-empty and contained in the buffer. */
+    source.left = max(0, min(source.left, shm_buffer->width - 1));
+    source.top = max(0, min(source.top, shm_buffer->height - 1));
+    source.right = max(source.left + 1, min(source.right, shm_buffer->width));
+    source.bottom = max(source.top + 1, min(source.bottom, shm_buffer->height));
+    source_width = source.right - source.left;
+    source_height = source.bottom - source.top;
 
-    /* Source must be inside the buffer. A 1x1 carrier uses its viewport to
-     * cover the full surface. */
-    win_width = max(1, min(win_width, shm_buffer->width));
-    win_height = max(1, min(win_height, shm_buffer->height));
-
-    wp_viewport_set_source(surface->wp_viewport, 0, 0,
-                           wl_fixed_from_int(win_width),
-                           wl_fixed_from_int(win_height));
+    wp_viewport_set_source(surface->wp_viewport,
+                           wl_fixed_from_int(source.left),
+                           wl_fixed_from_int(source.top),
+                           wl_fixed_from_int(source_width),
+                           wl_fixed_from_int(source_height));
     wayland_surface_mark_pending_commit(surface);
 
-    surface->content_width = win_width;
-    surface->content_height = win_height;
+    surface->content_width = source_width;
+    surface->content_height = source_height;
 }
 
 static void wayland_viewport_unset(struct wp_viewport *viewport)
@@ -2995,7 +3000,8 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 HRGN surface_damage_region)
 {
     wayland_surface_clear_carrier(surface);
-    wayland_surface_attach_shm_buffer(surface, shm_buffer, surface_damage_region);
+    wayland_surface_attach_shm_buffer(surface, shm_buffer, surface_damage_region,
+                                      &surface->window.shm_source);
 }
 
 static void wayland_shm_buffer_clone_release(void *data, struct wl_buffer *buffer)
@@ -5079,7 +5085,7 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
         wl_region_destroy(region);
     }
     else wl_surface_set_opaque_region(surface->wl_surface, NULL);
-    wayland_surface_attach_shm_buffer(surface, shm_buffer, shm_buffer->damage_region);
+    wayland_surface_attach_shm_buffer(surface, shm_buffer, shm_buffer->damage_region, NULL);
     wayland_surface_commit(surface);
     wayland_shm_buffer_unref(shm_buffer);
     surface->carrier_attached = TRUE;

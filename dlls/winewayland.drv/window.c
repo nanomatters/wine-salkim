@@ -308,11 +308,14 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     /* The Win32 iconic rect is not compositor geometry. */
     if (!conf->minimized)
     {
+        RECT source = data->rects.visible;
+
         if (explicit_fullscreen)
         {
             conf->rect = fullscreen_rect;
             conf->window_rect = fullscreen_rect;
             conf->client_rect = fullscreen_rect;
+            source = data->rects.client;
         }
         else
         {
@@ -328,10 +331,16 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
             conf->rect = data->rects.client;
             conf->window_rect = data->rects.client;
             conf->client_rect = data->rects.client;
+            source = data->rects.client;
         }
+
+        conf->shm_source = source;
+        OffsetRect(&conf->shm_source, -data->rects.visible.left,
+                   -data->rects.visible.top);
     }
 
-    TRACE("window=%s style=%#x exstyle=%#x\n", wine_dbgstr_rect(&conf->rect), style, exstyle);
+    TRACE("window=%s shm_source=%s style=%#x exstyle=%#x\n",
+          wine_dbgstr_rect(&conf->rect), wine_dbgstr_rect(&conf->shm_source), style, exstyle);
 
     if (conf->minimized)
     {
