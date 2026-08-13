@@ -1383,15 +1383,10 @@ static void wayland_configure_window(HWND hwnd)
         needs_exit_size_move = TRUE;
     }
 
-    /* Transitions between normal/max/fullscreen may entail a frame change. */
-    if ((state ^ surface->current.state) &
-        (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
-         WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
-    {
-        flags |= SWP_FRAMECHANGED;
-    }
-    /* Transitions between decoration modes may entail a frame change. */
-    else if (surface->processing.decor != surface->current.decor)
+    /* Only Win32 maximize and decoration transitions change non-client metrics.
+     * Fullscreen is a Wayland presentation state, not a Win32 window style. */
+    if (((state ^ surface->current.state) & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) ||
+        surface->processing.decor != surface->current.decor)
     {
         flags |= SWP_FRAMECHANGED;
     }
