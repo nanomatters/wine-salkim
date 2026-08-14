@@ -1994,6 +1994,9 @@ BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *sty
 
     *style_mask = *ex_style_mask = 0;
 
+    /* Hosted windows are subsurfaces and cannot receive xdg-toplevel decorations.
+     * Leave their frames visible for Wine to render into the carrier. */
+    if (wayland_window_is_externally_hosted(hwnd, NULL)) return FALSE;
     if (!process_wayland.zxdg_decoration_manager_v1) return FALSE;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
@@ -2027,7 +2030,7 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     HWND focused_hwnd, old_foreground = NtUserGetForegroundWindow();
     RECT restore_rect;
-    BOOL ret, restore_rect_valid;
+    BOOL ret, restore_rect_valid, surface_focused;
 
     *state_cmd = *swp_flags = 0;
     *foreground = NULL;
@@ -2058,11 +2061,14 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
     pthread_mutex_lock(&keyboard->mutex);
     focused_hwnd = keyboard->focused_hwnd;
     pthread_mutex_unlock(&keyboard->mutex);
+    surface_focused = focused_hwnd == hwnd;
 
-    /* if the foreground window is not the hwnd then this is a stale focus loss */
-    if (!focused_hwnd && old_foreground == hwnd)
+    /* A host surface represents the foreground window in its owned tree. */
+    if (!focused_hwnd && old_foreground == wayland_keyboard_get_input_hwnd(hwnd, old_foreground))
         focused_hwnd = NtUserGetDesktopWindow();
-    else if (focused_hwnd != hwnd) focused_hwnd = NULL;
+    else if (surface_focused)
+        focused_hwnd = wayland_keyboard_get_input_hwnd(hwnd, old_foreground);
+    else focused_hwnd = NULL;
 
     if (!*foreground && old_foreground != focused_hwnd)
     {
@@ -2073,7 +2079,7 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
     /* xdg-shell has no unminimize event. When the compositor maps a minimized
      * toplevel again, keyboard focus is the only signal available to make the
      * Win32 window leave its iconic state. */
-    if (!*state_cmd && (style & WS_MINIMIZE) && focused_hwnd == hwnd &&
+    if (!*state_cmd && (style & WS_MINIMIZE) && surface_focused &&
         old_foreground != hwnd)
     {
         *state_cmd = MAKELONG(SC_RESTORE, 1);

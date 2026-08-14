@@ -154,6 +154,7 @@ struct wayland_keyboard
     /* scancode -> keystate mapping. The keyboard state is the same across every instance of a seat.
      * We bind to the first seat each time, and this first bind seat should be the same every time. */
     unsigned char keystate[0x300];
+    HWND key_hwnds[0x300];
 };
 
 struct wayland_cursor
@@ -830,6 +831,7 @@ BOOL wayland_is_menu_popup_candidate(HWND hwnd);
 BOOL wayland_is_menu_popup(HWND hwnd);
 BOOL wayland_window_is_externally_hosted(HWND hwnd, HWND *host);
 BOOL wayland_window_get_effective_alpha(HWND hwnd, BYTE *alpha);
+HWND wayland_keyboard_get_input_hwnd(HWND surface_hwnd, HWND foreground);
 void wayland_window_surface_set_external_host(struct window_surface *surface, HWND host);
 BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
 void wayland_set_layer_menu_hwnd(HWND hwnd);
