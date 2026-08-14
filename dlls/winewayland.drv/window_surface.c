@@ -1373,7 +1373,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     {
         wayland_gdi_overlay_reset(window_surface->hwnd, &wws->gdi_overlay);
         InterlockedExchange(&wws->host_dirty, TRUE);
-        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE, NULL);
         wl_display_flush(process_wayland.wl_display);
         goto done;
     }
@@ -1381,7 +1381,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     if (!window_surface->app_painted_full && !window_surface->app_painted_region && !refresh_host)
     {
         if (shape_changed) wayland_window_surface_sync_regions(window_surface);
-        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE, NULL);
         wl_display_flush(process_wayland.wl_display);
         goto done;
     }
@@ -1488,10 +1488,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         overlay_flushed = wayland_gdi_overlay_update(
                 window_surface->hwnd, &wws->gdi_overlay, shm_buffer,
                 effective_dirty, gdi_over_region, gdi_over_paint_region);
-    /* Slots exist only after GDI pixels have been published. */
-    content_over_producer = wws->gdi_overlay.slots_created ||
-                            (window_surface->clip_region &&
-                             NtGdiRectInRegion(window_surface->clip_region, &surface_rect));
+    /* Slots are allocated only when GDI pixels require overlay transport. */
+    content_over_producer = wws->gdi_overlay.slots_created;
     if (wws->occlusion_clipped && !externally_hosted)
         wayland_shm_buffer_clear_outside_clip(shm_buffer, effective_dirty,
                                               window_surface->clip_region);
@@ -1504,8 +1502,9 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
      * cannot publish yet, leave the surface dirty so the next idle flush
      * retries both together. */
     if (overlay_flushed)
-        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region,
-                                              content_over_producer);
+        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer,
+                                              surface_damage_region, content_over_producer,
+                                              window_surface->clip_region);
     wl_display_flush(process_wayland.wl_display);
 
 done:

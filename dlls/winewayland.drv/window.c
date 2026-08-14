@@ -293,6 +293,18 @@ BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
     return EqualRect(&intersection, &virtual_screen);
 }
 
+static RECT wayland_win_data_get_shm_source(const struct wayland_win_data *data,
+                                            BOOL explicit_fullscreen, BOOL fullscreen)
+{
+    RECT source = data->rects.visible;
+
+    if (explicit_fullscreen ||
+        (fullscreen && (data->style & (WS_CAPTION | WS_THICKFRAME))))
+        source = data->rects.client;
+    OffsetRect(&source, -data->rects.visible.left, -data->rects.visible.top);
+    return source;
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
@@ -308,14 +320,11 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     /* The Win32 iconic rect is not compositor geometry. */
     if (!conf->minimized)
     {
-        RECT source = data->rects.visible;
-
         if (explicit_fullscreen)
         {
             conf->rect = fullscreen_rect;
             conf->window_rect = fullscreen_rect;
             conf->client_rect = fullscreen_rect;
-            source = data->rects.client;
         }
         else
         {
@@ -331,12 +340,10 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
             conf->rect = data->rects.client;
             conf->window_rect = data->rects.client;
             conf->client_rect = data->rects.client;
-            source = data->rects.client;
         }
 
-        conf->shm_source = source;
-        OffsetRect(&conf->shm_source, -data->rects.visible.left,
-                   -data->rects.visible.top);
+        conf->shm_source = wayland_win_data_get_shm_source(data, explicit_fullscreen,
+                                                           fullscreen);
     }
 
     TRACE("window=%s shm_source=%s style=%#x exstyle=%#x\n",
@@ -2160,16 +2167,36 @@ static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)
 }
 
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer,
-                                 HRGN damage_region, BOOL content_over_producer)
+                                 HRGN damage_region, BOOL overlay_content,
+                                 HRGN clip_region)
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
     BOOL committed = FALSE;
-    BOOL has_content_over_producer = shm_buffer && content_over_producer;
+    BOOL has_content_over_producer = FALSE;
     BOOL content_over_changed;
     uint32_t current_serial;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    if (shm_buffer)
+    {
+        RECT fullscreen_rect, source;
+        BOOL explicit_fullscreen = data->client_surface &&
+            wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE,
+                                                       &fullscreen_rect);
+        BOOL fullscreen = wayland_win_data_is_fullscreen(data);
+        BOOL clip_content;
+
+        source = wayland_win_data_get_shm_source(data, explicit_fullscreen, fullscreen);
+        if (IsRectEmpty(&source))
+        {
+            source.left = source.top = 0;
+            source.right = shm_buffer->width;
+            source.bottom = shm_buffer->height;
+        }
+        clip_content = clip_region && NtGdiRectInRegion(clip_region, &source);
+        has_content_over_producer = overlay_content || clip_content;
+    }
     content_over_changed = data->content_over_producer != has_content_over_producer;
     data->content_over_producer = has_content_over_producer;
 

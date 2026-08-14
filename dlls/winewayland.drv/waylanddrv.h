@@ -933,7 +933,7 @@ BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
 BOOL wayland_toplevel_has_visible_child_surface(HWND toplevel);
 void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *parent);
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
-                                 BOOL content_over_producer);
+                                 BOOL overlay_content, HRGN clip_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
 void wayland_window_init(void);
