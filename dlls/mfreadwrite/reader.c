@@ -2795,7 +2795,7 @@ static HRESULT source_reader_read_sample_async(struct source_reader *reader, uns
         DWORD *actual_index, DWORD *stream_flags, LONGLONG *timestamp, IMFSample **sample)
 {
     struct source_reader_async_command *command;
-    unsigned int stream_index;
+    DWORD stream_index;
     HRESULT hr;
 
     if (actual_index || stream_flags || timestamp || sample)
@@ -2837,7 +2837,7 @@ static HRESULT source_reader_read_sample_async(struct source_reader *reader, uns
                 if (command->u.read.any_stream)
                     --reader->queued_any_reads;
                 else if (command->u.read.resolved)
-                    --reader->streams[stream_index].queued_reads;
+                    --reader->streams[command->u.read.stream_index].queued_reads;
             }
             IUnknown_Release(&command->IUnknown_iface);
         }
