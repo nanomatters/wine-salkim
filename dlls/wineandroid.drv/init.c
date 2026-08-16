@@ -294,6 +294,11 @@ UINT ANDROID_UpdateDisplayDevices( const struct gdi_device_manager *device_manag
 }
 
 
+static enum wine_display_backend ANDROID_GetDisplayBackend(void)
+{
+    return WINE_DISPLAY_BACKEND_ANDROID;
+}
+
 static const struct user_driver_funcs android_drv_funcs =
 {
     .dc_funcs.pCreateCompatibleDC = ANDROID_CreateCompatibleDC,
@@ -311,6 +316,7 @@ static const struct user_driver_funcs android_drv_funcs =
     .pCreateWindow = ANDROID_CreateWindow,
     .pDesktopWindowProc = ANDROID_DesktopWindowProc,
     .pDestroyWindow = ANDROID_DestroyWindow,
+    .pGetDisplayBackend = ANDROID_GetDisplayBackend,
     .pProcessEvents = ANDROID_ProcessEvents,
     .pSetCapture = ANDROID_SetCapture,
     .pSetParent = ANDROID_SetParent,

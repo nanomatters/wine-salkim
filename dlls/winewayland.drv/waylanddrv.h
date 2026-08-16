@@ -1040,6 +1040,7 @@ BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size);
 BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
 BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd,  UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
 BOOL WAYLAND_HasWindowManager(const char *name);
+enum wine_display_backend WAYLAND_GetDisplayBackend(void);
 UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
 UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
 

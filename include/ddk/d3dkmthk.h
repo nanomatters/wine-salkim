@@ -277,8 +277,48 @@ typedef enum _KMTQUERYADAPTERINFOTYPE
     KMTQAITYPE_WDDM_3_0_CAPS,
     KMTQAITYPE_WSAUMDIMAGENAME,
     KMTQAITYPE_VGPUINTERFACEID,
-    KMTQAITYPE_WDDM_3_1_CAPS
+    KMTQAITYPE_WDDM_3_1_CAPS,
+    KMTQAITYPE_WINE_PERFDATA = 0x80000000
 } KMTQUERYADAPTERINFOTYPE;
+
+typedef struct _D3DKMT_ADAPTER_PERFDATA
+{
+    UINT32 PhysicalAdapterIndex;
+    ULONGLONG MemoryFrequency;
+    ULONGLONG MaxMemoryFrequency;
+    ULONGLONG MaxMemoryFrequencyOC;
+    ULONGLONG MemoryBandwidth;
+    ULONGLONG PCIEBandwidth;
+    ULONG FanRPM;
+    ULONG Power;
+    ULONG Temperature;
+    UCHAR PowerStateOverride;
+} D3DKMT_ADAPTER_PERFDATA;
+
+typedef struct _D3DKMT_ADAPTER_PERFDATACAPS
+{
+    UINT32 PhysicalAdapterIndex;
+    ULONGLONG MaxMemoryBandwidth;
+    ULONGLONG MaxPCIEBandwidth;
+    ULONG MaxFanRPM;
+    ULONG TemperatureMax;
+    ULONG TemperatureWarning;
+} D3DKMT_ADAPTER_PERFDATACAPS;
+
+#define D3DKMT_WINE_PERFDATA_GPU_POWER       0x00000001
+#define D3DKMT_WINE_PERFDATA_GPU_TEMPERATURE 0x00000002
+#define D3DKMT_WINE_PERFDATA_V1_SIZE          32
+
+typedef struct _D3DKMT_WINE_PERFDATA
+{
+    UINT32 PhysicalAdapterIndex;
+    UINT32 Requested;
+    UINT32 Valid;
+    UINT32 Reserved;
+    ULONGLONG GpuPowerMicrowatts;
+    ULONG GpuTemperatureDeciCelsius;
+    ULONG Reserved2;
+} D3DKMT_WINE_PERFDATA;
 
 typedef struct _D3DKMT_QUERYADAPTERINFO
 {

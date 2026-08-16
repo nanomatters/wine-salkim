@@ -1901,6 +1901,14 @@ void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)
 }
 
 /***********************************************************************
+ *          WAYLAND_GetDisplayBackend
+ */
+enum wine_display_backend WAYLAND_GetDisplayBackend(void)
+{
+    return WINE_DISPLAY_BACKEND_WAYLAND;
+}
+
+/***********************************************************************
  *          WAYLAND_HasWindowManager
  */
 BOOL WAYLAND_HasWindowManager(const char *name)

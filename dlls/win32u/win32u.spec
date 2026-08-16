@@ -1,4 +1,5 @@
 @ extern -arch=win32 Wow64Transition __wine_syscall_dispatcher
+@ stdcall -syscall __wine_get_display_backend()
 @ stub -syscall NtBindCompositionSurface
 @ stub -syscall NtCloseCompositionInputSink
 @ stub -syscall NtCompositionInputThread

@@ -4222,6 +4222,14 @@ void net_supporting_wm_check_init( struct x11drv_thread_data *data )
     }
 }
 
+enum wine_display_backend X11DRV_GetDisplayBackend(void)
+{
+    int opcode, event, error;
+
+    return XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error )
+           ? WINE_DISPLAY_BACKEND_XWAYLAND : WINE_DISPLAY_BACKEND_X11;
+}
+
 BOOL X11DRV_HasWindowManager( const char *name )
 {
     struct x11drv_thread_data *data = x11drv_init_thread_data();

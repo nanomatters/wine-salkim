@@ -23,7 +23,19 @@
 #include "config.h"
 
 #include <assert.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#ifdef HAVE_SYS_EVENTFD_H
+#include <sys/eventfd.h>
+#endif
+#include <poll.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -39,6 +51,11 @@
 #include <d3d12.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3dkmt);
+
+C_ASSERT( sizeof(D3DKMT_ADAPTER_PERFDATA) == 64 );
+C_ASSERT( sizeof(D3DKMT_ADAPTER_PERFDATACAPS) == 40 );
+C_ASSERT( FIELD_OFFSET(D3DKMT_WINE_PERFDATA, Reserved2) + sizeof(ULONG) ==
+          D3DKMT_WINE_PERFDATA_V1_SIZE );
 
 /* D3DKMT runtime descriptors */
 
@@ -168,6 +185,26 @@ struct d3dkmt_adapter
 {
     struct d3dkmt_object obj;
     struct vulkan_physical_device *physical_device;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci;
+    UINT vendor_id;
+    char hwmon_path[PATH_MAX];
+    ULONGLONG energy;
+    ULONGLONG energy_time;
+    ULONGLONG energy_power;
+    BOOL energy_power_valid;
+    pthread_t telemetry_thread;
+    int telemetry_event;
+    LONG volatile telemetry_state;
+    LONG volatile telemetry_stop;
+    LONG volatile telemetry_valid;
+    LONG volatile telemetry_caps_valid;
+    LONG64 volatile telemetry_power;
+    LONG64 volatile telemetry_power_cap;
+    LONG volatile telemetry_temperature;
+    LONG volatile telemetry_fan_rpm;
+    LONG volatile telemetry_max_fan_rpm;
+    LONG volatile telemetry_temperature_max;
+    LONG volatile telemetry_temperature_warning;
 };
 
 struct d3dkmt_device
@@ -189,6 +226,21 @@ static struct list d3dkmt_vidpn_sources = LIST_INIT( d3dkmt_vidpn_sources );   /
 static struct d3dkmt_object **objects, **objects_end, **objects_next;
 
 #define D3DKMT_HANDLE_BIT  0x40000000
+
+#define D3DKMT_TELEMETRY_FAN_RPM             0x00000004
+#define D3DKMT_TELEMETRY_POWER_CAP           0x00000008
+#define D3DKMT_TELEMETRY_MAX_FAN_RPM         0x00000010
+#define D3DKMT_TELEMETRY_TEMPERATURE_MAX     0x00000020
+#define D3DKMT_TELEMETRY_TEMPERATURE_WARNING 0x00000040
+#define D3DKMT_TELEMETRY_INTERVAL_MS          500
+
+#define D3DKMT_TELEMETRY_DISABLED 0
+#define D3DKMT_TELEMETRY_READY    1
+#define D3DKMT_TELEMETRY_STARTING 2
+#define D3DKMT_TELEMETRY_RUNNING  3
+
+static void start_adapter_telemetry( struct d3dkmt_adapter *adapter );
+static void stop_adapter_telemetry( struct d3dkmt_adapter *adapter );
 
 static BOOL is_d3dkmt_global( D3DKMT_HANDLE handle )
 {
@@ -388,6 +440,8 @@ static NTSTATUS d3dkmt_object_query( enum d3dkmt_type type, D3DKMT_HANDLE global
 static void d3dkmt_object_free( struct d3dkmt_object *object )
 {
     TRACE( "object %p/%#x, global %#x\n", object, object->local, object->global );
+    if (object->type == D3DKMT_ADAPTER)
+        stop_adapter_telemetry( CONTAINING_RECORD( object, struct d3dkmt_adapter, obj ) );
     if (object->local) free_object_handle( object );
     if (object->handle) NtClose( object->handle );
     free( object );
@@ -610,6 +664,31 @@ static struct vulkan_physical_device *get_vulkan_physical_device( struct vulkan_
     return NULL;
 }
 
+static void init_adapter_telemetry( struct d3dkmt_adapter *adapter )
+{
+    VkPhysicalDeviceProperties2 properties = {0};
+    struct vulkan_physical_device *physical_device = adapter->physical_device;
+    const char *hud = getenv( "PROTON_ENABLE_HUD" );
+    int len;
+
+    adapter->telemetry_event = -1;
+    if (!hud || !hud[0] || !strcmp( hud, "0" )) return;
+    if (!physical_device || !physical_device->extensions.has_VK_EXT_pci_bus_info) return;
+
+    adapter->pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &adapter->pci;
+    physical_device->instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device,
+                                                                    &properties );
+    adapter->vendor_id = properties.properties.vendorID;
+
+    len = snprintf( adapter->hwmon_path, sizeof(adapter->hwmon_path),
+                    "/sys/bus/pci/devices/%04x:%02x:%02x.%u/hwmon", adapter->pci.pciDomain,
+                    adapter->pci.pciBus, adapter->pci.pciDevice, adapter->pci.pciFunction );
+    if (len < 0 || len >= sizeof(adapter->hwmon_path)) adapter->hwmon_path[0] = 0;
+    InterlockedExchange( &adapter->telemetry_state, D3DKMT_TELEMETRY_READY );
+}
+
 /******************************************************************************
  *           NtGdiDdDDIOpenAdapterFromLuid    (win32u.@)
  */
@@ -625,6 +704,7 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc 
     if (!(instance = get_d3dkmt_vulkan_instance())) WARN( "Vulkan is unavailable.\n" );
     else adapter->physical_device = get_vulkan_physical_device( instance, &desc->AdapterLuid );
     if (!adapter->physical_device) WARN( "Failed to find Vulkan physical device\n" );
+    else init_adapter_telemetry( adapter );
 
     desc->hAdapter = adapter->obj.local;
     return STATUS_SUCCESS;
@@ -680,6 +760,469 @@ NTSTATUS WINAPI NtGdiDdDDIDestroyDevice( const D3DKMT_DESTROYDEVICE *desc )
     return STATUS_SUCCESS;
 }
 
+static BOOL read_sysfs_value( const char *path, LONGLONG *value )
+{
+    char buffer[64], *end;
+    FILE *file;
+
+    if (!(file = fopen( path, "r" ))) return FALSE;
+    if (!fgets( buffer, sizeof(buffer), file ))
+    {
+        fclose( file );
+        return FALSE;
+    }
+    fclose( file );
+
+    errno = 0;
+    *value = strtoll( buffer, &end, 10 );
+    return !errno && end != buffer;
+}
+
+static BOOL read_hwmon_value( const char *hwmon_path, const char *name, LONGLONG *value )
+{
+    char path[PATH_MAX], device_name[64];
+    struct dirent *entry;
+    LONGLONG fallback;
+    BOOL have_fallback = FALSE;
+    DIR *dir;
+    FILE *file;
+    int len;
+
+    if (!(dir = opendir( hwmon_path ))) return FALSE;
+
+    while ((entry = readdir( dir )))
+    {
+        if (entry->d_name[0] == '.') continue;
+        len = snprintf( path, sizeof(path), "%s/%s/%s", hwmon_path, entry->d_name, name );
+        if (len < 0 || len >= sizeof(path)) continue;
+        if (!read_sysfs_value( path, value )) continue;
+
+        len = snprintf( path, sizeof(path), "%s/%s/name", hwmon_path, entry->d_name );
+        if (len >= 0 && len < sizeof(path) && (file = fopen( path, "r" )))
+        {
+            if (fgets( device_name, sizeof(device_name), file ) && strstr( device_name, "_gt" ))
+            {
+                if (!have_fallback) fallback = *value;
+                have_fallback = TRUE;
+                fclose( file );
+                continue;
+            }
+            fclose( file );
+        }
+
+        closedir( dir );
+        return TRUE;
+    }
+
+    closedir( dir );
+    if (!have_fallback) return FALSE;
+    *value = fallback;
+    return TRUE;
+}
+
+static ULONG hwmon_temperature( LONGLONG value )
+{
+    if (value <= 0) return 0;
+    return min( (ULONGLONG)(value + 50) / 100, UINT32_MAX );
+}
+
+typedef void *nvml_device_t;
+typedef int nvml_return_t;
+
+static pthread_once_t nvml_once = PTHREAD_ONCE_INIT;
+static void *nvml_handle;
+static nvml_return_t (*p_nvmlInit)(void);
+static nvml_return_t (*p_nvmlDeviceGetHandleByPciBusId)(const char *, nvml_device_t *);
+static nvml_return_t (*p_nvmlDeviceGetPowerUsage)(nvml_device_t, unsigned int *);
+static nvml_return_t (*p_nvmlDeviceGetEnforcedPowerLimit)(nvml_device_t, unsigned int *);
+static nvml_return_t (*p_nvmlDeviceGetPowerManagementLimit)(nvml_device_t, unsigned int *);
+static nvml_return_t (*p_nvmlDeviceGetTemperature)(nvml_device_t, unsigned int, unsigned int *);
+
+static void nvml_load(void)
+{
+    if (!(nvml_handle = dlopen( "libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL ))) return;
+
+    p_nvmlInit = dlsym( nvml_handle, "nvmlInit_v2" );
+    if (!p_nvmlInit) p_nvmlInit = dlsym( nvml_handle, "nvmlInit" );
+    p_nvmlDeviceGetHandleByPciBusId = dlsym( nvml_handle, "nvmlDeviceGetHandleByPciBusId_v2" );
+    if (!p_nvmlDeviceGetHandleByPciBusId)
+        p_nvmlDeviceGetHandleByPciBusId = dlsym( nvml_handle, "nvmlDeviceGetHandleByPciBusId" );
+    p_nvmlDeviceGetPowerUsage = dlsym( nvml_handle, "nvmlDeviceGetPowerUsage" );
+    p_nvmlDeviceGetEnforcedPowerLimit = dlsym( nvml_handle, "nvmlDeviceGetEnforcedPowerLimit" );
+    p_nvmlDeviceGetPowerManagementLimit = dlsym( nvml_handle, "nvmlDeviceGetPowerManagementLimit" );
+    p_nvmlDeviceGetTemperature = dlsym( nvml_handle, "nvmlDeviceGetTemperature" );
+
+    if (!p_nvmlInit || !p_nvmlDeviceGetHandleByPciBusId || !p_nvmlDeviceGetPowerUsage || p_nvmlInit())
+    {
+        dlclose( nvml_handle );
+        nvml_handle = NULL;
+    }
+}
+
+static BOOL get_nvml_device( struct d3dkmt_adapter *adapter, nvml_device_t *device )
+{
+    char pci_id[32];
+
+    if (adapter->vendor_id != 0x10de || !adapter->pci.sType) return FALSE;
+    pthread_once( &nvml_once, nvml_load );
+    if (!nvml_handle) return FALSE;
+
+    snprintf( pci_id, sizeof(pci_id), "%04x:%02x:%02x.%u", adapter->pci.pciDomain,
+              adapter->pci.pciBus, adapter->pci.pciDevice, adapter->pci.pciFunction );
+    return !p_nvmlDeviceGetHandleByPciBusId( pci_id, device );
+}
+
+static BOOL query_nvml_power( struct d3dkmt_adapter *adapter, ULONGLONG *power, ULONGLONG *cap )
+{
+    nvml_device_t device;
+    unsigned int value;
+
+    if (!get_nvml_device( adapter, &device ) || p_nvmlDeviceGetPowerUsage( device, &value )) return FALSE;
+    *power = (ULONGLONG)value * 1000;
+    if (!cap) return TRUE;
+
+    if (p_nvmlDeviceGetEnforcedPowerLimit && !p_nvmlDeviceGetEnforcedPowerLimit( device, &value ))
+        *cap = (ULONGLONG)value * 1000;
+    else if (p_nvmlDeviceGetPowerManagementLimit && !p_nvmlDeviceGetPowerManagementLimit( device, &value ))
+        *cap = (ULONGLONG)value * 1000;
+    else
+        *cap = 0;
+    return TRUE;
+}
+
+static BOOL query_nvml_temperature( struct d3dkmt_adapter *adapter, ULONG *temperature )
+{
+    nvml_device_t device;
+    unsigned int value;
+
+    if (!get_nvml_device( adapter, &device ) || !p_nvmlDeviceGetTemperature ||
+        p_nvmlDeviceGetTemperature( device, 0, &value ))
+        return FALSE;
+    *temperature = min( (ULONGLONG)value * 10, UINT32_MAX );
+    return TRUE;
+}
+
+static ULONGLONG monotonic_time_ns(void)
+{
+    struct timespec time;
+
+    if (clock_gettime( CLOCK_MONOTONIC, &time )) return 0;
+    return (ULONGLONG)time.tv_sec * 1000000000 + time.tv_nsec;
+}
+
+static BOOL update_energy_power( struct d3dkmt_adapter *adapter, ULONGLONG energy, ULONGLONG *power )
+{
+    ULONGLONG now = monotonic_time_ns(), elapsed;
+
+    if (!now) return FALSE;
+
+    if (!adapter->energy_time || energy < adapter->energy)
+    {
+        adapter->energy = energy;
+        adapter->energy_time = now;
+        adapter->energy_power_valid = FALSE;
+    }
+    else if ((elapsed = now - adapter->energy_time) >= 100000000)
+    {
+        double value = (double)(energy - adapter->energy) * 1000000000.0 / elapsed;
+
+        adapter->energy_power = value < UINT64_MAX ? (ULONGLONG)(value + 0.5) : UINT64_MAX;
+        adapter->energy = energy;
+        adapter->energy_time = now;
+        adapter->energy_power_valid = TRUE;
+    }
+
+    *power = adapter->energy_power;
+    return adapter->energy_power_valid;
+}
+
+static BOOL query_hwmon_power( struct d3dkmt_adapter *adapter, ULONGLONG *power, ULONGLONG *cap )
+{
+    LONGLONG value;
+
+    if (!adapter->hwmon_path[0]) return FALSE;
+
+    if (read_hwmon_value( adapter->hwmon_path, "power1_average", &value ) ||
+        read_hwmon_value( adapter->hwmon_path, "power1_input", &value ))
+    {
+        if (value < 0) return FALSE;
+        *power = value;
+    }
+    else if (read_hwmon_value( adapter->hwmon_path, "energy1_input", &value ))
+    {
+        if (value < 0 || !update_energy_power( adapter, value, power )) return FALSE;
+    }
+    else return FALSE;
+
+    if (!cap) return TRUE;
+    if ((read_hwmon_value( adapter->hwmon_path, "power1_cap", &value ) ||
+         read_hwmon_value( adapter->hwmon_path, "power1_max", &value ) ||
+         read_hwmon_value( adapter->hwmon_path, "power1_cap_max", &value ) ||
+         read_hwmon_value( adapter->hwmon_path, "power1_rated_max", &value )) && value > 0)
+        *cap = value;
+    else
+        *cap = 0;
+    return TRUE;
+}
+
+static BOOL query_adapter_power( struct d3dkmt_adapter *adapter, ULONGLONG *power, ULONGLONG *cap )
+{
+    *power = 0;
+    if (cap) *cap = 0;
+
+    if (adapter->vendor_id == 0x10de && query_nvml_power( adapter, power, cap )) return TRUE;
+    return query_hwmon_power( adapter, power, cap );
+}
+
+static BOOL query_adapter_temperature( struct d3dkmt_adapter *adapter, ULONG *temperature )
+{
+    LONGLONG value;
+
+    if (adapter->hwmon_path[0] && read_hwmon_value( adapter->hwmon_path, "temp1_input", &value ))
+    {
+        *temperature = hwmon_temperature( value );
+        return TRUE;
+    }
+    return query_nvml_temperature( adapter, temperature );
+}
+
+static void telemetry_write64( LONG64 volatile *target, ULONGLONG value )
+{
+    LONGLONG current, previous;
+
+    previous = InterlockedCompareExchange64( target, 0, 0 );
+    while ((current = InterlockedCompareExchange64( target, value, previous )) != previous)
+        previous = current;
+}
+
+static ULONGLONG telemetry_read64( LONG64 volatile *source )
+{
+    return InterlockedCompareExchange64( source, 0, 0 );
+}
+
+static void sample_adapter_telemetry_caps( struct d3dkmt_adapter *adapter )
+{
+    LONG valid = 0;
+    LONGLONG value;
+
+    if (adapter->hwmon_path[0] && read_hwmon_value( adapter->hwmon_path, "fan1_max", &value ) && value >= 0)
+    {
+        InterlockedExchange( &adapter->telemetry_max_fan_rpm,
+                             min( (ULONGLONG)value, UINT32_MAX ) );
+        valid |= D3DKMT_TELEMETRY_MAX_FAN_RPM;
+    }
+    if (adapter->hwmon_path[0] && read_hwmon_value( adapter->hwmon_path, "temp1_crit", &value ))
+    {
+        InterlockedExchange( &adapter->telemetry_temperature_max, hwmon_temperature( value ) );
+        valid |= D3DKMT_TELEMETRY_TEMPERATURE_MAX;
+    }
+    if (adapter->hwmon_path[0] && read_hwmon_value( adapter->hwmon_path, "temp1_max", &value ))
+    {
+        InterlockedExchange( &adapter->telemetry_temperature_warning, hwmon_temperature( value ) );
+        valid |= D3DKMT_TELEMETRY_TEMPERATURE_WARNING;
+    }
+    InterlockedExchange( &adapter->telemetry_caps_valid, valid );
+}
+
+static void sample_adapter_telemetry( struct d3dkmt_adapter *adapter )
+{
+    ULONGLONG power = 0, power_cap = 0;
+    ULONG temperature = 0, fan_rpm = 0;
+    LONGLONG value;
+    LONG valid = 0;
+
+    if (query_adapter_temperature( adapter, &temperature ))
+        valid |= D3DKMT_WINE_PERFDATA_GPU_TEMPERATURE;
+    if (adapter->hwmon_path[0] && read_hwmon_value( adapter->hwmon_path, "fan1_input", &value ) && value >= 0)
+    {
+        fan_rpm = min( (ULONGLONG)value, UINT32_MAX );
+        valid |= D3DKMT_TELEMETRY_FAN_RPM;
+    }
+    if (query_adapter_power( adapter, &power, &power_cap ))
+    {
+        valid |= D3DKMT_WINE_PERFDATA_GPU_POWER;
+        if (power_cap) valid |= D3DKMT_TELEMETRY_POWER_CAP;
+    }
+
+    InterlockedExchange( &adapter->telemetry_temperature, temperature );
+    InterlockedExchange( &adapter->telemetry_fan_rpm, fan_rpm );
+    telemetry_write64( &adapter->telemetry_power, power );
+    telemetry_write64( &adapter->telemetry_power_cap, power_cap );
+    InterlockedExchange( &adapter->telemetry_valid, valid );
+}
+
+static void *adapter_telemetry_thread( void *arg )
+{
+    struct d3dkmt_adapter *adapter = arg;
+
+    sample_adapter_telemetry_caps( adapter );
+    while (!ReadAcquire( &adapter->telemetry_stop ))
+    {
+        sample_adapter_telemetry( adapter );
+#ifdef HAVE_SYS_EVENTFD_H
+        {
+            struct pollfd pfd = {adapter->telemetry_event, POLLIN, 0};
+            int ret;
+
+            do ret = poll( &pfd, 1, D3DKMT_TELEMETRY_INTERVAL_MS );
+            while (ret < 0 && errno == EINTR && !ReadAcquire( &adapter->telemetry_stop ));
+            if (ret < 0) break;
+        }
+#else
+        {
+            struct timespec delay = {0, D3DKMT_TELEMETRY_INTERVAL_MS * 1000000};
+            while (nanosleep( &delay, &delay ) && errno == EINTR &&
+                   !ReadAcquire( &adapter->telemetry_stop ));
+        }
+#endif
+    }
+    return NULL;
+}
+
+static void start_adapter_telemetry( struct d3dkmt_adapter *adapter )
+{
+    int err;
+
+    if (InterlockedCompareExchange( &adapter->telemetry_state, D3DKMT_TELEMETRY_STARTING,
+                                    D3DKMT_TELEMETRY_READY ) != D3DKMT_TELEMETRY_READY)
+        return;
+#ifdef HAVE_SYS_EVENTFD_H
+    if ((adapter->telemetry_event = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK )) < 0)
+    {
+        WARN( "Failed to create telemetry event, error %d.\n", errno );
+        InterlockedExchange( &adapter->telemetry_state, D3DKMT_TELEMETRY_DISABLED );
+        return;
+    }
+#endif
+    if ((err = pthread_create( &adapter->telemetry_thread, NULL, adapter_telemetry_thread, adapter )))
+    {
+        WARN( "Failed to create telemetry thread, error %d.\n", err );
+        if (adapter->telemetry_event >= 0) close( adapter->telemetry_event );
+        adapter->telemetry_event = -1;
+        InterlockedExchange( &adapter->telemetry_state, D3DKMT_TELEMETRY_DISABLED );
+        return;
+    }
+    InterlockedExchange( &adapter->telemetry_state, D3DKMT_TELEMETRY_RUNNING );
+}
+
+static void stop_adapter_telemetry( struct d3dkmt_adapter *adapter )
+{
+    uint64_t value = 1;
+
+    if (ReadAcquire( &adapter->telemetry_state ) != D3DKMT_TELEMETRY_RUNNING) return;
+    InterlockedExchange( &adapter->telemetry_stop, TRUE );
+    if (adapter->telemetry_event >= 0 && write( adapter->telemetry_event, &value, sizeof(value) ) < 0 &&
+        errno != EAGAIN)
+        WARN( "Failed to wake telemetry thread, error %d.\n", errno );
+    pthread_join( adapter->telemetry_thread, NULL );
+    if (adapter->telemetry_event >= 0) close( adapter->telemetry_event );
+    adapter->telemetry_event = -1;
+    InterlockedExchange( &adapter->telemetry_state, D3DKMT_TELEMETRY_DISABLED );
+}
+
+static NTSTATUS query_adapter_perfdata( struct d3dkmt_adapter *adapter, D3DKMT_ADAPTER_PERFDATA *data )
+{
+    ULONGLONG power, power_cap;
+    LONG valid;
+    UINT index = data->PhysicalAdapterIndex;
+    BOOL found = FALSE;
+
+    if (index) return STATUS_INVALID_PARAMETER;
+    start_adapter_telemetry( adapter );
+    memset( data, 0, sizeof(*data) );
+    data->PhysicalAdapterIndex = index;
+
+    valid = ReadAcquire( &adapter->telemetry_valid );
+    if (valid & D3DKMT_WINE_PERFDATA_GPU_TEMPERATURE)
+    {
+        data->Temperature = ReadAcquire( &adapter->telemetry_temperature );
+        found = TRUE;
+    }
+    if (valid & D3DKMT_TELEMETRY_FAN_RPM)
+    {
+        data->FanRPM = ReadAcquire( &adapter->telemetry_fan_rpm );
+        found = TRUE;
+    }
+    if ((valid & (D3DKMT_WINE_PERFDATA_GPU_POWER | D3DKMT_TELEMETRY_POWER_CAP)) ==
+        (D3DKMT_WINE_PERFDATA_GPU_POWER | D3DKMT_TELEMETRY_POWER_CAP))
+    {
+        power = telemetry_read64( &adapter->telemetry_power );
+        power_cap = telemetry_read64( &adapter->telemetry_power_cap );
+        data->Power = min( (ULONGLONG)((double)power * 1000 / power_cap + 0.5),
+                           (ULONGLONG)1000 );
+        found = TRUE;
+    }
+
+    TRACE( "adapter %#x temperature %u power %u fan %u\n", adapter->obj.local,
+           data->Temperature, data->Power, data->FanRPM );
+    return found ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS query_adapter_perfdata_caps( struct d3dkmt_adapter *adapter,
+                                             D3DKMT_ADAPTER_PERFDATACAPS *data )
+{
+    LONG valid;
+    UINT index = data->PhysicalAdapterIndex;
+    BOOL found = FALSE;
+
+    if (index) return STATUS_INVALID_PARAMETER;
+    start_adapter_telemetry( adapter );
+    memset( data, 0, sizeof(*data) );
+    data->PhysicalAdapterIndex = index;
+
+    valid = ReadAcquire( &adapter->telemetry_caps_valid );
+    if (valid & D3DKMT_TELEMETRY_MAX_FAN_RPM)
+    {
+        data->MaxFanRPM = ReadAcquire( &adapter->telemetry_max_fan_rpm );
+        found = TRUE;
+    }
+    if (valid & D3DKMT_TELEMETRY_TEMPERATURE_MAX)
+    {
+        data->TemperatureMax = ReadAcquire( &adapter->telemetry_temperature_max );
+        found = TRUE;
+    }
+    if (valid & D3DKMT_TELEMETRY_TEMPERATURE_WARNING)
+    {
+        data->TemperatureWarning = ReadAcquire( &adapter->telemetry_temperature_warning );
+        found = TRUE;
+    }
+
+    return found ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS query_wine_perfdata( struct d3dkmt_adapter *adapter, D3DKMT_WINE_PERFDATA *data,
+                                     UINT size )
+{
+    LONG valid;
+    UINT requested = data->Requested;
+    UINT index = data->PhysicalAdapterIndex;
+
+    if (index) return STATUS_INVALID_PARAMETER;
+    start_adapter_telemetry( adapter );
+    memset( data, 0, min( size, (UINT)sizeof(*data) ) );
+    data->PhysicalAdapterIndex = index;
+    data->Requested = requested;
+
+    valid = ReadAcquire( &adapter->telemetry_valid );
+    if ((requested & D3DKMT_WINE_PERFDATA_GPU_TEMPERATURE) &&
+        (valid & D3DKMT_WINE_PERFDATA_GPU_TEMPERATURE))
+    {
+        data->GpuTemperatureDeciCelsius = ReadAcquire( &adapter->telemetry_temperature );
+        data->Valid |= D3DKMT_WINE_PERFDATA_GPU_TEMPERATURE;
+    }
+    if ((requested & D3DKMT_WINE_PERFDATA_GPU_POWER) &&
+        (valid & D3DKMT_WINE_PERFDATA_GPU_POWER))
+    {
+        data->GpuPowerMicrowatts = telemetry_read64( &adapter->telemetry_power );
+        data->Valid |= D3DKMT_WINE_PERFDATA_GPU_POWER;
+    }
+
+    TRACE( "adapter %#x requested %#x valid %#x gpu temperature %u gpu power %llu\n",
+           adapter->obj.local, requested, data->Valid, data->GpuTemperatureDeciCelsius,
+           (unsigned long long)data->GpuPowerMicrowatts );
+    return STATUS_SUCCESS;
+}
+
 /******************************************************************************
  *           NtGdiDdDDIQueryAdapterInfo    (win32u.@)
  */
@@ -713,6 +1256,30 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
 
         *value = KMT_DRIVERVERSION_WDDM_3_1;
         return STATUS_SUCCESS;
+    }
+    case KMTQAITYPE_ADAPTERPERFDATA:
+    {
+        D3DKMT_ADAPTER_PERFDATA *data = desc->pPrivateDriverData;
+
+        if (desc->PrivateDriverDataSize < sizeof(*data)) return STATUS_INVALID_PARAMETER;
+        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+        return query_adapter_perfdata( adapter, data );
+    }
+    case KMTQAITYPE_ADAPTERPERFDATA_CAPS:
+    {
+        D3DKMT_ADAPTER_PERFDATACAPS *data = desc->pPrivateDriverData;
+
+        if (desc->PrivateDriverDataSize < sizeof(*data)) return STATUS_INVALID_PARAMETER;
+        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+        return query_adapter_perfdata_caps( adapter, data );
+    }
+    case KMTQAITYPE_WINE_PERFDATA:
+    {
+        D3DKMT_WINE_PERFDATA *data = desc->pPrivateDriverData;
+
+        if (desc->PrivateDriverDataSize < D3DKMT_WINE_PERFDATA_V1_SIZE) return STATUS_INVALID_PARAMETER;
+        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+        return query_wine_perfdata( adapter, data, desc->PrivateDriverDataSize );
     }
     case KMTQAITYPE_WDDM_2_7_CAPS:
     {

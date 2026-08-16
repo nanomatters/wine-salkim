@@ -231,6 +231,11 @@ static INT macdrv_GetDeviceCaps(PHYSDEV dev, INT cap)
 }
 
 
+static enum wine_display_backend macdrv_GetDisplayBackend(void)
+{
+    return WINE_DISPLAY_BACKEND_MAC;
+}
+
 static const struct user_driver_funcs macdrv_funcs =
 {
     .dc_funcs.pCreateCompatibleDC = macdrv_CreateCompatibleDC,
@@ -253,6 +258,7 @@ static const struct user_driver_funcs macdrv_funcs =
     .pDestroyWindow = macdrv_DestroyWindow,
     .pUpdateDisplayDevices = macdrv_UpdateDisplayDevices,
     .pGetCursorPos = macdrv_GetCursorPos,
+    .pGetDisplayBackend = macdrv_GetDisplayBackend,
     .pGetKeyboardLayoutList = macdrv_GetKeyboardLayoutList,
     .pGetKeyNameText = macdrv_GetKeyNameText,
     .pMapVirtualKeyEx = macdrv_MapVirtualKeyEx,

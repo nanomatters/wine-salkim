@@ -803,6 +803,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pDesktopWindowProc = X11DRV_DesktopWindowProc,
     .pDestroyWindow = X11DRV_DestroyWindow,
     .pFlashWindowEx = X11DRV_FlashWindowEx,
+    .pGetDisplayBackend = X11DRV_GetDisplayBackend,
     .pHasWindowManager = X11DRV_HasWindowManager,
     .pGetDC = X11DRV_GetDC,
     .pProcessEvents = X11DRV_ProcessEvents,

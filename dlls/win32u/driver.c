@@ -790,6 +790,11 @@ static void nulldrv_FlashWindowEx( FLASHWINFO *info )
 {
 }
 
+static enum wine_display_backend nulldrv_GetDisplayBackend(void)
+{
+    return WINE_DISPLAY_BACKEND_UNKNOWN;
+}
+
 static BOOL nulldrv_HasWindowManager( const char *name )
 {
     return FALSE;
@@ -1228,6 +1233,11 @@ static void loaderdrv_FlashWindowEx( FLASHWINFO *info )
     load_driver()->pFlashWindowEx( info );
 }
 
+static enum wine_display_backend loaderdrv_GetDisplayBackend(void)
+{
+    return load_driver()->pGetDisplayBackend();
+}
+
 static BOOL loaderdrv_HasWindowManager( const char *name )
 {
     return load_driver()->pHasWindowManager( name );
@@ -1317,6 +1327,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_DesktopWindowProc,
     nulldrv_DestroyWindow,
     loaderdrv_FlashWindowEx,
+    loaderdrv_GetDisplayBackend,
     loaderdrv_HasWindowManager,
     loaderdrv_GetDC,
     nulldrv_ProcessEvents,
@@ -1420,6 +1431,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(DesktopWindowProc);
     SET_USER_FUNC(DestroyWindow);
     SET_USER_FUNC(FlashWindowEx);
+    SET_USER_FUNC(GetDisplayBackend);
     SET_USER_FUNC(HasWindowManager);
     SET_USER_FUNC(GetDC);
     SET_USER_FUNC(ProcessEvents);
@@ -1460,6 +1472,11 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
         free( driver );
         driver = prev;
     }
+}
+
+enum wine_display_backend WINAPI __wine_get_display_backend(void)
+{
+    return load_driver()->pGetDisplayBackend();
 }
 
 /******************************************************************************
