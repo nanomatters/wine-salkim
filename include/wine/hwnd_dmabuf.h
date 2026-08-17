@@ -22,6 +22,12 @@
 
 #define HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC     0x00000001
 #define HWND_DMABUF_HOST_CAP_CONSUMER_STATE    0x00000002
+#define HWND_DMABUF_HOST_CAP_SHM               0x00000004
+#define HWND_DMABUF_HOST_CAP_MAIN_DEVICE       0x00000008
+#define HWND_DMABUF_HOST_CAP_MAIN_MAJOR_SHIFT  4
+#define HWND_DMABUF_HOST_CAP_MAIN_MAJOR_MASK   0x0000fff0
+#define HWND_DMABUF_HOST_CAP_MAIN_MINOR_SHIFT  16
+#define HWND_DMABUF_HOST_CAP_MAIN_MINOR_MASK   0xffff0000
 
 enum hwnd_dmabuf_wake_flags
 {
@@ -69,19 +75,19 @@ typedef struct
     unsigned int     reserved;
 } hwnd_dmabuf_release_t;
 
-static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_list( HWND host_hwnd,
-                                                             hwnd_dmabuf_frame_info_t *frames,
-                                                             unsigned int max_frames,
-                                                             unsigned int *total_count,
-                                                             unsigned int *copied_count )
+static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_list_frames( HWND host_hwnd,
+                                                                    hwnd_dmabuf_frame_info_t *frames,
+                                                                    unsigned int max_frames,
+                                                                    unsigned int *total_count,
+                                                                    unsigned int *copied_count )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
     data_size_t reply_size = 0;
 
     if (total_count) *total_count = 0;
     if (copied_count) *copied_count = 0;
-    if (max_frames && !frames) return status;
-    if (max_frames > (data_size_t)-1 / sizeof(*frames)) return status;
+    if (max_frames && !frames) return HWND_DMABUF_INVALID_ARGS;
+    if (max_frames > (data_size_t)-1 / sizeof(*frames)) return HWND_DMABUF_INVALID_ARGS;
 
     SERVER_START_REQ( hwnd_list_dmabuf_frames )
     {
@@ -102,7 +108,7 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_list( HWND host_hwnd,
 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
     SERVER_START_REQ( hwnd_dmabuf_set_pending )
     {
@@ -118,9 +124,9 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_set_pending( HWND hwnd, B
 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, HANDLE *channel_handle )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
-    if (!channel_handle) return status;
+    if (!channel_handle) return HWND_DMABUF_INVALID_ARGS;
     *channel_handle = 0;
 
     SERVER_START_REQ( hwnd_dmabuf_get_channel )
@@ -142,9 +148,9 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, H
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_gdi_overlay_channel( HWND hwnd,
                                                                                 HANDLE *channel_handle )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
-    if (!channel_handle) return status;
+    if (!channel_handle) return HWND_DMABUF_INVALID_ARGS;
     *channel_handle = 0;
 
     SERVER_START_REQ( hwnd_dmabuf_get_channel )
@@ -166,9 +172,9 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_gdi_overlay_channel( 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel_exclusive( HWND hwnd,
                                                                               HANDLE *channel_handle )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
-    if (!channel_handle) return status;
+    if (!channel_handle) return HWND_DMABUF_INVALID_ARGS;
     *channel_handle = 0;
 
     SERVER_START_REQ( hwnd_dmabuf_get_channel_exclusive )
@@ -188,9 +194,9 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel_exclusive( HW
 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd, HANDLE *channel_handle )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
-    if (!channel_handle) return status;
+    if (!channel_handle) return HWND_DMABUF_INVALID_ARGS;
     *channel_handle = 0;
 
     SERVER_START_REQ( hwnd_dmabuf_claim_channel )
@@ -212,9 +218,9 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd,
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_gdi_overlay_channel( HWND hwnd,
                                                                                   HANDLE *channel_handle )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
-    if (!channel_handle) return status;
+    if (!channel_handle) return HWND_DMABUF_INVALID_ARGS;
     *channel_handle = 0;
 
     SERVER_START_REQ( hwnd_dmabuf_claim_channel )
@@ -235,7 +241,7 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_gdi_overlay_channel
 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_channel( HWND hwnd )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
     SERVER_START_REQ( hwnd_dmabuf_release_channel )
     {
@@ -251,7 +257,7 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_channel( HWND hwn
 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_gdi_overlay_channel( HWND hwnd )
 {
-    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+    enum hwnd_dmabuf_status status = HWND_DMABUF_SERVER_ERROR;
 
     SERVER_START_REQ( hwnd_dmabuf_release_channel )
     {
