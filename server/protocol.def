@@ -286,7 +286,8 @@ enum hwnd_dmabuf_status
     HWND_DMABUF_INVALID_ARGS = 1,
     HWND_DMABUF_NOT_FOUND = 2,
     HWND_DMABUF_NO_FRAME = 3,
-    HWND_DMABUF_BUSY = 4
+    HWND_DMABUF_BUSY = 4,
+    HWND_DMABUF_SERVER_ERROR = 5
 };
 
 #define HWND_DMABUF_RELEASE_PRESENTED     0x00000001
@@ -316,6 +317,8 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FLAG_LAYERED_COMPOSITE 0x00000020
 /* Global alpha is left for the consumer to apply. */
 #define HWND_DMABUF_FLAG_ALPHA_MODIFIER    0x00000040
+/* wl_shm payload is Vulkan RGBA and must be converted before attach. */
+#define HWND_DMABUF_FLAG_SHM_RGBA           0x00000080
 
 #define HWND_DMABUF_FRAME_OPENED          0x00000001
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002

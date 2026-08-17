@@ -24,7 +24,6 @@
 
 #include "config.h"
 
-#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,45 +34,50 @@
 
 #include "wine/vulkan.h"
 #include "wine/hwnd_dmabuf.h"
+
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
 #include "wine/vulkan_driver.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
-static struct wayland_client_surface *stash_client_surface(HWND hwnd,
-                                                           struct wayland_client_surface *surface)
+static void stash_client_surface(HWND hwnd, struct wayland_client_surface *surface)
 {
-    struct wayland_client_surface *ret = NULL;
+    struct wayland_client_surface *previous;
     struct wayland_win_data *data;
 
-    if (!(data = wayland_win_data_get(hwnd))) return NULL;
-
-    if (surface)
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    if ((previous = data->stashed_client) != surface)
     {
-        if ((ret = data->stashed_client) == surface)
-        {
-            wayland_win_data_release(data);
-            return ret;
-        }
         client_surface_add_ref(&surface->client);
         data->stashed_client = surface;
     }
-    else if ((ret = data->stashed_client) && !ReadAcquire(&ret->client.busy_ref))
+    wayland_win_data_release(data);
+
+    if (previous != surface && previous) client_surface_release(&previous->client);
+}
+
+static struct wayland_client_surface *take_stashed_client_surface(HWND hwnd)
+{
+    struct wayland_client_surface *surface;
+    struct wayland_win_data *data;
+
+    if (!(data = wayland_win_data_get(hwnd))) return NULL;
+    if ((surface = data->stashed_client) && !ReadAcquire(&surface->client.busy_ref))
     {
         /* Transfer the stash reference to the new VkSurface. */
         data->stashed_client = NULL;
         /* detach the client surface to ensure it is reparented */
-        wayland_client_surface_attach(ret, NULL);
-        if (data->client_surface == ret) data->client_surface = NULL;
+        wayland_client_surface_attach(surface, NULL);
+        if (data->client_surface == surface) data->client_surface = NULL;
     }
-    else ret = NULL;
+    else surface = NULL;
 
     wayland_win_data_release(data);
-
-    if (ret && surface) client_surface_release(&ret->client);
-
-    return ret;
+    return surface;
 }
 
 static VkResult wayland_vulkan_create_host_surface(const struct vulkan_instance *instance,
@@ -215,7 +219,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
     (void)raw;
 
-    surface = stash_client_surface(hwnd, NULL);
+    surface = take_stashed_client_surface(hwnd);
     if (!surface && !(surface = wayland_client_surface_create(hwnd)))
     {
         ERR("Failed to create vulkan client surface\n");
@@ -546,6 +550,19 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
 
     caps->format_modifier_count = copied;
     caps->flags |= HWND_DMABUF_HOST_CAP_CONSUMER_STATE;
+    if (process_wayland.wl_shm)
+        caps->flags |= HWND_DMABUF_HOST_CAP_SHM;
+    if (process_wayland.dmabuf_default_feedback.has_main_device)
+    {
+        unsigned int main_major = major(process_wayland.dmabuf_default_feedback.main_device);
+        unsigned int main_minor = minor(process_wayland.dmabuf_default_feedback.main_device);
+
+        caps->flags |= HWND_DMABUF_HOST_CAP_MAIN_DEVICE;
+        caps->flags |= (main_major << HWND_DMABUF_HOST_CAP_MAIN_MAJOR_SHIFT) &
+                       HWND_DMABUF_HOST_CAP_MAIN_MAJOR_MASK;
+        caps->flags |= (main_minor << HWND_DMABUF_HOST_CAP_MAIN_MINOR_SHIFT) &
+                       HWND_DMABUF_HOST_CAP_MAIN_MINOR_MASK;
+    }
     if (wayland_syncobj_available() || process_wayland.zwp_linux_explicit_synchronization_v1)
         caps->flags |= HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC;
     *format_modifier_count = count;
