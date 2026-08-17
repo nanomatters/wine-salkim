@@ -583,6 +583,17 @@ static BOOL read_source_mode( HKEY hkey, UINT index, DEVMODEW *mode )
     return TRUE;
 }
 
+static BOOL sync_mode_position( DEVMODEW *mode, const DEVMODEW *layout )
+{
+    if (!(layout->dmFields & DM_POSITION)) return FALSE;
+    if ((mode->dmFields & DM_POSITION) && mode->dmPosition.x == layout->dmPosition.x &&
+        mode->dmPosition.y == layout->dmPosition.y) return FALSE;
+
+    mode->dmFields |= DM_POSITION;
+    mode->dmPosition = layout->dmPosition;
+    return TRUE;
+}
+
 static BOOL source_get_registry_settings( const struct source *source, DEVMODEW *mode )
 {
     BOOL ret = FALSE;
@@ -2536,7 +2547,7 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
 static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEVMODEW *host_modes, void *param )
 {
     struct device_manager_ctx *ctx = param;
-    DEVMODEW dummy, physical, detached = *current, virtual, *virtual_modes = NULL;
+    DEVMODEW registry_mode, physical, detached = *current, virtual, *virtual_modes = NULL;
     UINT virtual_count, modes_count = host_modes_count;
     const DEVMODEW *modes = host_modes;
     struct source *source;
@@ -2568,6 +2579,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
         /* HACK: Gamescope doesn't really changes the display mode, pretend it changed to what was requested */
         if (user_driver->pHasWindowManager( "steamcompmgr" ) && read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ))
         {
+            sync_mode_position( &virtual, &physical );
             WARN( "Faking current mode to %s\n", debugstr_devmodew(&virtual) );
             current = &virtual;
             detached = *current;
@@ -2594,6 +2606,8 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     {
         if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ))
             virtual = physical;
+        else
+            sync_mode_position( &virtual, &physical );
 
         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
         {
@@ -2605,8 +2619,10 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
         }
     }
 
-    if (current == &detached || !read_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &dummy ))
+    if (current == &detached || !read_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &registry_mode ))
         write_source_mode( source->key, ENUM_REGISTRY_SETTINGS, current );
+    else if (sync_mode_position( &registry_mode, &physical ))
+        write_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &registry_mode );
     write_source_mode( source->key, ENUM_CURRENT_SETTINGS, current );
 
     assert( !modes_count || modes->dmDriverExtra == 0 );
