@@ -241,12 +241,25 @@ static BOOL wayland_win_data_configure_state_applied(const struct wayland_win_da
 static RECT wayland_win_data_configure_window_rect(const struct wayland_win_data *data,
                                                    int width, int height)
 {
+    const RECT *surface_rect = &data->rects.visible;
+    RECT fullscreen_rect;
     RECT rect;
 
-    /* Callers use only the frame-adjusted size. */
-    SetRect(&rect, 0, 0, width, height);
-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
-    if (!IsRectEmpty(&rect)) rect = window_rect_from_visible(&data->rects, rect);
+    /* Configure sizes describe the xdg window geometry selected in get_config. */
+    if (wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect) ||
+        (wayland_win_data_is_fullscreen(data) &&
+         (data->style & (WS_CAPTION | WS_THICKFRAME))))
+        surface_rect = &data->rects.client;
+
+    SetRect(&rect, surface_rect->left, surface_rect->top,
+            surface_rect->left + width, surface_rect->top + height);
+    if (!IsRectEmpty(&rect))
+    {
+        rect.left += data->rects.window.left - surface_rect->left;
+        rect.top += data->rects.window.top - surface_rect->top;
+        rect.right += data->rects.window.right - surface_rect->right;
+        rect.bottom += data->rects.window.bottom - surface_rect->bottom;
+    }
     return rect;
 }
 
