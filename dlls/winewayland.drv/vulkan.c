@@ -237,7 +237,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
     }
 
     set_client_surface(hwnd, surface);
-    wayland_client_surface_reactivate_direct_toplevel(&surface->client, hwnd, *handle);
+    wayland_client_surface_bind_direct_toplevel(&surface->client, hwnd, *handle);
     stash_client_surface(hwnd, surface);
     *client = &surface->client;
 

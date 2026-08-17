@@ -1740,7 +1740,6 @@ void wp_fractional_scale_handle_scale(void* user_data,
                                       struct wp_fractional_scale_v1 *fractional_scale_v1,
                                       uint32_t scale_fixed)
 {
-    struct wayland_client_surface *client;
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     double scale = scale_fixed / 120.0;
@@ -1757,14 +1756,8 @@ void wp_fractional_scale_handle_scale(void* user_data,
 
     surface->window.scale = scale;
 
-    /* Recreate direct presentation so the next handoff uses the new scale. */
-    if ((client = surface->direct_client))
-    {
-        TRACE("invalidating direct toplevel %s: fractional scale changed\n",
-              debugstr_client_surface(&client->client));
-        client_surface_invalidate_presentation_once(&client->client,
-                                                    &client->direct_toplevel_invalidated);
-    }
+    /* Scale changes keep the wl_surface and are applied by the next commit
+     * through the updated viewport destination. */
 
     wayland_win_data_release(data);
 
@@ -7108,11 +7101,11 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
     return TRUE;
 }
 
-/* A stashed client can be reused after its previous direct host surface has
- * been destroyed. Reclaim the root only after revalidating that it is still
- * the current eligible toplevel. */
-BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *client, HWND hwnd,
-                                                       UINT64 host_surface)
+/* Bind a reused client to its current host VkSurfaceKHR. An idle client can
+ * transfer the borrowed toplevel directly. A client whose old host was
+ * destroyed first must revalidate the toplevel before reclaiming it. */
+BOOL wayland_client_surface_bind_direct_toplevel(struct client_surface *client, HWND hwnd,
+                                                 UINT64 host_surface)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     struct wayland_win_data *data;
@@ -7121,7 +7114,28 @@ BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *cl
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
 
-    if (!ReadAcquire(&surface->direct_toplevel) || surface->direct_host_surface) goto done;
+    if (!ReadAcquire(&surface->direct_toplevel)) goto done;
+
+    if (surface->direct_host_surface)
+    {
+        if (surface->direct_host_surface == host_surface)
+            ret = TRUE;
+        else if (ReadAcquire(&surface->client.busy_ref))
+            TRACE("not transferring active direct toplevel %s from host 0x%s to 0x%s\n",
+                  debugstr_client_surface(client),
+                  wine_dbgstr_longlong(surface->direct_host_surface),
+                  wine_dbgstr_longlong(host_surface));
+        else
+        {
+            TRACE("transferring direct toplevel %s from host 0x%s to 0x%s\n",
+                  debugstr_client_surface(client),
+                  wine_dbgstr_longlong(surface->direct_host_surface),
+                  wine_dbgstr_longlong(host_surface));
+            surface->direct_host_surface = host_surface;
+            ret = TRUE;
+        }
+        goto done;
+    }
 
     failure = wayland_surface_check_direct_eligibility(data, surface);
     if (!failure && data->wayland_surface->wl_surface != surface->wl_surface)

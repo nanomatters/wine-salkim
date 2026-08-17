@@ -783,8 +783,8 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
                                                     UINT64 old_host_surface,
                                                     UINT64 new_host_surface,
                                                     const char **reason);
-BOOL wayland_client_surface_reactivate_direct_toplevel(struct client_surface *client, HWND hwnd,
-                                                       UINT64 host_surface);
+BOOL wayland_client_surface_bind_direct_toplevel(struct client_surface *client, HWND hwnd,
+                                                 UINT64 host_surface);
 struct wl_surface *wayland_client_surface_prepare_demotion(struct client_surface *client,
                                                            HWND hwnd, const char **reason,
                                                            BOOL *needed);
