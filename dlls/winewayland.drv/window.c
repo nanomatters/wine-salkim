@@ -262,13 +262,82 @@ static void wayland_win_data_update_restore_rect(struct wayland_win_data *data,
     data->restore_rect_valid = TRUE;
 }
 
+static BOOL wayland_window_style_allows_fullscreen(DWORD style)
+{
+    if (!(style & WS_POPUP) &&
+        (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
+        return FALSE;
+    if (!(style & (WS_CAPTION | WS_THICKFRAME))) return TRUE;
+    return (style & WS_POPUP) && !(style & WS_MAXIMIZE);
+}
+
+static BOOL wayland_window_matches_display_mode(const struct window_rects *rects,
+                                                RECT *fullscreen_rect)
+{
+    MONITORINFOEXW monitor_info = {.cbSize = sizeof(monitor_info)};
+    DEVMODEW mode = {.dmSize = sizeof(mode)};
+    UNICODE_STRING device;
+    HMONITOR monitor;
+    UINT context;
+    DWORD index;
+    BOOL ret = FALSE;
+
+    if (!EqualRect(&rects->window, &rects->client) || IsRectEmpty(&rects->client))
+        return FALSE;
+
+    context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
+    monitor = NtUserMonitorFromRect(&rects->client, MONITOR_DEFAULTTONULL);
+    if (!monitor || !NtUserGetMonitorInfo(monitor, (MONITORINFO *)&monitor_info))
+        goto done;
+    if (rects->client.left != monitor_info.rcMonitor.left ||
+        rects->client.top != monitor_info.rcMonitor.top)
+        goto done;
+
+    RtlInitUnicodeString(&device, monitor_info.szDevice);
+    for (index = 0; NtUserEnumDisplaySettings(&device, index, &mode, 0); index++)
+    {
+        if (mode.dmPelsWidth != rects->client.right - rects->client.left ||
+            mode.dmPelsHeight != rects->client.bottom - rects->client.top)
+            continue;
+        *fullscreen_rect = monitor_info.rcMonitor;
+        TRACE("display mode %ux%u at %d,%d selects fullscreen target %s\n",
+              mode.dmPelsWidth, mode.dmPelsHeight, rects->client.left,
+              rects->client.top, wine_dbgstr_rect(fullscreen_rect));
+        ret = TRUE;
+        break;
+    }
+
+done:
+    NtUserSetThreadDpiAwarenessContext(context);
+    return ret;
+}
+
+BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
+                                          BOOL active, RECT *rect)
+{
+    if (data->client_surface &&
+        wayland_client_surface_get_fullscreen_rect(data->client_surface, active, rect))
+        return TRUE;
+    if (!data->application_fullscreen) return FALSE;
+    *rect = data->application_fullscreen_rect;
+    return TRUE;
+}
+
+static BOOL wayland_win_data_has_fixed_fullscreen_size(const struct wayland_win_data *data)
+{
+    RECT rect;
+
+    return data->has_present_rect ||
+           (data->client_surface &&
+            wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect));
+}
+
 BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
 {
     DWORD style = data->style;
     RECT rect;
 
-    if (data->client_surface &&
-        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect))
+    if (wayland_win_data_get_fullscreen_rect(data, TRUE, &rect))
         return TRUE;
 
     if (!data->is_fullscreen) return FALSE;
@@ -281,24 +350,61 @@ BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
     return (style & WS_POPUP) && !(style & WS_MAXIMIZE);
 }
 
+static BOOL wayland_win_data_retargets_fullscreen(const struct wayland_win_data *data,
+                                                  const struct window_rects *new_rects,
+                                                  DWORD style, UINT swp_flags,
+                                                  RECT *fullscreen_rect)
+{
+    struct wayland_surface *surface = data->wayland_surface;
+    struct wayland_output *new_output;
+    BOOL ret = FALSE;
+
+    if ((swp_flags & SWP_HIDEWINDOW) || (style & WS_MINIMIZE)) return FALSE;
+    if (!data->application_fullscreen ||
+        !wayland_window_style_allows_fullscreen(style) ||
+        !surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL)
+        return FALSE;
+    if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+        return FALSE;
+
+    /* Keep a fullscreen request stable across no-op position updates while a
+     * compositor configure or output-layout refresh is in flight. */
+    if (EqualRect(&data->rects.window, &new_rects->window))
+    {
+        *fullscreen_rect = data->application_fullscreen_rect;
+        return TRUE;
+    }
+
+    if (!EqualRect(&new_rects->window, &new_rects->client)) return FALSE;
+    if (!(new_output = wayland_output_for_rect(&new_rects->client,
+                                                fullscreen_rect, NULL)))
+        return FALSE;
+
+    ret = new_rects->client.left == fullscreen_rect->left &&
+          new_rects->client.top == fullscreen_rect->top &&
+          !EqualRect(fullscreen_rect, &data->application_fullscreen_rect);
+
+    wayland_output_release(new_output);
+    return ret;
+}
+
 BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
 {
     RECT intersection, virtual_screen = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
     RECT rect = data->rects.client;
 
-    if (data->client_surface)
-        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect);
+    wayland_win_data_get_fullscreen_rect(data, TRUE, &rect);
 
     intersect_rect(&intersection, &rect, &virtual_screen);
     return EqualRect(&intersection, &virtual_screen);
 }
 
 static RECT wayland_win_data_get_shm_source(const struct wayland_win_data *data,
-                                            BOOL explicit_fullscreen, BOOL fullscreen)
+                                            BOOL application_fullscreen, BOOL fullscreen)
 {
     RECT source = data->rects.visible;
 
-    if (explicit_fullscreen ||
+    if (application_fullscreen ||
         (fullscreen && (data->style & (WS_CAPTION | WS_THICKFRAME))))
         source = data->rects.client;
     OffsetRect(&source, -data->rects.visible.left, -data->rects.visible.top);
@@ -311,16 +417,15 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     enum wayland_surface_config_state window_state = 0;
     DWORD style = data->style, exstyle = data->exstyle;
     RECT fullscreen_rect;
-    BOOL explicit_fullscreen = data->client_surface &&
-        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE,
-                                                   &fullscreen_rect);
+    BOOL application_fullscreen =
+        wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect);
     BOOL fullscreen = wayland_win_data_is_fullscreen(data);
 
     conf->minimized = style & WS_MINIMIZE;
     /* The Win32 iconic rect is not compositor geometry. */
     if (!conf->minimized)
     {
-        if (explicit_fullscreen)
+        if (application_fullscreen)
         {
             conf->rect = fullscreen_rect;
             conf->window_rect = fullscreen_rect;
@@ -334,7 +439,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         }
 
         /* Keep framed fullscreen extents out of the Wayland geometry. */
-        if (!explicit_fullscreen && fullscreen &&
+        if (!application_fullscreen && fullscreen &&
             (style & (WS_CAPTION | WS_THICKFRAME)))
         {
             conf->rect = data->rects.client;
@@ -342,7 +447,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
             conf->client_rect = data->rects.client;
         }
 
-        conf->shm_source = wayland_win_data_get_shm_source(data, explicit_fullscreen,
+        conf->shm_source = wayland_win_data_get_shm_source(data, application_fullscreen,
                                                            fullscreen);
     }
 
@@ -368,6 +473,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     conf->resizeable = (style & WS_THICKFRAME) && !fullscreen;
     conf->state = window_state;
     conf->managed = data->managed;
+    conf->preserve_fullscreen_size = wayland_win_data_has_fixed_fullscreen_size(data);
 }
 
 static void reapply_cursor_clipping(void)
@@ -1186,8 +1292,26 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL owned_overlay = overlay_owner != NULL;
     BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
     RECT present_rect;
-    BOOL has_present_rect = fullscreen && NtUserGetPresentRect(hwnd, &present_rect, -1);
+    BOOL has_present_rect;
+    BOOL application_fullscreen = FALSE;
+    RECT application_fullscreen_rect = {0};
     BOOL use_layer_shell = FALSE;
+
+    if (hwnd == root && (style & WS_VISIBLE) &&
+        !(style & WS_MINIMIZE) && !(swp_flags & SWP_HIDEWINDOW) &&
+        wayland_window_style_allows_fullscreen(style))
+    {
+        application_fullscreen = wayland_window_matches_display_mode(
+            new_rects, &application_fullscreen_rect);
+        if (!application_fullscreen && (data = wayland_win_data_get(hwnd)))
+        {
+            application_fullscreen = wayland_win_data_retargets_fullscreen(
+                data, new_rects, style, swp_flags, &application_fullscreen_rect);
+            wayland_win_data_release(data);
+        }
+        fullscreen |= application_fullscreen;
+    }
+    has_present_rect = fullscreen && NtUserGetPresentRect(hwnd, &present_rect, -1);
 
     /* Get the managed state with win_data unlocked, as is_window_managed
      * may need to query win_data information about other HWNDs and thus
@@ -1273,6 +1397,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->client_rect_in_toplevel_valid = client_rect_in_toplevel_valid;
     data->is_fullscreen = fullscreen;
     data->has_present_rect = has_present_rect;
+    data->application_fullscreen = application_fullscreen;
+    data->application_fullscreen_rect = application_fullscreen_rect;
     data->managed = managed;
     if (surface) wayland_window_surface_set_external_host(surface, external_host);
     if (data->client_surface)
@@ -1407,14 +1533,11 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_FRAMECHANGED;
     }
 
-    /* If the window is already fullscreen and its size is compatible with what
-     * the compositor is requesting, don't force a resize, since some applications
-     * are very insistent on a particular fullscreen size (which may not match
-     * the monitor size). */
-    if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-        (surface->window.state & managed_state) == (state & managed_state) &&
-        wayland_surface_config_is_compatible(&surface->processing, surface->window.rect,
-                                             surface->window.state))
+    /* Explicit presentation modes own their render extent. Ordinary xdg
+     * fullscreen follows the compositor extent and reaches Win32 as a resize. */
+    if (wayland_win_data_has_fixed_fullscreen_size(data) &&
+        (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        (surface->window.state & managed_state) == (state & managed_state))
     {
         flags |= SWP_NOSIZE;
     }
@@ -2187,13 +2310,12 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
     if (shm_buffer)
     {
         RECT fullscreen_rect, source;
-        BOOL explicit_fullscreen = data->client_surface &&
-            wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE,
-                                                       &fullscreen_rect);
+        BOOL application_fullscreen =
+            wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect);
         BOOL fullscreen = wayland_win_data_is_fullscreen(data);
         BOOL clip_content;
 
-        source = wayland_win_data_get_shm_source(data, explicit_fullscreen, fullscreen);
+        source = wayland_win_data_get_shm_source(data, application_fullscreen, fullscreen);
         if (IsRectEmpty(&source))
         {
             source.left = source.top = 0;

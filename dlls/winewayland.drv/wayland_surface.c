@@ -3037,18 +3037,20 @@ static struct wayland_shm_buffer *wayland_shm_buffer_clone(struct wayland_shm_bu
  * the provided arguments.
  */
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
-                                          enum wayland_surface_config_state state)
+                                          enum wayland_surface_config_state state,
+                                          BOOL preserve_fullscreen_size)
 {
     static enum wayland_surface_config_state mask =
         WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
+    int conf_width = conf->rect.right - conf->rect.left;
+    int conf_height = conf->rect.bottom - conf->rect.top;
 
-    /* The fullscreen state requires a size smaller or equal to the configured
-     * size. If we have a larger size, we can use surface geometry during
-     * surface reconfiguration to provide the smaller size, so we are always
-     * compatible with a fullscreen state.
-     * NOTE: Fullscreen combined with maximized is the same as fullscreen. */
+    /* Explicit presentation modes retain their application-owned extent.
+     * Ordinary fullscreen windows must first accept the compositor extent. */
     if (conf->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
-        return TRUE;
+        return preserve_fullscreen_size ||
+               ((!conf_width || rect.right - rect.left == conf_width) &&
+                (!conf_height || rect.bottom - rect.top == conf_height));
 
     /* We require the same state. */
     if ((state & mask) != (conf->state & mask)) return FALSE;
@@ -5736,7 +5738,8 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     /* Acknowledge any compatible processed config. */
     if (surface->processing.serial && surface->processing.processed &&
         wayland_surface_config_is_compatible(&surface->processing, rect,
-                                             window->state))
+                                             window->state,
+                                             window->preserve_fullscreen_size))
     {
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
@@ -5746,7 +5749,8 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     else if (!surface->current.serial && surface->queued.serial &&
              surface->current.decor == surface->queued.decor &&
              wayland_surface_config_is_compatible(&surface->queued, rect,
-                                                  window->state))
+                                                  window->state,
+                                                  window->preserve_fullscreen_size))
     {
         surface->current = surface->queued;
         memset(&surface->processing, 0, sizeof(surface->processing));
@@ -5756,7 +5760,8 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     }
     else if (!surface->current.serial ||
              !wayland_surface_config_is_compatible(&surface->current, rect,
-                                                   window->state))
+                                                   window->state,
+                                                   window->preserve_fullscreen_size))
     {
         return FALSE;
     }
@@ -6227,9 +6232,7 @@ RECT wayland_surface_get_input_rect(struct wayland_surface *surface,
 {
     RECT fullscreen_rect;
 
-    if (data && data->client_surface &&
-        wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE,
-                                                   &fullscreen_rect) &&
+    if (data && wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect) &&
         !IsRectEmpty(&data->rects.client))
         return data->rects.client;
 
@@ -6734,8 +6737,7 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
         toplevel_surface->direct_client == surface &&
         surface->direct_wl_surface == toplevel_surface->wl_surface)
     {
-        if (wayland_client_surface_get_fullscreen_rect(surface, FALSE,
-                                                       &fullscreen_rect))
+        if (wayland_win_data_get_fullscreen_rect(data, FALSE, &fullscreen_rect))
         {
             SetRect(host, 0, 0, fullscreen_rect.right - fullscreen_rect.left,
                     fullscreen_rect.bottom - fullscreen_rect.top);
@@ -6899,11 +6901,10 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
 {
     struct wayland_surface *surface = data->wayland_surface;
     RECT fullscreen_rect;
-    BOOL explicit_fullscreen = expected_client &&
-        wayland_client_surface_get_fullscreen_rect(expected_client, FALSE,
-                                                   &fullscreen_rect);
+    BOOL application_fullscreen = expected_client &&
+        wayland_win_data_get_fullscreen_rect(data, FALSE, &fullscreen_rect);
 
-    if (!explicit_fullscreen && !direct_toplevel_enabled())
+    if (!application_fullscreen && !direct_toplevel_enabled())
         return "direct toplevel not enabled by environment";
     if (!surface) return "no Wayland surface";
     if (!wayland_surface_is_toplevel(surface)) return "surface is not a live toplevel";
@@ -6921,10 +6922,10 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     if (surface->direct_client && surface->direct_client != expected_client)
         return "a previous direct WSI surface is still retiring";
     if (surface->shaped) return "the window is shaped";
-    if (data->visible && !explicit_fullscreen &&
+    if (data->visible && !application_fullscreen &&
         !wayland_surface_client_fills_window(surface))
         return "the client does not fill the toplevel";
-    if (data->visible && !explicit_fullscreen &&
+    if (data->visible && !application_fullscreen &&
         !wayland_surface_client_covers_presentation(surface))
         return "the client does not cover the presentation surface";
     return NULL;
@@ -6944,13 +6945,13 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     struct wayland_surface *toplevel;
     const char *failure = NULL;
     RECT fullscreen_rect;
-    BOOL explicit_fullscreen;
+    BOOL application_fullscreen;
 
     if (!(data = wayland_win_data_get(hwnd))) return "no Wayland window data";
 
     toplevel = data->wayland_surface;
-    explicit_fullscreen = wayland_client_surface_get_fullscreen_rect(
-        surface, FALSE, &fullscreen_rect);
+    application_fullscreen = wayland_win_data_get_fullscreen_rect(
+        data, FALSE, &fullscreen_rect);
     if (!toplevel) failure = "no Wayland surface";
     else if (toplevel->wl_surface != surface->wl_surface)
         failure = "the toplevel wl_surface was replaced";
@@ -6959,10 +6960,10 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (toplevel->direct_client != surface) failure = "the toplevel has a different direct client";
     else if (toplevel->shaped) failure = "the window is shaped";
     /* Hidden and iconic window rectangles are not presentation geometry. */
-    else if (data->visible && !explicit_fullscreen && !toplevel->window.minimized &&
+    else if (data->visible && !application_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_fills_window(toplevel))
         failure = "the client does not fill the toplevel";
-    else if (data->visible && !explicit_fullscreen && !toplevel->window.minimized &&
+    else if (data->visible && !application_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_covers_presentation(toplevel))
         failure = "the client does not cover the presentation surface";
 

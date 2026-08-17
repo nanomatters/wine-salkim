@@ -504,6 +504,7 @@ struct wayland_window_config
     BOOL managed;
     BOOL resizeable;
     BOOL minimized;
+    BOOL preserve_fullscreen_size;
 };
 
 struct wayland_retired_wl_surface
@@ -737,7 +738,8 @@ void wayland_surface_mark_pending_commit(struct wayland_surface *surface);
 void wayland_surface_commit(struct wayland_surface *surface);
 void wayland_surface_commit_pending_state(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
-                                          enum wayland_surface_config_state state);
+                                          enum wayland_surface_config_state state,
+                                          BOOL preserve_fullscreen_size);
 void wayland_surface_update_toplevel_parent(struct wayland_surface *surface);
 RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);
 POINT map_point_to_surface(struct wayland_surface *surface, POINT point);
@@ -900,6 +902,8 @@ struct wayland_win_data
     struct window_rects rects;
     BOOL is_fullscreen;
     BOOL has_present_rect;
+    BOOL application_fullscreen;
+    RECT application_fullscreen_rect;
     BOOL managed;
     BOOL frameless;
     RECT restore_rect;
@@ -925,6 +929,8 @@ void wayland_win_data_unlock(void);
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
 BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data);
+BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
+                                          BOOL active, RECT *rect);
 BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data);
 void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data);
 
