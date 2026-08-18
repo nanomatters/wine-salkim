@@ -627,7 +627,9 @@ struct wayland_surface
             struct xdg_toplevel *xdg_toplevel;
             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
             struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1;
+            /* Fullscreen requested by Wine and not rejected by the compositor. */
             const struct wl_output *requested_output;
+            BOOL fullscreen_requested;
         };
         struct
         {

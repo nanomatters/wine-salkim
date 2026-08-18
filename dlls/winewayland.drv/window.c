@@ -837,11 +837,13 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         }
         if (!window->minimized &&
             !(window->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+            (surface->fullscreen_requested ||
+             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)))
         {
             xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
             wayland_surface_shortcut_control(surface, FALSE);
             surface->requested_output = NULL;
+            surface->fullscreen_requested = FALSE;
             configure_requested = TRUE;
         }
 
@@ -861,27 +863,21 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
             if ((output = wayland_output_for_rect(rect, NULL, NULL)))
                 wl_output = output->wl_output;
 
-            if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
-            {
-                if (surface->requested_output != wl_output)
-                {
-                    xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
-                    wl_display_flush(process_wayland.wl_display);
-                    configure_requested = TRUE;
-                }
-                else
-                    goto skip_fullscreen;
-            }
-            else if (surface->requested_output == wl_output &&
-                     wayland_surface_has_pending_state(surface,
-                                                       WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
-            {
+            if (surface->fullscreen_requested && surface->requested_output == wl_output)
                 goto skip_fullscreen;
+
+            if (surface->fullscreen_requested ||
+                (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+            {
+                xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
+                wl_display_flush(process_wayland.wl_display);
+                configure_requested = TRUE;
             }
 
             xdg_toplevel_set_fullscreen(surface->xdg_toplevel, wl_output);
             wayland_surface_shortcut_control(surface, TRUE);
             surface->requested_output = wl_output;
+            surface->fullscreen_requested = TRUE;
             configure_requested = TRUE;
 
         skip_fullscreen:

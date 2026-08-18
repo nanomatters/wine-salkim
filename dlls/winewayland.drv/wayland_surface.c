@@ -2836,6 +2836,7 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
         }
 
         surface->requested_output = NULL;
+        surface->fullscreen_requested = FALSE;
         break;
 
     case WAYLAND_SURFACE_ROLE_LAYER:
@@ -5727,6 +5728,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
 static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, RECT rect)
 {
     struct wayland_window_config *window = &surface->window;
+    BOOL configure_acked = FALSE;
 
     /* Acknowledge any compatible processed config. */
     if (surface->processing.serial && surface->processing.processed &&
@@ -5738,6 +5740,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
         wayland_surface_mark_pending_commit(surface);
+        configure_acked = TRUE;
     }
     else if (!surface->current.serial && surface->queued.serial &&
              surface->current.decor == surface->queued.decor &&
@@ -5750,6 +5753,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
         memset(&surface->queued, 0, sizeof(surface->queued));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
         wayland_surface_mark_pending_commit(surface);
+        configure_acked = TRUE;
     }
     else if (!surface->current.serial ||
              !wayland_surface_config_is_compatible(&surface->current, rect,
@@ -5757,6 +5761,15 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
                                                    window->preserve_fullscreen_size))
     {
         return FALSE;
+    }
+
+    if (configure_acked && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+        surface->fullscreen_requested &&
+        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+    {
+        wayland_surface_shortcut_control(surface, FALSE);
+        surface->requested_output = NULL;
+        surface->fullscreen_requested = FALSE;
     }
 
     wayland_surface_reconfigure_geometry(surface, rect);
