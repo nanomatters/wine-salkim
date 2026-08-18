@@ -6220,16 +6220,72 @@ POINT map_point_from_surface(struct wayland_surface *surface, POINT point)
     return point;
 }
 
-RECT wayland_surface_get_input_rect(struct wayland_surface *surface,
-                                    const struct wayland_win_data *data)
+struct wayland_surface_input_transform
+{
+    RECT surface; /* Wayland surface-local logical coordinates */
+    RECT screen;  /* Win32 raw desktop coordinates */
+    double scale_x, scale_y;
+};
+
+static RECT wayland_surface_get_input_surface_rect(struct wayland_surface *surface,
+                                                   const struct wayland_win_data *data)
+{
+    struct wayland_client_surface *client;
+    LONG width = surface->viewport_dest_width;
+    LONG height = surface->viewport_dest_height;
+    RECT rect;
+
+    if (width <= 0)
+        width = round((surface->window.rect.right - surface->window.rect.left) /
+                      surface->window.scale);
+    if (height <= 0)
+        height = round((surface->window.rect.bottom - surface->window.rect.top) /
+                       surface->window.scale);
+    SetRect(&rect, 0, 0, width, height);
+
+    if (data && (client = data->client_surface) &&
+        !ReadAcquire(&client->direct_toplevel) &&
+        client->toplevel_wl_surface == surface->wl_surface &&
+        !IsRectEmpty(&client->rect))
+        rect = client->rect;
+
+    return rect;
+}
+
+static void wayland_surface_get_input_transform(struct wayland_surface *surface,
+                                                const struct wayland_win_data *data,
+                                                struct wayland_surface_input_transform *transform)
 {
     RECT fullscreen_rect;
+    LONG surface_width, surface_height, screen_width, screen_height;
 
     if (data && wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect) &&
         !IsRectEmpty(&data->rects.client))
-        return data->rects.client;
+        transform->screen = data->rects.client;
+    else
+    {
+        transform->screen = surface->window.rect;
+        data = NULL;
+    }
 
-    return surface->window.rect;
+    transform->surface = wayland_surface_get_input_surface_rect(surface, data);
+    surface_width = transform->surface.right - transform->surface.left;
+    surface_height = transform->surface.bottom - transform->surface.top;
+    screen_width = transform->screen.right - transform->screen.left;
+    screen_height = transform->screen.bottom - transform->screen.top;
+    transform->scale_x = surface_width > 0 && screen_width > 0 ?
+                         (double)screen_width / surface_width : surface->window.scale;
+    transform->scale_y = surface_height > 0 && screen_height > 0 ?
+                         (double)screen_height / surface_height : surface->window.scale;
+}
+
+RECT wayland_surface_get_input_rect(struct wayland_surface *surface,
+                                    const struct wayland_win_data *data)
+{
+    struct wayland_surface_input_transform transform;
+
+    wayland_surface_get_input_transform(surface, data, &transform);
+    return transform.screen;
 }
 
 void wayland_surface_coords_to_screen(struct wayland_surface *surface,
@@ -6237,22 +6293,25 @@ void wayland_surface_coords_to_screen(struct wayland_surface *surface,
                                       double surface_x, double surface_y,
                                       double *screen_x, double *screen_y)
 {
-    RECT input_rect = wayland_surface_get_input_rect(surface, data);
-    LONG host_width = surface->window.rect.right - surface->window.rect.left;
-    LONG host_height = surface->window.rect.bottom - surface->window.rect.top;
-    LONG input_width = input_rect.right - input_rect.left;
-    LONG input_height = input_rect.bottom - input_rect.top;
+    struct wayland_surface_input_transform transform;
 
-    surface_x *= surface->window.scale;
-    surface_y *= surface->window.scale;
-    if (host_width > 0 && host_height > 0 && input_width > 0 && input_height > 0)
-    {
-        surface_x *= (double)input_width / host_width;
-        surface_y *= (double)input_height / host_height;
-    }
+    wayland_surface_get_input_transform(surface, data, &transform);
+    *screen_x = transform.screen.left +
+                (surface_x - transform.surface.left) * transform.scale_x;
+    *screen_y = transform.screen.top +
+                (surface_y - transform.surface.top) * transform.scale_y;
+}
 
-    *screen_x = input_rect.left + surface_x;
-    *screen_y = input_rect.top + surface_y;
+void wayland_surface_delta_to_screen(struct wayland_surface *surface,
+                                     const struct wayland_win_data *data,
+                                     double surface_x, double surface_y,
+                                     double *screen_x, double *screen_y)
+{
+    struct wayland_surface_input_transform transform;
+
+    wayland_surface_get_input_transform(surface, data, &transform);
+    *screen_x = surface_x * transform.scale_x;
+    *screen_y = surface_y * transform.scale_y;
 }
 
 BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
@@ -6303,22 +6362,13 @@ void wayland_surface_coords_from_screen(struct wayland_surface *surface,
                                         double screen_x, double screen_y,
                                         double *surface_x, double *surface_y)
 {
-    RECT input_rect = wayland_surface_get_input_rect(surface, data);
-    LONG host_width = surface->window.rect.right - surface->window.rect.left;
-    LONG host_height = surface->window.rect.bottom - surface->window.rect.top;
-    LONG input_width = input_rect.right - input_rect.left;
-    LONG input_height = input_rect.bottom - input_rect.top;
+    struct wayland_surface_input_transform transform;
 
-    screen_x -= input_rect.left;
-    screen_y -= input_rect.top;
-    if (host_width > 0 && host_height > 0 && input_width > 0 && input_height > 0)
-    {
-        screen_x *= (double)host_width / input_width;
-        screen_y *= (double)host_height / input_height;
-    }
-
-    *surface_x = screen_x / surface->window.scale;
-    *surface_y = screen_y / surface->window.scale;
+    wayland_surface_get_input_transform(surface, data, &transform);
+    *surface_x = transform.surface.left +
+                 (screen_x - transform.screen.left) / transform.scale_x;
+    *surface_y = transform.surface.top +
+                 (screen_y - transform.screen.top) / transform.scale_y;
 }
 
 void wayland_surface_coords_from_window(struct wayland_surface *surface,

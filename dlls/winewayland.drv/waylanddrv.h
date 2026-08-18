@@ -751,6 +751,10 @@ void wayland_surface_coords_to_screen(struct wayland_surface *surface,
                                       const struct wayland_win_data *data,
                                       double surface_x, double surface_y,
                                       double *screen_x, double *screen_y);
+void wayland_surface_delta_to_screen(struct wayland_surface *surface,
+                                     const struct wayland_win_data *data,
+                                     double surface_x, double surface_y,
+                                     double *screen_x, double *screen_y);
 BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
                                                    double surface_x, double surface_y,
                                                    POINT *screen, RECT *input_rect);

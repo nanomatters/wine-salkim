@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -257,6 +258,7 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     RECT surface_rect;
+    double left, top, right, bottom;
 
     TRACE("hwnd %p, rect %s.\n", hwnd, wine_dbgstr_rect(&rect));
 
@@ -273,8 +275,9 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
     if (!(surface = data->wayland_surface) || !data->num_ime_children)
         goto err;
 
-    OffsetRect(&rect, -surface->window.rect.left, -surface->window.rect.top);
-    surface_rect = map_rect_to_surface(surface, rect);
+    wayland_surface_coords_from_screen(surface, data, rect.left, rect.top, &left, &top);
+    wayland_surface_coords_from_screen(surface, data, rect.right, rect.bottom, &right, &bottom);
+    SetRect(&surface_rect, round(left), round(top), round(right), round(bottom));
 
     zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3,
             surface_rect.left, surface_rect.top, surface_rect.right - surface_rect.left,

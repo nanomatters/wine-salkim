@@ -515,19 +515,6 @@ static const struct wl_pointer_listener pointer_listener =
 #endif
 };
 
-/**********************************************************************
- *          wayland_motion_delta_to_window
- *
- * Converts the surface-local delta to window (logical) coordinate delta.
- */
-static void wayland_motion_delta_to_window(struct wayland_surface *surface,
-                                           double surface_x, double surface_y,
-                                           double *window_x, double *window_y)
-{
-    *window_x = surface_x * surface->window.scale;
-    *window_y = surface_y * surface->window.scale;
-}
-
 static void relative_pointer_v1_relative_motion(void *private,
                                                 struct zwp_relative_pointer_v1 *zwp_relative_pointer_v1,
                                                 uint32_t utime_hi, uint32_t utime_lo,
@@ -544,10 +531,10 @@ static void relative_pointer_v1_relative_motion(void *private,
     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
     if (!(data = wayland_win_data_get(hwnd))) return;
 
-    wayland_motion_delta_to_window(data->wayland_surface,
-                                   wl_fixed_to_double(dx),
-                                   wl_fixed_to_double(dy),
-                                   &screen_x, &screen_y);
+    wayland_surface_delta_to_screen(data->wayland_surface, data,
+                                    wl_fixed_to_double(dx),
+                                    wl_fixed_to_double(dy),
+                                    &screen_x, &screen_y);
     wayland_win_data_release(data);
 
     raw_x = wl_fixed_to_double(dx_unaccel);
