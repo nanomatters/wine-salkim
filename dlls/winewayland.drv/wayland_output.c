@@ -136,6 +136,7 @@ static void wayland_output_mode_free_rb(struct rb_entry *entry, void *ctx)
 
 static void wayland_output_done(struct wayland_output *output)
 {
+    static BOOL warned_no_bt2100;
     struct wayland_output_mode *mode;
 
     /* Update current state from pending state. */
@@ -216,8 +217,17 @@ static void wayland_output_done(struct wayland_output *output)
         output->current.ref_lum = output->pending.ref_lum;
     }
 
-    output->current.supports_hdr = process_wayland.supports_win_scrgb &&
-                                    (output->current.max_target_lum > output->current.ref_lum);
+    output->current.supports_hdr = FALSE;
+    if (wayland_color_manager_may_support_hdr())
+    {
+        output->current.supports_hdr = output->current.max_target_lum > output->current.ref_lum;
+        if (output->current.supports_hdr && !wayland_color_manager_can_present_bt2100() &&
+            !warned_no_bt2100)
+        {
+            warned_no_bt2100 = TRUE;
+            WARN("Compositor cannot present Windows BT.2100, HDR10 ST2084 may look broken\n");
+        }
+    }
 
     output->pending_flags = 0;
 
@@ -777,6 +787,13 @@ struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
     if (!best) WARN("Could not find output for rect %s!\n", wine_dbgstr_rect(window_rect));
 
     return best;
+}
+
+BOOL wayland_color_manager_may_support_hdr(void)
+{
+    return process_wayland.supports_extended_volume &&
+           process_wayland.supports_pq &&
+           process_wayland.supports_win_scrgb;
 }
 
 BOOL wayland_color_manager_can_present_bt2100(void)

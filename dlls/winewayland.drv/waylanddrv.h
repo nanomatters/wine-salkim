@@ -448,10 +448,12 @@ struct wayland_output *wayland_output_for_rect(const RECT *rect);
 void output_info_array_update(void);
 UINT wayland_generic_output_get_edid_override(const char *output_name, unsigned char **edid);
 UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned char **edid);
+BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len);
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
-                                     unsigned char **edid);
+                                     BOOL hdr_supported, unsigned char **edid);
 void wayland_color_manager_init(void);
 BOOL wayland_color_manager_can_present_bt2100(void);
+BOOL wayland_color_manager_may_support_hdr(void);
 struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void);
 
 /**********************************************************************

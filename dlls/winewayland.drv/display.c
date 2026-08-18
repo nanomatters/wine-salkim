@@ -265,6 +265,7 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
                                        void *param, struct output_info *output_info,
                                        struct output_info *primary)
 {
+    BOOL desktop_hdr_enabled, panel_hdr_supported;
     const char *env;
     struct gdi_monitor monitor = {0};
 
@@ -278,19 +279,36 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
     if (!monitor.edid_len)
         monitor.edid_len = wayland_generic_output_get_edid_sysfs(output_info->output->name,
                                                                  &monitor.edid);
-    if (!monitor.edid_len)
-        monitor.edid_len = wayland_generic_output_get_edid(output_info->output, &monitor.edid);
-    /* We don't have a direct way to get the work area in Wayland. */
-    monitor.rc_work = monitor.rc_monitor;
-    monitor.hdr_enabled = output_info->output->supports_hdr;
+
+    if (monitor.edid_len)
+        panel_hdr_supported = wayland_output_edid_supports_hdr(monitor.edid, monitor.edid_len);
+    else
+        /* Without a real EDID, use compositor HDR support as a best-effort panel hint. */
+        panel_hdr_supported = wayland_color_manager_may_support_hdr();
+
+    monitor.hdr_supported = panel_hdr_supported && wayland_color_manager_can_present_bt2100();
+    desktop_hdr_enabled = output_info->output->supports_hdr;
+    monitor.hdr_enabled = monitor.hdr_supported && desktop_hdr_enabled;
 
     if ((env = getenv("DXVK_HDR")) && *env == '1')
+    {
+        monitor.hdr_supported = TRUE;
         monitor.hdr_enabled = TRUE;
+    }
     else if ((env = getenv("DXVK_NO_HDR")) && *env == '1')
+    {
         monitor.hdr_enabled = FALSE;
+    }
 
-    TRACE("name=%s rc_monitor=rc_work=%s\n",
-          output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor));
+    if (!monitor.edid_len)
+        monitor.edid_len = wayland_generic_output_get_edid(output_info->output,
+                                                           monitor.hdr_supported, &monitor.edid);
+    /* We don't have a direct way to get the work area in Wayland. */
+    monitor.rc_work = monitor.rc_monitor;
+
+    TRACE("name=%s rc_monitor=rc_work=%s hdr_supported=%u hdr_enabled=%u\n",
+          output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor),
+          monitor.hdr_supported, monitor.hdr_enabled);
 
     device_manager->add_monitor(&monitor, param);
     free(monitor.edid);

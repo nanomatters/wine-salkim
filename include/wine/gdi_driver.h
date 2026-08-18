@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 109
+#define WINE_GDI_DRIVER_VERSION 110
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -345,6 +345,7 @@ struct gdi_monitor
     RECT rc_work;         /* RcWork in MONITORINFO struct */
     unsigned char *edid;  /* Extended Device Identification Data */
     UINT edid_len;
+    BOOL hdr_supported;
     BOOL hdr_enabled;
 };
 

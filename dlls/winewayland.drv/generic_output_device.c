@@ -61,6 +61,39 @@ static BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_le
     return TRUE;
 }
 
+BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len)
+{
+    UINT i;
+
+    if (!wayland_output_edid_is_valid(edid, edid_len)) return FALSE;
+
+    for (i = 128; i < edid_len; i += 128)
+    {
+        const unsigned char *ext = edid + i;
+        unsigned int end, offset;
+
+        if (ext[0] != 0x02) continue; /* CTA-861 extension */
+
+        end = ext[2];
+        if (!end || end > 127) end = 127;
+
+        for (offset = 4; offset < end; )
+        {
+            unsigned int tag = ext[offset] >> 5;
+            unsigned int len = ext[offset] & 0x1f;
+            const unsigned char *data = ext + offset + 1;
+
+            offset += len + 1;
+            if (offset > end) break;
+
+            if (tag == 0x7 && len >= 2 && data[0] == 0x06 && (data[1] & 0x04))
+                return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 /* borrowed from gamescope with permission */
 static uint8_t encode_max_luminance(float nits)
 {
@@ -310,7 +343,7 @@ UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned cha
 }
 
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
-                                     unsigned char **edid)
+                                     BOOL hdr_supported, unsigned char **edid)
 {
     static const unsigned char manufacturer[3] = {23, 12, 4}; /* WLD */
     const struct wayland_primaries *primaries = &output->primaries;
@@ -323,7 +356,7 @@ UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
     char temp_model[13] = {0};
     uint32_t serial;
 
-    if (output->supports_hdr)
+    if (hdr_supported)
     {
         edid_size += 128;
         extensions++;
@@ -429,7 +462,7 @@ UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
 
     p = data;
 
-    if (output->supports_hdr)
+    if (hdr_supported)
     {
         p += 128;
 
