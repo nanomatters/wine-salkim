@@ -44,17 +44,47 @@ static uint8_t encode_max_luminance(float nits)
     return ceilf((logf(nits / 50.0f) / logf(2.0f)) * 32.0f);
 }
 
+static uint32_t hash_string(uint32_t hash, const char *str)
+{
+    if (!str) return hash;
+
+    while (*str)
+    {
+        hash ^= (unsigned char)*str++;
+        hash *= 16777619;
+    }
+
+    return hash;
+}
+
+static unsigned int mode_pixel_clock_10khz(const struct wayland_output_mode *mode)
+{
+    uint64_t clock;
+
+    clock = ((uint64_t)mode->width * mode->height * mode->refresh + 9999999) / 10000000;
+    if (!clock) return 1;
+    if (clock > 0xffff) return 0xffff;
+    return clock;
+}
+
+static unsigned int pixels_to_mm(int32_t pixels)
+{
+    return round(pixels * 25.4 / 150.0);
+}
+
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
                                      unsigned char **edid)
 {
+    static const unsigned char manufacturer[3] = {23, 12, 4}; /* WLD */
     const struct wayland_primaries *primaries = &output->primaries;
     struct wayland_output_mode *mode = output->current_mode;
     const char *model = output->model;
     unsigned int edid_size = 128, extensions = 0;
-    unsigned char l[3] = {19, 1, 13}; /* SAM */
     unsigned int i, mwidth, mheight;
+    unsigned int pixel_clock;
     unsigned char *data, *p, c;
     char temp_model[13] = {0};
+    uint32_t serial;
 
     if (output->supports_hdr)
     {
@@ -72,19 +102,24 @@ UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
 
     if (mwidth == 0 || mheight == 0)
     {
-        /* assume ~150 dpi */
-        mwidth = mode->width / 60;
-        mheight = mode->width / 60;
+        mwidth = pixels_to_mm(mode->width);
+        mheight = pixels_to_mm(mode->height);
     }
 
     *(uint64_t*)data = 0x00ffffffffffff00;
 
-    /* we cannot get this information from wayland, so make something up */
-    data[8] = ((l[0] & 0x1f) << 2) | ((l[1] & 0x18) >> 3);
-    data[9] = ((l[1] & 0x7) << 5) | (l[2] & 0x1f);
-    data[10] = 0xad;
-    data[11] = 0xde;
-    /* serial number is all zeros */
+    data[8] = ((manufacturer[0] & 0x1f) << 2) | ((manufacturer[1] & 0x18) >> 3);
+    data[9] = ((manufacturer[1] & 0x7) << 5) | (manufacturer[2] & 0x1f);
+    data[10] = 0x01;
+    data[11] = 0x00;
+
+    serial = hash_string(2166136261u, output->name);
+    serial = hash_string(serial, output->model);
+    data[12] = serial;
+    data[13] = serial >> 8;
+    data[14] = serial >> 16;
+    data[15] = serial >> 24;
+
     data[16] = 0xFF;
     data[17] = 31; /* 2021 */
     data[18] = 1;
@@ -110,7 +145,8 @@ UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
 
     p = data + 54;
 
-    *(uint16_t*)p = 0x0; /* 0 = reserved */
+    pixel_clock = mode_pixel_clock_10khz(mode);
+    *(uint16_t*)p = pixel_clock;
 
     /* assume blanking time is 0 */
     p[2] = mode->width;
