@@ -226,6 +226,18 @@ static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
     data->state_update_foreground = NULL;
 }
 
+static const RECT *wayland_win_data_configure_surface_rect(
+    const struct wayland_win_data *data)
+{
+    RECT fullscreen_rect;
+
+    if (wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect) ||
+        (wayland_win_data_is_fullscreen(data) &&
+         (data->style & (WS_CAPTION | WS_THICKFRAME))))
+        return &data->rects.client;
+    return &data->rects.visible;
+}
+
 static BOOL wayland_win_data_configure_state_applied(const struct wayland_win_data *data)
 {
     const struct wayland_surface *surface = data->wayland_surface;
@@ -241,16 +253,10 @@ static BOOL wayland_win_data_configure_state_applied(const struct wayland_win_da
 static RECT wayland_win_data_configure_window_rect(const struct wayland_win_data *data,
                                                    int width, int height)
 {
-    const RECT *surface_rect = &data->rects.visible;
-    RECT fullscreen_rect;
+    const RECT *surface_rect = wayland_win_data_configure_surface_rect(data);
     RECT rect;
 
     /* Configure sizes describe the xdg window geometry selected in get_config. */
-    if (wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect) ||
-        (wayland_win_data_is_fullscreen(data) &&
-         (data->style & (WS_CAPTION | WS_THICKFRAME))))
-        surface_rect = &data->rects.client;
-
     SetRect(&rect, surface_rect->left, surface_rect->top,
             surface_rect->left + width, surface_rect->top + height);
     if (!IsRectEmpty(&rect))
@@ -662,7 +668,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *parent_surface, *surface;
     enum wayland_surface_role role;
-    BOOL visible, layer_set, keep_toplevel_mapped, server_decor = FALSE;
+    BOOL visible, layer_set, keep_toplevel_mapped, fullscreen_target_active;
+    BOOL server_decor = FALSE;
     DWORD exstyle = data->exstyle;
     DWORD style = data->style;
 
@@ -692,12 +699,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     keep_toplevel_mapped = !owned_overlay && !owner_surface && !use_layer_shell &&
                            !toplevel_surface && should_keep_toplevel_mapped(
                                    surface, style, data->explicitly_hidden);
+    fullscreen_target_active = surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+                               surface->fullscreen_requested &&
+                               wayland_output_get_layout_rect(surface->requested_output, NULL);
     if (keep_toplevel_mapped)
         visible = TRUE;
 
     if (visible && !owned_overlay && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !wayland_output_layout_intersects_rect(&data->rects.window) &&
-        !keep_toplevel_mapped)
+        !keep_toplevel_mapped && !fullscreen_target_active)
         visible = FALSE;
 
     /* If the toplevel has no observable area, make it roleless. */
@@ -1471,8 +1481,9 @@ static void wayland_configure_window(HWND hwnd)
     BOOL needs_enter_size_move = FALSE;
     BOOL needs_exit_size_move = FALSE;
     BOOL resume_state_update;
+    BOOL position_fullscreen = FALSE;
     struct wayland_win_data *data;
-    RECT rect;
+    RECT output_rect, rect;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     if (!(surface = data->wayland_surface))
@@ -1557,6 +1568,18 @@ static void wayland_configure_window(HWND hwnd)
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
     if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
     rect = wayland_win_data_configure_window_rect(data, window_width, window_height);
+    if ((state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        surface->fullscreen_requested &&
+        wayland_output_get_layout_rect(surface->requested_output, &output_rect))
+    {
+        const RECT *surface_rect = wayland_win_data_configure_surface_rect(data);
+
+        OffsetRect(&rect, output_rect.left - surface_rect->left,
+                   output_rect.top - surface_rect->top);
+        position_fullscreen = TRUE;
+        TRACE("hwnd=%p anchoring fullscreen configure to output %s\n",
+              hwnd, wine_dbgstr_rect(&output_rect));
+    }
 
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     if (!(style & WS_MINIMIZE) &&
@@ -1600,6 +1623,7 @@ static void wayland_configure_window(HWND hwnd)
     }
 
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
+    if (position_fullscreen) flags &= ~SWP_NOMOVE;
     if (IsRectEmpty(&rect)) flags |= SWP_NOSIZE;
 
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);

@@ -699,6 +699,7 @@ void wayland_output_use_xdg_extension(struct wayland_output *output);
 void wayland_output_use_image_description(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *output_rect,
                                                double *output_scale);
+BOOL wayland_output_get_layout_rect(const struct wl_output *wl_output, RECT *rect);
 BOOL wayland_output_layout_intersects_rect(const RECT *rect);
 void output_info_array_update(void);
 BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);

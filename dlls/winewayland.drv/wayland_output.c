@@ -828,6 +828,34 @@ struct wayland_output *wayland_output_for_rect(const RECT *window_rect, RECT *ou
     return output;
 }
 
+BOOL wayland_output_get_layout_rect(const struct wl_output *wl_output, RECT *rect)
+{
+    struct output_info *output_info;
+    BOOL found = FALSE;
+
+    if (!wl_output) return FALSE;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    wl_array_for_each(output_info, &process_wayland.output_info_array)
+    {
+        struct wayland_output *output =
+            CONTAINING_RECORD(output_info->output, struct wayland_output, current);
+
+        if (output->wl_output != wl_output) continue;
+        if (rect)
+        {
+            SetRect(rect, output_info->x, output_info->y,
+                    output_info->x + output_info->output->current_mode->width,
+                    output_info->y + output_info->output->current_mode->height);
+        }
+        found = TRUE;
+        break;
+    }
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+
+    return found;
+}
+
 /**********************************************************************
  *          wayland_output_layout_intersects_rect
  */
