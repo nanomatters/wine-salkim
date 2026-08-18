@@ -440,6 +440,8 @@ void wayland_output_use_xdg_extension(struct wayland_output *output);
 void wayland_output_use_image_description(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect);
 void output_info_array_update(void);
+UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
+                                     unsigned char **edid);
 void wayland_color_manager_init(void);
 
 /**********************************************************************
