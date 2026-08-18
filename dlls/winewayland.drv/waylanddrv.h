@@ -269,8 +269,14 @@ struct wayland
     /* Protects the output_list, output_info_array, and the wayland_output.current states. */
     pthread_mutex_t output_mutex;
     LONG input_serial;
+    BOOL supports_parametric;
+    BOOL supports_pq;
     BOOL supports_win_scrgb;
-    BOOL supports_win_pq;
+    BOOL supports_windows_bt2100;
+    BOOL supports_set_primaries;
+    BOOL supports_set_luminances;
+    BOOL supports_bt2020_primaries;
+    BOOL supports_extended_volume;
 };
 
 struct wayland_output_mode
@@ -445,6 +451,8 @@ UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned cha
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
                                      unsigned char **edid);
 void wayland_color_manager_init(void);
+BOOL wayland_color_manager_can_present_bt2100(void);
+struct wp_image_description_v1 *wayland_color_manager_create_windows_bt2100(void);
 
 /**********************************************************************
  *          Wayland surface

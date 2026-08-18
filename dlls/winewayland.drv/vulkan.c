@@ -147,7 +147,8 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
 
     if (process_wayland.supports_win_scrgb && new == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
         new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
-    else if (process_wayland.supports_win_pq && colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+    else if (wayland_color_manager_can_present_bt2100() &&
+             colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
         new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
 
     if (!client) return new;
@@ -164,8 +165,7 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
             wp_color_manager_v1_create_windows_scrgb(process_wayland.wp_color_manager_v1);
         break;
     case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-        wp_image_description_v1 =
-            wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
+        wp_image_description_v1 = wayland_color_manager_create_windows_bt2100();
     default: break;
     }
 
