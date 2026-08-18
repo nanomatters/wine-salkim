@@ -204,6 +204,7 @@ struct source_reader
     CONDITION_VARIABLE sample_event;
     CONDITION_VARIABLE state_event;
     CONDITION_VARIABLE stop_event;
+    CONDITION_VARIABLE callback_event;
 
     BOOL flag_eos_for_all_streams;
     DWORD next_stream_eos_index;
@@ -1471,6 +1472,20 @@ static struct stream_response *media_stream_pop_response(struct source_reader *r
     return NULL;
 }
 
+static struct stream_response *media_stream_pop_response_generation(struct source_reader *reader,
+        unsigned int stream_index, unsigned int generation)
+{
+    struct stream_response *response;
+
+    LIST_FOR_EACH_ENTRY(response, &reader->responses, struct stream_response, entry)
+    {
+        if (response->stream_index == stream_index && response->generation == generation)
+            return media_stream_detach_response(reader, response);
+    }
+
+    return NULL;
+}
+
 static void source_reader_release_response(struct stream_response *response)
 {
     if (response->sample)
@@ -1697,9 +1712,18 @@ static void source_reader_release_responses(struct source_reader *reader, struct
 static void source_reader_flush_stream(struct source_reader *reader, DWORD stream_index)
 {
     struct media_stream *stream = &reader->streams[stream_index];
+    enum media_stream_state state = stream->state;
     struct list *ptr;
     HRESULT hr;
 
+    stream->state = STREAM_STATE_FLUSHING;
+    stream->flushing = TRUE;
+    ++stream->generation;
+    stream->queued_reads = 0;
+    stream->sample_requested = FALSE;
+    stream->active_request_id = 0;
+    while (stream->callbacks)
+        SleepConditionVariableCS(&reader->callback_event, &reader->cs, INFINITE);
     source_reader_release_responses(reader, stream);
 
     if ((ptr = list_head(&stream->transforms)))
@@ -1710,6 +1734,52 @@ static void source_reader_flush_stream(struct source_reader *reader, DWORD strea
     }
 
     stream->requests = 0;
+    stream->flushing = FALSE;
+    if (stream->state == STREAM_STATE_FLUSHING)
+        stream->state = state;
+    TRACE("Flushed stream %u, generation %u.\n", stream->index, stream->generation);
+}
+
+static void source_reader_prepare_seek(struct source_reader *reader)
+{
+    unsigned int i;
+
+    for (i = 0; i < reader->stream_count; ++i)
+    {
+        struct media_stream *stream = &reader->streams[i];
+        struct list *ptr;
+        HRESULT hr;
+
+        ++stream->generation;
+        stream->sample_requested = FALSE;
+        stream->active_request_id = 0;
+        stream->state = STREAM_STATE_SEEKING;
+        stream->last_sample_ts = 0;
+        source_reader_release_responses(reader, stream);
+
+        if ((ptr = list_head(&stream->transforms)))
+        {
+            struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+            if (FAILED(hr = source_reader_flush_transform_samples(reader, stream, entry)))
+                WARN("Failed to flush stream %u transforms, hr %#lx.\n", stream->index, hr);
+        }
+    }
+}
+
+static void source_reader_cancel_seek(struct source_reader *reader)
+{
+    unsigned int i;
+
+    reader->flags &= ~SOURCE_READER_SEEKING;
+    for (i = 0; i < reader->stream_count; ++i)
+    {
+        struct media_stream *stream = &reader->streams[i];
+
+        if (stream->state == STREAM_STATE_SEEKING)
+            stream->state = !stream->stream ? STREAM_STATE_DETACHED
+                    : reader->source_state == SOURCE_STATE_STARTED ? STREAM_STATE_STARTED : STREAM_STATE_ANNOUNCED;
+    }
+    WakeAllConditionVariable(&reader->state_event);
 }
 
 static HRESULT source_reader_flush(struct source_reader *reader, unsigned int index)
@@ -1719,6 +1789,8 @@ static HRESULT source_reader_flush(struct source_reader *reader, unsigned int in
 
     if (index == MF_SOURCE_READER_ALL_STREAMS)
     {
+        ++reader->flush_generation;
+        reader->queued_any_reads = 0;
         for (stream_index = 0; stream_index < reader->stream_count; ++stream_index)
             source_reader_flush_stream(reader, stream_index);
     }
@@ -1737,7 +1809,11 @@ static HRESULT source_reader_flush(struct source_reader *reader, unsigned int in
         }
 
         if (stream_index < reader->stream_count)
+        {
+            ++reader->flush_generation;
+            reader->queued_any_reads = 0;
             source_reader_flush_stream(reader, stream_index);
+        }
         else
             hr = MF_E_INVALIDSTREAMNUMBER;
     }
@@ -1749,6 +1825,7 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
 {
     struct source_reader *reader = impl_from_async_commands_callback_IMFAsyncCallback(iface);
     struct media_stream *stream, stub_stream = { .requests = 1 };
+    struct media_stream *callback_stream = NULL;
     struct source_reader_async_command *command;
     struct stream_response *response;
     DWORD stream_index, stream_flags;
@@ -1768,32 +1845,82 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
         case SOURCE_READER_ASYNC_READ:
             EnterCriticalSection(&reader->cs);
 
-            if (SUCCEEDED(hr = source_reader_start_source(reader)))
+            hr = S_OK;
+            if (command->u.read.any_stream)
             {
-                if (SUCCEEDED(hr = source_reader_get_stream_read_index(reader, command->u.read.stream_index, &stream_index)))
-                {
-                    stream = &reader->streams[stream_index];
+                if (reader->queued_any_reads)
+                    --reader->queued_any_reads;
 
-                    if (!(report_sample = source_reader_get_read_result(reader, stream, command->u.read.flags, &status,
-                            &stream_index, &stream_flags, &timestamp, &sample)))
-                    {
-                        stream->requests++;
-                        source_reader_request_sample(reader, stream);
-                        /* FIXME: set error stream/reader state on request failure */
-                    }
+                if (command->u.read.generation != reader->flush_generation)
+                {
+                    TRACE("Discarding flushed any-stream read from generation %u, current %u.\n",
+                            command->u.read.generation, reader->flush_generation);
+                    stream = NULL;
+                }
+                else if (FAILED(command->u.read.status = source_reader_get_stream_read_index(reader,
+                        MF_SOURCE_READER_ANY_STREAM, &stream_index)))
+                {
+                    stub_stream.index = MF_SOURCE_READER_ANY_STREAM;
+                    source_reader_queue_response(reader, &stub_stream, command->u.read.status,
+                            MF_SOURCE_READERF_ERROR, 0, NULL);
+                    stream = NULL;
+                }
+                else
+                    stream = &reader->streams[stream_index];
+            }
+            else if (!command->u.read.resolved)
+            {
+                stub_stream.index = command->u.read.stream_index;
+                source_reader_queue_response(reader, &stub_stream, command->u.read.status,
+                        MF_SOURCE_READERF_ERROR, 0, NULL);
+                stream = NULL;
+            }
+            else
+            {
+                stream_index = command->u.read.stream_index;
+                stream = &reader->streams[stream_index];
+                if (stream->queued_reads)
+                    --stream->queued_reads;
+
+                if (command->u.read.generation != stream->generation)
+                {
+                    TRACE("Discarding flushed stream %u read from generation %u, current %u.\n",
+                            stream->index, command->u.read.generation, stream->generation);
+                    stream = NULL;
+                }
+            }
+
+            if (stream)
+            {
+                if (FAILED(hr = source_reader_start_source(reader)))
+                {
+                    stream->requests++;
+                    source_reader_fail_requests(reader, stream, hr);
+                }
+                else if (!(report_sample = source_reader_get_read_result(reader, stream, command->u.read.flags,
+                        &status, &stream_index, &stream_flags, &timestamp, &sample)))
+                {
+                    stream->requests++;
+                    source_reader_update_sample_request(reader, stream);
                 }
                 else
                 {
-                    stub_stream.index = command->u.read.stream_index;
-                    source_reader_queue_response(reader, &stub_stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
+                    callback_stream = stream;
+                    ++callback_stream->callbacks;
                 }
             }
 
             LeaveCriticalSection(&reader->cs);
 
             if (report_sample)
+            {
                 IMFSourceReaderCallback_OnReadSample(reader->async_callback, status, stream_index, stream_flags,
                         timestamp, sample);
+                EnterCriticalSection(&reader->cs);
+                --callback_stream->callbacks;
+                WakeAllConditionVariable(&reader->callback_event);
+                LeaveCriticalSection(&reader->cs);
+            }
 
             if (sample)
                 IMFSample_Release(sample);
@@ -1806,8 +1933,11 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
             if (SUCCEEDED(IMFMediaSource_Start(reader->source, reader->descriptor, &command->u.seek.format,
                     &command->u.seek.position)))
             {
-                reader->flags |= SOURCE_READER_SEEKING;
+                source_reader_prepare_seek(reader);
+                TRACE("Async seek accepted.\n");
             }
+            else
+                source_reader_cancel_seek(reader);
             LeaveCriticalSection(&reader->cs);
 
             break;
@@ -1815,14 +1945,23 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
         case SOURCE_READER_ASYNC_SAMPLE_READY:
 
             EnterCriticalSection(&reader->cs);
-            stream = &reader->streams[command->u.sample.stream_index];
-            response = media_stream_pop_response(reader, stream);
+            response = media_stream_pop_response_generation(reader, command->u.sample.stream_index,
+                    command->u.sample.generation);
+            if (response && response->stream_index < reader->stream_count)
+                ++reader->streams[response->stream_index].callbacks;
             LeaveCriticalSection(&reader->cs);
 
             if (response)
             {
                 IMFSourceReaderCallback_OnReadSample(reader->async_callback, response->status, response->stream_index,
                         response->stream_flags, response->timestamp, response->sample);
+                if (response->stream_index < reader->stream_count)
+                {
+                    EnterCriticalSection(&reader->cs);
+                    --reader->streams[response->stream_index].callbacks;
+                    WakeAllConditionVariable(&reader->callback_event);
+                    LeaveCriticalSection(&reader->cs);
+                }
                 source_reader_release_response(response);
             }
 
@@ -2530,10 +2669,12 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
 
     EnterCriticalSection(&reader->cs);
 
-    /* Check if we got pending requests. */
-    for (i = 0; i < reader->stream_count; ++i)
+    if (reader->queued_any_reads)
+        hr = MF_E_INVALIDREQUEST;
+
+    for (i = 0; SUCCEEDED(hr) && i < reader->stream_count; ++i)
     {
-        if (reader->streams[i].requests)
+        if (reader->streams[i].queued_reads || reader->streams[i].requests)
         {
             hr = MF_E_INVALIDREQUEST;
             break;
@@ -2542,32 +2683,38 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
 
     if (SUCCEEDED(hr))
     {
-        for (i = 0; i < reader->stream_count; ++i)
-        {
-            reader->streams[i].last_sample_ts = 0;
-        }
-
         if (reader->async_callback)
         {
             if (SUCCEEDED(hr = source_reader_create_async_op(SOURCE_READER_ASYNC_SEEK, &command)))
             {
                 command->u.seek.format = *format;
-                PropVariantCopy(&command->u.seek.position, position);
+                if (FAILED(hr = PropVariantCopy(&command->u.seek.position, position)))
+                {
+                    IUnknown_Release(&command->IUnknown_iface);
+                    LeaveCriticalSection(&reader->cs);
+                    return hr;
+                }
 
+                reader->flags |= SOURCE_READER_SEEKING;
                 hr = MFPutWorkItem(reader->queue, &reader->async_commands_callback, &command->IUnknown_iface);
                 IUnknown_Release(&command->IUnknown_iface);
+                if (FAILED(hr))
+                    source_reader_cancel_seek(reader);
             }
         }
         else
         {
-            if (SUCCEEDED(IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
+            reader->flags |= SOURCE_READER_SEEKING;
+            if (SUCCEEDED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
             {
-                reader->flags |= SOURCE_READER_SEEKING;
+                source_reader_prepare_seek(reader);
                 while (reader->flags & SOURCE_READER_SEEKING)
                 {
                     SleepConditionVariableCS(&reader->state_event, &reader->cs, INFINITE);
                 }
             }
+            else
+                source_reader_cancel_seek(reader);
         }
     }
 
@@ -2633,6 +2780,7 @@ static HRESULT source_reader_read_sample_async(struct source_reader *reader, uns
         DWORD *actual_index, DWORD *stream_flags, LONGLONG *timestamp, IMFSample **sample)
 {
     struct source_reader_async_command *command;
+    DWORD stream_index;
     HRESULT hr;
 
     if (actual_index || stream_flags || timestamp || sample)
@@ -2644,10 +2792,38 @@ static HRESULT source_reader_read_sample_async(struct source_reader *reader, uns
     {
         if (SUCCEEDED(hr = source_reader_create_async_op(SOURCE_READER_ASYNC_READ, &command)))
         {
-            command->u.read.stream_index = index;
             command->u.read.flags = flags;
+            command->u.read.any_stream = index == MF_SOURCE_READER_ANY_STREAM;
+            if (command->u.read.any_stream)
+            {
+                command->u.read.status = S_OK;
+                command->u.read.resolved = TRUE;
+                command->u.read.stream_index = index;
+                command->u.read.generation = reader->flush_generation;
+                ++reader->queued_any_reads;
+            }
+            else
+            {
+                command->u.read.status = source_reader_get_stream_read_index(reader, index, &stream_index);
+                command->u.read.resolved = SUCCEEDED(command->u.read.status);
+                command->u.read.stream_index = command->u.read.resolved ? stream_index : index;
+                if (command->u.read.resolved)
+                {
+                    struct media_stream *stream = &reader->streams[stream_index];
+
+                    command->u.read.generation = stream->generation;
+                    ++stream->queued_reads;
+                }
+            }
 
             hr = MFPutWorkItem(reader->queue, &reader->async_commands_callback, &command->IUnknown_iface);
+            if (FAILED(hr))
+            {
+                if (command->u.read.any_stream)
+                    --reader->queued_any_reads;
+                else if (command->u.read.resolved)
+                    --reader->streams[command->u.read.stream_index].queued_reads;
+            }
             IUnknown_Release(&command->IUnknown_iface);
         }
     }
@@ -3014,6 +3190,7 @@ static HRESULT create_source_reader_from_source(IMFMediaSource *source, IMFAttri
     InitializeConditionVariable(&object->sample_event);
     InitializeConditionVariable(&object->state_event);
     InitializeConditionVariable(&object->stop_event);
+    InitializeConditionVariable(&object->callback_event);
 
     if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(object->source, &object->descriptor)))
         goto failed;
