@@ -2369,6 +2369,7 @@ static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, U
         {1920, 1280},
         /* 21:9 ultra-wide */
         {2560, 1080},
+        {3440, 1440},
         /* 12:5 */
         {1920,  800},
         {3840, 1600},
