@@ -273,7 +273,13 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
             output_info->y + output_info->output->current_mode->height);
     OffsetRect(&monitor.rc_monitor, -primary->x, -primary->y);
 
-    monitor.edid_len = wayland_generic_output_get_edid(output_info->output, &monitor.edid);
+    monitor.edid_len = wayland_generic_output_get_edid_override(output_info->output->name,
+                                                                &monitor.edid);
+    if (!monitor.edid_len)
+        monitor.edid_len = wayland_generic_output_get_edid_sysfs(output_info->output->name,
+                                                                 &monitor.edid);
+    if (!monitor.edid_len)
+        monitor.edid_len = wayland_generic_output_get_edid(output_info->output, &monitor.edid);
     /* We don't have a direct way to get the work area in Wayland. */
     monitor.rc_work = monitor.rc_monitor;
     monitor.hdr_enabled = output_info->output->supports_hdr;
