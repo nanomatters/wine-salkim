@@ -1868,23 +1868,24 @@ DEFINE_MF_ASYNC_CALLBACK(media_source, async_create, IMFMediaSource_iface)
 static WCHAR *get_byte_stream_url(IMFByteStream *stream, const WCHAR *url)
 {
     IMFAttributes *attributes;
-    WCHAR buffer[MAX_PATH];
-    UINT32 size;
+    const WCHAR *resolved_url;
+    WCHAR *origin = NULL, *resolved;
     HRESULT hr;
 
     TRACE("stream %p, url %s\n", stream, debugstr_w(url));
 
     if (SUCCEEDED(hr = IMFByteStream_QueryInterface(stream, &IID_IMFAttributes, (void **)&attributes)))
     {
-        if (FAILED(hr = IMFAttributes_GetString(attributes, &MF_BYTESTREAM_ORIGIN_NAME,
-                buffer, ARRAY_SIZE(buffer), &size)))
-            WARN("Failed to get MF_BYTESTREAM_ORIGIN_NAME got size %#x, hr %#lx\n", size, hr);
-        else
-            url = buffer;
+        if (FAILED(hr = IMFAttributes_GetAllocatedString(attributes, &MF_BYTESTREAM_ORIGIN_NAME,
+                &origin, NULL)))
+            WARN("Failed to get MF_BYTESTREAM_ORIGIN_NAME, hr %#lx\n", hr);
         IMFAttributes_Release(attributes);
     }
 
-    return url ? wcsdup(url) : NULL;
+    resolved_url = origin && *origin ? origin : url;
+    resolved = resolved_url ? wcsdup(resolved_url) : NULL;
+    CoTaskMemFree(origin);
+    return resolved;
 }
 
 static HRESULT media_source_create(const WCHAR *url, IMFByteStream *stream, IMFMediaSource **out)
