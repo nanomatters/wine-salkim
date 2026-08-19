@@ -2783,6 +2783,7 @@ static void test_message_window(void)
     int pixel_format;
     HWND window;
     RECT vp, r;
+    GLint viewport[4];
     HGLRC ctx;
     BOOL ret;
     HDC dc;
@@ -2824,8 +2825,18 @@ static void test_message_window(void)
     glFinish();
     glerr = glGetError();
     ok(glerr == GL_NO_ERROR, "Failed glClear, error %#x.\n", glerr);
+
+    glViewport(0, 7, 73, 61);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    ok(viewport[0] == 0 && viewport[1] == 7 && viewport[2] == 73 && viewport[3] == 61,
+            "Unexpected viewport %d, %d, %d, %d.\n",
+            viewport[0], viewport[1], viewport[2], viewport[3]);
     ret = SwapBuffers(dc);
     ok(ret, "Failed SwapBuffers, error %#lx.\n", GetLastError());
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    ok(viewport[0] == 0 && viewport[1] == 7 && viewport[2] == 73 && viewport[3] == 61,
+            "SwapBuffers changed viewport to %d, %d, %d, %d.\n",
+            viewport[0], viewport[1], viewport[2], viewport[3]);
 
     ret = wglMakeCurrent(NULL, NULL);
     ok(ret, "Failed to clear current context, last error %#lx.\n", GetLastError());
