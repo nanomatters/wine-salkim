@@ -2575,7 +2575,11 @@ void wayland_surface_commit(struct wayland_surface *surface)
 
 void wayland_surface_commit_pending_state(struct wayland_surface *surface)
 {
-    if (!surface->wl_surface || wayland_surface_has_external_commit_owner(surface) ||
+    /* An invalidated WSI keeps its root buffer but no longer blocks parent
+     * state needed to latch a replacement subsurface. */
+    if (!surface->wl_surface ||
+        (wayland_surface_has_external_commit_owner(surface) &&
+         !ReadAcquire(&surface->direct_client->direct_toplevel_invalidated)) ||
         !InterlockedExchange(&surface->pending_commit, FALSE))
         return;
     wl_surface_commit(surface->wl_surface);
@@ -2616,6 +2620,23 @@ static void wayland_surface_invalidate_direct_toplevel(struct wayland_surface *s
     {
         TRACE("invalidating direct toplevel %s: %s\n",
               debugstr_client_surface(&client->client), reason);
+    }
+}
+
+static void wayland_surface_clear_direct_client(struct wayland_surface *surface,
+                                                struct wayland_win_data *data,
+                                                struct wayland_client_surface *client)
+{
+    if (!surface || surface->direct_client != client) return;
+
+    surface->direct_client = NULL;
+    if (data->client_surface && data->client_surface != client)
+        wayland_client_surface_attach(data->client_surface, data->hwnd);
+    else
+    {
+        wayland_surface_restore_gdi_shm_contents(surface, data->window_contents);
+        if (data->client_surface == client)
+            wayland_client_surface_attach(client, data->hwnd);
     }
 }
 
@@ -2666,18 +2687,13 @@ void wayland_client_surface_release_vulkan_surface(struct client_surface *client
         }
         if (data)
         {
-            /* A live direct toplevel keeps its last frame until a new WSI or
-             * GDI commit replaces it. Complete only post-demotion stacking. */
+            BOOL selected = data->client_surface == client;
+
+            /* Keep a selected direct toplevel available for VkSurface reuse.
+             * Demoted and superseded clients relinquish the root here. */
             surface = data->wayland_surface;
-            if (surface && surface->direct_client == client)
-            {
-                if (!ReadAcquire(&client->direct_toplevel))
-                {
-                    surface->direct_client = NULL;
-                    wayland_surface_restore_gdi_shm_contents(surface, data->window_contents);
-                    wayland_client_surface_attach(client, data->hwnd);
-                }
-            }
+            if (!ReadAcquire(&client->direct_toplevel) || !selected)
+                wayland_surface_clear_direct_client(surface, data, client);
         }
         client->direct_wl_surface = NULL;
     }
@@ -2732,6 +2748,7 @@ static BOOL wayland_surface_evict_direct_client(struct wayland_surface *surface)
     surface->viewport_dest_width = surface->viewport_dest_height = 0;
 
     surface->wl_surface = fresh;
+    surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
     surface->wp_viewport = viewport;
     if (process_wayland.wp_alpha_modifier_v1)
         surface->wp_alpha_modifier_surface_v1 =
@@ -2757,12 +2774,14 @@ static void wayland_surface_clear_carrier(struct wayland_surface *surface)
 
 BOOL wayland_surface_clear_role(struct wayland_surface *surface)
 {
+    struct wl_surface *parent = surface->wl_surface;
+
     TRACE("surface=%p\n", surface);
 
     if (!wayland_surface_evict_direct_client(surface)) return FALSE;
 
     if (surface->role != WAYLAND_SURFACE_ROLE_NONE)
-        wayland_surface_invalidate_attached_clients(surface->hwnd, surface->wl_surface);
+        wayland_surface_invalidate_attached_clients(surface->hwnd, parent);
 
     /* Keep input state across role churn; it follows wl_surface enter/leave. */
     wayland_surface_clear_child_surfaces(surface);
@@ -6532,10 +6551,7 @@ static void wayland_client_surface_destroy(struct client_surface *client)
     if (data)
     {
         if (data->wayland_surface && data->wayland_surface->direct_client == surface)
-        {
-            data->wayland_surface->direct_client = NULL;
-            wayland_surface_restore_gdi_shm_contents(data->wayland_surface, data->window_contents);
-        }
+            wayland_surface_clear_direct_client(data->wayland_surface, data, surface);
     }
 
     if ((callback = InterlockedExchangePointer((void **)&surface->wl_callback, NULL)))
@@ -6621,9 +6637,23 @@ static enum client_surface_attachment client_surface_attachment_for_window(
     return CLIENT_SURFACE_ATTACH;
 }
 
+static void wayland_client_surface_refresh_attachment(struct wayland_win_data *data,
+                                                       struct wayland_client_surface *client,
+                                                       HWND toplevel)
+{
+    enum client_surface_attachment attachment;
+
+    attachment = client_surface_attachment_for_window(data, client, toplevel);
+    if (attachment == CLIENT_SURFACE_ATTACH)
+        wayland_client_surface_attach(client, toplevel);
+    else if (attachment == CLIENT_SURFACE_DETACH)
+        wayland_client_surface_attach(client, NULL);
+}
+
 static void wayland_client_surface_update(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_win_data *data;
     const char *reason;
 
     TRACE("%s\n", debugstr_client_surface(client));
@@ -6636,9 +6666,19 @@ static void wayland_client_surface_update(struct client_surface *client)
                                                      &surface->direct_toplevel_invalidated);
     }
 
-    set_client_surface(client->hwnd, surface);
-    surface->updated_attachment_generation =
-        ReadAcquire(&surface->attachment_generation);
+    /* A window update is broadcast to every live client surface. Refresh the
+     * selected client without letting list order choose the renderer. */
+    if ((data = wayland_win_data_get(client->hwnd)))
+    {
+        if (data->client_surface == surface)
+        {
+            wayland_client_surface_refresh_attachment(data, surface,
+                                                       data->toplevel);
+            surface->updated_attachment_generation =
+                ReadAcquire(&surface->attachment_generation);
+        }
+        wayland_win_data_release(data);
+    }
 }
 
 static BOOL wayland_visual_constraint_equal(const struct wayland_visual_constraint *a,
@@ -6837,7 +6877,6 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_client_surface *old_client;
-    enum client_surface_attachment attachment;
     struct wayland_win_data *data;
 
     /* ownership is shared with the callers, the last caller to release
@@ -6859,14 +6898,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
     }
 
     if (data->client_surface)
-    {
-        attachment = client_surface_attachment_for_window(data, data->client_surface,
-                                                          toplevel);
-        if (attachment == CLIENT_SURFACE_ATTACH)
-            wayland_client_surface_attach(data->client_surface, toplevel);
-        else if (attachment == CLIENT_SURFACE_DETACH)
-            wayland_client_surface_attach(data->client_surface, NULL);
-    }
+        wayland_client_surface_refresh_attachment(data, data->client_surface, toplevel);
 
 done:
     wayland_win_data_release(data);
@@ -7299,6 +7331,7 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     struct wp_viewport *viewport;
     struct wayland_win_data *data;
     struct wl_region *empty_region;
+    BOOL root_borrowed, root_evicted;
 
     if (!(viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter, new_wl_surface)))
     {
@@ -7314,15 +7347,22 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     wl_surface_set_input_region(new_wl_surface, empty_region);
     wl_region_destroy(empty_region);
 
-    if (!(data = wayland_win_data_get(hwnd)) || data->client_surface != surface)
+    wayland_win_data_lock();
+    data = wayland_win_data_get_nolock(hwnd);
+    root_evicted = surface->owns_wl_surface;
+    root_borrowed = data && data->wayland_surface &&
+                    data->wayland_surface->direct_client == surface;
+    /* A root borrower or an evicted generation can demote independently of
+     * which replacement client the HWND currently selects. */
+    if (!root_evicted && !root_borrowed)
     {
-        if (data) wayland_win_data_release(data);
+        wayland_win_data_unlock();
         wp_viewport_destroy(viewport);
         return FALSE;
     }
     if (surface->direct_host_surface && surface->direct_host_surface != old_host_surface)
     {
-        wayland_win_data_release(data);
+        wayland_win_data_unlock();
         wp_viewport_destroy(viewport);
         return FALSE;
     }
@@ -7330,13 +7370,13 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     wayland_client_surface_finish_direct_handoff(surface);
 
     /* Release the borrowed toplevel wl_surface. */
-    if (surface->owns_wl_surface)
+    if (root_evicted)
     {
         struct wl_surface *retired_wl_surface = surface->wl_surface;
 
         if (!wayland_client_surface_retire_wl_surface(surface, surface->wl_surface, old_host_surface))
         {
-            wayland_win_data_release(data);
+            wayland_win_data_unlock();
             wp_viewport_destroy(viewport);
             return FALSE;
         }
@@ -7361,7 +7401,7 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     surface->toplevel = 0;
     surface->toplevel_wl_surface = NULL;
     InterlockedExchange(&surface->has_presented, FALSE);
-    if (data->wayland_surface) data->wayland_surface->direct_client = surface;
+    if (root_borrowed) data->wayland_surface->direct_client = surface;
 
     if (surface->wp_content_type_v1)
     {
@@ -7370,12 +7410,7 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
     }
     wayland_client_surface_set_content_type(surface);
 
-    /* Keep the borrowed root untouched until its host surface is released.
-     * The replacement child is placed above it while that happens. */
-    if (data)
-    {
-        wayland_win_data_release(data);
-    }
+    wayland_win_data_unlock();
 
     wl_display_flush(process_wayland.wl_display);
     TRACE("demoted %s to child wl_surface=%p for hwnd=%p\n",
@@ -7475,14 +7510,11 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
         return;
     }
 
-    /* Another client surface cannot share a borrowed toplevel. */
+    /* Close the old direct presentation generation before attaching its
+     * replacement as a child of the same live toplevel. */
     if (wayland_surface_has_external_commit_owner(surface) &&
         surface->direct_client != client)
-    {
         wayland_surface_invalidate_direct_toplevel(surface, "another client surface appeared");
-        wayland_win_data_release(toplevel_data);
-        return;
-    }
 
     client_data = wayland_win_data_get_nolock(hwnd);
     stack_above_parent = wayland_client_surface_should_stack_above_parent(

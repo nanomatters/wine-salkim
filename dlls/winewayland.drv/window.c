@@ -880,7 +880,6 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
                 (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
             {
                 xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
-                wl_display_flush(process_wayland.wl_display);
                 configure_requested = TRUE;
             }
 
