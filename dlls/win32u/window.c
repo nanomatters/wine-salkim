@@ -2254,7 +2254,6 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     UINT dpi = get_dpi_for_window( hwnd ), style_mask, ex_style_mask;
     RECT visible_rect, rect = {0};
 
-    if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
     /* Kept borders are non-client space; present only the client area. */
     if (is_frameless_window( hwnd, style, ex_style, rects )) return rects->client;
@@ -2348,10 +2347,11 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     BOOL shaped, needs_surface, create_opaque, is_layered, is_child;
     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
     struct window_surface *new_surface;
-    struct window_rects monitor_rects;
+    struct window_rects monitor_rects, presentation_rects;
     UINT raw_dpi, style, ex_style;
     DWORD layered_flags;
-    RECT dummy;
+    RECT dummy, presentation_rect;
+    BOOL has_present_rect;
     HRGN shape;
 
     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
@@ -2364,9 +2364,12 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     if (get_window_region( hwnd, FALSE, &shape, &dummy, NULL )) shaped = FALSE;
     else if ((shaped = !!shape)) NtGdiDeleteObjectApp( shape );
 
-    if (!get_present_rect( hwnd, &rects->visible, get_thread_dpi() )) rects->visible = rects->window;
-    if (is_child) monitor_rects = map_dpi_window_rects( *rects, get_thread_dpi(), raw_dpi );
-    else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
+    /* Keep presentation geometry separate from the HWND geometry used for input. */
+    presentation_rects = *rects;
+    has_present_rect = get_present_rect( hwnd, &presentation_rect, get_thread_dpi() );
+    presentation_rects.visible = has_present_rect ? presentation_rect : rects->window;
+    if (is_child) monitor_rects = map_dpi_window_rects( presentation_rects, get_thread_dpi(), raw_dpi );
+    else monitor_rects = map_window_rects_virt_to_raw( presentation_rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
     else if (is_child) needs_surface = FALSE;
@@ -2374,8 +2377,10 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
     else needs_surface = !!(style & WS_VISIBLE);
 
-    if (!is_child) rects->visible = get_visible_rect( hwnd, shaped, style, ex_style, rects );
-    if (!get_surface_rect( &rects->visible, surface_rect )) needs_surface = FALSE;
+    if (is_child) rects->visible = rects->window;
+    else rects->visible = get_visible_rect( hwnd, shaped, style, ex_style, rects );
+    if (!has_present_rect) presentation_rect = rects->visible;
+    if (!get_surface_rect( &presentation_rect, surface_rect )) needs_surface = FALSE;
     if (!get_default_window_surface( hwnd, surface_rect, &new_surface )) return NULL;
 
     is_layered = new_surface && new_surface->alpha_mask;

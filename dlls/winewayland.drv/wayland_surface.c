@@ -1806,13 +1806,13 @@ static void wayland_surface_clear_child_surfaces(struct wayland_surface *surface
 static void wayland_surface_clear_input_state(struct wayland_surface *surface)
 {
     pthread_mutex_lock(&process_wayland.pointer.mutex);
-    if (process_wayland.pointer.focused_hwnd == surface->hwnd)
+    if (process_wayland.pointer.focused_wl_surface == surface->wl_surface)
     {
         process_wayland.pointer.focused_wl_surface = NULL;
         process_wayland.pointer.focused_hwnd = NULL;
         process_wayland.pointer.enter_serial = 0;
     }
-    if (process_wayland.pointer.constraint_hwnd == surface->hwnd)
+    if (process_wayland.pointer.constraint_wl_surface == surface->wl_surface)
         wayland_pointer_clear_constraint();
     if (process_wayland.pointer.popup_serial_hwnd == surface->hwnd)
     {
@@ -6289,10 +6289,22 @@ static void wayland_surface_get_input_transform(struct wayland_surface *surface,
                                                 struct wayland_surface_input_transform *transform)
 {
     RECT fullscreen_rect;
+    BOOL fullscreen;
     LONG surface_width, surface_height, screen_width, screen_height;
 
-    if (data && wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect) &&
-        !IsRectEmpty(&data->rects.client))
+    fullscreen = data && wayland_win_data_get_fullscreen_rect(data, TRUE,
+                                                              &fullscreen_rect);
+    if (data && data->has_present_rect && !IsRectEmpty(&data->present_rect) &&
+        (fullscreen || !IsRectEmpty(&data->rects.client)))
+    {
+        const RECT *target = fullscreen ? &fullscreen_rect : &data->rects.client;
+
+        /* The target selects the output while the present rect defines its Win32 extent. */
+        SetRect(&transform->screen, target->left, target->top,
+                target->left + data->present_rect.right - data->present_rect.left,
+                target->top + data->present_rect.bottom - data->present_rect.top);
+    }
+    else if (fullscreen && !IsRectEmpty(&data->rects.client))
         transform->screen = data->rects.client;
     else
     {

@@ -188,6 +188,14 @@ struct wayland_pointer_frame
     enum wayland_pointer_frame_flags flags;
 };
 
+enum wayland_pointer_constraint_state
+{
+    WAYLAND_POINTER_CONSTRAINT_NONE,
+    WAYLAND_POINTER_CONSTRAINT_PENDING,
+    WAYLAND_POINTER_CONSTRAINT_ACTIVE,
+    WAYLAND_POINTER_CONSTRAINT_INACTIVE,
+};
+
 struct wayland_pointer
 {
     struct wl_pointer *wl_pointer;
@@ -196,8 +204,12 @@ struct wayland_pointer
     struct zwp_relative_pointer_v1 *zwp_relative_pointer_v1;
     struct wp_cursor_shape_device_v1 *wp_cursor_shape_device_v1;
     struct wl_surface *focused_wl_surface;
+    struct wl_surface *constraint_wl_surface;
     HWND focused_hwnd;
     HWND constraint_hwnd;
+    enum wayland_pointer_constraint_state constraint_state;
+    RECT confine_rect;
+    BOOL confine_rect_valid;
     BOOL pending_warp;
     POINT warp;
     BOOL relative_mode;
@@ -909,6 +921,7 @@ struct wayland_win_data
     struct window_rects rects;
     BOOL is_fullscreen;
     BOOL has_present_rect;
+    RECT present_rect;
     BOOL application_fullscreen;
     RECT application_fullscreen_rect;
     BOOL managed;

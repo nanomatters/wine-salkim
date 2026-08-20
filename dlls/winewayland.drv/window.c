@@ -1309,7 +1309,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     HWND overlay_owner = get_owned_overlay_owner(hwnd, window_owner, style, exstyle);
     BOOL owned_overlay = overlay_owner != NULL;
     BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
-    RECT present_rect;
+    RECT present_rect = {0};
     BOOL has_present_rect;
     BOOL application_fullscreen = FALSE;
     RECT application_fullscreen_rect = {0};
@@ -1415,6 +1415,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->client_rect_in_toplevel_valid = client_rect_in_toplevel_valid;
     data->is_fullscreen = fullscreen;
     data->has_present_rect = has_present_rect;
+    data->present_rect = present_rect;
     data->application_fullscreen = application_fullscreen;
     data->application_fullscreen_rect = application_fullscreen_rect;
     data->managed = managed;
