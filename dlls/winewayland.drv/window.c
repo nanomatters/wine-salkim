@@ -717,8 +717,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (use_layer_shell && !IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_LAYER;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
-    else if (should_defer_unanchored_menu_popup(style, exstyle, data->is_fullscreen,
-                                                has_menu_popup_owner))
+    else if (!client && should_defer_unanchored_menu_popup(style, exstyle,
+                                                           data->is_fullscreen,
+                                                           has_menu_popup_owner))
         role = WAYLAND_SURFACE_ROLE_NONE;
     else if (!IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     else role = WAYLAND_SURFACE_ROLE_NONE;
@@ -1167,6 +1168,8 @@ static HWND get_menu_popup_owner(HWND hwnd, HWND owner_hint)
     owner = NtUserGetAncestor(owner, GA_ROOT);
     if (!owner || owner == hwnd || owner == NtUserGetDesktopWindow() ||
         !NtUserIsWindow(owner))
+        return NULL;
+    if ((DWORD)(ULONG_PTR)NtUserQueryWindow(owner, WindowProcess) != GetCurrentProcessId())
         return NULL;
 
     return owner;
