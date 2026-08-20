@@ -6992,7 +6992,7 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     BOOL application_fullscreen = expected_client &&
         wayland_win_data_get_fullscreen_rect(data, FALSE, &fullscreen_rect);
 
-    if (!application_fullscreen && !direct_toplevel_enabled())
+    if (!direct_toplevel_enabled())
         return "direct toplevel not enabled by environment";
     if (!surface) return "no Wayland surface";
     if (!wayland_surface_is_toplevel(surface)) return "surface is not a live toplevel";
