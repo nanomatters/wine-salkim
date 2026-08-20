@@ -681,6 +681,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
 
     if (data->external_host)
     {
+        if (client && client_surface_suspend_presentation(&client->client, TRUE))
+        {
+            TRACE("deferring external hosting for hwnd=%p while a present is active\n", data->hwnd);
+            return TRUE;
+        }
         if (client) wayland_client_surface_attach(client, NULL);
         if (surface)
         {
@@ -723,6 +728,16 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         role = WAYLAND_SURFACE_ROLE_NONE;
     else if (!IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     else role = WAYLAND_SURFACE_ROLE_NONE;
+
+    /* Keep frame callbacks reachable until registered native presentation returns. */
+    if (client && surface && surface->role != WAYLAND_SURFACE_ROLE_NONE &&
+        (surface->role != role ||
+         (role == WAYLAND_SURFACE_ROLE_LAYER && !surface->zwlr_layer_surface_v1)) &&
+        client_surface_suspend_presentation(&client->client, TRUE))
+    {
+        TRACE("deferring role change for hwnd=%p while a present is active\n", data->hwnd);
+        return TRUE;
+    }
 
     parent_surface = owner_surface ? owner_surface : toplevel_surface;
     if (parent_surface &&
@@ -795,9 +810,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     if (client)
     {
         if (role == WAYLAND_SURFACE_ROLE_NONE)
+        {
+            client_surface_suspend_presentation(&client->client, FALSE);
             wayland_client_surface_attach(client, NULL);
+        }
         else if (!window_or_root_minimized(data))
+        {
             wayland_client_surface_attach(client, data->hwnd);
+            client_surface_resume_presentation(&client->client);
+        }
     }
     wayland_surface_sync_window_regions(surface, window_surface, data->exstyle);
 

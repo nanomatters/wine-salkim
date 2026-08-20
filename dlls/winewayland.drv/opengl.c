@@ -259,6 +259,9 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
     struct wayland_client_surface *surface = impl_from_client_surface(base->client);
     struct wl_callback *callback;
+    LONG generation = ReadAcquire(&base->client->presentation_generation);
+
+    if (!client_surface_begin_present_wait(base->client, generation)) return TRUE;
 
     client_surface_present(base->client);
     if (!gl->swap_interval_initialized)
@@ -290,6 +293,7 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
         }
     }
     funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
+    client_surface_end_present_wait(base->client);
 
     return TRUE;
 }

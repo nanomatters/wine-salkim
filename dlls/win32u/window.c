@@ -292,10 +292,14 @@ static void client_surface_release_locked( struct client_surface *surface )
 
     if (!ref)
     {
+        if (surface->presentation_wait_count)
+            WARN( "%s destroyed with %u presentation waits in flight\n",
+                  debugstr_client_surface( surface ), surface->presentation_wait_count );
         client_surface_detach_locked( surface );
         surface->funcs->destroy( surface );
         assert( !surface->presentation_wait_count );
         assert( !surface->presentation_retiring );
+        assert( !surface->presentation_update_pending );
         pthread_cond_destroy( &surface->presentation_cond );
         pthread_mutex_destroy( &surface->presentation_mutex );
         free( surface );
@@ -377,7 +381,7 @@ BOOL client_surface_begin_present_wait( struct client_surface *surface, LONG gen
     /* Register against the generation under the same lock used by topology
      * changes. The target is then kept intact until the wait is released. */
     pthread_mutex_lock( &surface->presentation_mutex );
-    if ((ret = !surface->presentation_retiring &&
+    if ((ret = !surface->presentation_retiring && !surface->presentation_suspended &&
                generation == ReadAcquire( &surface->presentation_generation )))
         surface->presentation_wait_count++;
     pthread_mutex_unlock( &surface->presentation_mutex );
@@ -386,10 +390,44 @@ BOOL client_surface_begin_present_wait( struct client_surface *surface, LONG gen
 
 void client_surface_end_present_wait( struct client_surface *surface )
 {
+    HWND update_hwnd = NULL;
+
     pthread_mutex_lock( &surface->presentation_mutex );
     assert( surface->presentation_wait_count );
     if (!--surface->presentation_wait_count)
+    {
         pthread_cond_broadcast( &surface->presentation_cond );
+        if (surface->presentation_update_pending)
+        {
+            surface->presentation_update_pending = FALSE;
+            update_hwnd = ReadPointerAcquire( (void * const volatile *)&surface->hwnd );
+        }
+    }
+    pthread_mutex_unlock( &surface->presentation_mutex );
+
+    if (update_hwnd) NtUserPostMessage( update_hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
+BOOL client_surface_suspend_presentation( struct client_surface *surface, BOOL defer_update )
+{
+    BOOL wait;
+
+    pthread_mutex_lock( &surface->presentation_mutex );
+    if (!surface->presentation_suspended)
+    {
+        surface->presentation_suspended = TRUE;
+        InterlockedIncrement( &surface->presentation_generation );
+    }
+    wait = surface->presentation_wait_count != 0;
+    if (wait && defer_update) surface->presentation_update_pending = TRUE;
+    pthread_mutex_unlock( &surface->presentation_mutex );
+    return wait;
+}
+
+void client_surface_resume_presentation( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    surface->presentation_suspended = FALSE;
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 

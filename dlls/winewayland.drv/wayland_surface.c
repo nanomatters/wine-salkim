@@ -6657,9 +6657,15 @@ static void wayland_client_surface_refresh_attachment(struct wayland_win_data *d
 
     attachment = client_surface_attachment_for_window(data, client, toplevel);
     if (attachment == CLIENT_SURFACE_ATTACH)
+    {
         wayland_client_surface_attach(client, toplevel);
+        client_surface_resume_presentation(&client->client);
+    }
     else if (attachment == CLIENT_SURFACE_DETACH)
+    {
+        if (client_surface_suspend_presentation(&client->client, TRUE)) return;
         wayland_client_surface_attach(client, NULL);
+    }
 }
 
 static void wayland_client_surface_update(struct client_surface *client)
@@ -6890,6 +6896,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_client_surface *old_client;
     struct wayland_win_data *data;
+    BOOL refresh_state = FALSE;
 
     /* ownership is shared with the callers, the last caller to release
      * its reference will also destroy it and clear our pointer. */
@@ -6907,6 +6914,9 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
             wayland_client_surface_attach(old_client, NULL);
 
         data->client_surface = new_client;
+        refresh_state = new_client && data->wayland_surface &&
+                        data->wayland_surface->role == WAYLAND_SURFACE_ROLE_NONE &&
+                        data->wayland_surface->window.visible;
     }
 
     if (data->client_surface)
@@ -6914,6 +6924,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 
 done:
     wayland_win_data_release(data);
+    if (refresh_state) NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
 }
 
 static const struct client_surface_funcs wayland_client_surface_funcs =
@@ -6945,6 +6956,7 @@ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
     struct wl_region *empty_region;
 
     if (!(client = client_surface_create(sizeof(*client), &wayland_client_surface_funcs, hwnd))) return NULL;
+    client_surface_suspend_presentation(&client->client, FALSE);
 
     list_init(&client->fullscreen_requests);
 

@@ -272,10 +272,12 @@ struct client_surface
     LONG                               updated;        /* has been moved / resized / reparented */
     LONG                               offscreen;      /* client window is offscreen */
     LONG                               presentation_generation; /* invalidates swapchains with an obsolete presentation target */
-    pthread_mutex_t                    presentation_mutex; /* protects generation changes and active host waits */
+    pthread_mutex_t                    presentation_mutex; /* protects presentation state and active host calls */
     pthread_cond_t                     presentation_cond;
     unsigned int                       presentation_wait_count;
     BOOL                               presentation_retiring;
+    BOOL                               presentation_suspended;
+    BOOL                               presentation_update_pending;
 };
 
 W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );
@@ -283,6 +285,8 @@ W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI BOOL client_surface_begin_present_wait( struct client_surface *surface, LONG generation );
 W32KAPI void client_surface_end_present_wait( struct client_surface *surface );
+W32KAPI BOOL client_surface_suspend_presentation( struct client_surface *surface, BOOL defer_update );
+W32KAPI void client_surface_resume_presentation( struct client_surface *surface );
 W32KAPI void client_surface_invalidate_presentation( struct client_surface *surface );
 W32KAPI BOOL client_surface_invalidate_presentation_once( struct client_surface *surface,
                                                           LONG *invalidated );

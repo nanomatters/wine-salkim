@@ -6712,6 +6712,14 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             if (!swapchain->managed->explicit_sync) all_managed_explicit = FALSE;
             continue;
         }
+        if (!client_surface_begin_present_wait( swapchain->surface->client,
+                                                swapchain->presentation_generation ))
+        {
+            present_swapchains[i] = NULL;
+            present_results[i] = VK_ERROR_OUT_OF_DATE_KHR;
+            out_of_date = TRUE;
+            continue;
+        }
         swapchains[host_count] = swapchain->obj.host.swapchain;
         host_indices[host_count] = i;
         host_count++;
@@ -7008,6 +7016,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
 failed:
+    for (uint32_t i = 0; i < host_count; i++)
+    {
+        struct swapchain *swapchain = present_swapchains[host_indices[i]];
+
+        client_surface_end_present_wait( swapchain->surface->client );
+    }
     mem_free( &pool );
     return res;
 }
