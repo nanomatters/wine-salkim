@@ -421,12 +421,14 @@ BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
 static RECT wayland_win_data_get_shm_source(const struct wayland_win_data *data,
                                             BOOL application_fullscreen, BOOL fullscreen)
 {
-    RECT source = data->rects.visible;
+    RECT buffer_rect = data->has_present_rect ? data->present_rect : data->rects.visible;
+    RECT source = buffer_rect;
 
-    if (application_fullscreen ||
-        (fullscreen && (data->style & (WS_CAPTION | WS_THICKFRAME))))
+    if (!data->has_present_rect &&
+        (application_fullscreen ||
+         (fullscreen && (data->style & (WS_CAPTION | WS_THICKFRAME)))))
         source = data->rects.client;
-    OffsetRect(&source, -data->rects.visible.left, -data->rects.visible.top);
+    OffsetRect(&source, -buffer_rect.left, -buffer_rect.top);
     return source;
 }
 
