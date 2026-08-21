@@ -6358,6 +6358,66 @@ void wayland_surface_delta_to_screen(struct wayland_surface *surface,
     *screen_y = surface_y * transform.scale_y;
 }
 
+struct wayland_external_input_transform
+{
+    RECT surface;
+    LONG width, height;
+    double scale_x, scale_y;
+};
+
+static void wayland_surface_get_external_input_transform(
+        struct wayland_surface *surface, const struct wayland_win_data *data,
+        struct wayland_external_input_transform *transform)
+{
+    struct wayland_client_surface *client = data ? data->client_surface : NULL;
+    UINT width = 0, height = 0;
+
+    transform->surface = wayland_surface_get_input_surface_rect(surface, data);
+    if (!client || !client_surface_get_presentation_size(&client->client, &width, &height))
+    {
+        width = max(1, transform->surface.right - transform->surface.left);
+        height = max(1, transform->surface.bottom - transform->surface.top);
+    }
+    transform->width = width;
+    transform->height = height;
+    transform->scale_x = transform->surface.right > transform->surface.left ?
+                         (double)width / (transform->surface.right - transform->surface.left) : 1.0;
+    transform->scale_y = transform->surface.bottom > transform->surface.top ?
+                         (double)height / (transform->surface.bottom - transform->surface.top) : 1.0;
+}
+
+void wayland_surface_coords_to_external_input(struct wayland_surface *surface,
+                                              const struct wayland_win_data *data,
+                                              double surface_x, double surface_y,
+                                              LONG *input_x, LONG *input_y,
+                                              LONG *input_width, LONG *input_height)
+{
+    struct wayland_external_input_transform transform;
+
+    wayland_surface_get_external_input_transform(surface, data, &transform);
+    *input_width = transform.width;
+    *input_height = transform.height;
+    *input_x = max(0, min((LONG)round((surface_x - transform.surface.left) *
+                                     transform.scale_x), transform.width - 1));
+    *input_y = max(0, min((LONG)round((surface_y - transform.surface.top) *
+                                     transform.scale_y), transform.height - 1));
+}
+
+void wayland_surface_delta_to_external_input(struct wayland_surface *surface,
+                                             const struct wayland_win_data *data,
+                                             double surface_x, double surface_y,
+                                             double *input_x, double *input_y,
+                                             LONG *input_width, LONG *input_height)
+{
+    struct wayland_external_input_transform transform;
+
+    wayland_surface_get_external_input_transform(surface, data, &transform);
+    *input_width = transform.width;
+    *input_height = transform.height;
+    *input_x = surface_x * transform.scale_x;
+    *input_y = surface_y * transform.scale_y;
+}
+
 BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
                                                    double surface_x, double surface_y,
                                                    POINT *screen, RECT *input_rect)

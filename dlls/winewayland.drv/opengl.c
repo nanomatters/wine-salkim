@@ -160,6 +160,7 @@ static void wayland_gl_drawable_sync_size(struct wayland_gl_drawable *gl)
     if (client_width == 0 || client_height == 0) client_width = client_height = 1;
 
     wl_egl_window_resize(gl->wl_egl_window, client_width, client_height, 0, 0);
+    client_surface_set_presentation_size(gl->base.client, client_width, client_height);
 }
 
 static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable)
@@ -200,6 +201,7 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struc
     NtCreateEvent(&client->throttle, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, TRUE);
 
     if (!(gl->wl_egl_window = wl_egl_window_create(client->wl_surface, rect.right, rect.bottom))) goto err;
+    client_surface_set_presentation_size(&client->client, rect.right, rect.bottom);
     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
     set_client_surface(hwnd, client);
 

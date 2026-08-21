@@ -972,6 +972,7 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
     pthread_mutex_lock(&keyboard->mutex);
     keyboard->focused_hwnd = hwnd;
     pthread_mutex_unlock(&keyboard->mutex);
+    wayland_external_input_set_keyboard_focus(TRUE);
 
     input_hwnd = wayland_keyboard_get_input_hwnd(hwnd, NtUserGetForegroundWindow());
     /* Input language follows Win32 focus while surface state remains tied to the Wayland toplevel. */
@@ -1011,6 +1012,7 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
                                   uint32_t serial, struct wl_surface *wl_surface)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    BOOL focused;
     HWND foreground, hwnd, input_hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
@@ -1028,7 +1030,9 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
     pthread_mutex_lock(&keyboard->mutex);
     if (keyboard->focused_hwnd == hwnd)
         keyboard->focused_hwnd = NULL;
+    focused = keyboard->focused_hwnd != NULL;
     pthread_mutex_unlock(&keyboard->mutex);
+    wayland_external_input_set_keyboard_focus(focused);
 
     /* The spec for the leave event tells us to treat all keys as released,
      * and for any key repetition to stop. */
@@ -1134,8 +1138,11 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
                                 uint32_t serial, uint32_t time, uint32_t key,
                                 uint32_t state)
 {
+    struct wine_wayland_external_input_event event;
+    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
     UINT scan = key2scan(key);
     INPUT input = {0};
+    BOOL consumed, deliver_to_game;
     HWND focused, hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
@@ -1152,6 +1159,23 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 
     if (key == KEY_ESC && state == WL_KEYBOARD_KEY_STATE_PRESSED)
         wayland_cancel_layer_menu_if_needed(NULL);
+
+    consumed = FALSE;
+    if (wayland_external_input_is_registered())
+    {
+        event = (struct wine_wayland_external_input_event)
+        {
+            .size = sizeof(event),
+            .type = WINE_WAYLAND_EXTERNAL_INPUT_KEY,
+            .time = time,
+            .code = key,
+            .state = state,
+        };
+        consumed = wayland_external_input_emit(&event);
+    }
+    deliver_to_game = !consumed ||
+                      (state == WL_KEYBOARD_KEY_STATE_RELEASED && keyboard->keystate[scan]);
+    if (!deliver_to_game) return;
 
     /* NOTE: Windows normally sends VK_CONTROL + VK_MENU only if the layout has KLLF_ALTGR */
     if (key == KEY_RIGHTALT) send_right_control(hwnd, state);
@@ -1254,8 +1278,11 @@ void wayland_keyboard_init(struct wl_keyboard *wl_keyboard)
 void wayland_keyboard_deinit(void)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    BOOL focused;
 
     pthread_mutex_lock(&keyboard->mutex);
+    focused = keyboard->focused_hwnd != NULL;
+    keyboard->focused_hwnd = NULL;
     if (keyboard->wl_keyboard)
     {
         wl_keyboard_destroy(keyboard->wl_keyboard);
@@ -1272,6 +1299,7 @@ void wayland_keyboard_deinit(void)
         keyboard->xkb_state = NULL;
     }
     pthread_mutex_unlock(&keyboard->mutex);
+    if (focused) wayland_external_input_set_keyboard_focus(FALSE);
 
     if (rxkb_context)
     {

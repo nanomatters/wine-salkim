@@ -65,6 +65,7 @@ struct xkb_compose_table;
 #include "wine/gdi_driver.h"
 #include "wine/list.h"
 #include "wine/rbtree.h"
+#include "wine/wayland_external_input.h"
 #include "wine/vulkan_driver.h"
 
 #include "unixlib.h"
@@ -180,7 +181,10 @@ enum wayland_pointer_frame_flags
 struct wayland_pointer_frame
 {
     LONG x, y;
+    LONG external_x, external_y;
+    LONG external_width, external_height;
     double dx, dy;
+    double external_dx, external_dy;
     double dx_raw, dy_raw;
     double axis, horz_axis;
     LONG scroll, horz_scroll;
@@ -213,6 +217,7 @@ struct wayland_pointer
     BOOL pending_warp;
     POINT warp;
     BOOL relative_mode;
+    BOOL external_input_active;
     uint32_t enter_serial;
     uint32_t button_serial;
     uint32_t popup_serial;
@@ -692,12 +697,28 @@ struct wayland_surface
 };
 
 BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier);
+BOOL wayland_vulkan_proxy_create_surface(const struct vulkan_instance *instance,
+                                         struct wl_surface *wl_surface,
+                                         VkSurfaceKHR *surface, VkResult *result);
 
 /**********************************************************************
  *          Wayland initialization
  */
 
 BOOL wayland_process_init(void);
+BOOL wayland_external_input_emit(const struct wine_wayland_external_input_event *event);
+void wayland_external_input_set_keyboard_focus(BOOL focused);
+extern int wayland_external_input_active;
+extern int wayland_external_input_registered;
+static inline BOOL wayland_external_input_is_active(void)
+{
+    return __atomic_load_n(&wayland_external_input_active, __ATOMIC_ACQUIRE);
+}
+static inline BOOL wayland_external_input_is_registered(void)
+{
+    return __atomic_load_n(&wayland_external_input_registered, __ATOMIC_ACQUIRE);
+}
+void wayland_pointer_set_external_input_active(BOOL active);
 
 /**********************************************************************
  *          Wayland output
@@ -770,6 +791,16 @@ void wayland_surface_delta_to_screen(struct wayland_surface *surface,
                                      const struct wayland_win_data *data,
                                      double surface_x, double surface_y,
                                      double *screen_x, double *screen_y);
+void wayland_surface_coords_to_external_input(struct wayland_surface *surface,
+                                              const struct wayland_win_data *data,
+                                              double surface_x, double surface_y,
+                                              LONG *input_x, LONG *input_y,
+                                              LONG *input_width, LONG *input_height);
+void wayland_surface_delta_to_external_input(struct wayland_surface *surface,
+                                             const struct wayland_win_data *data,
+                                             double surface_x, double surface_y,
+                                             double *input_x, double *input_y,
+                                             LONG *input_width, LONG *input_height);
 BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
                                                    double surface_x, double surface_y,
                                                    POINT *screen, RECT *input_rect);

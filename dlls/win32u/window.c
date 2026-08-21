@@ -374,6 +374,22 @@ void client_surface_release( struct client_surface *surface )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+void client_surface_set_presentation_size( struct client_surface *surface,
+                                           UINT width, UINT height )
+{
+    WriteRelease64( &surface->presentation_size, ((UINT64)height << 32) | width );
+}
+
+BOOL client_surface_get_presentation_size( struct client_surface *surface,
+                                           UINT *width, UINT *height )
+{
+    UINT64 size = ReadAcquire64( &surface->presentation_size );
+
+    *width = size;
+    *height = size >> 32;
+    return *width && *height;
+}
+
 BOOL client_surface_begin_present_wait( struct client_surface *surface, LONG generation )
 {
     BOOL ret;

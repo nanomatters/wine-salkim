@@ -812,7 +812,9 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
 {
     const VkBaseInStructure *header = (const VkBaseInStructure *)info;
     const VkDebugReportCallbackCreateInfoEXT *debug_report_callback;
-    const char **extensions;
+    const char *const *driver_layers = NULL;
+    const char **extensions, **layers;
+    uint32_t layer_count = 0;
     uint32_t count = 0;
 
     while ((header = find_next_struct( header->pNext, VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT )))
@@ -838,6 +840,17 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
     {
         FIXME( "Loading explicit layers is not supported!\n" );
         return VK_ERROR_LAYER_NOT_PRESENT;
+    }
+
+    if (driver_funcs->p_get_vulkan_instance_layers)
+        layer_count = driver_funcs->p_get_vulkan_instance_layers( &driver_layers );
+    if (layer_count)
+    {
+        if (!(layers = mem_alloc( pool, layer_count * sizeof(*layers) )))
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        memcpy( layers, driver_layers, layer_count * sizeof(*layers) );
+        info->ppEnabledLayerNames = layers;
+        info->enabledLayerCount = layer_count;
     }
 
     driver_funcs->p_map_instance_extensions( &instance->obj.extensions );
@@ -5365,6 +5378,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             surface, topology_updated, generation_before_update );
     surface->swapchain = swapchain;
     swapchain->extents = create_info->imageExtent;
+    client_surface_set_presentation_size( surface->client, create_info_host.imageExtent.width,
+                                          create_info_host.imageExtent.height );
     instance->p_insert_object( instance, &swapchain->obj.obj );
     swapchain->host_surface->swapchain_count++;
     pthread_mutex_unlock( &surface->host_lock );
@@ -5454,7 +5469,11 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     }
     if (surface)
     {
-        if (surface->swapchain == swapchain) surface->swapchain = NULL;
+        if (surface->swapchain == swapchain)
+        {
+            surface->swapchain = NULL;
+            client_surface_set_presentation_size( surface->client, 0, 0 );
+        }
         if (swapchain->host_surface)
         {
             if (swapchain->host_surface->swapchain_count)

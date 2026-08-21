@@ -27,8 +27,10 @@ SOURCES = \
 	version.rc \
 	viewporter.xml \
 	vulkan.c \
+	vulkan_x11_proxy.c \
 	wayland.c \
 	wayland_data_device.c \
+	wayland_external_input.c \
 	wayland_keyboard.c \
 	wayland_output.c \
 	wayland_pointer.c \

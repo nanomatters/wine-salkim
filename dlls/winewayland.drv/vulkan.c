@@ -41,6 +41,23 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
+/* The native Steam overlay only reaches an X11 input method when it records an
+ * X11 window for the presenting surface. Create the surface through the Xlib
+ * entry point, so layers above us record the proxy window, and let the Wineland
+ * translation layer below us present to the real Wayland surface. */
+static BOOL wayland_vulkan_steam_overlay_enabled(void)
+{
+    static int enabled = -1;
+    const char *env;
+
+    if (enabled == -1)
+    {
+        env = getenv("PROTON_WAYLAND_STEAM_OVERLAY");
+        enabled = env && *env != '0';
+    }
+    return enabled;
+}
+
 static struct wayland_client_surface *stash_client_surface(HWND hwnd,
                                                            struct wayland_client_surface *surface)
 {
@@ -80,12 +97,17 @@ static VkResult wayland_vulkan_create_host_surface(const struct vulkan_instance 
                                                    struct wl_surface *wl_surface,
                                                    VkSurfaceKHR *host_surface)
 {
+    VkResult res;
     VkWaylandSurfaceCreateInfoKHR create_info_host =
     {
         .sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
         .display = process_wayland.wl_display,
         .surface = wl_surface,
     };
+
+    if (wayland_vulkan_steam_overlay_enabled() &&
+        wayland_vulkan_proxy_create_surface(instance, wl_surface, host_surface, &res))
+        return res;
 
     return instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info_host,
                                                  NULL /* allocator */, host_surface);
@@ -209,7 +231,6 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
                                               VkSurfaceKHR *handle, struct client_surface **client)
 {
     VkResult res;
-    VkWaylandSurfaceCreateInfoKHR create_info_host;
     struct wayland_client_surface *surface;
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
@@ -222,13 +243,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
-    create_info_host.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
-    create_info_host.pNext = NULL;
-    create_info_host.flags = 0; /* reserved */
-    create_info_host.display = process_wayland.wl_display;
-    create_info_host.surface = surface->wl_surface;
-
-    res = instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
+    res = wayland_vulkan_create_host_surface(instance, surface->wl_surface, handle);
     if (res != VK_SUCCESS)
     {
         ERR("Failed to create vulkan wayland surface, res=%d\n", res);
@@ -400,10 +415,38 @@ static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_p
                                                                         process_wayland.wl_display);
 }
 
+static UINT wayland_get_vulkan_instance_layers(const char *const **layers)
+{
+#if defined(__x86_64__)
+    static const char *const names[] =
+    {
+        "VK_LAYER_VALVE_steam_overlay_64",
+        "VK_LAYER_WINELAND_translate_x86_64",
+    };
+#elif defined(__i386__)
+    static const char *const names[] =
+    {
+        "VK_LAYER_VALVE_steam_overlay_32",
+        "VK_LAYER_WINELAND_translate_i386",
+    };
+#else
+    (void)layers;
+    return 0;
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (!wayland_vulkan_steam_overlay_enabled()) return 0;
+    *layers = names;
+    return ARRAY_SIZE(names);
+#endif
+}
+
 static void wayland_map_instance_extensions(struct vulkan_instance_extensions *extensions)
 {
     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_wayland_surface = 1;
     if (extensions->has_VK_KHR_wayland_surface) extensions->has_VK_KHR_win32_surface = 1;
+    if (extensions->has_VK_KHR_wayland_surface && wayland_vulkan_steam_overlay_enabled())
+        extensions->has_VK_KHR_xlib_surface = 1;
 }
 
 static void wayland_map_device_extensions(struct vulkan_device_extensions *extensions)
@@ -566,6 +609,7 @@ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
     .p_vulkan_surface_fullscreen = wayland_vulkan_surface_fullscreen,
     .p_vulkan_get_hwnd_dmabuf_caps = wayland_vulkan_get_hwnd_dmabuf_caps,
     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
+    .p_get_vulkan_instance_layers = wayland_get_vulkan_instance_layers,
     .p_map_instance_extensions = wayland_map_instance_extensions,
     .p_map_device_extensions = wayland_map_device_extensions,
 };

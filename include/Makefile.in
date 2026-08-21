@@ -997,6 +997,8 @@ SOURCES = \
 	wine/unixlib.h \
 	wine/vulkan.h \
 	wine/vulkan_driver.h \
+	wine/wayland_external_input.h \
+	wine/wayland_vulkan_proxy.h \
 	wine/wgl.h \
 	wine/winbase16.h \
 	wine/windef16.h \
