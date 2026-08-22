@@ -5075,20 +5075,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         else free( updated_host );
     }
 
-    if (fullscreen_owner)
-    {
-        RECT host_rect, dst_rect;
-
-        if (!surface->client->funcs->get_presentation_rects ||
-            !surface->client->funcs->get_presentation_rects(
-                surface->client, &host_rect, &dst_rect ))
-        {
-            pthread_mutex_unlock( &surface->host_lock );
-            clear_fullscreen_owner( surface, fullscreen_owner );
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-    }
-
     if (surface) create_info_host.surface = surface_host_handle( surface );
     create_info_host.oldSwapchain = old_swapchain && old_swapchain->host_surface == surface->active_host
                                     ? old_swapchain->obj.host.swapchain : VK_NULL_HANDLE;
