@@ -6730,11 +6730,14 @@ static void wayland_client_surface_update(struct client_surface *client)
                                                      &surface->direct_toplevel_invalidated);
     }
 
-    /* A window update is broadcast to every live client surface. Refresh the
-     * selected client without letting list order choose the renderer. */
+    /* Keep the selected client attached without letting list order choose the
+     * renderer. Also attach an active replacement before its first present so
+     * host WSI can make progress while the old client preserves the last frame. */
     if ((data = wayland_win_data_get(client->hwnd)))
     {
-        if (data->client_surface == surface)
+        if (data->client_surface == surface ||
+            (ReadAcquire(&surface->client.busy_ref) &&
+             !ReadAcquire(&surface->has_presented)))
         {
             wayland_client_surface_refresh_attachment(data, surface,
                                                        data->toplevel);
