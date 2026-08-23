@@ -1168,17 +1168,6 @@ static int use_lsteamclient(void)
     return use;
 }
 
-static int use_wayland_steam_overlay(void)
-{
-    WCHAR env[32];
-    static int use = -1;
-
-    if (use != -1) return use;
-
-    use = get_env( L"PROTON_WAYLAND_STEAM_OVERLAY", env, sizeof(env) ) && *env != '0';
-    return use;
-}
-
 /*************************************************************************
  *		import_dll
  *
@@ -2454,7 +2443,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     SIZE_T map_size;
     WCHAR *basename, *tmp;
     ULONG basename_len;
-    BOOL is_gameoverlayrenderer, is_steamclient32;
+    BOOL is_steamclient32;
 
     if (!(nt = RtlImageNtHeader( *module ))) return STATUS_INVALID_IMAGE_FORMAT;
 
@@ -2482,13 +2471,10 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     basename_len = wcslen(basename);
     if (basename_len >= 4 && !wcscmp(basename + basename_len - 4, L".dll")) basename_len -= 4;
 
-    is_gameoverlayrenderer = !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer", 19, TRUE) ||
-                             !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer64", 21, TRUE);
-    is_steamclient32 = !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE);
-
-    if (use_lsteamclient() && (is_steamclient32 ||
+    if (use_lsteamclient() && ((is_steamclient32 = !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE)) ||
          !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient64", 13, TRUE) ||
-         (is_gameoverlayrenderer && !use_wayland_steam_overlay())) &&
+         !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer", 19, TRUE) ||
+         !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer64", 21, TRUE)) &&
         RtlCreateUnicodeStringFromAsciiz(&lsteamclient_us, "lsteamclient.dll") &&
         (lsteamclient || LdrLoadDll(load_path, 0, &lsteamclient_us, &lsteamclient) == STATUS_SUCCESS))
     {
