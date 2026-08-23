@@ -68,11 +68,9 @@ static void wayland_vk_proxy_init(void)
     unsigned long pid;
     Atom net_wm_pid;
 
-    if (!(x11_handle = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL)))
-    {
-        WARN("Failed to load libX11, no Steam overlay input proxy: %s\n", dlerror());
-        return;
-    }
+    /* This initializer may run on lsteamclient's native pthread, which has no
+     * Wine thread state for debug logging. */
+    if (!(x11_handle = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL))) return;
 
 #define LOAD_FUNCPTR(f) if (!(p_##f = dlsym(RTLD_DEFAULT, #f))) goto failed
     LOAD_FUNCPTR(XInitThreads);
@@ -89,14 +87,9 @@ static void wayland_vk_proxy_init(void)
     LOAD_FUNCPTR(XChangeProperty);
 #undef LOAD_FUNCPTR
 
-    if (!p_XInitThreads())
-        WARN("XInitThreads failed for the Steam overlay input proxy\n");
+    p_XInitThreads();
 
-    if (!(proxy_display = p_XOpenDisplay(NULL)))
-    {
-        WARN("Failed to open the X display, no Steam overlay input proxy\n");
-        goto failed;
-    }
+    if (!(proxy_display = p_XOpenDisplay(NULL))) goto failed;
 
     /* Resolve Xlib through RTLD_DEFAULT so the overlay observes the same
      * display and window that it later records for the Vulkan surface. The
@@ -108,11 +101,7 @@ static void wayland_vk_proxy_init(void)
     proxy_window = p_XCreateWindow(proxy_display, p_XDefaultRootWindow(proxy_display),
                                    -10000, -10000, 32, 32, 0, CopyFromParent, InputOutput,
                                    CopyFromParent, CWOverrideRedirect | CWEventMask, &attrs);
-    if (!proxy_window)
-    {
-        WARN("Failed to create the Steam overlay input proxy window\n");
-        goto failed;
-    }
+    if (!proxy_window) goto failed;
 
     if ((appid = getenv("SteamAppId")) && *appid)
         snprintf(class_name, sizeof(class_name), "steam_app_%s", appid);
@@ -131,7 +120,6 @@ static void wayland_vk_proxy_init(void)
     p_XMapWindow(proxy_display, proxy_window);
     p_XSync(proxy_display, False);
 
-    TRACE("Created Steam overlay input proxy window %lx class %s\n", proxy_window, class_name);
     return;
 
 failed:
