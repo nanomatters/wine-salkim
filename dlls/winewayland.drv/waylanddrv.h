@@ -593,7 +593,6 @@ struct wayland_client_surface
     /* if true then the client surface has an alpha channel controlling transparency */
     LONG has_alpha;
     LONG has_presented;
-    LONG presentation_scaling;
     LONG attachment_generation;
     LONG updated_attachment_generation;
     struct list fullscreen_requests;
@@ -844,8 +843,6 @@ BOOL wayland_client_surface_finish_demotion(struct client_surface *client, HWND 
 void wayland_client_surface_release_vulkan_surface(struct client_surface *client,
                                                    UINT64 host_surface);
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
-void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *surface,
-                                                      struct wayland_win_data *data);
 BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
                                                 struct wayland_client_surface *client,
                                                 BOOL content_over_producer);

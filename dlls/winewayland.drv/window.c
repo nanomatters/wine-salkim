@@ -2481,9 +2481,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             wayland_client_surface_attach(data->client_surface, NULL);
     }
 
-    if (committed && wayland_surface)
-        wayland_client_surface_sync_presentation_scaling(wayland_surface, data);
-
     wayland_win_data_release(data);
 
     return committed;

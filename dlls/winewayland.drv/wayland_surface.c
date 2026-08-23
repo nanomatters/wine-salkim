@@ -167,7 +167,6 @@ static void wayland_surface_sync_shape_input_region(struct wayland_surface *surf
 void wayland_surface_sync_window_regions(struct wayland_surface *surface,
                                          struct window_surface *window_surface, DWORD exstyle)
 {
-    struct wayland_win_data *data;
     HRGN shape_region;
 
     assert(window_surface);
@@ -175,9 +174,6 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
     wayland_surface_sync_shape_input_region(surface, shape_region, exstyle);
     wayland_surface_set_region_constraints(surface, shape_region, window_surface->clip_region,
                                            window_surface->clip_producer);
-
-    if ((data = wayland_win_data_get_nolock(surface->hwnd)))
-        wayland_client_surface_sync_presentation_scaling(surface, data);
 }
 
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
@@ -3340,23 +3336,6 @@ BOOL wayland_client_surface_scales_presentation(struct wayland_surface *surface,
     return wayland_surface_is_toplevel(surface) &&
            wayland_surface_client_fills_window(surface) &&
            !wayland_surface_client_covers_presentation(surface);
-}
-
-void wayland_client_surface_sync_presentation_scaling(struct wayland_surface *surface,
-                                                      struct wayland_win_data *data)
-{
-    struct wayland_client_surface *client = data->client_surface;
-    BOOL scaled;
-
-    if (!client || !surface || surface->window.minimized) return;
-    if (ReadAcquire(&client->direct_toplevel)) return;
-
-    scaled = wayland_client_surface_scales_presentation(surface, client,
-                                                        data->content_over_producer);
-    if (ReadAcquire(&client->presentation_scaling) == scaled) return;
-
-    InterlockedExchange(&client->presentation_scaling, scaled);
-    client_surface_invalidate_presentation(&client->client);
 }
 
 static BOOL wayland_client_surface_should_stack_above_parent(struct wayland_surface *surface,
@@ -6566,7 +6545,8 @@ BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surfa
         changed = TRUE;
     }
 
-    if (changed) client_surface_invalidate_presentation(&client->client);
+    /* Retargeting does not replace the client wl_surface or host VkSurfaceKHR.
+     * Keep its swapchains valid while the normal state update applies it. */
     return changed;
 }
 
@@ -6944,8 +6924,6 @@ static BOOL wayland_client_surface_is_presentation_scaled(struct client_surface 
 
     ret = wayland_client_surface_scales_presentation(data->wayland_surface, surface,
                                                      data->content_over_producer);
-
-    InterlockedExchange(&surface->presentation_scaling, ret);
 
     wayland_win_data_release(data);
     return ret;
@@ -7803,15 +7781,9 @@ static BOOL wayland_client_surface_set_opaque_region(struct wayland_client_surfa
 void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    BOOL changed = InterlockedExchange(&surface->has_alpha, alpha) != alpha;
     BOOL opaque = !alpha;
-    struct wayland_win_data *data;
 
-    if (changed && (data = wayland_win_data_get(client->hwnd)))
-    {
-        wayland_client_surface_sync_presentation_scaling(data->wayland_surface, data);
-        wayland_win_data_release(data);
-    }
+    InterlockedExchange(&surface->has_alpha, alpha);
 
     /* Vulkan reports the aggregate state of its live swapchains. */
     if (surface->wl_surface)
