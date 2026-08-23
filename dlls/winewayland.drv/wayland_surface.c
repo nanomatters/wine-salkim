@@ -6513,13 +6513,15 @@ BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surfa
     struct wayland_output *output;
     RECT target_rect;
     BOOL changed = FALSE, follows_window = FALSE;
+    UINT64 active_owner = client->fullscreen_active_owner;
 
     if (IsRectEmpty(window_rect)) return FALSE;
 
     LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
                         struct wayland_fullscreen_request, entry)
     {
-        if (request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW)
+        if (request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW ||
+            request->owner == active_owner)
         {
             follows_window = TRUE;
             break;
@@ -6534,7 +6536,11 @@ BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surfa
     LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
                         struct wayland_fullscreen_request, entry)
     {
-        if (request->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW ||
+        /* A fixed request selects the initial output. Once acquired, moving
+         * its Win32 window retargets host presentation without replacing the
+         * VkSurfaceKHR or its swapchain. */
+        if ((request->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW &&
+             request->owner != active_owner) ||
             EqualRect(&request->rect, &target_rect))
             continue;
 
