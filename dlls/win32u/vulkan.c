@@ -5093,6 +5093,19 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     create_info_host.imageColorSpace = mapped_color_space;
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
+
+    /* DOOM Eternal and DOOM: The Dark Ages rely on an extra image to continue
+     * acquiring while an earlier image is still pending presentation. Request
+     * one when the application asks for exactly the surface minimum. */
+    if (capabilities.minImageCount < UINT32_MAX &&
+        create_info_host.minImageCount == capabilities.minImageCount &&
+        (!capabilities.maxImageCount || capabilities.minImageCount < capabilities.maxImageCount))
+    {
+        create_info_host.minImageCount = capabilities.minImageCount + 1;
+        TRACE( "Increasing host swapchain image count to %u for surface minimum %u\n",
+               create_info_host.minImageCount, capabilities.minImageCount );
+    }
+
     compositor_scaling = surface_is_presentation_scaled( surface );
 
     /* If the swapchain image size is not equal to the presentation size (e.g. because of DPI virtualization or
