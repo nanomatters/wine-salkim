@@ -265,21 +265,23 @@ static void syscall_frame_fixup_for_fastpath( struct syscall_frame *frame )
  *
  * Set the FPU context from a sigcontext.
  */
-static void save_fpu( CONTEXT *context, const ucontext_t *sigcontext )
+static BOOL save_fpu( NEON128 vregs[32], ULONG *fpcr, ULONG *fpsr, const ucontext_t *sigcontext )
 {
 #ifdef linux
     struct fpsimd_context *fp = get_fpsimd_context( sigcontext );
 
-    if (!fp) return;
-    context->ContextFlags |= CONTEXT_FLOATING_POINT;
-    context->Fpcr = fp->fpcr;
-    context->Fpsr = fp->fpsr;
-    memcpy( context->V, fp->vregs, sizeof(context->V) );
+    if (!fp) return FALSE;
+    *fpcr = fp->fpcr;
+    *fpsr = fp->fpsr;
+    memcpy( vregs, fp->vregs, 32 * sizeof(*vregs) );
+    return TRUE;
 #elif defined(__APPLE__)
-    context->ContextFlags |= CONTEXT_FLOATING_POINT;
-    context->Fpcr = sigcontext->uc_mcontext->__ns.__fpcr;
-    context->Fpsr = sigcontext->uc_mcontext->__ns.__fpsr;
-    memcpy( context->V, sigcontext->uc_mcontext->__ns.__v, sizeof(context->V) );
+    *fpcr = sigcontext->uc_mcontext->__ns.__fpcr;
+    *fpsr = sigcontext->uc_mcontext->__ns.__fpsr;
+    memcpy( vregs, sigcontext->uc_mcontext->__ns.__v, 32 * sizeof(*vregs) );
+    return TRUE;
+#else
+    return FALSE;
 #endif
 }
 
@@ -322,7 +324,8 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
     context->Pc   = PC_sig(sigcontext);     /* Program Counter */
     context->Cpsr = PSTATE_sig(sigcontext); /* Current State Register */
     for (i = 0; i <= 28; i++) context->X[i] = REGn_sig( i, sigcontext );
-    save_fpu( context, sigcontext );
+    if (save_fpu( context->V, &context->Fpcr, &context->Fpsr, sigcontext ))
+        context->ContextFlags |= CONTEXT_FLOATING_POINT;
 }
 
 
@@ -1363,6 +1366,31 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 }
 
 
+/***********************************************************************
+ *           save_syscall_entry_frame
+ *
+ * Save the syscall frame from the syscall dispatcher entry context.
+ */
+static void save_syscall_entry_frame( struct thread_data *data, ucontext_t *sigcontext )
+{
+    struct syscall_frame *frame = get_syscall_frame( data );
+    unsigned int i;
+
+    for (i = 18; i < 29; i++) frame->x[i] = REGn_sig( i, sigcontext );
+    frame->fp = FP_sig( sigcontext );
+    frame->lr = REGn_sig( 9, sigcontext );
+    frame->sp = SP_sig(sigcontext);
+    frame->pc = LR_sig(sigcontext);
+    frame->cpsr = PSTATE_sig(sigcontext);
+    frame->restore_flags = 0;
+    frame->syscall_id = REGn_sig( 8, sigcontext );
+    save_fpu( frame->v, &frame->fpcr, &frame->fpsr, sigcontext );
+
+    REGn_sig( 11, sigcontext ) = frame->sp;
+    SP_sig(sigcontext) = (ULONG_PTR)frame;
+}
+
+
 /**********************************************************************
  *		usr1_handler
  *
@@ -1375,11 +1403,39 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     CHPE_V2_CPU_AREA_INFO *chpe;
     CONTEXT context;
 
+    extern const ULONG_PTR __wine_syscall_dispatcher_kernel_stack_ptr;
+    extern const ULONG_PTR __wine_syscall_dispatcher_user_stack;
+    extern const ULONG_PTR __wine_unix_call_dispatcher_kernel_stack_ptr;
+    extern const ULONG_PTR __wine_unix_call_dispatcher_user_stack;
+
     if (!data->teb || data->system_thread)
     {
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
+        return;
     }
-    else if ((chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo) && chpe->SuspendDoorbell &&
+
+    /* if we're in a syscall dispatcher, but not yet on the syscall stack, construct
+     * the frame now from the signal context. */
+    if ((ULONG_PTR)__wine_syscall_dispatcher <= PC_sig(sigcontext) &&
+        PC_sig(sigcontext) < __wine_syscall_dispatcher_kernel_stack_ptr)
+    {
+        save_syscall_entry_frame( data, sigcontext );
+        PC_sig(sigcontext) = __wine_syscall_dispatcher_kernel_stack_ptr;
+    }
+    else if ((ULONG_PTR)__wine_unix_call_dispatcher <= PC_sig(sigcontext) &&
+        PC_sig(sigcontext) < __wine_unix_call_dispatcher_kernel_stack_ptr)
+    {
+        save_syscall_entry_frame( data, sigcontext );
+        PC_sig(sigcontext) = __wine_unix_call_dispatcher_kernel_stack_ptr;
+    }
+    else if (PC_sig(sigcontext) == __wine_syscall_dispatcher_user_stack ||
+        PC_sig(sigcontext) == __wine_unix_call_dispatcher_user_stack)
+    {
+        struct syscall_frame *frame = get_syscall_frame( data );
+        PC_sig(sigcontext) = frame->pc;
+    }
+
+    if ((chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo) && chpe->SuspendDoorbell &&
              (chpe->InSimulation || chpe->InSyscallCallback))
     {
         NTSTATUS status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_COOPERATIVE_SUSPEND,
@@ -1713,6 +1769,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI(".cfi_offset 26, -0x78\n\t")
                    __ASM_CFI(".cfi_offset 27, -0x70\n\t")
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_kernel_stack") ":\n\t"
                    "mov x22, sp\n\t"
                    __ASM_CFI_CFA_IS_AT2(x22, 0x98, 0x02) /* frame->syscall_cfa */
                    "and x20, x8, #0xfff\n\t"    /* syscall number */
@@ -1791,6 +1848,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "ldp x30, x17, [sp, #0xf0]\n\t"
                    /* switch to user stack */
                    "mov sp, x17\n\t"
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_user_stack") ":\n\t"
                    "ret x16\n"
 
                    __ASM_LOCAL_LABEL("trace_syscall") ":\n\t"
@@ -1865,6 +1923,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    __ASM_CFI(".cfi_offset 26, -0x78\n\t")
                    __ASM_CFI(".cfi_offset 27, -0x70\n\t")
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                   __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_kernel_stack") ":\n\t"
                    "mov x19, sp\n\t"
                    __ASM_CFI_CFA_IS_AT2(x19, 0x98, 0x02) /* frame->syscall_cfa */
                    "ldr x16, [x0, x1, lsl 3]\n\t"
@@ -1877,6 +1936,17 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
+                   __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_user_stack") ":\n\t"
                    "ret x17" )
+
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_kernel_stack_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_kernel_stack") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_user_stack"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_user_stack") )
+
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_kernel_stack_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_kernel_stack") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_user_stack"),
+                      __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_user_stack") )
 
 #endif  /* __aarch64__ */
