@@ -65,6 +65,7 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
 
 static const struct vulkan_driver_funcs *driver_funcs;
 static int fshack_enabled = -1;
+static LONG disable_driver_instance_layers;
 
 static void vulkan_driver_load(void);
 
@@ -841,7 +842,8 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
         return VK_ERROR_LAYER_NOT_PRESENT;
     }
 
-    if (driver_funcs->p_get_vulkan_instance_layers)
+    if (!ReadAcquire( &disable_driver_instance_layers ) &&
+        driver_funcs->p_get_vulkan_instance_layers)
         layer_count = driver_funcs->p_get_vulkan_instance_layers( &driver_layers );
     if (layer_count)
     {
@@ -1116,6 +1118,20 @@ static void parse_instance_extensions( struct vulkan_instance_extensions *extens
     if (next > str) add_instance_extension( str, next - str, extensions );
 }
 
+static VkResult create_host_instance( const VkInstanceCreateInfo *create_info,
+                                      const VkAllocationCallbacks *allocator,
+                                      const VkCreateInfoWineInstanceCallback *callback_info,
+                                      VkInstance *host_instance )
+{
+    if (callback_info)
+    {
+        PFN_vkCreateInstanceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
+        return callback( create_info, allocator, host_instance, p_vkGetInstanceProcAddr,
+                         (void *)(UINT_PTR)callback_info->context );
+    }
+    return p_vkCreateInstance( create_info, NULL /* allocator */, host_instance );
+}
+
 static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_create_info, const VkAllocationCallbacks *allocator,
                                          VkInstance *client_instance_ptr )
 {
@@ -1125,6 +1141,7 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
     struct vulkan_physical_device *physical_devices;
     struct mempool pool = {0};
     struct instance *instance;
+    uint32_t driver_layer_count;
     unsigned int i;
     VkResult res;
 
@@ -1144,12 +1161,24 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
     pthread_key_create(&instance->obj.transient_object_handle, free);
 
     if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
-    if ((callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext, VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK )))
+    driver_layer_count = create_info->enabledLayerCount;
+    callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext,
+                                     VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK );
+    res = create_host_instance( create_info, allocator, callback_info, &host_instance );
+    if (res && driver_layer_count)
     {
-        PFN_vkCreateInstanceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
-        if ((res = callback( create_info, allocator, &host_instance, p_vkGetInstanceProcAddr, (void *)(UINT_PTR)callback_info->context ))) goto failed;
+        WARN( "Optional Vulkan instance layers failed with %d, retrying without them.\n", res );
+        create_info->enabledLayerCount = 0;
+        create_info->ppEnabledLayerNames = NULL;
+        host_instance = VK_NULL_HANDLE;
+        res = create_host_instance( create_info, allocator, callback_info, &host_instance );
+        if (!res)
+        {
+            InterlockedExchange( &disable_driver_instance_layers, TRUE );
+            WARN( "Vulkan instance created without optional driver layers.\n" );
+        }
     }
-    else if ((res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance ))) goto failed;
+    if (res) goto failed;
 
     vulkan_object_init_ptr( &instance->obj.obj, (UINT_PTR)host_instance, &client_instance->obj );
     instance->obj.p_insert_object = vulkan_instance_insert_object;

@@ -107,7 +107,10 @@ static VkResult wayland_vulkan_create_host_surface(const struct vulkan_instance 
 
     if (wayland_vulkan_steam_overlay_enabled() &&
         wayland_vulkan_proxy_create_surface(instance, wl_surface, host_surface, &res))
-        return res;
+    {
+        if (res == VK_SUCCESS) return res;
+        WARN("Steam overlay surface translation failed with %d, using Wayland directly.\n", res);
+    }
 
     return instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info_host,
                                                  NULL /* allocator */, host_surface);
@@ -420,14 +423,14 @@ static UINT wayland_get_vulkan_instance_layers(const char *const **layers)
 #if defined(__x86_64__)
     static const char *const names[] =
     {
-        "VK_LAYER_VALVE_steam_overlay_64",
         "VK_LAYER_WINELAND_translate_x86_64",
+        "VK_LAYER_MANGOHUD_overlay_x86_64",
     };
 #elif defined(__i386__)
     static const char *const names[] =
     {
-        "VK_LAYER_VALVE_steam_overlay_32",
         "VK_LAYER_WINELAND_translate_i386",
+        "VK_LAYER_MANGOHUD_overlay_x86",
     };
 #else
     (void)layers;
@@ -435,9 +438,19 @@ static UINT wayland_get_vulkan_instance_layers(const char *const **layers)
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
+    const char *mangohud;
+
     if (!wayland_vulkan_steam_overlay_enabled()) return 0;
+    mangohud = getenv("MANGOHUD");
+    if (mangohud && !strcmp(mangohud, "1"))
+    {
+        /* MangoHud must follow the translation layer to observe the real
+         * Wayland surface instead of Steam's Xlib proxy. */
+        *layers = names;
+        return ARRAY_SIZE(names);
+    }
     *layers = names;
-    return ARRAY_SIZE(names);
+    return ARRAY_SIZE(names) - 1;
 #endif
 }
 
