@@ -426,11 +426,8 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         frame->sp    = context->Sp;
         frame->pc    = context->Pc;
         frame->cpsr  = context->Cpsr;
-        if (is_arm64ec())
-        {
-            if (!is_ec_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
-            else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
-        }
+        if (is_emulated_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
+        else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
     }
     if (flags & CONTEXT_FLOATING_POINT)
     {
@@ -1405,7 +1402,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         save_context( &context, sigcontext );
         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         wait_suspend( &context );
-        if (is_arm64ec() && !is_ec_code( context.Pc ))
+        if (is_emulated_code( context.Pc ))
         {
             CONTEXT *user_context = (CONTEXT *)((context.Sp - sizeof(CONTEXT)) & ~15);
 
@@ -1435,7 +1432,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
     if (!frame) return;
 
-    if (is_arm64ec() && !is_ec_code( frame->pc ))
+    if (is_emulated_code( frame->pc ))
     {
         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
 

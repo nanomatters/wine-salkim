@@ -348,6 +348,7 @@ extern void virtual_fill_image_information( const struct pe_image_info *pe_info,
                                             SECTION_IMAGE_INFORMATION *info );
 extern void *get_builtin_so_handle( void *module );
 extern NTSTATUS set_builtin_unixlib_name( void *module, const char *name );
+extern BOOL is_emulated_code( ULONG_PTR ptr );
 
 extern NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *info, ULONG len );
 extern void *get_native_context( CONTEXT *context );
@@ -503,13 +504,6 @@ static inline BOOL is_inside_syscall( struct thread_data *data, ULONG_PTR sp )
     if (!data->teb || data->system_thread) return TRUE;
     return ((char *)sp >= (char *)get_kernel_stack( data ) &&
             (char *)sp <= (char *)get_syscall_frame( data ));
-}
-
-static inline BOOL is_ec_code( ULONG_PTR ptr )
-{
-    const UINT64 *map = (const UINT64 *)peb->EcCodeBitMap;
-    ULONG_PTR page = ptr / page_size;
-    return (map[page / 64] >> (page & 63)) & 1;
 }
 
 static inline void mutex_lock( pthread_mutex_t *mutex )
