@@ -1355,7 +1355,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     RECT application_fullscreen_rect = {0};
     BOOL use_layer_shell = FALSE;
 
-    if (hwnd == root && (style & WS_VISIBLE) &&
+    /* Infer application fullscreen only when win32u has not supplied fullscreen intent. */
+    if (!fullscreen && hwnd == root && (style & WS_VISIBLE) &&
         !(style & WS_MINIMIZE) && !(swp_flags & SWP_HIDEWINDOW) &&
         wayland_window_style_allows_fullscreen(style))
     {
