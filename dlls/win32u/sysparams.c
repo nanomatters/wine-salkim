@@ -2325,13 +2325,18 @@ static UINT add_screen_size( SIZE *sizes, UINT count, SIZE size )
 
 static UINT add_virtual_mode( DEVMODEW *modes, UINT count, const DEVMODEW *mode, BOOL center )
 {
-    TRACE( "adding %s\n", debugstr_devmodew(mode) );
-    modes[count++] = *mode;
+    /* Keep the default presentation policy internal to the synthetic mode. */
+    modes[count] = *mode;
+    modes[count].dmFields |= DM_DISPLAYFIXEDOUTPUT;
+    modes[count].dmDisplayFixedOutput = DMDFO_STRETCH;
+    TRACE( "adding %s\n", debugstr_devmodew(&modes[count]) );
+    count++;
     if (!center) return 1;
 
     modes[count] = *mode;
     modes[count].dmFields |= DM_DISPLAYFIXEDOUTPUT;
     modes[count].dmDisplayFixedOutput = DMDFO_CENTER;
+    TRACE( "adding %s\n", debugstr_devmodew(&modes[count]) );
     return 2;
 }
 
@@ -2690,24 +2695,42 @@ static BOOL is_monitor_primary( struct monitor *monitor )
 }
 
 /* display_lock must be held */
-static void monitor_virt_to_raw_ratio( struct monitor *monitor, UINT *num, UINT *den )
+static void monitor_virt_to_raw_ratios( struct monitor *monitor, UINT num[2], UINT den[2] )
 {
     struct source *source = monitor->source;
+    UINT aspect_num, aspect_den;
 
-    *num = *den = 1;
+    num[0] = num[1] = den[0] = den[1] = 1;
     if (!source) return;
+
+    /* Explicit fixed-output modes define their transform. Adapter-default modes preserve aspect ratio. */
+    if ((source->current.dmFields & DM_DISPLAYFIXEDOUTPUT) &&
+        source->current.dmDisplayFixedOutput == DMDFO_STRETCH)
+    {
+        num[0] = source->physical.dmPelsWidth;
+        den[0] = source->current.dmPelsWidth;
+        num[1] = source->physical.dmPelsHeight;
+        den[1] = source->current.dmPelsHeight;
+        return;
+    }
+
+    if ((source->current.dmFields & DM_DISPLAYFIXEDOUTPUT) &&
+        source->current.dmDisplayFixedOutput == DMDFO_CENTER)
+        return;
 
     if (source->physical.dmPelsWidth * source->current.dmPelsHeight <=
         source->physical.dmPelsHeight * source->current.dmPelsWidth)
     {
-        *num = source->physical.dmPelsWidth;
-        *den = source->current.dmPelsWidth;
+        aspect_num = source->physical.dmPelsWidth;
+        aspect_den = source->current.dmPelsWidth;
     }
     else
     {
-        *num = source->physical.dmPelsHeight;
-        *den = source->current.dmPelsHeight;
+        aspect_num = source->physical.dmPelsHeight;
+        aspect_den = source->current.dmPelsHeight;
     }
+    num[0] = num[1] = aspect_num;
+    den[0] = den[1] = aspect_den;
 }
 
 static UINT64 gcd( UINT64 a, UINT64 b )
@@ -2847,7 +2870,7 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
     {
         double points[4] = {rect.left, rect.top, rect.right, rect.bottom}, from[2], to[2];
         DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)}, physical_mode;
-        UINT num, den, dpi;
+        UINT num[2], den[2], dpi;
 
         source_get_current_settings( monitor->source, &current_mode );
         physical_mode = monitor->source->physical;
@@ -2858,7 +2881,7 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
 
         if (type_from == MDT_RAW_DPI || type_from == MDT_WINE_RAW_DPI)
         {
-            monitor_virt_to_raw_ratio( monitor, &den, &num );
+            monitor_virt_to_raw_ratios( monitor, den, num );
             from[0] = physical_mode.dmPosition.x + physical_mode.dmPelsWidth / 2.0;
             from[1] = physical_mode.dmPosition.y + physical_mode.dmPelsHeight / 2.0;
             to[0] = current_mode.dmPosition.x + current_mode.dmPelsWidth / 2.0;
@@ -2866,7 +2889,7 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
         }
         else
         {
-            monitor_virt_to_raw_ratio( monitor, &num, &den );
+            monitor_virt_to_raw_ratios( monitor, num, den );
             from[0] = current_mode.dmPosition.x + current_mode.dmPelsWidth / 2.0;
             from[1] = current_mode.dmPosition.y + current_mode.dmPelsHeight / 2.0;
             to[0] = physical_mode.dmPosition.x + physical_mode.dmPelsWidth / 2.0;
@@ -2877,7 +2900,7 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
         {
             points[i] *= (double)dpi / dpi_from;
             points[i] -= from[i & 1];
-            points[i] *= (double)num / den;
+            points[i] *= (double)num[i & 1] / den[i & 1];
             points[i] += to[i & 1];
             points[i] *= (double)dpi_to / dpi;
             points[i] = roundf( points[i] );
@@ -5060,6 +5083,11 @@ static BOOL source_enum_display_settings( const struct source *source, UINT inde
         if (!i--)
         {
             memcpy( &devmode->dmFields, &source_mode->dmFields, offsetof(DEVMODEW, dmICMMethod) - FIELD_OFFSET(DEVMODEW, dmFields) );
+            /* Stretch is Wine's default for synthetic modes, not an
+             * application-visible mode attribute. */
+            if ((devmode->dmFields & DM_DISPLAYFIXEDOUTPUT) &&
+                devmode->dmDisplayFixedOutput == DMDFO_STRETCH)
+                devmode->dmFields &= ~DM_DISPLAYFIXEDOUTPUT;
             devmode->dmDisplayFlags &= ~WINE_DM_UNSUPPORTED;
             return TRUE;
         }
