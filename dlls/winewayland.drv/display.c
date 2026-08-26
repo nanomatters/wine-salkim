@@ -155,63 +155,48 @@ static BOOL output_info_array_resolve_overlaps(struct wl_array *output_info_arra
     return found_overlap;
 }
 
-static void output_info_array_zero_primary(struct wl_array *output_info_array)
+static void output_info_array_set_origin(struct wl_array *output_info_array,
+                                         const struct output_info *origin)
 {
-    const char *env = getenv("WAYLANDDRV_PRIMARY_MONITOR");
-    int x_offset = 0, y_offset = 0;
+    int x_offset = origin->x, y_offset = origin->y;
     struct output_info *info;
-    UINT64 max_score = 0;
-    int count = 0;
-
-    if (env)
-    {
-        wl_array_for_each(info, output_info_array)
-        {
-            if (!strcmp(info->output->name, env))
-            {
-                x_offset = info->x;
-                y_offset = info->y;
-                count++;
-            }
-        }
-
-        if (count > 1)
-        {
-            x_offset = 0;
-            y_offset = 0;
-            ERR("More than one output with name %s\n", debugstr_a(env));
-        }
-        else if (count == 0)
-        {
-            ERR("Could not find output %s\n", debugstr_a(env));
-        }
-    }
-    else
-    {
-        /* rank monitors by bandwidth */
-        wl_array_for_each(info, output_info_array)
-        {
-            struct wayland_output_mode *mode = info->output->current_mode;
-            UINT64 score = (UINT64)mode->height *
-                        (UINT64)mode->width * ((UINT64)(mode->refresh + 500) / 1000)
-                        - (INT64)(info->output->logical_x / 100)
-                        - (INT64)(info->output->logical_y / 100)
-                        + (UINT64)info->output->max_cll;
-
-            if (score > max_score)
-            {
-                x_offset = info->x;
-                y_offset = info->y;
-                max_score = score;
-            }
-        }
-    }
 
     wl_array_for_each(info, output_info_array)
     {
         info->x -= x_offset;
         info->y -= y_offset;
     }
+}
+
+static void output_info_array_apply_primary_override(struct wl_array *output_info_array)
+{
+    const char *env = getenv("WAYLANDDRV_PRIMARY_MONITOR");
+    struct output_info *info, *primary = NULL;
+    int count = 0;
+
+    if (!env) return;
+
+    wl_array_for_each(info, output_info_array)
+    {
+        if (!strcmp(info->output->name, env))
+        {
+            primary = info;
+            count++;
+        }
+    }
+
+    if (count > 1)
+    {
+        ERR("More than one output with name %s\n", debugstr_a(env));
+        return;
+    }
+    if (!count)
+    {
+        ERR("Could not find output %s\n", debugstr_a(env));
+        return;
+    }
+
+    output_info_array_set_origin(output_info_array, primary);
 }
 
 static void output_info_array_arrange_physical_coords(struct wl_array *output_info_array)
@@ -233,13 +218,16 @@ static void output_info_array_arrange_physical_coords(struct wl_array *output_in
            ++steps < num_outputs)
         continue;
 
-    /* places the primary output at 0,0 and offsets the other outputs accordingly */
-    output_info_array_zero_primary(output_info_array);
+    /* Apply only an explicit primary override. */
+    output_info_array_apply_primary_override(output_info_array);
 
-    /* Now that we have our physical pixel coordinates, sort from physical left
-     * to right, but ensure the primary output is first. */
+    /* Prefer the compositor origin, then follow the layout order. */
     qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
           output_info_cmp_primary_x_y);
+
+    /* Keep every output consumer in the primary-relative Windows space. */
+    if (num_outputs)
+        output_info_array_set_origin(output_info_array, output_info_array->data);
 }
 
 static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,
