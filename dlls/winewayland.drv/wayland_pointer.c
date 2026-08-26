@@ -449,7 +449,7 @@ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
         relative.mi.dy = round(frame->dy);
         frame->dx -= relative.mi.dx;
         frame->dy -= relative.mi.dy;
-        have_relative = relative.mi.dx || relative.mi.dy;
+        have_relative = pointer->relative_mode && (relative.mi.dx || relative.mi.dy);
 
         raw.mi.dwFlags = MOUSEEVENTF_MOVE;
         raw.mi.dx = round(frame->dx_raw);
