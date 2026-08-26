@@ -658,6 +658,8 @@ static void queue_owned_overlay_updates(HWND owner)
     }
 }
 
+static void wayland_surface_update_state_toplevel(struct wayland_surface *surface);
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
                                                     struct wayland_surface *owner_surface,
@@ -665,7 +667,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                                                     struct window_surface *window_surface,
                                                     BOOL has_menu_popup_owner,
                                                     BOOL owned_overlay,
-                                                    BOOL foreground)
+                                                    BOOL foreground,
+                                                    BOOL *initial_state_committed)
 {
     struct wayland_client_surface *client = data->client_surface;
     struct wayland_surface *parent_surface, *surface;
@@ -676,6 +679,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     DWORD style = data->style;
 
     TRACE("hwnd=%p\n", data->hwnd);
+
+    *initial_state_committed = FALSE;
 
     surface = data->wayland_surface;
 
@@ -802,8 +807,16 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         wayland_surface_make_subsurface(surface, toplevel_surface);
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
-        wayland_surface_make_toplevel(surface, server_decor, data->owner,
-                                      data->window_text ? data->window_text : emptyW);
+        if (wayland_surface_make_toplevel(surface, server_decor, data->owner,
+                                          data->window_text ? data->window_text : emptyW))
+        {
+            /* Send initial state before the empty commit that requests the
+             * first configure. */
+            wayland_surface_update_state_toplevel(surface);
+            wayland_surface_commit(surface);
+            wl_display_flush(process_wayland.wl_display);
+            *initial_state_committed = TRUE;
+        }
         break;
     }
 
@@ -1337,6 +1350,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
     RECT present_rect = {0};
     BOOL has_present_rect;
+    BOOL initial_state_committed = FALSE;
     BOOL application_fullscreen = FALSE;
     RECT application_fullscreen_rect = {0};
     BOOL use_layer_shell = FALSE;
@@ -1469,9 +1483,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
                                                      use_layer_shell, surface,
                                                      menu_popup_owner != NULL, owned_overlay,
-                                                     foreground))
+                                                     foreground, &initial_state_committed))
     {
-        wayland_win_data_update_wayland_state(data);
+        if (!initial_state_committed) wayland_win_data_update_wayland_state(data);
     }
 
     if (overlay_owner) refresh_owned_overlays(overlay_owner, FALSE);

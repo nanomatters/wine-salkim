@@ -2049,7 +2049,7 @@ void wayland_surface_sync_alpha(struct wayland_surface *surface)
  *
  * Gives the toplevel role to a plain wayland surface.
  */
-void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
+BOOL wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
                                    HWND owner, LPCWSTR title)
 {
     static char steam_proton[] = "steam_proton";
@@ -2062,7 +2062,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
 
     if (surface->xdg_surface && surface->xdg_toplevel)
     {
-        if (!process_wayland.zxdg_decoration_manager_v1) return;
+        if (!process_wayland.zxdg_decoration_manager_v1) return FALSE;
 
         if (!server_decor && surface->zxdg_toplevel_decoration_v1)
         {
@@ -2076,10 +2076,10 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
         wayland_surface_commit_pending_state(surface);
         wl_display_flush(process_wayland.wl_display);
 
-        return;
+        return FALSE;
     }
 
-    if (!wayland_surface_clear_role(surface)) return;
+    if (!wayland_surface_clear_role(surface)) return FALSE;
     surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
 
     surface->xdg_surface =
@@ -2124,14 +2124,13 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_
 
     if (server_decor) wayland_surface_init_decoration(surface);
 
-    wayland_surface_commit(surface);
-    wl_display_flush(process_wayland.wl_display);
-
-    return;
+    /* The caller must apply initial toplevel state before committing. */
+    return TRUE;
 
 err:
     wayland_surface_clear_role(surface);
     ERR("Failed to assign toplevel role to wayland surface\n");
+    return FALSE;
 }
 
 /**********************************************************************

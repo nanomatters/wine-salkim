@@ -755,7 +755,7 @@ enum wayland_image_description_status wayland_color_manager_get_image_descriptio
 unsigned long long wayland_time_ms(void);
 struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flags);
 void wayland_surface_destroy(struct wayland_surface *surface);
-void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
+BOOL wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
                                    HWND owner, LPCWSTR title);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
