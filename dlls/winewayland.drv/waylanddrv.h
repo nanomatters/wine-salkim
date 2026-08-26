@@ -465,6 +465,7 @@ struct wayland_output
 struct output_info
 {
     int x, y;
+    BOOL is_primary;
     struct wayland_output_state *output;
 };
 

@@ -40,11 +40,9 @@ static int output_info_cmp_primary_x_y(const void *va, const void *vb)
 {
     const struct output_info *a = va;
     const struct output_info *b = vb;
-    BOOL a_is_primary = a->x == 0 && a->y == 0;
-    BOOL b_is_primary = b->x == 0 && b->y == 0;
 
-    if (a_is_primary && !b_is_primary) return -1;
-    if (!a_is_primary && b_is_primary) return 1;
+    if (a->is_primary && !b->is_primary) return -1;
+    if (!a->is_primary && b->is_primary) return 1;
     if (a->x < b->x) return -1;
     if (a->x > b->x) return 1;
     if (a->y < b->y) return -1;
@@ -168,35 +166,42 @@ static void output_info_array_set_origin(struct wl_array *output_info_array,
     }
 }
 
-static void output_info_array_apply_primary_override(struct wl_array *output_info_array)
+static void output_info_array_select_primary(struct wl_array *output_info_array)
 {
     const char *env = getenv("WAYLANDDRV_PRIMARY_MONITOR");
     struct output_info *info, *primary = NULL;
     int count = 0;
 
-    if (!env) return;
+    /* Wayland has no primary-output state. Use an explicit override or the
+     * output at the compositor's logical origin. */
+    if (env && *env)
+    {
+        wl_array_for_each(info, output_info_array)
+        {
+            if (!strcmp(info->output->name, env))
+            {
+                primary = info;
+                count++;
+            }
+        }
+
+        if (count == 1)
+        {
+            primary->is_primary = TRUE;
+            return;
+        }
+        if (count > 1)
+            ERR("More than one output with name %s\n", debugstr_a(env));
+        else
+            ERR("Could not find output %s\n", debugstr_a(env));
+    }
 
     wl_array_for_each(info, output_info_array)
     {
-        if (!strcmp(info->output->name, env))
-        {
-            primary = info;
-            count++;
-        }
-    }
-
-    if (count > 1)
-    {
-        ERR("More than one output with name %s\n", debugstr_a(env));
+        if (info->output->logical_x || info->output->logical_y) continue;
+        info->is_primary = TRUE;
         return;
     }
-    if (!count)
-    {
-        ERR("Could not find output %s\n", debugstr_a(env));
-        return;
-    }
-
-    output_info_array_set_origin(output_info_array, primary);
 }
 
 static void output_info_array_arrange_physical_coords(struct wl_array *output_info_array)
@@ -210,6 +215,7 @@ static void output_info_array_arrange_physical_coords(struct wl_array *output_in
     {
         info->x = info->output->logical_x;
         info->y = info->output->logical_y;
+        info->is_primary = FALSE;
     }
 
     /* Try to iteratively resolve overlaps, but be defensive and set an upper
@@ -218,10 +224,9 @@ static void output_info_array_arrange_physical_coords(struct wl_array *output_in
            ++steps < num_outputs)
         continue;
 
-    /* Apply only an explicit primary override. */
-    output_info_array_apply_primary_override(output_info_array);
+    output_info_array_select_primary(output_info_array);
 
-    /* Prefer the compositor origin, then follow the layout order. */
+    /* Enumerate the selected primary first, then follow the layout order. */
     qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
           output_info_cmp_primary_x_y);
 
