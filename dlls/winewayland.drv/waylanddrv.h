@@ -980,6 +980,9 @@ void wayland_win_data_release(struct wayland_win_data *data);
 BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data);
 BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
                                           BOOL active, RECT *rect);
+/* Returns TRUE when rect was filled with host presentation geometry. */
+BOOL wayland_win_data_get_presentation_rect(const struct wayland_win_data *data,
+                                            BOOL active, RECT *rect);
 BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data);
 void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data);
 

@@ -552,14 +552,14 @@ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
     {
         HWND hwnd = UlongToHandle( desc->hContext );
         RECT *rect = desc->pPrivateDriverData;
-        UINT dpi = get_dpi_for_window( hwnd );
+        UINT dpi = get_thread_dpi();
         WND *win;
 
         if (desc->PrivateDriverDataSize != sizeof(*rect)) return STATUS_INVALID_PARAMETER;
 
         TRACE( "hwnd %p, rect %s\n", hwnd, wine_dbgstr_rect( rect ) );
         if (!(win = get_win_ptr( hwnd ))) return STATUS_INVALID_PARAMETER;
-        win->present_rect = map_dpi_rect( *rect, get_thread_dpi(), dpi );
+        win->present_rect = IsRectEmpty( rect ) ? *rect : map_rect_virt_to_raw( *rect, dpi );
         release_win_ptr( win );
 
         return STATUS_SUCCESS;

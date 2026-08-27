@@ -2401,7 +2401,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     BOOL shaped, needs_surface, create_opaque, is_layered, is_child;
     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
     struct window_surface *new_surface;
-    struct window_rects monitor_rects, presentation_rects;
+    struct window_rects monitor_rects;
     UINT raw_dpi, style, ex_style;
     DWORD layered_flags;
     RECT dummy, presentation_rect;
@@ -2419,11 +2419,9 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if ((shaped = !!shape)) NtGdiDeleteObjectApp( shape );
 
     /* Keep presentation geometry separate from the HWND geometry used for input. */
-    presentation_rects = *rects;
     has_present_rect = get_present_rect( hwnd, &presentation_rect, get_thread_dpi() );
-    presentation_rects.visible = has_present_rect ? presentation_rect : rects->window;
-    if (is_child) monitor_rects = map_dpi_window_rects( presentation_rects, get_thread_dpi(), raw_dpi );
-    else monitor_rects = map_window_rects_virt_to_raw( presentation_rects, get_thread_dpi() );
+    if (is_child) monitor_rects = map_dpi_window_rects( *rects, get_thread_dpi(), raw_dpi );
+    else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
     else if (is_child) needs_surface = FALSE;
@@ -2611,11 +2609,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         if (is_child) monitor_rects = map_dpi_window_rects( *new_rects, dpi, raw_dpi );
         else if (!IsRectEmpty( &win->present_rect ))
         {
-            MONITORINFO monitor_info = monitor_info_from_rect( new_rects->window, dpi );
-            struct window_rects rects = { monitor_info.rcMonitor, monitor_info.rcMonitor, monitor_info.rcMonitor };
             swp_flags |= WINE_SWP_FULLSCREEN;
             swp_flags &= ~WINE_SWP_RESIZABLE;
-            monitor_rects = map_window_rects_virt_to_raw( rects, dpi );
+            monitor_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
         }
         else
         {
@@ -6529,12 +6525,10 @@ static BOOL set_raw_window_pos( HWND hwnd, RECT rect, UINT flags, BOOL internal 
 
 BOOL get_present_rect( HWND hwnd, RECT *rect, UINT dpi )
 {
-    UINT dpi_from = get_dpi_for_window( hwnd );
     WND *win;
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return FALSE;
-    if (dpi != -1) *rect = map_dpi_rect( win->present_rect, dpi_from, dpi );
-    else *rect = map_rect_virt_to_raw( win->present_rect, dpi_from );
+    *rect = dpi == -1 ? win->present_rect : map_rect_raw_to_virt( win->present_rect, dpi );
     release_win_ptr( win );
 
     return !IsRectEmpty( rect );

@@ -44,6 +44,7 @@
 #include "wine/vulkan.h"
 #include "wine/wgl.h"
 #include "wine/test.h"
+#include "ntuser.h"
 
 #define D3DUSAGE_SURFACE    0x8000000
 #define D3DUSAGE_LOCKABLE   0x4000000
@@ -6730,10 +6731,31 @@ skip_tests:
     DestroyWindow( hwnd );
 }
 
-static void test_escape(void)
+struct monitor_rects
 {
+    RECT rects[2];
+    unsigned int count;
+};
+
+static BOOL CALLBACK collect_monitor_rects( HMONITOR monitor, HDC hdc, RECT *rect, LPARAM lparam )
+{
+    struct monitor_rects *monitors = (struct monitor_rects *)lparam;
+    unsigned int i;
+
+    for (i = 0; i < monitors->count; ++i)
+        if (EqualRect( &monitors->rects[i], rect )) return TRUE;
+    if (monitors->count == ARRAY_SIZE(monitors->rects)) return FALSE;
+    monitors->rects[monitors->count++] = *rect;
+    return TRUE;
+}
+
+static void test_present_rect_escape(void)
+{
+    struct monitor_rects monitors = {0};
     D3DKMT_ESCAPE escape = {0};
-    RECT rect = {0};
+    RECT rect = {0}, raw_rect, result, window_rect, expected;
+    HWND hwnd;
+    NTSTATUS status;
 
     todo_wine ok_nt( STATUS_INVALID_PARAMETER, D3DKMTEscape( &escape ) );
 
@@ -6746,6 +6768,47 @@ static void test_escape(void)
     escape.pPrivateDriverData = (void *)&rect;
     escape.hContext = 0x1eadbeed;
     ok_nt( STATUS_INVALID_PARAMETER, D3DKMTEscape( &escape ) );
+
+    hwnd = CreateWindowW( L"static", NULL, WS_POPUP, 0, 0, 1, 1, NULL, NULL, NULL, NULL );
+    ok( !!hwnd, "CreateWindowW failed, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    EnumDisplayMonitors( NULL, NULL, collect_monitor_rects, (LPARAM)&monitors );
+    if (monitors.count < 2)
+    {
+        skip( "A second monitor is required for present rectangle movement tests\n" );
+        DestroyWindow( hwnd );
+        return;
+    }
+
+    escape.hContext = HandleToUlong( hwnd );
+    escape.pPrivateDriverData = &monitors.rects[0];
+    status = D3DKMTEscape( &escape );
+    if (status)
+    {
+        win_skip( "D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE is unavailable, status %#lx\n", status );
+        DestroyWindow( hwnd );
+        return;
+    }
+    ok( NtUserGetPresentRect( hwnd, &raw_rect, -1 ), "Expected a presentation rectangle\n" );
+
+    SetRect( &expected, monitors.rects[1].left, monitors.rects[1].top,
+             monitors.rects[1].left + 17, monitors.rects[1].top + 19 );
+    ok( MoveWindow( hwnd, expected.left, expected.top,
+                    expected.right - expected.left, expected.bottom - expected.top, FALSE ),
+        "MoveWindow failed, error %lu\n", GetLastError() );
+    ok( GetWindowRect( hwnd, &window_rect ), "GetWindowRect failed, error %lu\n", GetLastError() );
+    ok( EqualRect( &window_rect, &expected ), "Expected HWND %s, got %s\n",
+        wine_dbgstr_rect( &expected ), wine_dbgstr_rect( &window_rect ) );
+    ok( NtUserGetPresentRect( hwnd, &result, -1 ), "Expected a presentation rectangle\n" );
+    ok( EqualRect( &result, &raw_rect ), "Expected fixed presentation %s, got %s\n",
+        wine_dbgstr_rect( &raw_rect ), wine_dbgstr_rect( &result ) );
+
+    SetRectEmpty( &rect );
+    escape.pPrivateDriverData = &rect;
+    ok_nt( STATUS_SUCCESS, D3DKMTEscape( &escape ) );
+    ok( !NtUserGetPresentRect( hwnd, &result, -1 ), "Expected no presentation rectangle\n" );
+    DestroyWindow( hwnd );
 }
 
 START_TEST( d3dkmt )
@@ -6781,5 +6844,5 @@ START_TEST( d3dkmt )
     test_D3DKMTShareObjects();
     test_shared_resources();
     test_shared_fences();
-    test_escape();
+    test_present_rect_escape();
 }

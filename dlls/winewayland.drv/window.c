@@ -342,6 +342,37 @@ BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
     return TRUE;
 }
 
+BOOL wayland_win_data_get_presentation_rect(const struct wayland_win_data *data,
+                                            BOOL active, RECT *rect)
+{
+    struct wayland_output *output;
+    RECT target_rect = {0};
+    BOOL fullscreen = wayland_win_data_get_fullscreen_rect(data, active, &target_rect);
+
+    if (!data->has_present_rect)
+    {
+        if (fullscreen) *rect = target_rect;
+        return fullscreen;
+    }
+
+    /* A Vulkan fullscreen request selects its output directly. Otherwise use
+     * the output selected by the HWND, while keeping the D3DKMT request intact. */
+    if (fullscreen)
+    {
+        *rect = target_rect;
+        return TRUE;
+    }
+    if (!IsRectEmpty(&data->rects.client) &&
+        (output = wayland_output_for_rect(&data->rects.client, rect, NULL)))
+    {
+        wayland_output_release(output);
+        return TRUE;
+    }
+
+    *rect = data->present_rect;
+    return TRUE;
+}
+
 static BOOL wayland_win_data_has_fixed_fullscreen_size(const struct wayland_win_data *data)
 {
     RECT rect;
@@ -412,7 +443,7 @@ BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
     RECT intersection, virtual_screen = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
     RECT rect = data->rects.client;
 
-    wayland_win_data_get_fullscreen_rect(data, TRUE, &rect);
+    wayland_win_data_get_presentation_rect(data, TRUE, &rect);
 
     intersect_rect(&intersection, &rect, &virtual_screen);
     return EqualRect(&intersection, &virtual_screen);
@@ -437,7 +468,9 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
 {
     enum wayland_surface_config_state window_state = 0;
     DWORD style = data->style, exstyle = data->exstyle;
-    RECT fullscreen_rect;
+    RECT presentation_rect, fullscreen_rect;
+    BOOL has_presentation_rect =
+        wayland_win_data_get_presentation_rect(data, TRUE, &presentation_rect);
     BOOL application_fullscreen =
         wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect);
     BOOL fullscreen = wayland_win_data_is_fullscreen(data);
@@ -446,11 +479,11 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     /* The Win32 iconic rect is not compositor geometry. */
     if (!conf->minimized)
     {
-        if (application_fullscreen)
+        if (has_presentation_rect)
         {
-            conf->rect = fullscreen_rect;
-            conf->window_rect = fullscreen_rect;
-            conf->client_rect = fullscreen_rect;
+            conf->rect = presentation_rect;
+            conf->window_rect = presentation_rect;
+            conf->client_rect = presentation_rect;
         }
         else
         {
@@ -460,7 +493,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         }
 
         /* Keep framed fullscreen extents out of the Wayland geometry. */
-        if (!application_fullscreen && fullscreen &&
+        if (!has_presentation_rect && fullscreen &&
             (style & (WS_CAPTION | WS_THICKFRAME)))
         {
             conf->rect = data->rects.client;

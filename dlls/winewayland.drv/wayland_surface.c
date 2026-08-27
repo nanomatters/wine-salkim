@@ -6272,18 +6272,12 @@ static void wayland_surface_get_input_transform(struct wayland_surface *surface,
 
     fullscreen = data && wayland_win_data_get_fullscreen_rect(data, TRUE,
                                                               &fullscreen_rect);
-    if (data && data->has_present_rect && !IsRectEmpty(&data->present_rect) &&
-        (fullscreen || !IsRectEmpty(&data->rects.client)))
+    if (data && !IsRectEmpty(&data->rects.client) &&
+        (fullscreen || data->has_present_rect))
     {
-        const RECT *target = fullscreen ? &fullscreen_rect : &data->rects.client;
-
-        /* The target selects the output while the present rect defines its Win32 extent. */
-        SetRect(&transform->screen, target->left, target->top,
-                target->left + data->present_rect.right - data->present_rect.left,
-                target->top + data->present_rect.bottom - data->present_rect.top);
-    }
-    else if (fullscreen && !IsRectEmpty(&data->rects.client))
+        /* Input remains in HWND client space while the present rectangle controls display. */
         transform->screen = data->rects.client;
+    }
     else
     {
         transform->screen = surface->window.rect;
@@ -6889,7 +6883,7 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     struct wayland_surface *toplevel_surface;
     struct wayland_win_data *data;
-    RECT fullscreen_rect;
+    RECT presentation_rect;
     BOOL ret = FALSE;
 
     if (!ReadAcquire(&surface->direct_toplevel)) return FALSE;
@@ -6899,10 +6893,10 @@ static BOOL wayland_client_surface_get_presentation_rects(struct client_surface 
         toplevel_surface->direct_client == surface &&
         surface->direct_wl_surface == toplevel_surface->wl_surface)
     {
-        if (wayland_win_data_get_fullscreen_rect(data, FALSE, &fullscreen_rect))
+        if (wayland_win_data_get_presentation_rect(data, FALSE, &presentation_rect))
         {
-            SetRect(host, 0, 0, fullscreen_rect.right - fullscreen_rect.left,
-                    fullscreen_rect.bottom - fullscreen_rect.top);
+            SetRect(host, 0, 0, presentation_rect.right - presentation_rect.left,
+                    presentation_rect.bottom - presentation_rect.top);
             *dst = *host;
         }
         else
