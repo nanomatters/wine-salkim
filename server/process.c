@@ -280,7 +280,7 @@ static struct job *get_job_obj( struct process *process, obj_handle_t handle, un
 static void add_job_completion( struct job *job, apc_param_t msg, apc_param_t pid )
 {
     if (job->completion_port)
-        add_completion( job->completion_port, job->completion_key, pid, STATUS_SUCCESS, msg );
+        add_completion( job->completion_port, job->completion_key, pid, STATUS_SUCCESS, msg, 1 );
 }
 
 static void add_job_completion_existing_processes( struct job *job, struct job *completion_job )

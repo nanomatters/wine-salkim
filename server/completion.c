@@ -23,8 +23,10 @@
 
 #include "config.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -74,10 +76,22 @@ struct completion
 {
     struct object       obj;
     struct object      *sync;
+    struct inproc_sync *iocp;
     struct list         queue;
     struct list         wait_queue;
     unsigned int        depth;
+    int                 post_error;
 };
+
+static client_ptr_t next_iocp_cookie = 1;
+
+static client_ptr_t alloc_iocp_cookie(void)
+{
+    client_ptr_t cookie = next_iocp_cookie++;
+
+    if (!next_iocp_cookie) next_iocp_cookie++;
+    return cookie;
+}
 
 static void completion_wait_dump( struct object*, int );
 static int completion_wait_signaled( struct object *obj, struct wait_queue_entry *entry );
@@ -216,6 +230,7 @@ static int completion_close_handle( struct object *obj, struct process *process,
 {
     struct completion *completion = (struct completion *)obj;
     struct completion_wait *wait, *wait_next;
+    int err;
 
     if (completion->obj.handle_count != 1) return 1;
 
@@ -230,7 +245,16 @@ static int completion_close_handle( struct object *obj, struct process *process,
             cleanup_thread_completion( wait->thread );
         }
     }
-    signal_sync( completion->sync );
+    if (completion->iocp)
+    {
+        if ((err = abandon_inproc_iocp( completion->iocp, alloc_iocp_cookie() )))
+        {
+            fprintf( stderr, "wineserver: failed to abandon I/O completion port %p: %s\n",
+                     completion, strerror( err ) );
+            shutdown_inproc_iocp( completion->iocp );
+        }
+    }
+    else signal_sync( completion->sync );
     return 1;
 }
 
@@ -264,6 +288,26 @@ static struct completion_wait *create_completion_wait( struct thread *thread )
     return wait;
 }
 
+static int associate_completion( struct completion *completion, int alertable, int packet_available )
+{
+    if (alertable && !list_empty( &current->user_apc )
+        && !(packet_available && current->completion_wait
+             && current->completion_wait->completion == completion))
+    {
+        set_error( STATUS_USER_APC );
+        return 0;
+    }
+
+    if (current->completion_wait)
+        list_remove( &current->completion_wait->wait_queue_entry );
+    else if (!(current->completion_wait = create_completion_wait( current )))
+        return 0;
+
+    current->completion_wait->completion = completion;
+    list_add_head( &completion->wait_queue, &current->completion_wait->wait_queue_entry );
+    return 1;
+}
+
 static struct completion *create_completion( struct object *root, const struct unicode_str *name,
                                              unsigned int attr, unsigned int concurrent,
                                              const struct security_descriptor *sd )
@@ -274,12 +318,22 @@ static struct completion *create_completion( struct object *root, const struct u
     {
         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
         {
+            client_ptr_t cookie = alloc_iocp_cookie();
             completion->sync = NULL;
+            completion->iocp = NULL;
             list_init( &completion->queue );
             list_init( &completion->wait_queue );
             completion->depth = 0;
+            completion->post_error = 0;
 
-            if (!(completion->sync = create_internal_sync( 1, 0 )))
+            if ((completion->iocp = create_inproc_iocp_sync( concurrent, cookie )))
+                completion->sync = (struct object *)completion->iocp;
+            else
+            {
+                clear_error();
+                completion->sync = create_internal_sync( 1, 0 );
+            }
+            if (!completion->sync)
             {
                 release_object( completion );
                 return NULL;
@@ -295,14 +349,28 @@ struct completion *get_completion_obj( struct process *process, obj_handle_t han
     return (struct completion *) get_handle_obj( process, handle, access, &completion_ops );
 }
 
-void add_completion( struct completion *completion, apc_param_t ckey, apc_param_t cvalue,
-                     unsigned int status, apc_param_t information )
+int add_completion( struct completion *completion, apc_param_t ckey, apc_param_t cvalue,
+                    unsigned int status, apc_param_t information, int internal )
 {
-    struct comp_msg *msg = mem_alloc( sizeof( *msg ) );
+    struct comp_msg *msg;
     struct completion_wait *wait;
+    int err;
 
-    if (!msg)
-        return;
+    if (completion->iocp)
+    {
+        if (!(err = post_inproc_iocp( completion->iocp, ckey, cvalue, status, information, internal )))
+        {
+            completion->post_error = 0;
+            return 1;
+        }
+        if (err != ESHUTDOWN && err != completion->post_error)
+            fprintf( stderr, "wineserver: failed to post I/O completion to %p: %s\n",
+                     completion, strerror( err ) );
+        completion->post_error = err;
+        return 0;
+    }
+
+    if (!(msg = mem_alloc( sizeof( *msg ) ))) return 0;
 
     msg->ckey = ckey;
     msg->cvalue = cvalue;
@@ -314,9 +382,10 @@ void add_completion( struct completion *completion, apc_param_t ckey, apc_param_
     LIST_FOR_EACH_ENTRY( wait, &completion->wait_queue, struct completion_wait, wait_queue_entry )
     {
         wake_up( &wait->obj, 1 );
-        if (list_empty( &completion->queue )) return;
+        if (list_empty( &completion->queue )) return 1;
     }
     if (!list_empty( &completion->queue )) signal_sync( completion->sync );
+    return 1;
 }
 
 /* create a completion */
@@ -367,7 +436,8 @@ DECL_HANDLER(add_completion)
         return;
     }
 
-    add_completion( completion, req->ckey, req->cvalue, req->status, req->information );
+    if (!add_completion( completion, req->ckey, req->cvalue, req->status, req->information, 0 ))
+        set_error( STATUS_INSUFFICIENT_RESOURCES );
 
     if (reserve) release_object( reserve );
     release_object( completion );
@@ -382,25 +452,19 @@ DECL_HANDLER(remove_completion)
 
     if (!completion) return;
 
+    if (completion->iocp)
+    {
+        set_error( STATUS_NOT_IMPLEMENTED );
+        release_object( completion );
+        return;
+    }
+
     entry = list_head( &completion->queue );
-    if (req->alertable && !list_empty( &current->user_apc )
-        && !(entry && current->completion_wait && current->completion_wait->completion == completion))
-    {
-        set_error( STATUS_USER_APC );
-        release_object( completion );
-        return;
-    }
-    if (current->completion_wait)
-    {
-        list_remove( &current->completion_wait->wait_queue_entry );
-    }
-    else if (!(current->completion_wait = create_completion_wait( current )))
+    if (!associate_completion( completion, req->alertable, !!entry ))
     {
         release_object( completion );
         return;
     }
-    current->completion_wait->completion = completion;
-    list_add_head( &completion->wait_queue, &current->completion_wait->wait_queue_entry );
     if (!entry)
     {
         reply->wait_handle = current->completion_wait->handle;
@@ -447,10 +511,43 @@ DECL_HANDLER(get_thread_completion)
 DECL_HANDLER(query_completion)
 {
     struct completion* completion = get_completion_obj( current->process, req->handle, IO_COMPLETION_QUERY_STATE );
+    int err;
 
     if (!completion) return;
 
-    reply->depth = completion->depth;
+    if (completion->iocp)
+    {
+        if ((err = read_inproc_iocp( completion->iocp, &reply->depth )))
+        {
+            fprintf( stderr, "wineserver: failed to query I/O completion port %p: %s\n",
+                     completion, strerror( err ) );
+            set_error( STATUS_UNSUCCESSFUL );
+        }
+    }
+    else reply->depth = completion->depth;
+
+    release_object( completion );
+}
+
+/* associate the current thread with a kernel-backed completion port */
+DECL_HANDLER(associate_completion)
+{
+    struct completion *completion;
+    unsigned int depth;
+    int err;
+
+    if (!(completion = get_completion_obj( current->process, req->handle,
+                                            IO_COMPLETION_MODIFY_STATE ))) return;
+    if (!completion->iocp)
+        set_error( STATUS_NOT_IMPLEMENTED );
+    else if ((err = read_inproc_iocp( completion->iocp, &depth )))
+    {
+        fprintf( stderr, "wineserver: failed to associate I/O completion port %p: %s\n",
+                 completion, strerror( err ) );
+        set_error( STATUS_UNSUCCESSFUL );
+    }
+    else
+        associate_completion( completion, req->alertable, !!depth );
 
     release_object( completion );
 }

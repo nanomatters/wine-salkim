@@ -25,6 +25,43 @@ struct ntsync_event_args {
 	__u32 signaled;
 };
 
+struct ntsync_iocp_args {
+	__u32 concurrency;
+	__u32 version;
+};
+
+#define NTSYNC_IOCP_VERSION		1
+#define NTSYNC_IOCP_INITIAL_GENERATION	1
+
+struct ntsync_iocp_info {
+	__u32 concurrency;
+	__u32 depth;
+};
+
+struct ntsync_iocp_packet {
+	__u64 key;
+	__u64 value;
+	__u64 information;
+	__s32 status;
+	__u32 pad;
+};
+
+#define NTSYNC_IOCP_MAX_REMOVE	64
+
+struct ntsync_iocp_remove_args {
+	__u64 packets;
+	__u64 timeout;
+	__u32 count;
+	__u32 written;
+	__u32 alert;
+	__u32 flags;
+	__u64 generation;
+};
+
+struct ntsync_iocp_abandon_args {
+	__u64 generation;
+};
+
 #define NTSYNC_WAIT_REALTIME	0x1
 
 struct ntsync_wait_args {
@@ -55,5 +92,13 @@ struct ntsync_wait_args {
 #define NTSYNC_IOC_SEM_READ		_IOR ('N', 0x8b, struct ntsync_sem_args)
 #define NTSYNC_IOC_MUTEX_READ		_IOR ('N', 0x8c, struct ntsync_mutex_args)
 #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+#define NTSYNC_IOC_CREATE_IOCP		_IOW('N', 0x8e, struct ntsync_iocp_args)
+#define NTSYNC_IOC_IOCP_POST		_IOW('N', 0x8f, struct ntsync_iocp_packet)
+#define NTSYNC_IOC_IOCP_REMOVE		_IOR('N', 0x90, struct ntsync_iocp_packet)
+#define NTSYNC_IOC_IOCP_READ		_IOR('N', 0x91, struct ntsync_iocp_info)
+#define NTSYNC_IOC_IOCP_REMOVE_BATCH	_IOWR('N', 0x92, struct ntsync_iocp_remove_args)
+#define NTSYNC_IOC_IOCP_SHUTDOWN	_IO('N', 0x93)
+#define NTSYNC_IOC_IOCP_ABANDON		_IOW('N', 0x94, struct ntsync_iocp_abandon_args)
+#define NTSYNC_IOC_IOCP_POST_INTERNAL	_IOW('N', 0x95, struct ntsync_iocp_packet)
 
 #endif

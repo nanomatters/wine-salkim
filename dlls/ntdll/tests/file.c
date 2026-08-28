@@ -980,13 +980,13 @@ static void WINAPI user_apc_proc(ULONG_PTR arg)
 
 static void test_set_io_completion(void)
 {
-    FILE_IO_COMPLETION_INFORMATION info[2] = {{0}};
+    FILE_IO_COMPLETION_INFORMATION info[80] = {{0}};
     LARGE_INTEGER timeout = {{0}};
     unsigned int apc_count;
     IO_STATUS_BLOCK iosb;
     ULONG_PTR key, value;
     NTSTATUS res;
-    ULONG count;
+    ULONG count, i;
     SIZE_T size = 3;
     HANDLE h, h2;
 
@@ -1111,6 +1111,26 @@ static void test_set_io_completion(void)
         info[1].IoStatusBlock.Information );
     ok( info[1].IoStatusBlock.Status == 56, "wrong status %#lx\n", info[1].IoStatusBlock.Status);
 
+    for (i = 0; i < ARRAY_SIZE(info); ++i)
+    {
+        res = pNtSetIoCompletion( h, i, i + 1, 0x1000 + i, i + 2 );
+        ok( res == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", res );
+    }
+    count = 0xdeadbeef;
+    res = pNtRemoveIoCompletionEx( h, info, ARRAY_SIZE(info), &count, &timeout, FALSE );
+    ok( res == STATUS_SUCCESS, "NtRemoveIoCompletionEx failed: %#lx\n", res );
+    ok( count == ARRAY_SIZE(info), "wrong count %lu\n", count );
+    for (i = 0; i < count; ++i)
+    {
+        ok( info[i].CompletionKey == i, "entry %lu has wrong key %#Ix\n", i, info[i].CompletionKey );
+        ok( info[i].CompletionValue == i + 1, "entry %lu has wrong value %#Ix\n",
+            i, info[i].CompletionValue );
+        ok( info[i].IoStatusBlock.Information == i + 2, "entry %lu has wrong information %#Ix\n",
+            i, info[i].IoStatusBlock.Information );
+        ok( info[i].IoStatusBlock.Status == 0x1000 + i, "entry %lu has wrong status %#lx\n",
+            i, info[i].IoStatusBlock.Status );
+    }
+
     res = pNtSetIoCompletion( h, 123, 456, 789, size );
     ok( res == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", res );
 
@@ -1163,6 +1183,33 @@ static void test_set_io_completion(void)
     ok( !apc_count, "wrong apc count %u\n", apc_count );
 
     SleepEx( 1, TRUE );
+
+    ok( !is_signaled( h ), "empty completion port is signaled\n" );
+    res = pNtSetIoCompletion( h, 123, 456, 789, size );
+    ok( res == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", res );
+    ok( is_signaled( h ), "nonempty completion port is not signaled\n" );
+    count = get_pending_msgs( h );
+    ok( count == 1, "unexpected msg count: %lu\n", count );
+    res = pNtRemoveIoCompletionEx( h, info, 1, &count, &timeout, FALSE );
+    ok( res == STATUS_SUCCESS, "NtRemoveIoCompletionEx failed: %#lx\n", res );
+    ok( count == 1, "wrong count %lu\n", count );
+    ok( !is_signaled( h ), "drained completion port is signaled\n" );
+
+    h2 = NULL;
+    ok( DuplicateHandle( GetCurrentProcess(), h, GetCurrentProcess(), &h2, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS ), "DuplicateHandle failed: %lu\n", GetLastError() );
+    res = pNtSetIoCompletion( h, 123, 456, 789, size );
+    ok( res == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", res );
+    res = pNtRemoveIoCompletionEx( h2, info, 1, &count, &timeout, FALSE );
+    ok( res == STATUS_SUCCESS, "NtRemoveIoCompletionEx failed: %#lx\n", res );
+    ok( count == 1, "wrong count %lu\n", count );
+    CloseHandle( h2 );
+
+    res = pNtSetIoCompletion( h, 999, 999, 999, size );
+    ok( res == STATUS_SUCCESS, "NtSetIoCompletion after duplicated handle closed failed: %#lx\n", res );
+    res = pNtRemoveIoCompletionEx( h, info, 1, &count, &timeout, FALSE );
+    ok( res == STATUS_SUCCESS, "NtRemoveIoCompletionEx after duplicated handle closed failed: %#lx\n", res );
+    ok( count == 1, "wrong count %lu\n", count );
 
     pNtClose( h );
 }

@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -70,6 +71,8 @@ struct inproc_sync
     struct object          obj;  /* object header */
     enum inproc_sync_type  type;
     int                    fd;
+    client_ptr_t           cookie;
+    uint64_t               generation;
     struct list            entry;
 };
 
@@ -116,6 +119,8 @@ struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
     struct inproc_sync *event;
 
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
+    event->cookie = 0;
+    event->generation = 0;
     if (do_fsync())
     {
         event->type = manual ? FSYNC_MANUAL_SERVER : FSYNC_AUTO_SERVER;
@@ -143,6 +148,8 @@ struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
     struct inproc_sync *event;
 
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
+    event->cookie = 0;
+    event->generation = 0;
     if (do_fsync())
     {
         event->type = manual ? FSYNC_MANUAL_EVENT : FSYNC_AUTO_EVENT;
@@ -170,6 +177,8 @@ struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int co
     struct inproc_sync *mutex;
 
     if (!(mutex = alloc_object( &inproc_sync_ops ))) return NULL;
+    mutex->cookie = 0;
+    mutex->generation = 0;
     if (do_fsync())
     {
         mutex->type = FSYNC_MUTEX;
@@ -197,6 +206,8 @@ struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned
     struct inproc_sync *sem;
 
     if (!(sem = alloc_object( &inproc_sync_ops ))) return NULL;
+    sem->cookie = 0;
+    sem->generation = 0;
 
     if (do_fsync())
     {
@@ -217,6 +228,75 @@ struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned
         return NULL;
     }
     return sem;
+}
+
+struct inproc_sync *create_inproc_iocp_sync( unsigned int concurrency, client_ptr_t cookie )
+{
+    struct ntsync_iocp_args args = {.concurrency = concurrency, .version = NTSYNC_IOCP_VERSION};
+    static int supported = -1;
+    struct inproc_sync *iocp;
+    int err;
+
+    if (do_fsync() || get_inproc_device_fd() < 0 || !supported) return NULL;
+    if (!(iocp = alloc_object( &inproc_sync_ops ))) return NULL;
+
+    iocp->type = INPROC_SYNC_IOCP;
+    iocp->cookie = cookie;
+    iocp->generation = NTSYNC_IOCP_INITIAL_GENERATION;
+    iocp->fd = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_IOCP, &args );
+    list_init( &iocp->entry );
+
+    if (iocp->fd == -1)
+    {
+        err = errno;
+        release_object( iocp );
+        if (err == ENOTTY || err == EINVAL) supported = 0;
+        return NULL;
+    }
+    if (supported < 0)
+    {
+        supported = 1;
+        fprintf( stderr, "ntsync: IOCP acceleration enabled.\n" );
+    }
+    return iocp;
+}
+
+int post_inproc_iocp( struct inproc_sync *sync, client_ptr_t key, client_ptr_t value,
+                      unsigned int status, client_ptr_t information, int internal )
+{
+    struct ntsync_iocp_packet packet = {key, value, information, status};
+    unsigned long request = internal ? NTSYNC_IOC_IOCP_POST_INTERNAL : NTSYNC_IOC_IOCP_POST;
+
+    assert( sync->type == INPROC_SYNC_IOCP );
+    if (ioctl( sync->fd, request, &packet ) < 0) return errno;
+    return 0;
+}
+
+int read_inproc_iocp( struct inproc_sync *sync, unsigned int *depth )
+{
+    struct ntsync_iocp_info info;
+
+    assert( sync->type == INPROC_SYNC_IOCP );
+    if (ioctl( sync->fd, NTSYNC_IOC_IOCP_READ, &info ) < 0) return errno;
+    *depth = info.depth;
+    return 0;
+}
+
+void shutdown_inproc_iocp( struct inproc_sync *sync )
+{
+    assert( sync->type == INPROC_SYNC_IOCP );
+    ioctl( sync->fd, NTSYNC_IOC_IOCP_SHUTDOWN );
+}
+
+int abandon_inproc_iocp( struct inproc_sync *sync, client_ptr_t cookie )
+{
+    struct ntsync_iocp_abandon_args args = {.generation = sync->generation};
+
+    assert( sync->type == INPROC_SYNC_IOCP );
+    if (ioctl( sync->fd, NTSYNC_IOC_IOCP_ABANDON, &args ) < 0) return errno;
+    if (!++sync->generation) ++sync->generation;
+    sync->cookie = cookie;
+    return 0;
 }
 
 static void inproc_sync_dump( struct object *obj, int verbose )
@@ -280,7 +360,8 @@ void abandon_inproc_mutexes( thread_id_t tid )
         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
 }
 
-static int get_obj_inproc_sync( struct object *obj, int *type )
+static int get_obj_inproc_sync( struct object *obj, int *type, client_ptr_t *cookie,
+                                uint64_t *generation )
 {
     struct object *sync;
     int fd = -1;
@@ -290,6 +371,8 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
     {
         struct inproc_sync *inproc = (struct inproc_sync *)sync;
         *type = inproc->type;
+        *cookie = inproc->cookie;
+        *generation = inproc->generation;
         fd = inproc->fd;
     }
 
@@ -329,6 +412,31 @@ struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned
     return NULL;
 }
 
+struct inproc_sync *create_inproc_iocp_sync( unsigned int concurrency, client_ptr_t cookie )
+{
+    return NULL;
+}
+
+int post_inproc_iocp( struct inproc_sync *sync, client_ptr_t key, client_ptr_t value,
+                      unsigned int status, client_ptr_t information, int internal )
+{
+    return ENOTSUP;
+}
+
+int abandon_inproc_iocp( struct inproc_sync *sync, client_ptr_t cookie )
+{
+    return ENOTSUP;
+}
+
+int read_inproc_iocp( struct inproc_sync *sync, unsigned int *depth )
+{
+    return ENOTSUP;
+}
+
+void shutdown_inproc_iocp( struct inproc_sync *sync )
+{
+}
+
 void signal_inproc_sync( struct inproc_sync *sync )
 {
 }
@@ -341,7 +449,8 @@ void abandon_inproc_mutexes( thread_id_t tid )
 {
 }
 
-static int get_obj_inproc_sync( struct object *obj, int *type )
+static int get_obj_inproc_sync( struct object *obj, int *type, client_ptr_t *cookie,
+                                uint64_t *generation )
 {
     return -1;
 }
@@ -357,7 +466,8 @@ DECL_HANDLER(get_inproc_sync_fd)
 
     reply->access = get_handle_access( current->process, req->handle );
 
-    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+    if ((fd = get_obj_inproc_sync( obj, &reply->type, &reply->cookie, &reply->generation )) < 0)
+        set_error( STATUS_NOT_IMPLEMENTED );
     else if (do_fsync()) reply->fsync_shm_idx = fsync_grab_shm_idx( fd );
     else send_client_fd( current->process, fd, req->handle );
 

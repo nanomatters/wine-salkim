@@ -398,28 +398,33 @@ static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
     return STATUS_SUCCESS;
 }
 
+static void init_ntsync_timeout( const LARGE_INTEGER *timeout, __u64 *value, __u32 *flags )
+{
+    struct timespec now;
+
+    *flags = 0;
+    if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)
+        *value = ~(__u64)0;
+    else if (timeout->QuadPart <= 0)
+    {
+        clock_gettime( CLOCK_MONOTONIC, &now );
+        *value = ((ULONGLONG)now.tv_sec * NSECPERSEC) + now.tv_nsec + (-timeout->QuadPart * 100);
+    }
+    else
+    {
+        *value = (timeout->QuadPart * 100) - (SECS_1601_TO_1970 * NSECPERSEC);
+        *flags = NTSYNC_WAIT_REALTIME;
+    }
+}
+
 static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
                                  int alert_fd, const LARGE_INTEGER *timeout )
 {
     struct ntsync_wait_args args = {0};
     unsigned long request;
-    struct timespec now;
     int ret;
 
-    if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)
-    {
-        args.timeout = ~(__u64)0;
-    }
-    else if (timeout->QuadPart <= 0)
-    {
-        clock_gettime( CLOCK_MONOTONIC, &now );
-        args.timeout = ((ULONGLONG)now.tv_sec * NSECPERSEC) + now.tv_nsec + (-timeout->QuadPart * 100);
-    }
-    else
-    {
-        args.timeout = (timeout->QuadPart * 100) - (SECS_1601_TO_1970 * NSECPERSEC);
-        args.flags |= NTSYNC_WAIT_REALTIME;
-    }
+    init_ntsync_timeout( timeout, &args.timeout, &args.flags );
 
     args.objs = (uintptr_t)objs;
     args.count = count;
@@ -542,7 +547,11 @@ struct inproc_sync
     unsigned int   access;    /* handle access rights */
     unsigned short type;      /* enum inproc_sync_type as short to save space */
     unsigned short closed;    /* fd has been closed but sync is still referenced */
+    UINT64         cookie;    /* completion association identity */
+    UINT64         generation; /* I/O completion removal generation */
 };
+
+C_ASSERT( !(65536 % sizeof(struct inproc_sync)) );
 
 #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
@@ -602,6 +611,8 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
 
     cache->fd = sync->fd;
     cache->access = sync->access;
+    cache->cookie = sync->cookie;
+    cache->generation = sync->generation;
     cache->type = sync->type;
     cache->closed = sync->closed;
     /* Make sure we set the other members before the refcount; this store needs
@@ -680,6 +691,8 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
             sync->fd = wine_server_receive_fd( &fd_handle );
             assert( wine_server_ptr_handle(fd_handle) == handle );
             sync->access = reply->access;
+            sync->cookie = reply->cookie;
+            sync->generation = reply->generation;
             sync->type = reply->type;
             sync->closed = 0;
         }
@@ -744,6 +757,7 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
     switch (sync->type)
     {
     case INPROC_SYNC_INTERNAL:
+    case INPROC_SYNC_IOCP:
         return STATUS_OBJECT_TYPE_MISMATCH;
     case INPROC_SYNC_EVENT:
         if (!(sync->access & EVENT_MODIFY_STATE)) return STATUS_ACCESS_DENIED;
@@ -921,6 +935,168 @@ int get_inproc_alert_fd(void)
     }
 
     return fd;
+}
+
+static NTSTATUS get_iocp_sync( HANDLE handle, ACCESS_MASK access, struct inproc_sync *stack,
+                               struct inproc_sync **out )
+{
+    NTSTATUS status;
+
+    if (do_fsync() || inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
+    if ((status = get_inproc_sync( handle, INPROC_SYNC_UNKNOWN, access, stack, out ))) return status;
+    if ((*out)->type == INPROC_SYNC_IOCP) return STATUS_SUCCESS;
+
+    release_inproc_sync( *out );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+static NTSTATUS associate_iocp( HANDLE handle, struct inproc_sync *sync, BOOLEAN alertable )
+{
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    NTSTATUS status;
+
+    if (data->completion_cookie == sync->cookie) return STATUS_SUCCESS;
+
+    SERVER_START_REQ( associate_completion )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        req->alertable = alertable;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+
+    if (!status) data->completion_cookie = sync->cookie;
+    return status;
+}
+
+static NTSTATUS iocp_errno_to_status( int err )
+{
+    if (err == ETIMEDOUT || err == EAGAIN) return STATUS_TIMEOUT;
+    if (err == ECANCELED) return STATUS_ABANDONED;
+    if (err == ENOSPC) return STATUS_INSUFFICIENT_RESOURCES;
+    if (err == ENOMEM) return STATUS_NO_MEMORY;
+    if (err == ESHUTDOWN) return STATUS_INVALID_HANDLE;
+    return errno_to_status( err );
+}
+
+static NTSTATUS inproc_set_iocp( HANDLE handle, ULONG_PTR key, ULONG_PTR value,
+                                 NTSTATUS status, SIZE_T information )
+{
+    struct ntsync_iocp_packet packet = {key, value, information, status};
+    struct inproc_sync stack, *sync;
+    NTSTATUS ret;
+
+    if ((ret = get_iocp_sync( handle, IO_COMPLETION_MODIFY_STATE, &stack, &sync ))) return ret;
+    if (ioctl( sync->fd, NTSYNC_IOC_IOCP_POST, &packet ) < 0) ret = iocp_errno_to_status( errno );
+    release_inproc_sync( sync );
+    return ret;
+}
+
+static NTSTATUS inproc_query_iocp( HANDLE handle, ULONG *depth )
+{
+    struct ntsync_iocp_info info;
+    struct inproc_sync stack, *sync;
+    NTSTATUS status;
+    int err;
+
+    if ((status = get_iocp_sync( handle, IO_COMPLETION_QUERY_STATE, &stack, &sync ))) return status;
+    if (ioctl( sync->fd, NTSYNC_IOC_IOCP_READ, &info ) < 0)
+    {
+        err = errno;
+        ERR( "failed to query accelerated I/O completion port %p: %s\n", handle, strerror( err ) );
+        status = iocp_errno_to_status( err );
+    }
+    else *depth = info.depth;
+    release_inproc_sync( sync );
+    return status;
+}
+
+static NTSTATUS inproc_remove_iocp( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
+                                    ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable )
+{
+    struct ntsync_iocp_packet packets[NTSYNC_IOCP_MAX_REMOVE];
+    struct inproc_sync stack, *sync;
+    __u64 wait_timeout;
+    __u32 wait_flags;
+    NTSTATUS status;
+    ULONG total = 0;
+    int alert_fd = 0, ret;
+
+    *written = 0;
+    if ((status = get_iocp_sync( handle, IO_COMPLETION_MODIFY_STATE, &stack, &sync ))) return status;
+    init_ntsync_timeout( timeout, &wait_timeout, &wait_flags );
+
+retry_association:
+    if ((status = associate_iocp( handle, sync, alertable )))
+    {
+        if (status == STATUS_USER_APC)
+        {
+            static const LARGE_INTEGER zero;
+
+            status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero );
+            if (status == STATUS_TIMEOUT) goto retry_association;
+        }
+        goto done;
+    }
+    if (alertable && (alert_fd = get_inproc_alert_fd()) < 0)
+    {
+        ERR( "failed to get the current thread APC alert fd\n" );
+        status = STATUS_UNSUCCESSFUL;
+        goto done;
+    }
+
+    while (total < count)
+    {
+        struct ntsync_iocp_remove_args args = {0};
+        LARGE_INTEGER poll_timeout = {0};
+        ULONG batch = min( count - total, (ULONG)ARRAY_SIZE(packets) );
+
+        args.packets = (uintptr_t)packets;
+        args.count = batch;
+        args.alert = !total ? alert_fd : 0;
+        args.generation = sync->generation;
+        if (total)
+            init_ntsync_timeout( &poll_timeout, &args.timeout, &args.flags );
+        else
+        {
+            args.timeout = wait_timeout;
+            args.flags = wait_flags;
+        }
+
+        do { ret = ioctl( sync->fd, NTSYNC_IOC_IOCP_REMOVE_BATCH, &args ); }
+        while (ret < 0 && errno == EINTR);
+
+        if (ret < 0)
+        {
+            status = iocp_errno_to_status( errno );
+            if (total) status = STATUS_SUCCESS;
+            break;
+        }
+        if (!args.written)
+        {
+            static const LARGE_INTEGER zero;
+
+            status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero );
+            if (status == STATUS_TIMEOUT) continue;
+            break;
+        }
+
+        for (ULONG i = 0; i < args.written; ++i)
+        {
+            info[total + i].CompletionKey = packets[i].key;
+            info[total + i].CompletionValue = packets[i].value;
+            info[total + i].IoStatusBlock.Information = packets[i].information;
+            info[total + i].IoStatusBlock.Status = packets[i].status;
+        }
+        total += args.written;
+        status = STATUS_SUCCESS;
+        if (args.written < batch) break;
+    }
+
+done:
+    release_inproc_sync( sync );
+    *written = total;
+    return status;
 }
 
 static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
@@ -2799,6 +2975,9 @@ NTSTATUS WINAPI NtSetIoCompletion( HANDLE handle, ULONG_PTR key, ULONG_PTR value
 
     TRACE( "(%p, %lx, %lx, %x, %lx)\n", handle, key, value, status, count );
 
+    ret = inproc_set_iocp( handle, key, value, status, count );
+    if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+
     SERVER_START_REQ( add_completion )
     {
         req->handle      = wine_server_obj_handle( handle );
@@ -2848,10 +3027,25 @@ NTSTATUS WINAPI NtSetIoCompletionEx( HANDLE completion_handle, HANDLE completion
 NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *value,
                                       IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout )
 {
+    FILE_IO_COMPLETION_INFORMATION info;
     HANDLE wait_handle = NULL;
+    ULONG written;
     unsigned int status;
 
     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+
+    status = inproc_remove_iocp( handle, &info, 1, &written, timeout, FALSE );
+    if (status != STATUS_NOT_IMPLEMENTED)
+    {
+        if (!status)
+        {
+            *key = info.CompletionKey;
+            *value = info.CompletionValue;
+            *io = info.IoStatusBlock;
+        }
+        return status;
+    }
+    ntdll_get_thread_data()->completion_cookie = 0;
 
     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {
@@ -2900,6 +3094,7 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
 NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
                                         ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable )
 {
+    LARGE_INTEGER timeout_deadline = {0};
     HANDLE wait_handle = NULL;
     unsigned int status;
     ULONG i = 0;
@@ -2907,6 +3102,15 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
     TRACE( "%p %p %u %p %p %u\n", handle, info, count, written, timeout, alertable );
 
     if (!count) return STATUS_INVALID_PARAMETER;
+    if (timeout && timeout->QuadPart < 0)
+    {
+        NtQueryPerformanceCounter( &timeout_deadline, NULL );
+        timeout_deadline.QuadPart -= timeout->QuadPart;
+    }
+
+    status = inproc_remove_iocp( handle, info, count, written, timeout, alertable );
+    if (status != STATUS_NOT_IMPLEMENTED) return status;
+    ntdll_get_thread_data()->completion_cookie = 0;
 
     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {
@@ -2914,6 +3118,7 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
         if (status != WAIT_OBJECT_0) goto done;
     }
 
+retry_remove:
     while (i < count)
     {
         SERVER_START_REQ( remove_completion )
@@ -2940,12 +3145,26 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
     }
     if (status == STATUS_USER_APC)
     {
-        status = NtDelayExecution( TRUE, NULL );
-        assert( status == STATUS_USER_APC );
+        static const LARGE_INTEGER zero;
+
+        status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero );
+        if (status == STATUS_TIMEOUT) goto retry_remove;
         goto done;
     }
-    if (!timeout || timeout->QuadPart) status = server_wait_for_object( wait_handle, alertable, timeout );
-    else                               status = STATUS_TIMEOUT;
+    if (!timeout || timeout->QuadPart)
+    {
+        LARGE_INTEGER remaining, now;
+        const LARGE_INTEGER *wait_timeout = timeout;
+
+        if (timeout && timeout->QuadPart < 0)
+        {
+            NtQueryPerformanceCounter( &now, NULL );
+            remaining.QuadPart = min( now.QuadPart - timeout_deadline.QuadPart, (LONGLONG)0 );
+            wait_timeout = &remaining;
+        }
+        status = server_wait_for_object( wait_handle, alertable, wait_timeout );
+    }
+    else status = STATUS_TIMEOUT;
     if (status != WAIT_OBJECT_0) goto done;
 
     SERVER_START_REQ( get_thread_completion )
@@ -2987,6 +3206,9 @@ NTSTATUS WINAPI NtQueryIoCompletion( HANDLE handle, IO_COMPLETION_INFORMATION_CL
         if (ret_len) *ret_len = sizeof(*info);
         if (len == sizeof(*info))
         {
+            status = inproc_query_iocp( handle, info );
+            if (status != STATUS_NOT_IMPLEMENTED) break;
+
             SERVER_START_REQ( query_completion )
             {
                 req->handle = wine_server_obj_handle( handle );

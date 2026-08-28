@@ -3430,6 +3430,54 @@ static void test_object_permanence(void)
         winetest_pop_context();
     }
 
+    if (creatpermapriv)
+    {
+        WCHAR name_buffer[64];
+        ULONG_PTR key, value;
+        IO_STATUS_BLOCK iosb;
+        LARGE_INTEGER timeout = {0};
+        OBJECT_ATTRIBUTES attr;
+        UNICODE_STRING name;
+        HANDLE handle, reopened;
+
+        swprintf( name_buffer, ARRAY_SIZE(name_buffer), L"\\BaseNamedObjects\\test_iocp_permanence_%08lx",
+                  GetCurrentProcessId() );
+        RtlInitUnicodeString( &name, name_buffer );
+        InitializeObjectAttributes( &attr, &name, OBJ_PERMANENT, 0, NULL );
+        status = NtCreateIoCompletion( &handle, IO_COMPLETION_ALL_ACCESS, &attr, 0 );
+        ok( status == STATUS_SUCCESS, "NtCreateIoCompletion returned %08lx\n", status );
+        if (status == STATUS_SUCCESS)
+        {
+            status = NtSetIoCompletion( handle, 0x1234, 0x5678, STATUS_INVALID_DEVICE_REQUEST, 0x9abc );
+            ok( status == STATUS_SUCCESS, "NtSetIoCompletion returned %08lx\n", status );
+            NtClose( handle );
+
+            attr.Attributes = 0;
+            status = NtOpenIoCompletion( &reopened, IO_COMPLETION_ALL_ACCESS, &attr );
+            ok( status == STATUS_SUCCESS, "NtOpenIoCompletion returned %08lx\n", status );
+            if (status == STATUS_SUCCESS)
+            {
+                status = NtRemoveIoCompletion( reopened, &key, &value, &iosb, &timeout );
+                ok( status == STATUS_SUCCESS, "NtRemoveIoCompletion returned %08lx\n", status );
+                ok( key == 0x1234, "expected key 0x1234, got %#Ix\n", key );
+                ok( value == 0x5678, "expected value 0x5678, got %#Ix\n", value );
+                ok( iosb.Status == STATUS_INVALID_DEVICE_REQUEST, "unexpected status %08lx\n", iosb.Status );
+                ok( iosb.Information == 0x9abc, "unexpected information %#Ix\n", iosb.Information );
+                NtMakeTemporaryObject( reopened );
+                NtClose( reopened );
+            }
+            else
+            {
+                status = NtCreateIoCompletion( &reopened, IO_COMPLETION_ALL_ACCESS, &attr, 0 );
+                if (NT_SUCCESS(status))
+                {
+                    NtMakeTemporaryObject( reopened );
+                    NtClose( reopened );
+                }
+            }
+        }
+    }
+
     thread_token = NULL;
     status = NtSetInformationThread( GetCurrentThread(), ThreadImpersonationToken, &thread_token, sizeof(thread_token) );
     ok( status == STATUS_SUCCESS, "NtSetInformationThread returned %08lx\n", status );

@@ -3224,6 +3224,12 @@ static void dump_query_completion_reply( const struct query_completion_reply *re
     fprintf( stderr, " depth=%08x", req->depth );
 }
 
+static void dump_associate_completion_request( const struct associate_completion_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", alertable=%d", req->alertable );
+}
+
 static void dump_set_completion_info_request( const struct set_completion_info_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -3481,6 +3487,8 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
     fprintf( stderr, " type=%d", req->type );
     fprintf( stderr, ", access=%08x", req->access );
     fprintf( stderr, ", fsync_shm_idx=%08x", req->fsync_shm_idx );
+    dump_uint64( ", cookie=", &req->cookie );
+    dump_uint64( ", generation=", &req->generation );
 }
 
 static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
@@ -3948,6 +3956,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_remove_completion_request,
     (dump_func)dump_get_thread_completion_request,
     (dump_func)dump_query_completion_request,
+    (dump_func)dump_associate_completion_request,
     (dump_func)dump_set_completion_info_request,
     (dump_func)dump_add_fd_completion_request,
     (dump_func)dump_set_fd_completion_mode_request,
@@ -4277,6 +4286,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     NULL,
     NULL,
+    NULL,
     (dump_func)dump_get_window_layered_info_reply,
     NULL,
     (dump_func)dump_alloc_user_handle_reply,
@@ -4594,6 +4604,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "remove_completion",
     "get_thread_completion",
     "query_completion",
+    "associate_completion",
     "set_completion_info",
     "add_fd_completion",
     "set_fd_completion_mode",

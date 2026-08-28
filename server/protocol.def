@@ -4090,6 +4090,13 @@ struct handle_info
 @END
 
 
+/* associate the current thread with a kernel-backed completion port */
+@REQ(associate_completion)
+    obj_handle_t  handle;         /* port handle */
+    int           alertable;      /* honor a pending user APC before association */
+@END
+
+
 /* associate object with completion port */
 @REQ(set_completion_info)
     obj_handle_t  handle;         /* object handle */
@@ -4339,6 +4346,7 @@ enum inproc_sync_type
     INPROC_SYNC_EVENT     = 2,
     INPROC_SYNC_MUTEX     = 3,
     INPROC_SYNC_SEMAPHORE = 4,
+    INPROC_SYNC_IOCP      = 5,
 };
 
 /* Get the in-process synchronization fd associated with the waitable handle */
@@ -4348,6 +4356,8 @@ enum inproc_sync_type
     int           type;         /* inproc sync type */
     unsigned int access;        /* handle access rights */
     unsigned int fsync_shm_idx;
+    client_ptr_t  cookie;       /* completion association identity */
+    unsigned __int64 generation; /* I/O completion removal generation */
 @END
 
 

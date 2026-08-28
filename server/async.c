@@ -560,7 +560,7 @@ static void add_async_completion( struct async *async, apc_param_t cvalue, unsig
                                   apc_param_t information )
 {
     if (async->fd && !async->completion) async->completion = fd_get_completion( async->fd, &async->comp_key );
-    if (async->completion) add_completion( async->completion, async->comp_key, cvalue, status, information );
+    if (async->completion) add_completion( async->completion, async->comp_key, cvalue, status, information, 1 );
 }
 
 static void async_complete_cancel( struct async *async )

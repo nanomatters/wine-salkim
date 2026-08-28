@@ -5772,6 +5772,20 @@ struct query_completion_reply
 
 
 
+struct associate_completion_request
+{
+    struct request_header __header;
+    obj_handle_t  handle;
+    int           alertable;
+    char __pad_20[4];
+};
+struct associate_completion_reply
+{
+    struct reply_header __header;
+};
+
+
+
 struct set_completion_info_request
 {
     struct request_header __header;
@@ -6196,6 +6210,7 @@ enum inproc_sync_type
     INPROC_SYNC_EVENT     = 2,
     INPROC_SYNC_MUTEX     = 3,
     INPROC_SYNC_SEMAPHORE = 4,
+    INPROC_SYNC_IOCP      = 5,
 };
 
 
@@ -6211,6 +6226,8 @@ struct get_inproc_sync_fd_reply
     unsigned int access;
     unsigned int fsync_shm_idx;
     char __pad_20[4];
+    client_ptr_t  cookie;
+    unsigned __int64 generation;
 };
 
 
@@ -6766,6 +6783,7 @@ enum request
     REQ_remove_completion,
     REQ_get_thread_completion,
     REQ_query_completion,
+    REQ_associate_completion,
     REQ_set_completion_info,
     REQ_add_fd_completion,
     REQ_set_fd_completion_mode,
@@ -7092,6 +7110,7 @@ union generic_request
     struct remove_completion_request remove_completion_request;
     struct get_thread_completion_request get_thread_completion_request;
     struct query_completion_request query_completion_request;
+    struct associate_completion_request associate_completion_request;
     struct set_completion_info_request set_completion_info_request;
     struct add_fd_completion_request add_fd_completion_request;
     struct set_fd_completion_mode_request set_fd_completion_mode_request;
@@ -7416,6 +7435,7 @@ union generic_reply
     struct remove_completion_reply remove_completion_reply;
     struct get_thread_completion_reply get_thread_completion_reply;
     struct query_completion_reply query_completion_reply;
+    struct associate_completion_reply associate_completion_reply;
     struct set_completion_info_reply set_completion_info_reply;
     struct add_fd_completion_reply add_fd_completion_reply;
     struct set_fd_completion_mode_reply set_fd_completion_mode_reply;
@@ -7462,6 +7482,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 938
+#define SERVER_PROTOCOL_VERSION 939
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

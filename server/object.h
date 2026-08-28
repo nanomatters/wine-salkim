@@ -254,6 +254,12 @@ extern struct inproc_sync *create_inproc_internal_sync( int manual, int signaled
 extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );
 extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count );
+extern struct inproc_sync *create_inproc_iocp_sync( unsigned int concurrency, client_ptr_t cookie );
+extern int post_inproc_iocp( struct inproc_sync *sync, client_ptr_t key, client_ptr_t value,
+                            unsigned int status, client_ptr_t information, int internal );
+extern int read_inproc_iocp( struct inproc_sync *sync, unsigned int *depth );
+extern int abandon_inproc_iocp( struct inproc_sync *sync, client_ptr_t cookie );
+extern void shutdown_inproc_iocp( struct inproc_sync *sync );
 extern void abandon_inproc_mutexes( thread_id_t owner );
 extern void signal_inproc_sync( struct inproc_sync *sync );
 extern void reset_inproc_sync( struct inproc_sync *sync );

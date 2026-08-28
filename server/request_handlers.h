@@ -282,6 +282,7 @@ DECL_HANDLER(add_completion);
 DECL_HANDLER(remove_completion);
 DECL_HANDLER(get_thread_completion);
 DECL_HANDLER(query_completion);
+DECL_HANDLER(associate_completion);
 DECL_HANDLER(set_completion_info);
 DECL_HANDLER(add_fd_completion);
 DECL_HANDLER(set_fd_completion_mode);
@@ -605,6 +606,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_remove_completion,
     (req_handler)req_get_thread_completion,
     (req_handler)req_query_completion,
+    (req_handler)req_associate_completion,
     (req_handler)req_set_completion_info,
     (req_handler)req_add_fd_completion,
     (req_handler)req_set_fd_completion_mode,
@@ -2256,6 +2258,9 @@ C_ASSERT( offsetof(struct query_completion_request, handle) == 12 );
 C_ASSERT( sizeof(struct query_completion_request) == 16 );
 C_ASSERT( offsetof(struct query_completion_reply, depth) == 8 );
 C_ASSERT( sizeof(struct query_completion_reply) == 16 );
+C_ASSERT( offsetof(struct associate_completion_request, handle) == 12 );
+C_ASSERT( offsetof(struct associate_completion_request, alertable) == 16 );
+C_ASSERT( sizeof(struct associate_completion_request) == 24 );
 C_ASSERT( offsetof(struct set_completion_info_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_completion_info_request, ckey) == 16 );
 C_ASSERT( offsetof(struct set_completion_info_request, chandle) == 24 );
@@ -2386,7 +2391,9 @@ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, fsync_shm_idx) == 16 );
-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
+C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, cookie) == 24 );
+C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, generation) == 32 );
+C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 40 );
 C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
 C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
 C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, fsync_shm_idx) == 12 );
