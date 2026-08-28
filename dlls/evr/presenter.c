@@ -1446,6 +1446,7 @@ static HRESULT WINAPI video_presenter_control_SetVideoWindow(IMFVideoDisplayCont
     {
         if (presenter->swapchain)
             IDirect3DSwapChain9_Release(presenter->swapchain);
+        presenter->swapchain = NULL;
         presenter->video_window = window;
         hr = video_presenter_create_swapchain(presenter);
     }
