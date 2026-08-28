@@ -2229,34 +2229,35 @@ static void clear_response_headers( struct request *request )
 
 static void finished_reading( struct request *request )
 {
-    BOOL close = FALSE, close_request_headers;
+    BOOL close = FALSE, close_request_headers = FALSE;
     WCHAR connection[20];
-    DWORD size = sizeof(connection);
+    DWORD size = sizeof(connection), size2 = size;
 
     if (!request->netconn) return;
 
     if (request->netconn->socket == -1) close = TRUE;
     else if (request->hdr.disable_flags & WINHTTP_DISABLE_KEEP_ALIVE) close = TRUE;
     else if (!query_headers( request, WINHTTP_QUERY_CONNECTION, NULL, connection, &size, NULL ) ||
-             !query_headers( request, WINHTTP_QUERY_PROXY_CONNECTION, NULL, connection, &size, NULL ))
+             !query_headers( request, WINHTTP_QUERY_PROXY_CONNECTION, NULL, connection, &size2, NULL ))
     {
         if (!wcsicmp( connection, L"close" )) close = TRUE;
     }
     else if (!wcscmp( request->version, L"HTTP/1.0" )) close = TRUE;
 
-    size = sizeof(connection);
-    close_request_headers =
-            (!query_headers( request, WINHTTP_QUERY_CONNECTION | WINHTTP_QUERY_FLAG_REQUEST_HEADERS, NULL, connection, &size, NULL )
-             || !query_headers( request, WINHTTP_QUERY_PROXY_CONNECTION | WINHTTP_QUERY_FLAG_REQUEST_HEADERS, NULL, connection, &size, NULL ))
-             && !wcsicmp( connection, L"close" );
+    size = size2 = sizeof(connection);
+    if (!query_headers( request, WINHTTP_QUERY_CONNECTION | WINHTTP_QUERY_FLAG_REQUEST_HEADERS, NULL, connection, &size, NULL ) ||
+        !query_headers( request, WINHTTP_QUERY_PROXY_CONNECTION | WINHTTP_QUERY_FLAG_REQUEST_HEADERS, NULL, connection, &size2, NULL ))
+    {
+        if (!wcsicmp( connection, L"close" )) close_request_headers = TRUE;
+    }
+
     if (close || close_request_headers)
     {
         if (close_request_headers) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CLOSING_CONNECTION, 0, 0 );
         netconn_release( request->netconn );
         if (close_request_headers) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CONNECTION_CLOSED, 0, 0 );
     }
-    else
-        cache_connection( request->netconn );
+    else cache_connection( request->netconn );
     request->netconn = NULL;
 }
 
