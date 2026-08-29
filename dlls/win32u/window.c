@@ -280,6 +280,7 @@ static void client_surface_notify_presentation_timing_locked( struct client_surf
 {
     struct client_surface_presentation_timing_listener *listener;
 
+    pthread_cond_broadcast( &surface->presentation_cond );
     LIST_FOR_EACH_ENTRY( listener, &surface->presentation_timing_listeners,
                          struct client_surface_presentation_timing_listener, entry )
         listener->changed( listener );
@@ -292,6 +293,10 @@ static void client_surface_detach_locked( struct client_surface *surface )
     list_remove( &surface->entry );
     surface->funcs->detach( surface );
     surface->hwnd = NULL;
+    pthread_mutex_lock( &surface->presentation_mutex );
+    InterlockedIncrement( &surface->presentation_generation );
+    client_surface_notify_presentation_timing_locked( surface );
+    pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
 static void client_surface_release_locked( struct client_surface *surface )
@@ -311,6 +316,8 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->presentation_update_pending );
         assert( !surface->presentation_timing_requests );
         assert( list_empty( &surface->presentation_timing_listeners ) );
+        assert( !surface->active_ref );
+        assert( !surface->native_ref );
         pthread_cond_destroy( &surface->presentation_cond );
         pthread_mutex_destroy( &surface->presentation_mutex );
         free( surface );
@@ -363,6 +370,7 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
     }
     surface->funcs = funcs;
     surface->ref = 1;
+    surface->presentation_owner = TRUE;
     surface->hwnd = hwnd;
     list_init( &surface->entry );
     list_init( &surface->presentation_timing_listeners );
@@ -448,6 +456,7 @@ BOOL client_surface_suspend_presentation( struct client_surface *surface, BOOL d
     }
     wait = surface->presentation_wait_count != 0;
     if (wait && defer_update) surface->presentation_update_pending = TRUE;
+    client_surface_notify_presentation_timing_locked( surface );
     pthread_mutex_unlock( &surface->presentation_mutex );
     return wait;
 }
@@ -456,6 +465,7 @@ void client_surface_resume_presentation( struct client_surface *surface )
 {
     pthread_mutex_lock( &surface->presentation_mutex );
     surface->presentation_suspended = FALSE;
+    client_surface_notify_presentation_timing_locked( surface );
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
@@ -463,6 +473,7 @@ void client_surface_invalidate_presentation( struct client_surface *surface )
 {
     pthread_mutex_lock( &surface->presentation_mutex );
     InterlockedIncrement( &surface->presentation_generation );
+    client_surface_notify_presentation_timing_locked( surface );
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
@@ -474,7 +485,10 @@ BOOL client_surface_invalidate_presentation_once( struct client_surface *surface
      * objects are kept intact until the later retirement phase. */
     pthread_mutex_lock( &surface->presentation_mutex );
     if ((ret = !InterlockedExchange( invalidated, TRUE )))
+    {
         InterlockedIncrement( &surface->presentation_generation );
+        client_surface_notify_presentation_timing_locked( surface );
+    }
     pthread_mutex_unlock( &surface->presentation_mutex );
     return ret;
 }
@@ -488,6 +502,7 @@ BOOL client_surface_prepare_presentation_retirement( struct client_surface *surf
     {
         InterlockedIncrement( &surface->presentation_generation );
         surface->presentation_retiring = TRUE;
+        client_surface_notify_presentation_timing_locked( surface );
     }
     wait = surface->presentation_wait_count != 0;
     pthread_mutex_unlock( &surface->presentation_mutex );
@@ -509,7 +524,7 @@ void client_surface_cancel_presentation_retirement( struct client_surface *surfa
     {
         assert( !surface->presentation_wait_count );
         surface->presentation_retiring = FALSE;
-        pthread_cond_broadcast( &surface->presentation_cond );
+        client_surface_notify_presentation_timing_locked( surface );
     }
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
@@ -520,7 +535,7 @@ void client_surface_complete_presentation_retirement( struct client_surface *sur
     assert( surface->presentation_retiring );
     assert( !surface->presentation_wait_count );
     surface->presentation_retiring = FALSE;
-    pthread_cond_broadcast( &surface->presentation_cond );
+    client_surface_notify_presentation_timing_locked( surface );
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
@@ -614,6 +629,55 @@ void client_surface_update( struct client_surface *surface )
 {
     pthread_mutex_lock( &surfaces_lock );
     if (surface->hwnd) surface->funcs->update( surface );
+    pthread_mutex_unlock( &surfaces_lock );
+}
+
+BOOL client_surface_is_presentation_candidate( struct client_surface *surface )
+{
+    BOOL ret = TRUE;
+
+    pthread_mutex_lock( &surfaces_lock );
+    if (surface->hwnd && surface->funcs->is_presentation_candidate)
+        ret = surface->funcs->is_presentation_candidate( surface );
+    pthread_mutex_unlock( &surfaces_lock );
+    return ret;
+}
+
+BOOL client_surface_activate( struct client_surface *surface, BOOL native,
+                              struct client_surface **owner )
+{
+    struct client_surface *selected = surface;
+    BOOL ret;
+
+    if (owner) *owner = NULL;
+
+    pthread_mutex_lock( &surfaces_lock );
+    InterlockedIncrement( &surface->active_ref );
+    if (native) InterlockedIncrement( &surface->native_ref );
+    if (surface->hwnd && surface->funcs->activate)
+        selected = surface->funcs->activate( surface );
+    ret = selected == surface;
+    if (!ret && selected && owner)
+    {
+        client_surface_add_ref( selected );
+        *owner = selected;
+    }
+    pthread_mutex_unlock( &surfaces_lock );
+    return ret;
+}
+
+void client_surface_deactivate( struct client_surface *surface, BOOL native )
+{
+    pthread_mutex_lock( &surfaces_lock );
+    assert( surface->active_ref > 0 );
+    if (native)
+    {
+        assert( surface->native_ref > 0 );
+        InterlockedDecrement( &surface->native_ref );
+    }
+    InterlockedDecrement( &surface->active_ref );
+    if (surface->hwnd && surface->funcs->deactivate)
+        surface->funcs->deactivate( surface );
     pthread_mutex_unlock( &surfaces_lock );
 }
 

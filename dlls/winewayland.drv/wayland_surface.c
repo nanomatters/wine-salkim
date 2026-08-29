@@ -2693,6 +2693,10 @@ void wayland_client_surface_release_vulkan_surface(struct client_surface *client
         client->direct_wl_surface = NULL;
     }
 
+    if (data && data->client_surface != client &&
+        !ReadAcquire(&client->client.native_ref))
+        wayland_client_surface_attach(client, NULL);
+
     wayland_win_data_unlock();
 }
 
@@ -3343,6 +3347,7 @@ static BOOL wayland_client_surface_should_stack_above_parent(struct wayland_surf
                                                              BOOL content_over_producer,
                                                              DWORD exstyle)
 {
+    if (!ReadAcquire(&client->client.presentation_owner)) return FALSE;
     if (content_over_producer) return FALSE;
 
     if (ReadAcquire(&client->has_presented) &&
@@ -6557,9 +6562,9 @@ static void wayland_client_surface_reset_opaque_region(struct wayland_client_sur
 static BOOL wayland_client_surface_can_set_opaque_region(struct wayland_client_surface *surface,
                                                          BOOL opaque)
 {
-    /* A busy WSI may still present an alpha frame. */
+    /* A native WSI may still present an alpha frame. */
     return !opaque || !ReadAcquire(&surface->has_presented) ||
-           !ReadAcquire(&surface->client.busy_ref);
+           !ReadAcquire(&surface->client.native_ref);
 }
 
 static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *surface,
@@ -6588,6 +6593,109 @@ static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *sur
     wayland_shm_buffer_unref(clone);
 }
 
+/* The list is non-owning and protected by win_data_mutex. */
+static void wayland_client_surface_register(struct wayland_win_data *data,
+                                            struct wayland_client_surface *surface)
+{
+    if (list_empty(&surface->hwnd_entry))
+        list_add_tail(&data->client_surfaces, &surface->hwnd_entry);
+}
+
+static void wayland_client_surface_unregister(struct wayland_client_surface *surface)
+{
+    if (list_empty(&surface->hwnd_entry)) return;
+    list_remove(&surface->hwnd_entry);
+    list_init(&surface->hwnd_entry);
+}
+
+static void wayland_client_surface_register_latest(
+        struct wayland_win_data *data, struct wayland_client_surface *surface)
+{
+    wayland_client_surface_unregister(surface);
+    list_add_tail(&data->client_surfaces, &surface->hwnd_entry);
+}
+
+static struct wayland_client_surface *wayland_client_surface_find_owner(
+        struct wayland_win_data *data, struct wayland_client_surface *exclude,
+        BOOL active_only)
+{
+    struct wayland_client_surface *surface;
+
+    LIST_FOR_EACH_ENTRY_REV(surface, &data->client_surfaces,
+                            struct wayland_client_surface, hwnd_entry)
+    {
+        if (surface == exclude) continue;
+        if (active_only && !ReadAcquire(&surface->client.active_ref)) continue;
+        return surface;
+    }
+    return NULL;
+}
+
+BOOL wayland_client_surface_is_presentation_candidate(
+        struct wayland_win_data *data, struct wayland_client_surface *surface)
+{
+    return data->client_surface == surface ||
+           wayland_client_surface_find_owner(data, NULL, FALSE) == surface;
+}
+
+/* Presentation ownership follows VkSurface creation generations, not host
+ * swapchain creation or present order. Replacement flip-model presenters are
+ * created after legacy presenters, so the latest active generation models
+ * their precedence without importing API-specific swap-effect policy here.
+ * This also keeps a lazily-created older generation from replacing a newer API
+ * surface targeting the same HWND. */
+static BOOL wayland_client_surface_set_owner(struct wayland_win_data *data,
+                                             struct wayland_client_surface *surface)
+{
+    struct wayland_client_surface *client;
+    struct wayland_client_surface *previous = data->client_surface;
+
+    if (previous == surface) return FALSE;
+
+    if (previous)
+    {
+        InterlockedExchange(&previous->client.presentation_owner, FALSE);
+        if (ReadAcquire(&previous->client.active_ref))
+            client_surface_invalidate_presentation(&previous->client);
+    }
+    data->client_surface = surface;
+    if (surface)
+    {
+        InterlockedExchange(&surface->client.presentation_owner, TRUE);
+        if (ReadAcquire(&surface->client.active_ref))
+            client_surface_invalidate_presentation(&surface->client);
+    }
+
+    /* Every active background presenter must recreate against the exact new
+     * owner; otherwise a third generation can leave it subscribed to timing
+     * from the presenter that was just displaced. */
+    LIST_FOR_EACH_ENTRY(client, &data->client_surfaces,
+                        struct wayland_client_surface, hwnd_entry)
+    {
+        if (client == previous || client == surface ||
+            !ReadAcquire(&client->client.active_ref))
+            continue;
+        client_surface_invalidate_presentation(&client->client);
+    }
+
+    TRACE("hwnd=%p presentation owner %s -> %s\n", data->hwnd,
+          previous ? debugstr_client_surface(&previous->client) : "(none)",
+          surface ? debugstr_client_surface(&surface->client) : "(none)");
+    return TRUE;
+}
+
+static void wayland_client_surface_restore_owner(
+        struct wayland_win_data *data, struct wayland_client_surface *surface)
+{
+    struct wayland_client_surface *replacement;
+
+    replacement = wayland_client_surface_find_owner(data, surface, TRUE);
+    if (!replacement)
+        replacement = wayland_client_surface_find_owner(data, surface, FALSE);
+    wayland_client_surface_set_owner(data, replacement);
+    if (replacement) wayland_client_surface_attach(replacement, data->toplevel);
+}
+
 static void wayland_client_surface_destroy(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
@@ -6603,7 +6711,11 @@ static void wayland_client_surface_destroy(struct client_surface *client)
     {
         if (data->wayland_surface && data->wayland_surface->direct_client == surface)
             wayland_surface_clear_direct_client(data->wayland_surface, data, surface);
+        if (data->client_surface == surface)
+            wayland_client_surface_restore_owner(data, surface);
     }
+    InterlockedExchange(&surface->client.presentation_owner, FALSE);
+    wayland_client_surface_unregister(surface);
 
     if ((callback = InterlockedExchangePointer((void **)&surface->wl_callback, NULL)))
         wl_callback_destroy(callback);
@@ -6644,10 +6756,13 @@ static void wayland_client_surface_detach(struct client_surface *client)
 
     if ((data = wayland_win_data_get(client->hwnd)))
     {
-        if (data->client_surface == surface) data->client_surface = NULL;
+        if (data->client_surface == surface)
+            wayland_client_surface_restore_owner(data, surface);
+        wayland_client_surface_unregister(surface);
         wayland_client_surface_attach(surface, NULL);
         wayland_win_data_release(data);
     }
+    InterlockedExchange(&surface->client.presentation_owner, FALSE);
 }
 
 static BOOL wayland_surface_has_live_role(struct wayland_surface *surface);
@@ -6723,20 +6838,32 @@ static void wayland_client_surface_update(struct client_surface *client)
                                                      &surface->direct_toplevel_invalidated);
     }
 
-    /* Keep the selected client attached without letting list order choose the
-     * renderer. Also attach an active replacement before its first present so
-     * host WSI can make progress while the old client preserves the last frame. */
+    /* Keep every active native WSI surface mapped so the compositor continues
+     * to release its buffers. Locally retired presenters have no native WSI and
+     * stay detached. */
     if ((data = wayland_win_data_get(client->hwnd)))
     {
+        struct wayland_client_surface *owner;
+
+        wayland_client_surface_register(data, surface);
+        owner = wayland_client_surface_find_owner(data, NULL, TRUE);
+        if (!owner && !data->client_surface) owner = surface;
+        if (owner) wayland_client_surface_set_owner(data, owner);
         if (data->client_surface == surface ||
-            (ReadAcquire(&surface->client.busy_ref) &&
-             !ReadAcquire(&surface->has_presented)))
+            ReadAcquire(&surface->client.native_ref))
         {
-            wayland_client_surface_refresh_attachment(data, surface,
-                                                       data->toplevel);
+            wayland_client_surface_refresh_attachment(data, surface, data->toplevel);
             surface->updated_attachment_generation =
                 ReadAcquire(&surface->attachment_generation);
         }
+        else if (surface->toplevel)
+            wayland_client_surface_attach(surface, NULL);
+
+        /* Background attachment may have changed the carrier. Reapply the
+         * owner's stacking and carrier policy last. */
+        if (data->client_surface && data->client_surface != surface)
+            wayland_client_surface_refresh_attachment(data, data->client_surface,
+                                                       data->toplevel);
         wayland_win_data_release(data);
     }
 }
@@ -6870,7 +6997,7 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
         ReadAcquire(&surface->attachment_generation) !=
         surface->updated_attachment_generation)
     {
-        set_client_surface(hwnd, surface);
+        wayland_client_surface_update(client);
         surface->updated_attachment_generation =
             ReadAcquire(&surface->attachment_generation);
     }
@@ -6972,6 +7099,8 @@ static BOOL wayland_presentation_feedback_claim(
 static void presentation_feedback_handle_sync_output(
         void *data, struct wp_presentation_feedback *feedback, struct wl_output *wl_output)
 {
+    /* The compositor's refresh value is authoritative. In particular, zero
+     * means that no useful fixed-cadence prediction is available. */
 }
 
 static void presentation_feedback_handle_presented(
@@ -7034,7 +7163,9 @@ static BOOL wayland_client_surface_prepare_presentation_feedback(
     struct wp_presentation_feedback *feedback;
     struct wl_surface *wl_surface;
 
-    if (!process_wayland.wp_presentation) return FALSE;
+    if (!process_wayland.wp_presentation ||
+        !ReadAcquire(&client->presentation_owner))
+        return FALSE;
     if (InterlockedCompareExchange(&surface->presentation_feedback_pending,
                                    TRUE, FALSE))
         return FALSE;
@@ -7079,40 +7210,118 @@ static void wayland_client_surface_finish_presentation_feedback(
     client_surface_release(client);
 }
 
-void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+static void wayland_client_surface_refresh_presenters(struct wayland_win_data *data,
+                                                       HWND toplevel)
 {
-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-    struct wayland_client_surface *old_client;
-    struct wayland_win_data *data;
-    BOOL refresh_state = FALSE;
+    struct wayland_client_surface *surface;
 
-    /* ownership is shared with the callers, the last caller to release
-     * its reference will also destroy it and clear our pointer. */
-
-    if (!(data = wayland_win_data_get(hwnd))) return;
-
-    if (new_client && new_client != data->client_surface && data->client_surface &&
-        ReadAcquire(&data->client_surface->has_presented) &&
-        !ReadAcquire(&new_client->has_presented))
-        goto done;
-
-    if (new_client != data->client_surface)
+    /* Attach background presenters first. Their WSI surfaces must remain
+     * compositor-serviced, but the selected presenter owns the final stacking
+     * and carrier state for the HWND. */
+    LIST_FOR_EACH_ENTRY(surface, &data->client_surfaces,
+                        struct wayland_client_surface, hwnd_entry)
     {
-        if ((old_client = data->client_surface))
-            wayland_client_surface_attach(old_client, NULL);
+        if (surface == data->client_surface) continue;
 
-        data->client_surface = new_client;
-        refresh_state = new_client && data->wayland_surface &&
-                        data->wayland_surface->role == WAYLAND_SURFACE_ROLE_NONE &&
-                        data->wayland_surface->window.visible;
+        if (ReadAcquire(&surface->client.native_ref))
+            wayland_client_surface_refresh_attachment(data, surface, toplevel);
+        else if (surface->toplevel)
+            wayland_client_surface_attach(surface, NULL);
     }
 
     if (data->client_surface)
         wayland_client_surface_refresh_attachment(data, data->client_surface, toplevel);
+}
 
-done:
+void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+{
+    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+    struct wayland_client_surface *owner;
+    struct wayland_win_data *data;
+    BOOL changed, refresh_state;
+
+    /* Re-registering moves a recycled Wayland surface to the newest position
+     * in the per-window presentation ordering. */
+    if (!(data = wayland_win_data_get(hwnd))) return;
+
+    wayland_client_surface_register_latest(data, new_client);
+    owner = wayland_client_surface_find_owner(data, NULL, TRUE);
+    if (!owner) owner = data->client_surface ? data->client_surface : new_client;
+    changed = wayland_client_surface_set_owner(data, owner);
+    refresh_state = owner && data->wayland_surface &&
+                    data->wayland_surface->role == WAYLAND_SURFACE_ROLE_NONE &&
+                    data->wayland_surface->window.visible;
+    wayland_client_surface_refresh_presenters(data, toplevel);
+
+    TRACE("registered latest %s, owner %s\n",
+          debugstr_client_surface(&new_client->client),
+          owner ? debugstr_client_surface(&owner->client) : "(none)");
     wayland_win_data_release(data);
+
     if (refresh_state) NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+    if (changed) wl_display_flush(process_wayland.wl_display);
+}
+
+static struct client_surface *wayland_client_surface_activate(struct client_surface *client)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_client_surface *owner;
+    struct wayland_win_data *data;
+    HWND toplevel = NtUserGetAncestor(client->hwnd, GA_ROOT);
+    BOOL changed;
+
+    if (!(data = wayland_win_data_get(client->hwnd))) return client;
+
+    wayland_client_surface_register(data, surface);
+    owner = wayland_client_surface_find_owner(data, NULL, TRUE);
+    changed = wayland_client_surface_set_owner(data, owner);
+    wayland_client_surface_refresh_presenters(data, toplevel);
+
+    TRACE("activated %s as %s\n",
+          debugstr_client_surface(client),
+          owner == surface ? "presentation owner" : "background presenter");
+    wayland_win_data_release(data);
+
+    if (changed) wl_display_flush(process_wayland.wl_display);
+    return owner ? &owner->client : NULL;
+}
+
+static BOOL wayland_client_surface_is_candidate(struct client_surface *client)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_win_data *data;
+    BOOL ret = TRUE;
+
+    if ((data = wayland_win_data_get(client->hwnd)))
+    {
+        wayland_client_surface_register(data, surface);
+        ret = wayland_client_surface_is_presentation_candidate(data, surface);
+        wayland_win_data_release(data);
+    }
+    return ret;
+}
+
+static void wayland_client_surface_deactivate(struct client_surface *client)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_client_surface *owner;
+    struct wayland_win_data *data;
+    HWND toplevel = NtUserGetAncestor(client->hwnd, GA_ROOT);
+    BOOL changed = FALSE;
+
+    if (!(data = wayland_win_data_get(client->hwnd))) return;
+
+    if (!ReadAcquire(&client->active_ref) && data->client_surface == surface &&
+        (owner = wayland_client_surface_find_owner(data, surface, TRUE)))
+        changed = wayland_client_surface_set_owner(data, owner);
+    wayland_client_surface_refresh_presenters(data, toplevel);
+
+    TRACE("deactivated %s%s\n",
+          debugstr_client_surface(client),
+          changed ? ", restored previous owner" : "");
+    wayland_win_data_release(data);
+
+    if (changed) wl_display_flush(process_wayland.wl_display);
 }
 
 static const struct client_surface_funcs wayland_client_surface_funcs =
@@ -7120,6 +7329,9 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
     .destroy = wayland_client_surface_destroy,
     .detach = wayland_client_surface_detach,
     .update = wayland_client_surface_update,
+    .is_presentation_candidate = wayland_client_surface_is_candidate,
+    .activate = wayland_client_surface_activate,
+    .deactivate = wayland_client_surface_deactivate,
     .prepare_presentation_feedback = wayland_client_surface_prepare_presentation_feedback,
     .finish_presentation_feedback = wayland_client_surface_finish_presentation_feedback,
     .present = wayland_client_surface_present,
@@ -7146,8 +7358,10 @@ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
     struct wl_region *empty_region;
 
     if (!(client = client_surface_create(sizeof(*client), &wayland_client_surface_funcs, hwnd))) return NULL;
+    InterlockedExchange(&client->client.presentation_owner, FALSE);
     client_surface_suspend_presentation(&client->client, FALSE);
 
+    list_init(&client->hwnd_entry);
     list_init(&client->fullscreen_requests);
 
     client->wl_surface =

@@ -925,7 +925,7 @@ BOOL wayland_process_init(void)
     }
 
     if (!process_wayland.wp_presentation)
-        TRACE("Wayland compositor doesn't support optional wp_presentation\n");
+        WARN("Wayland compositor doesn't support optional wp_presentation (local presentation pacing will be unavailable)\n");
 
     /* Check for optional globals. */
     if (!process_wayland.zwp_pointer_constraints_v1)

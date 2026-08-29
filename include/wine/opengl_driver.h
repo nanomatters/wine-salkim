@@ -257,6 +257,7 @@ struct opengl_drawable
     int                                 interval;       /* last set surface swap interval */
     BOOL                                doublebuffer;   /* pixel format is double buffered */
     BOOL                                stereo;         /* pixel format is stereo buffered */
+    BOOL                                client_active;  /* client surface activation was committed */
     EGLSurface                          surface;        /* surface for EGL based drivers */
     GLuint                              read_fbo;       /* default read FBO name when emulating framebuffer */
     GLuint                              draw_fbo;       /* default draw FBO name when emulating framebuffer */

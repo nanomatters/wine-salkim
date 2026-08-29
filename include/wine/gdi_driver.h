@@ -280,6 +280,12 @@ struct client_surface_funcs
     void (*detach)( struct client_surface *surface );
     /* update the surface to match its window state */
     void (*update)( struct client_surface *surface );
+    /* return whether a successful presenter would own native presentation */
+    BOOL (*is_presentation_candidate)( struct client_surface *surface );
+    /* commit a successfully created presenter and return the selected window owner */
+    struct client_surface *(*activate)( struct client_surface *surface );
+    /* notify the surface that a committed presenter was destroyed */
+    void (*deactivate)( struct client_surface *surface );
     /* request feedback for the next native presentation commit */
     BOOL (*prepare_presentation_feedback)( struct client_surface *surface );
     /* finish the request, cancelling feedback when the present was not submitted */
@@ -297,7 +303,12 @@ struct client_surface
     const struct client_surface_funcs *funcs;
     struct list                        entry;          /* entry in win32u managed list */
     LONG                               ref;            /* reference count */
+    /* A native presenter is active, and every active presenter holds a busy
+     * drawable or swapchain reference: native_ref <= active_ref <= busy_ref. */
     LONG                               busy_ref;       /* count of drawables/swapchains referencing this surface */
+    LONG                               active_ref;     /* count of successfully created drawables/swapchains */
+    LONG                               native_ref;     /* active drawables/swapchains using host WSI */
+    LONG                               presentation_owner; /* selected renderer for the window */
     LONG                               presentation_timing_requests; /* consumers of native timing feedback */
     HWND                               hwnd;           /* window the surface was created for */
     LONG                               updated;        /* has been moved / resized / reparented */
@@ -350,6 +361,11 @@ W32KAPI void client_surface_remove_presentation_timing_listener(
         struct client_surface *surface,
         struct client_surface_presentation_timing_listener *listener );
 W32KAPI void client_surface_update( struct client_surface *surface );
+W32KAPI BOOL client_surface_is_presentation_candidate( struct client_surface *surface );
+/* owner receives a referenced exact owner when surface is a background presenter. */
+W32KAPI BOOL client_surface_activate( struct client_surface *surface, BOOL native,
+                                     struct client_surface **owner );
+W32KAPI void client_surface_deactivate( struct client_surface *surface, BOOL native );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 

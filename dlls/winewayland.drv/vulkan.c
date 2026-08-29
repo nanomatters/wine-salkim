@@ -76,13 +76,23 @@ static struct wayland_client_surface *stash_client_surface(HWND hwnd,
         client_surface_add_ref(&surface->client);
         data->stashed_client = surface;
     }
-    else if ((ret = data->stashed_client) && !ReadAcquire(&ret->client.busy_ref))
+    else if ((ret = data->stashed_client) && ReadAcquire(&ret->client.ref) == 1 &&
+             !ReadAcquire(&ret->client.busy_ref))
     {
-        /* Transfer the stash reference to the new VkSurface. */
+        /* Transfer the stash's sole reference to the new VkSurface. */
         data->stashed_client = NULL;
         /* detach the client surface to ensure it is reparented */
         wayland_client_surface_attach(ret, NULL);
-        if (data->client_surface == ret) data->client_surface = NULL;
+        if (data->client_surface == ret)
+        {
+            InterlockedExchange(&ret->client.presentation_owner, FALSE);
+            data->client_surface = NULL;
+        }
+        if (!list_empty(&ret->hwnd_entry))
+        {
+            list_remove(&ret->hwnd_entry);
+            list_init(&ret->hwnd_entry);
+        }
     }
     else ret = NULL;
 
@@ -309,7 +319,7 @@ static VkBool32 wayland_vulkan_surface_fullscreen_supported(
     client = impl_from_client_surface(client_surface);
     wayland_win_data_lock();
     data = wayland_win_data_get_nolock(client_surface->hwnd);
-    valid = data && data->client_surface == client;
+    valid = data && wayland_client_surface_is_presentation_candidate(data, client);
     wayland_win_data_unlock();
     return valid;
 }
@@ -344,7 +354,7 @@ static VkResult wayland_vulkan_surface_fullscreen(
     switch (action)
     {
     case VULKAN_SURFACE_FULLSCREEN_PREPARE:
-        if (!data || data->client_surface != client)
+        if (!data || !wayland_client_surface_is_presentation_candidate(data, client))
         {
             res = VK_ERROR_SURFACE_LOST_KHR;
             break;

@@ -150,6 +150,8 @@ void opengl_drawable_release( struct opengl_drawable *drawable )
         if (drawable->surface) funcs->p_eglDestroySurface( egl->display, drawable->surface );
         if (drawable->client)
         {
+            if (drawable->client_active)
+                client_surface_deactivate( drawable->client, TRUE );
             InterlockedDecrement( &drawable->client->busy_ref );
             client_surface_release( drawable->client );
         }
@@ -1996,7 +1998,15 @@ static struct opengl_drawable *get_window_unused_drawable( HWND hwnd, int format
     if (!drawable)
     {
         driver_funcs->p_surface_create( hwnd, raw, format, &drawable );
-        if (drawable && drawable->client) add_window_client_surface( hwnd, drawable->client );
+        if (drawable && drawable->client)
+        {
+            /* EGL has no local discard path. Keep background drawables native;
+             * winewayland keeps their WSI surfaces compositor-serviced below
+             * the selected presenter. */
+            client_surface_activate( drawable->client, TRUE, NULL );
+            drawable->client_active = TRUE;
+            add_window_client_surface( hwnd, drawable->client );
+        }
     }
 
     if (drawable && drawable->funcs != &framebuffer_surface_funcs && raw)

@@ -27,6 +27,7 @@
 
 #include <pthread.h>
 #include <sys/types.h>
+#include <time.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbregistry.h>
@@ -569,6 +570,7 @@ struct wayland_fullscreen_request
 struct wayland_client_surface
 {
     struct client_surface client;
+    struct list hwnd_entry;
     HWND toplevel;
     HANDLE throttle;
     struct wl_callback *wl_callback;
@@ -950,8 +952,10 @@ struct wayland_win_data
     BOOL content_over_producer;
     /* wayland surface (if any) for this window */
     struct wayland_surface *wayland_surface;
-    /* wayland client surface (if any) for this window */
+    /* wayland client surface selected for presentation */
     struct wayland_client_surface *client_surface;
+    /* non-owning client surfaces in creation order */
+    struct list client_surfaces;
     /* track a stale client surface to ensure DMABUF modifiers stay valid */
     struct wayland_client_surface *stashed_client;
     /* window rects, relative to parent client area */
@@ -996,6 +1000,8 @@ void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+BOOL wayland_client_surface_is_presentation_candidate(struct wayland_win_data *data,
+                                                      struct wayland_client_surface *surface);
 BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
                                                struct wayland_client_surface *client);
 BOOL wayland_toplevel_has_visible_child_surface(HWND toplevel);

@@ -130,6 +130,7 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     data->rects = *rects;
     data->ime_enabled = FALSE;
     data->num_ime_children = 0;
+    list_init(&data->client_surfaces);
 
     pthread_mutex_lock(&win_data_mutex);
 
@@ -153,6 +154,7 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
  */
 static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
+    struct wayland_client_surface *client, *next;
     struct wayland_client_surface *stashed_client = data->stashed_client;
     struct wayland_shm_buffer *window_contents = data->window_contents;
 
@@ -163,6 +165,15 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
     /* Keep direct-surface ownership changes serialized with Vulkan release.
      * Release client references after unlocking to preserve lock ordering. */
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
+
+    LIST_FOR_EACH_ENTRY_SAFE(client, next, &data->client_surfaces,
+                             struct wayland_client_surface, hwnd_entry)
+    {
+        InterlockedExchange(&client->client.presentation_owner, FALSE);
+        list_remove(&client->hwnd_entry);
+        list_init(&client->hwnd_entry);
+    }
+    data->client_surface = NULL;
 
     pthread_mutex_unlock(&win_data_mutex);
     if (stashed_client) client_surface_release(&stashed_client->client);
@@ -569,10 +580,14 @@ BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
 
     RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
     {
-        struct wayland_client_surface *other = data->client_surface;
+        struct wayland_client_surface *other;
 
-        if (other && other != client && other->toplevel == toplevel && other->wl_subsurface)
-            return TRUE;
+        LIST_FOR_EACH_ENTRY(other, &data->client_surfaces,
+                            struct wayland_client_surface, hwnd_entry)
+        {
+            if (other != client && other->toplevel == toplevel && other->wl_subsurface)
+                return TRUE;
+        }
     }
     return FALSE;
 }
@@ -612,12 +627,16 @@ void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *p
 
     RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
     {
-        struct wayland_client_surface *client = data->client_surface;
+        struct wayland_client_surface *client;
 
-        if (!client || !client->wl_subsurface) continue;
-        if (client->toplevel != hwnd || client->toplevel_wl_surface != parent) continue;
+        LIST_FOR_EACH_ENTRY(client, &data->client_surfaces,
+                            struct wayland_client_surface, hwnd_entry)
+        {
+            if (!client->wl_subsurface) continue;
+            if (client->toplevel != hwnd || client->toplevel_wl_surface != parent) continue;
 
-        client_surface_invalidate_presentation(&client->client);
+            client_surface_invalidate_presentation(&client->client);
+        }
     }
 }
 
