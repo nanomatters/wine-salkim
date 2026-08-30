@@ -283,6 +283,15 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
 #define HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER 0x00000080
 
+#define HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK  0x00000100
+#define HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED 0x00000200
+
+
+#define HWND_DMABUF_PRESENTATION_VSYNC          0x00000001
+#define HWND_DMABUF_PRESENTATION_HW_CLOCK       0x00000002
+#define HWND_DMABUF_PRESENTATION_HW_COMPLETION  0x00000004
+#define HWND_DMABUF_PRESENTATION_ZERO_COPY      0x00000008
+
 
 /* image_id names a dmabuf slot whose backing store stays valid until its release
  * token returns. The consumer may cache and reuse the wl_buffer for that slot.
@@ -300,6 +309,8 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FLAG_LAYERED_COMPOSITE 0x00000020
 
 #define HWND_DMABUF_FLAG_ALPHA_MODIFIER    0x00000040
+
+#define HWND_DMABUF_FLAG_PRESENTATION_FEEDBACK 0x00000080
 
 #define HWND_DMABUF_FRAME_OPENED          0x00000001
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
@@ -7482,6 +7493,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 939
+#define SERVER_PROTOCOL_VERSION 940
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

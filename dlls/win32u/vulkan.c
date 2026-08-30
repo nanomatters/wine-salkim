@@ -330,6 +330,18 @@ static const char *debugstr_vkextent2d( const VkExtent2D *ext )
 #define WINE_VK_MANAGED_REANNOUNCE_MAX_MS  4000
 /* Allow brief pauses beyond the consumer's dmabuf grace period. */
 #define WINE_VK_MANAGED_STALL_MS       2000
+#define WINE_VK_MANAGED_MAX_FEEDBACKS  64
+/* One result per outstanding feedback and one release per busy image. */
+#define WINE_VK_MANAGED_MAX_ROUTED_RESPONSES \
+    (WINE_VK_MANAGED_MAX_FEEDBACKS + WINE_VK_MANAGED_MAX_IMAGES)
+
+C_ASSERT(offsetof(hwnd_dmabuf_release_t, frame_seq) == 32);
+C_ASSERT(offsetof(hwnd_dmabuf_release_t, presented_ns) == 40);
+C_ASSERT(sizeof(hwnd_dmabuf_release_t) == 64);
+C_ASSERT(HWND_DMABUF_PRESENTATION_VSYNC == CLIENT_SURFACE_PRESENTATION_VSYNC);
+C_ASSERT(HWND_DMABUF_PRESENTATION_HW_CLOCK == CLIENT_SURFACE_PRESENTATION_HW_CLOCK);
+C_ASSERT(HWND_DMABUF_PRESENTATION_HW_COMPLETION == CLIENT_SURFACE_PRESENTATION_HW_COMPLETION);
+C_ASSERT(HWND_DMABUF_PRESENTATION_ZERO_COPY == CLIENT_SURFACE_PRESENTATION_ZERO_COPY);
 
 static pthread_mutex_t nvidia_wayland_instance_lock = PTHREAD_MUTEX_INITIALIZER;
 /* NVIDIA tears down process-global Wayland WSI state from vkDestroyInstance()
@@ -354,16 +366,19 @@ enum wine_managed_image_layout
     WINE_MANAGED_IMAGE_LAYOUT_LINEAR,
 };
 
-/* The server reuses one channel while swapchains overlap during recreation. */
+/* The server reuses one SOCK_SEQPACKET channel while swapchains overlap.
+ * Serialize reverse reads and route producer-tagged responses locally. */
 struct wine_managed_consumer
 {
     struct list entry;
+    struct list producers;
     HWND hwnd;
     unsigned int refcount;
     LONG state;
     LONG reannounce_pending;
     LONG last_reannounce_ms;
     LONG reannounce_delay_ms;
+    LONG response_drain_active;     /* preserve shared socket receive order */
 };
 
 static pthread_mutex_t managed_consumers_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -383,8 +398,15 @@ struct wine_managed_image
     BOOL consumer_cached;           /* consumer explicitly acked this slot's dmabuf cache */
 };
 
+struct wine_managed_feedback
+{
+    UINT64 present_id;
+    uint32_t frame_seq;
+};
+
 struct wine_managed_swapchain
 {
+    struct list consumer_entry;
     struct wine_managed_image images[WINE_VK_MANAGED_MAX_IMAGES];
     uint32_t image_count;
 
@@ -403,6 +425,18 @@ struct wine_managed_swapchain
     UINT64 next_release_token;
     UINT64 present_id;              /* monotonic frame_seq counter */
     UINT64 producer_unique_id;      /* unique across managed swapchain recreates */
+    UINT64 completed_application_present_id;
+    UINT64 completed_presentation_count;
+    struct wine_managed_feedback feedbacks[WINE_VK_MANAGED_MAX_FEEDBACKS];
+    uint32_t feedback_count;
+    hwnd_dmabuf_release_t routed_responses[WINE_VK_MANAGED_MAX_ROUTED_RESPONSES];
+    uint32_t routed_response_head;
+    uint32_t routed_response_count;
+    LONG routed_response_pending;
+    BOOL routed_response_overflow;
+    UINT64 timing_properties_counter;
+    UINT64 timing_presented_ns;
+    UINT64 refresh_interval_ns;     /* latest compositor refresh interval */
     unsigned int ring_generation;
     DWORD ring_full_since_ms;
 
@@ -416,9 +450,12 @@ struct wine_managed_swapchain
     PFN_vkWaitForFences p_vkWaitForFences;
     PFN_vkResetFences p_vkResetFences;
     BOOL explicit_sync;
+    BOOL presentation_feedback;
+    struct client_surface *client_surface; /* borrowed from the owning swapchain */
     HWND hwnd;                      /* server-visible producer HWND */
     BOOL pending_registered;        /* server pending reference is live */
     BOOL channel_registered;        /* server active producer reference is live */
+    BOOL consumer_registered;       /* registered for per-hwnd response routing */
 };
 
 struct swapchain
@@ -3977,6 +4014,7 @@ static struct wine_managed_consumer *managed_consumer_get( HWND hwnd )
 
     if ((consumer = calloc( 1, sizeof(*consumer) )))
     {
+        list_init( &consumer->producers );
         consumer->hwnd = hwnd;
         consumer->refcount = 1;
         list_add_tail( &managed_consumers, &consumer->entry );
@@ -3992,9 +4030,36 @@ static void managed_consumer_put( struct wine_managed_consumer *consumer )
     pthread_mutex_lock( &managed_consumers_lock );
     if (!--consumer->refcount)
     {
+        assert( list_empty( &consumer->producers ) );
         list_remove( &consumer->entry );
         free( consumer );
     }
+    pthread_mutex_unlock( &managed_consumers_lock );
+}
+
+static void managed_consumer_register( struct wine_managed_swapchain *managed )
+{
+    struct wine_managed_consumer *consumer = managed->consumer;
+
+    pthread_mutex_lock( &managed_consumers_lock );
+    assert( !managed->consumer_registered );
+    assert( list_empty( &managed->consumer_entry ) );
+    list_add_tail( &consumer->producers, &managed->consumer_entry );
+    managed->consumer_registered = TRUE;
+    pthread_mutex_unlock( &managed_consumers_lock );
+}
+
+static void managed_consumer_unregister( struct wine_managed_swapchain *managed )
+{
+    if (!managed->consumer_registered) return;
+    pthread_mutex_lock( &managed_consumers_lock );
+    list_remove( &managed->consumer_entry );
+    list_init( &managed->consumer_entry );
+    managed->consumer_registered = FALSE;
+    managed->routed_response_head = 0;
+    managed->routed_response_count = 0;
+    managed->routed_response_overflow = FALSE;
+    InterlockedExchange( &managed->routed_response_pending, FALSE );
     pthread_mutex_unlock( &managed_consumers_lock );
 }
 
@@ -4054,6 +4119,7 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
     uint32_t i;
 
     if (!managed) return;
+    managed_consumer_unregister( managed );
     /* Wait only for writes to these images. The exported dmabufs stay alive
      * for the compositor through their kernel references. */
     for (i = 0; i < managed->image_count; i++)
@@ -4068,6 +4134,68 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
     managed_consumer_put( managed->consumer );
     pthread_mutex_destroy( &managed->lock );
     free( managed );
+}
+
+static VkResult managed_swapchain_alloc( struct vulkan_device *device,
+                                         struct surface *surface,
+                                         const VkSwapchainCreateInfoKHR *create_info,
+                                         struct wine_managed_swapchain **out )
+{
+    VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    struct wine_managed_swapchain *managed;
+
+    *out = NULL;
+    if (!(managed = calloc( 1, sizeof(*managed) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    list_init( &managed->consumer_entry );
+    pthread_mutex_init( &managed->lock, NULL );
+    managed->channel_fd = -1;
+    managed->wake_fd = -1;
+    managed->hwnd = surface->hwnd;
+    managed->format = create_info->imageFormat;
+    managed->extents = create_info->imageExtent;
+    managed->usage = create_info->imageUsage;
+    managed->client_surface = surface->client;
+    if (device->queue_count) managed->signal_queue = device->queues;
+    managed->p_vkWaitForFences = device->p_vkWaitForFences;
+    managed->p_vkResetFences = device->p_vkResetFences;
+
+#ifdef HAVE_SYS_EVENTFD_H
+    if ((managed->wake_fd = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK )) < 0)
+    {
+        managed_free( device, managed );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+#else
+    managed_free( device, managed );
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+#endif
+
+    if (device->p_vkCreateFence( device->host.device, &fence_info, NULL,
+                                 &managed->present_fence ))
+        managed->present_fence = VK_NULL_HANDLE;
+
+    *out = managed;
+    return VK_SUCCESS;
+}
+
+static uint32_t managed_find_memory_type( struct vulkan_device *device,
+                                          uint32_t type_bits,
+                                          VkMemoryPropertyFlags required )
+{
+    const VkPhysicalDeviceMemoryProperties *properties =
+            &device->physical_device->memory_properties;
+    uint32_t fallback = UINT32_MAX, i;
+
+    for (i = 0; i < properties->memoryTypeCount; i++)
+    {
+        VkMemoryPropertyFlags flags = properties->memoryTypes[i].propertyFlags;
+
+        if (!(type_bits & (1u << i)) || (flags & required) != required) continue;
+        if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) return i;
+        if (fallback == UINT32_MAX) fallback = i;
+    }
+    return fallback;
 }
 
 static BOOL managed_fd_is_dmabuf( int fd )
@@ -4129,9 +4257,8 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     VkImageDrmFormatModifierPropertiesEXT mod_props = { .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT };
     VkMemoryGetFdInfoKHR get_fd = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
     VkImageSubresource subresource = {0};
-    struct vulkan_physical_device *physical_device = device->physical_device;
     VkSubresourceLayout layout = {0};
-    uint32_t mem_type_index = ~0u, plane_count, i;
+    uint32_t mem_type_index, plane_count, i;
     uint64_t wire_modifier = 0;
     BOOL linear = managed->layout == WINE_MANAGED_IMAGE_LAYOUT_LINEAR;
     VkExternalMemoryHandleTypeFlagBits handle_type = linear ?
@@ -4155,20 +4282,9 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
     req_info.image = image->image;
     device->p_vkGetImageMemoryRequirements2( device->host.device, &req_info, &req );
 
-    for (i = 0; i < physical_device->memory_properties.memoryTypeCount; i++)
-    {
-        if (!(req.memoryRequirements.memoryTypeBits & (1u << i))) continue;
-        if (!(physical_device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
-        mem_type_index = i;
-        break;
-    }
-    if (mem_type_index == ~0u)
-    {
-        /* fall back to any supported type */
-        for (i = 0; i < physical_device->memory_properties.memoryTypeCount; i++)
-            if (req.memoryRequirements.memoryTypeBits & (1u << i)) { mem_type_index = i; break; }
-    }
-    if (mem_type_index == ~0u) { res = VK_ERROR_OUT_OF_DEVICE_MEMORY; goto failed; }
+    mem_type_index = managed_find_memory_type(
+            device, req.memoryRequirements.memoryTypeBits, 0 );
+    if (mem_type_index == UINT32_MAX) { res = VK_ERROR_OUT_OF_DEVICE_MEMORY; goto failed; }
 
     dedicated.image = image->image;
     alloc_info.allocationSize = req.memoryRequirements.size;
@@ -4343,11 +4459,9 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
 
-    if (!(managed = calloc( 1, sizeof(*managed) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    pthread_mutex_init( &managed->lock, NULL );
-    managed->channel_fd = -1;
-    managed->wake_fd = -1;
-    managed->hwnd = surface->hwnd;
+    if ((res = managed_swapchain_alloc( device, surface, create_info, &managed )))
+        return res;
+    managed->usage = usage;
     if (!(managed->consumer = managed_consumer_get( managed->hwnd )))
     {
         managed_free( device, managed );
@@ -4355,7 +4469,8 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     }
     if (!(caps_flags & HWND_DMABUF_HOST_CAP_CONSUMER_STATE))
         managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
-    managed->format = create_info->imageFormat;
+    managed->presentation_feedback =
+        !!(caps_flags & HWND_DMABUF_HOST_CAP_PRESENTATION_FEEDBACK);
     managed->fourcc = fourcc;
     managed->layout = layout;
     managed->has_color_space =
@@ -4364,24 +4479,11 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
      * alpha. Otherwise leave alpha as straight. */
     managed->alpha_mode = (fourcc == vk_format_to_drm_fourcc( create_info->imageFormat, TRUE ))
                           ? HWND_DMABUF_ALPHA_MODE_IGNORE : HWND_DMABUF_ALPHA_MODE_UNSPECIFIED;
-    managed->extents = create_info->imageExtent;
-    managed->usage = usage;
     managed->next_release_token = 0;
     managed->producer_unique_id = InterlockedIncrement64( &managed_next_producer_id );
     if (!managed->producer_unique_id)
         managed->producer_unique_id = InterlockedIncrement64( &managed_next_producer_id );
     managed->ring_generation = 1;
-
-#ifdef HAVE_SYS_EVENTFD_H
-    if ((managed->wake_fd = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK )) < 0)
-    {
-        managed_free( device, managed );
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-#else
-    managed_free( device, managed );
-    return VK_ERROR_FEATURE_NOT_PRESENT;
-#endif
 
     status = hwnd_dmabuf_set_pending( managed->hwnd, TRUE );
     if (status != HWND_DMABUF_OK)
@@ -4396,18 +4498,6 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     /* Keep enough images available for asynchronous consumer release. */
     count = max( create_info->minImageCount, 3u );
     if (count > WINE_VK_MANAGED_MAX_IMAGES) count = WINE_VK_MANAGED_MAX_IMAGES;
-
-    /* Pick the first queue for empty acquire-signal submits. */
-    if (device->queue_count) managed->signal_queue = device->queues;
-
-    /* Per-frame fence to gate export on just this frame's render (see managed_present). */
-    managed->p_vkWaitForFences = (void *)p_vkGetDeviceProcAddr( device->host.device, "vkWaitForFences" );
-    managed->p_vkResetFences = (void *)p_vkGetDeviceProcAddr( device->host.device, "vkResetFences" );
-    {
-        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        if (device->p_vkCreateFence( device->host.device, &fci, NULL, &managed->present_fence ))
-            managed->present_fence = VK_NULL_HANDLE;
-    }
 
     managed->explicit_sync = (caps_flags & HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC) &&
                              device->extensions.has_VK_KHR_external_semaphore_fd &&
@@ -4437,6 +4527,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
     }
     managed->channel_registered = TRUE;
     managed->pending_registered = FALSE;
+    managed_consumer_register( managed );
     managed_consumer_request_state( managed );
     TRACE( "managed swapchain %p hwnd %p socket channel fd %d\n", managed, surface->hwnd, managed->channel_fd );
 
@@ -4677,22 +4768,176 @@ static BOOL dmabuf_send_error_is_fatal( int err )
            err == ECONNABORTED || err == ESHUTDOWN || err == EBADF;
 }
 
+static VkResult managed_add_feedback_locked(
+        struct wine_managed_swapchain *managed, uint32_t frame_seq,
+        UINT64 present_id )
+{
+    if (managed->feedback_count == ARRAY_SIZE(managed->feedbacks))
+        return VK_ERROR_OUT_OF_DATE_KHR;
+
+    managed->feedbacks[managed->feedback_count++] =
+        (struct wine_managed_feedback){ present_id, frame_seq };
+    return VK_SUCCESS;
+}
+
+static BOOL managed_complete_feedback_locked(
+        struct wine_managed_swapchain *managed, uint32_t frame_seq )
+{
+    BOOL found = FALSE;
+    uint32_t i;
+
+    for (i = 0; i < managed->feedback_count; i++)
+    {
+        struct wine_managed_feedback *feedback = &managed->feedbacks[i];
+
+        if (feedback->frame_seq != frame_seq) continue;
+        if (feedback->present_id > managed->completed_application_present_id)
+            managed->completed_application_present_id = feedback->present_id;
+        memmove( feedback, feedback + 1,
+                 (--managed->feedback_count - i) * sizeof(*feedback) );
+        found = TRUE;
+        break;
+    }
+    if (!found) return FALSE;
+
+    managed->completed_presentation_count++;
+    return TRUE;
+}
+
+static BOOL managed_pop_routed_response( struct wine_managed_swapchain *managed,
+                                         hwnd_dmabuf_release_t *rel,
+                                         BOOL *overflow )
+{
+    BOOL ret = FALSE;
+
+    *overflow = FALSE;
+    if (!ReadAcquire( &managed->routed_response_pending )) return FALSE;
+
+    pthread_mutex_lock( &managed_consumers_lock );
+    if (managed->routed_response_overflow)
+    {
+        managed->routed_response_overflow = FALSE;
+        managed->routed_response_head = 0;
+        managed->routed_response_count = 0;
+        *overflow = TRUE;
+    }
+    else if (managed->routed_response_count)
+    {
+        *rel = managed->routed_responses[managed->routed_response_head];
+        managed->routed_response_head = (managed->routed_response_head + 1) %
+                                        ARRAY_SIZE(managed->routed_responses);
+        managed->routed_response_count--;
+        ret = TRUE;
+    }
+    if (!managed->routed_response_count && !managed->routed_response_overflow)
+        InterlockedExchange( &managed->routed_response_pending, FALSE );
+    pthread_mutex_unlock( &managed_consumers_lock );
+    return ret;
+}
+
+static void managed_route_response( struct wine_managed_swapchain *managed,
+                                    const hwnd_dmabuf_release_t *rel )
+{
+    struct wine_managed_consumer *consumer = managed->consumer;
+    struct wine_managed_swapchain *target, *found = NULL;
+
+    pthread_mutex_lock( &managed_consumers_lock );
+    LIST_FOR_EACH_ENTRY( target, &consumer->producers,
+                         struct wine_managed_swapchain, consumer_entry )
+    {
+        if (target->producer_unique_id != rel->producer_unique_id) continue;
+        found = target;
+        break;
+    }
+
+    if (found)
+    {
+        if (found->routed_response_count == ARRAY_SIZE(found->routed_responses))
+            found->routed_response_overflow = TRUE;
+        else
+        {
+            uint32_t index = (found->routed_response_head +
+                              found->routed_response_count) %
+                             ARRAY_SIZE(found->routed_responses);
+
+            found->routed_responses[index] = *rel;
+            found->routed_response_count++;
+        }
+        InterlockedExchange( &found->routed_response_pending, TRUE );
+        managed_wake_acquire( found );
+    }
+    pthread_mutex_unlock( &managed_consumers_lock );
+}
+
 /* Drain exact release tokens from the consumer. Caller holds managed->lock. */
 static void managed_drain_releases( struct wine_managed_swapchain *managed )
 {
     hwnd_dmabuf_release_t rel;
-    BOOL received = FALSE;
-    ssize_t ret;
+    BOOL drain_channel, received = FALSE, routing_overflow = FALSE;
+    ssize_t ret = -1;
 
-    if (managed->channel_fd < 0) return;
+    if (managed->channel_fd < 0 || !managed->consumer_registered) return;
+    drain_channel = !InterlockedCompareExchange(
+            &managed->consumer->response_drain_active, TRUE, FALSE );
     for (;;)
     {
-        ret = recv( managed->channel_fd, &rel, sizeof(rel), MSG_DONTWAIT );
+        BOOL overflow;
+
+        if (managed_pop_routed_response( managed, &rel, &overflow ))
+            ret = sizeof(rel);
+        else if (overflow)
+        {
+            WARN( "hwnd %p managed response routing overflowed\n", managed->hwnd );
+            managed_mark_lost( managed );
+            routing_overflow = TRUE;
+            break;
+        }
+        else if (drain_channel)
+            ret = recv( managed->channel_fd, &rel, sizeof(rel), MSG_DONTWAIT );
+        else
+            break;
+
         if (ret == (ssize_t)sizeof(rel))
         {
             struct wine_managed_image *image;
 
             received = TRUE;
+            if (rel.producer_unique_id &&
+                rel.producer_unique_id != managed->producer_unique_id)
+            {
+                managed_route_response( managed, &rel );
+                continue;
+            }
+            if (rel.flags & HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK)
+            {
+                BOOL discarded;
+
+                if (rel.producer_unique_id != managed->producer_unique_id ||
+                    rel.ring_generation != managed->ring_generation)
+                    continue;
+                discarded = !!(rel.flags & HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED);
+                if (managed_complete_feedback_locked( managed, rel.frame_seq ) &&
+                    !discarded && rel.presented_ns > managed->timing_presented_ns)
+                {
+                    managed->timing_presented_ns = rel.presented_ns;
+                    if (managed->refresh_interval_ns != rel.refresh_ns)
+                    {
+                        managed->refresh_interval_ns = rel.refresh_ns;
+                        managed->timing_properties_counter++;
+                    }
+                    client_surface_set_presentation_timing(
+                        managed->client_surface, rel.presented_ns, rel.refresh_ns,
+                        rel.refresh_count, rel.presentation_flags );
+                }
+                TRACE( "hwnd %p frame %u %s at %s ns, refresh %s ns, flags %#x\n",
+                       managed->hwnd, rel.frame_seq,
+                       rel.flags & HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED ?
+                       "discarded" : "presented",
+                       wine_dbgstr_longlong(rel.presented_ns),
+                       wine_dbgstr_longlong(rel.refresh_ns),
+                       rel.presentation_flags );
+                continue;
+            }
             /* Zero-token records update the channel's consumer state. */
             if (!rel.release_token)
             {
@@ -4729,31 +4974,35 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
         else if (ret < 0 && errno == EINTR) continue;
         else break;
     }
-
     if (received && managed_consumer_state( managed ) == WINE_MANAGED_CONSUMER_UNKNOWN)
     {
         InterlockedExchange( &managed->consumer->reannounce_pending, FALSE );
         InterlockedExchange( &managed->consumer->reannounce_delay_ms, 0 );
     }
 
-    if (ret == 0 || (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+    if (drain_channel && !routing_overflow &&
+        (ret == 0 || (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK)))
     {
         managed_mark_lost( managed );
     }
+    if (drain_channel)
+        InterlockedExchange( &managed->consumer->response_drain_active, FALSE );
 }
 
 /* Publish one managed image over the dmabuf channel. */
 static VkResult managed_present( struct vulkan_device *device, struct swapchain *swapchain, uint32_t image_index,
-                                 BOOL present_waits_consumed, int sync_fd )
+                                 BOOL present_waits_consumed, int sync_fd,
+                                 UINT64 application_present_id )
 {
     struct wine_managed_swapchain *managed = swapchain->managed;
     struct surface *surface = swapchain->surface;
     struct wine_managed_image *image;
     hwnd_dmabuf_frame_desc_t desc;
     UINT64 release_token = 0;
+    uint32_t frame_seq;
     int channel_fd_dup = -1, send_sync_fd = -1;
     enum wine_managed_consumer_state consumer_state;
-    BOOL send_frame = FALSE, send_fd = FALSE;
+    BOOL send_frame = FALSE, send_fd = FALSE, need_feedback, request_feedback;
     RECT client_rect;
     VkResult res = VK_SUCCESS;
 
@@ -4829,6 +5078,24 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     }
 
     managed->present_id++;
+    frame_seq = (uint32_t)managed->present_id;
+    need_feedback = application_present_id ||
+                    ReadAcquire( &surface->client->presentation_timing_requests );
+    request_feedback = need_feedback && managed->presentation_feedback;
+    if (need_feedback &&
+        (res = managed_add_feedback_locked(
+            managed, frame_seq, application_present_id )) < VK_SUCCESS)
+    {
+        if (channel_fd_dup >= 0) close( channel_fd_dup );
+        if (send_sync_fd >= 0) close( send_sync_fd );
+        image->completion_fd = sync_fd;
+        image->acquired = FALSE;
+        managed_wake_acquire( managed );
+        sync_fd = -1;
+        pthread_mutex_unlock( &managed->lock );
+        if (!present_waits_consumed) vulkan_device_unlock_queues( device );
+        return res;
+    }
     if (send_frame)
     {
         /* Assign a fresh release token (never 0: consumer rejects token 0). */
@@ -4840,15 +5107,19 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
         desc.producer_unique_id = managed->producer_unique_id;
         desc.image_id = image_index;
         desc.ring_generation = managed->ring_generation;
-        desc.frame_seq = (unsigned int)managed->present_id;
+        desc.frame_seq = frame_seq;
         desc.release_token = release_token;
         desc.sync_fd_kind = sync_fd >= 0 ? HWND_DMABUF_SYNC_FILE : HWND_DMABUF_SYNC_NONE;
+        if (request_feedback)
+            desc.flags |= HWND_DMABUF_FLAG_PRESENTATION_FEEDBACK;
         image->busy = TRUE;
     }
     assert(image->completion_fd < 0);
     image->completion_fd = sync_fd;
     sync_fd = -1;
     image->acquired = FALSE;
+    if (need_feedback && (!send_frame || !request_feedback))
+        managed_complete_feedback_locked( managed, frame_seq );
     managed_wake_acquire( managed );
     pthread_mutex_unlock( &managed->lock );
     if (!present_waits_consumed) vulkan_device_unlock_queues( device );
@@ -4863,6 +5134,7 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
 
             pthread_mutex_lock( &managed->lock );
             managed_release_token( managed, release_token, FALSE );
+            managed_complete_feedback_locked( managed, frame_seq );
             if (fatal) managed_mark_lost( managed );
             pthread_mutex_unlock( &managed->lock );
             if (fatal) return VK_ERROR_OUT_OF_DATE_KHR;
@@ -5739,6 +6011,82 @@ static VkResult swapchain_wait_for_present( struct vulkan_device *device, struct
     }
 }
 
+static VkResult managed_wait_for_external_present( struct swapchain *swapchain,
+                                                   UINT64 present_id,
+                                                   UINT64 timeout )
+{
+    struct wine_managed_swapchain *managed = swapchain->managed;
+    UINT64 start = managed_monotonic_time_ns();
+    BOOL infinite = timeout == UINT64_MAX;
+
+    for (;;)
+    {
+        struct pollfd pfds[2];
+        UINT64 slice = infinite ? WINE_VK_PRESENT_WAIT_SLICE_NS :
+                                  min( timeout, WINE_VK_PRESENT_WAIT_SLICE_NS );
+        BOOL pending = FALSE;
+        uint32_t pfd_count = 0, i;
+        int poll_timeout, ret;
+
+        if (swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
+
+        pthread_mutex_lock( &managed->lock );
+        managed_drain_releases( managed );
+        if (managed->lost)
+        {
+            pthread_mutex_unlock( &managed->lock );
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
+        if (present_id && present_id <= managed->completed_application_present_id)
+        {
+            pthread_mutex_unlock( &managed->lock );
+            return VK_SUCCESS;
+        }
+        for (i = 0; i < managed->feedback_count; i++)
+            if (managed->feedbacks[i].present_id == present_id)
+            {
+                pending = TRUE;
+                break;
+            }
+        pthread_mutex_unlock( &managed->lock );
+
+        if (!present_id || !pending) return VK_ERROR_OUT_OF_DATE_KHR;
+        if (!timeout) return VK_TIMEOUT;
+        if (!infinite)
+        {
+            UINT64 elapsed = managed_monotonic_time_ns() - start;
+
+            if (elapsed >= timeout) return VK_TIMEOUT;
+            slice = min( slice, timeout - elapsed );
+        }
+        poll_timeout = min( slice / 1000000 + !!(slice % 1000000),
+                            (UINT64)INT_MAX );
+        if (managed->channel_fd >= 0)
+            pfds[pfd_count++] = (struct pollfd){ .fd = managed->channel_fd,
+                                                 .events = POLLIN };
+        if (managed->wake_fd >= 0)
+            pfds[pfd_count++] = (struct pollfd){ .fd = managed->wake_fd,
+                                                 .events = POLLIN };
+        do ret = poll( pfds, pfd_count, poll_timeout );
+        while (ret < 0 && errno == EINTR);
+        if (ret < 0)
+            return errno == ENOMEM ? VK_ERROR_OUT_OF_HOST_MEMORY :
+                                     VK_ERROR_OUT_OF_DATE_KHR;
+        for (i = 0; i < pfd_count; i++)
+            if (pfds[i].fd == managed->wake_fd && (pfds[i].revents & POLLIN))
+                managed_drain_acquire_wake( managed );
+
+        if (should_skip_wait( managed->hwnd )) return VK_SUCCESS;
+        if (infinite && managed_monotonic_time_ns() - start >=
+                        WINE_VK_PRESENT_WAIT_STALL_NS)
+        {
+            WARN( "hwnd %p managed presentation feedback stalled, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+                  managed->hwnd );
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
+    }
+}
+
 static VkResult win32u_vkWaitForPresentKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
                                             uint64_t presentId, uint64_t timeout )
 {
@@ -5747,9 +6095,8 @@ static VkResult win32u_vkWaitForPresentKHR( VkDevice client_device, VkSwapchainK
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
-    /* Managed swapchains have no host swapchain to wait on. Wine paces the present
-     * itself. Report presentation as proceeding. */
-    if (swapchain->managed) return VK_SUCCESS;
+    if (swapchain->managed)
+        return managed_wait_for_external_present( swapchain, presentId, timeout );
 
     if (swapchain->surface && should_skip_wait( swapchain->surface->hwnd )) return VK_SUCCESS;
 
@@ -5764,7 +6111,9 @@ static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchain
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
-    if (swapchain->managed) return VK_SUCCESS;
+    if (swapchain->managed)
+        return managed_wait_for_external_present( swapchain, info->presentId,
+                                                  info->timeout );
 
     if (swapchain->surface && should_skip_wait( swapchain->surface->hwnd )) return VK_SUCCESS;
 
@@ -5806,14 +6155,16 @@ static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapch
     return device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, count, images );
 }
 
-static VkResult managed_swapchain_get_status( struct swapchain *swapchain, UINT64 *present_id )
+static VkResult managed_swapchain_get_status( struct swapchain *swapchain,
+                                              UINT64 *counter, UINT64 *refresh_ns )
 {
     struct wine_managed_swapchain *managed = swapchain->managed;
     VkResult res = VK_SUCCESS;
 
     pthread_mutex_lock( &managed->lock );
     managed_drain_releases( managed );
-    if (present_id) *present_id = managed->present_id;
+    if (counter) *counter = managed->timing_properties_counter;
+    if (refresh_ns) *refresh_ns = managed->refresh_interval_ns;
     if (managed->lost) res = VK_ERROR_OUT_OF_DATE_KHR;
     pthread_mutex_unlock( &managed->lock );
     return res;
@@ -5827,7 +6178,7 @@ static VkResult win32u_vkSetSwapchainPresentTimingQueueSizeEXT( VkDevice client_
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
-    if (swapchain->managed) return managed_swapchain_get_status( swapchain, NULL );
+    if (swapchain->managed) return managed_swapchain_get_status( swapchain, NULL, NULL );
 
     return device->p_vkSetSwapchainPresentTimingQueueSizeEXT( device->host.device,
                                                               swapchain->obj.host.swapchain, size );
@@ -5845,11 +6196,16 @@ static VkResult win32u_vkGetSwapchainTimingPropertiesEXT( VkDevice client_device
 
     if (swapchain->managed)
     {
-        res = managed_swapchain_get_status( swapchain, NULL );
+        UINT64 timing_counter, refresh_ns;
+
+        res = managed_swapchain_get_status( swapchain, &timing_counter,
+                                            &refresh_ns );
         if (res < VK_SUCCESS) return res;
-        properties->refreshDuration = 0;
-        properties->refreshInterval = 0;
-        if (counter) *counter = 0;
+        /* wp_presentation supplies one fixed refresh period, or zero when no
+         * cadence is known. Equal nonzero values are Vulkan's FRR encoding. */
+        properties->refreshDuration = refresh_ns;
+        properties->refreshInterval = refresh_ns;
+        if (counter) *counter = timing_counter;
         return VK_SUCCESS;
     }
 
@@ -5864,7 +6220,7 @@ static VkResult win32u_vkGetPastPresentationTimingEXT( VkDevice client_device,
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct swapchain *swapchain;
     VkPastPresentationTimingInfoEXT info_host = *info;
-    UINT64 present_id = 0;
+    UINT64 timing_counter = 0;
     VkResult res;
 
     swapchain = swapchain_from_handle( info->swapchain );
@@ -5872,9 +6228,9 @@ static VkResult win32u_vkGetPastPresentationTimingEXT( VkDevice client_device,
 
     if (swapchain->managed)
     {
-        res = managed_swapchain_get_status( swapchain, &present_id );
+        res = managed_swapchain_get_status( swapchain, &timing_counter, NULL );
         if (res < VK_SUCCESS) return res;
-        properties->timingPropertiesCounter = present_id;
+        properties->timingPropertiesCounter = timing_counter;
         properties->timeDomainsCounter = 0;
         properties->presentationTimingCount = 0;
         return VK_SUCCESS;
@@ -6661,7 +7017,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     VkSwapchainKHR *swapchains;
     uint32_t host_indices_buffer[16], *host_indices = host_indices_buffer;
     VkSemaphore *host_wait_semaphores = NULL;
-    const VkSwapchainPresentFenceInfoKHR *present_fence_info = NULL;
+    const VkSwapchainPresentFenceInfoKHR *present_fence_info =
+        win32u_vk_find_struct( present_info, SWAPCHAIN_PRESENT_FENCE_INFO_KHR );
+    const VkPresentIdKHR *present_id_info =
+        win32u_vk_find_struct( present_info, PRESENT_ID_KHR );
+    const VkPresentId2KHR *present_id2_info =
+        win32u_vk_find_struct( present_info, PRESENT_ID_2_KHR );
     struct wine_managed_swapchain *first_managed = NULL;
     uint32_t host_count = 0;
     BOOL skip_managed = FALSE;
@@ -6912,14 +7273,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
     if (out_of_date && res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
 
-    /* Managed and stale swapchains have no host present to signal these fences. */
-    for (const VkBaseInStructure *header = present_info->pNext; header; header = header->pNext)
-        if (header->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR)
-        {
-            present_fence_info = (const VkSwapchainPresentFenceInfoKHR *)header;
-            break;
-        }
-
     /* A discarded present still consumes its waits and signals its present
      * fences. Otherwise a binary semaphore stays signaled and a caller
      * waiting to retire the rejected presentation can block forever. */
@@ -6964,12 +7317,20 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = present_swapchains[i];
+        UINT64 application_present_id = 0;
         VkResult managed_res;
         VkFence fence;
         int sync_fd = -1;
 
         if (!swapchain) continue;
         if (!swapchain->managed) continue;
+
+        if (present_id2_info && present_id2_info->pPresentIds &&
+            i < present_id2_info->swapchainCount)
+            application_present_id = present_id2_info->pPresentIds[i];
+        else if (present_id_info && present_id_info->pPresentIds &&
+                 i < present_id_info->swapchainCount)
+            application_present_id = present_id_info->pPresentIds[i];
 
         if (skip_managed)
         {
@@ -6991,8 +7352,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (managed_sync_fd >= 0 && !managed_sync_complete && sync_fd < 0)
             managed_res = VK_ERROR_OUT_OF_HOST_MEMORY;
         else
-            managed_res = managed_present( device, swapchain, present_info->pImageIndices[i],
-                                           managed_present_waits_consumed, sync_fd );
+            managed_res = managed_present( device, swapchain,
+                                           present_info->pImageIndices[i],
+                                           managed_present_waits_consumed, sync_fd,
+                                           application_present_id );
 
         /* Managed swapchains have no host present to signal this fence. */
         if ((fence = get_present_fence( present_fence_info, i )))
