@@ -67,6 +67,8 @@ static void wayland_client_surface_retarget_image_description(
         struct wayland_client_surface *surface, struct wl_surface *wl_surface);
 static const char *wayland_client_surface_direct_toplevel_failure(
         struct wayland_client_surface *surface, HWND hwnd);
+static BOOL wayland_presentation_time_to_monotonic(UINT64 source_ns,
+                                                   UINT64 *monotonic_ns);
 
 enum wayland_opaque_region_state
 {
@@ -196,6 +198,32 @@ static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
 
 struct wayland_hwnd_dmabuf_surface;
 struct wayland_hwnd_dmabuf_color_surface;
+struct wayland_hwnd_dmabuf_presentation;
+
+struct wayland_hwnd_dmabuf_presentation_part
+{
+    struct wayland_hwnd_dmabuf_presentation *presentation;
+    struct wp_presentation_feedback *feedback;
+};
+
+struct wayland_hwnd_dmabuf_presentation
+{
+    int channel_fd;
+    UINT64 producer_unique_id;
+    UINT64 release_token;
+    UINT64 presented_ns;
+    UINT64 refresh_count;
+    unsigned int frame_seq;
+    unsigned int image_id;
+    unsigned int ring_generation;
+    unsigned int refresh_ns;
+    unsigned int presentation_flags;
+    unsigned int part_count;
+    unsigned int remaining;
+    BOOL discarded;
+    BOOL timing_valid;
+    struct wayland_hwnd_dmabuf_presentation_part parts[];
+};
 
 struct wayland_hwnd_dmabuf_buffer
 {
@@ -589,7 +617,7 @@ static int wayland_hwnd_dmabuf_surface_send_consumer_state(
 
     if (process_wayland.wp_alpha_modifier_v1)
         flag |= HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER;
-    rel = (hwnd_dmabuf_release_t){ 0, 0, flag, 0, 0, 0 };
+    rel = (hwnd_dmabuf_release_t){ .flags = flag };
 
     if (surface->channel_fd < 0) return ENOTCONN;
     return wayland_hwnd_dmabuf_channel_send_release(surface->channel_fd, &rel);
@@ -604,9 +632,14 @@ static void wayland_hwnd_dmabuf_buffer_send_release(struct wayland_hwnd_dmabuf_b
     release_token = wayland_hwnd_dmabuf_buffer_exchange_release_token(buffer, 0);
     if (release_token)
     {
-        hwnd_dmabuf_release_t rel = { buffer->producer_unique_id, release_token,
-                                      flags | wayland_hwnd_dmabuf_buffer_cache_flags(buffer),
-                                      buffer->image_id, buffer->ring_generation, 0 };
+        hwnd_dmabuf_release_t rel =
+        {
+            .producer_unique_id = buffer->producer_unique_id,
+            .release_token = release_token,
+            .flags = flags | wayland_hwnd_dmabuf_buffer_cache_flags(buffer),
+            .image_id = buffer->image_id,
+            .ring_generation = buffer->ring_generation,
+        };
         if (keep_token && wayland_hwnd_dmabuf_channel_send_release(buffer->channel_fd, &rel))
             InterlockedCompareExchange64((LONGLONG volatile *)&buffer->release_token, release_token, 0);
         else if (!keep_token)
@@ -690,11 +723,211 @@ static void wayland_hwnd_dmabuf_send_release(struct wayland_hwnd_dmabuf_surface 
                                              unsigned int flags, unsigned int image_id,
                                              unsigned int ring_generation)
 {
-    hwnd_dmabuf_release_t rel = { producer_unique_id, release_token, flags, image_id, ring_generation, 0 };
+    hwnd_dmabuf_release_t rel =
+    {
+        .producer_unique_id = producer_unique_id,
+        .release_token = release_token,
+        .flags = flags,
+        .image_id = image_id,
+        .ring_generation = ring_generation,
+    };
 
     /* One-shot reject/orphan releases are best effort. */
     if (release_token && surface->channel_fd >= 0)
         wayland_hwnd_dmabuf_channel_send_release(surface->channel_fd, &rel);
+}
+
+static void wayland_hwnd_dmabuf_send_presentation_result(
+        int channel_fd, UINT64 producer_unique_id, UINT64 release_token,
+        unsigned int frame_seq, unsigned int image_id,
+        unsigned int ring_generation, BOOL discarded, UINT64 presented_ns,
+        unsigned int refresh_ns, UINT64 refresh_count,
+        unsigned int presentation_flags)
+{
+    hwnd_dmabuf_release_t rel =
+    {
+        .producer_unique_id = producer_unique_id,
+        .release_token = release_token,
+        .flags = HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK |
+                 (discarded ? HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED : 0),
+        .image_id = image_id,
+        .ring_generation = ring_generation,
+        .frame_seq = frame_seq,
+        .presentation_flags = presentation_flags,
+        .presented_ns = presented_ns,
+        .refresh_ns = refresh_ns,
+        .refresh_count = refresh_count,
+    };
+    int err;
+
+    if (channel_fd < 0) return;
+    if ((err = wayland_hwnd_dmabuf_channel_send_release(channel_fd, &rel)))
+        WARN("failed to return presentation feedback for frame %u, error %d\n",
+             frame_seq, err);
+}
+
+static void wayland_hwnd_dmabuf_discard_presentation_desc(
+        struct wayland_hwnd_dmabuf_surface *surface,
+        const hwnd_dmabuf_frame_desc_t *desc)
+{
+    if (!(desc->flags & HWND_DMABUF_FLAG_PRESENTATION_FEEDBACK)) return;
+    wayland_hwnd_dmabuf_send_presentation_result(
+        surface->channel_fd, desc->producer_unique_id, desc->release_token,
+        desc->frame_seq, desc->image_id, desc->ring_generation, TRUE, 0, 0, 0, 0);
+}
+
+static void wayland_hwnd_dmabuf_presentation_complete(
+        struct wayland_hwnd_dmabuf_presentation *presentation)
+{
+    wayland_hwnd_dmabuf_send_presentation_result(
+        presentation->channel_fd, presentation->producer_unique_id,
+        presentation->release_token, presentation->frame_seq,
+        presentation->image_id, presentation->ring_generation,
+        presentation->discarded,
+        presentation->timing_valid ? presentation->presented_ns : 0,
+        presentation->refresh_ns, presentation->refresh_count,
+        presentation->presentation_flags);
+    close(presentation->channel_fd);
+    free(presentation);
+}
+
+static void hwnd_dmabuf_presentation_handle_sync_output(
+        void *data, struct wp_presentation_feedback *feedback,
+        struct wl_output *output)
+{
+}
+
+static void hwnd_dmabuf_presentation_handle_presented(
+        void *data, struct wp_presentation_feedback *feedback,
+        uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec,
+        uint32_t refresh, uint32_t seq_hi, uint32_t seq_lo, uint32_t flags)
+{
+    struct wayland_hwnd_dmabuf_presentation_part *part = data;
+    struct wayland_hwnd_dmabuf_presentation *presentation = part->presentation;
+    UINT64 source_ns, presented_ns;
+    unsigned int presentation_flags = 0;
+
+    assert(part->feedback == feedback);
+    part->feedback = NULL;
+    wp_presentation_feedback_destroy(feedback);
+
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_VSYNC)
+        presentation_flags |= HWND_DMABUF_PRESENTATION_VSYNC;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK)
+        presentation_flags |= HWND_DMABUF_PRESENTATION_HW_CLOCK;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION)
+        presentation_flags |= HWND_DMABUF_PRESENTATION_HW_COMPLETION;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY)
+        presentation_flags |= HWND_DMABUF_PRESENTATION_ZERO_COPY;
+    if (presentation->remaining == presentation->part_count)
+        presentation->presentation_flags = presentation_flags;
+    else
+        presentation->presentation_flags &= presentation_flags;
+
+    source_ns = (((UINT64)tv_sec_hi << 32) | tv_sec_lo) * 1000000000 + tv_nsec;
+    if (!wayland_presentation_time_to_monotonic(source_ns, &presented_ns))
+        presentation->timing_valid = FALSE;
+    else if (presented_ns >= presentation->presented_ns)
+    {
+        presentation->presented_ns = presented_ns;
+        presentation->refresh_ns = refresh;
+        presentation->refresh_count = ((UINT64)seq_hi << 32) | seq_lo;
+    }
+
+    if (!--presentation->remaining)
+        wayland_hwnd_dmabuf_presentation_complete(presentation);
+}
+
+static void hwnd_dmabuf_presentation_handle_discarded(
+        void *data, struct wp_presentation_feedback *feedback)
+{
+    struct wayland_hwnd_dmabuf_presentation_part *part = data;
+    struct wayland_hwnd_dmabuf_presentation *presentation = part->presentation;
+
+    assert(part->feedback == feedback);
+    part->feedback = NULL;
+    wp_presentation_feedback_destroy(feedback);
+    presentation->discarded = TRUE;
+    if (!--presentation->remaining)
+        wayland_hwnd_dmabuf_presentation_complete(presentation);
+}
+
+static const struct wp_presentation_feedback_listener hwnd_dmabuf_presentation_listener =
+{
+    hwnd_dmabuf_presentation_handle_sync_output,
+    hwnd_dmabuf_presentation_handle_presented,
+    hwnd_dmabuf_presentation_handle_discarded,
+};
+
+static void wayland_hwnd_dmabuf_cancel_presentation(
+        struct wayland_hwnd_dmabuf_presentation *presentation)
+{
+    unsigned int i;
+
+    if (!presentation) return;
+    for (i = 0; i < presentation->part_count; i++)
+        if (presentation->parts[i].feedback)
+            wp_presentation_feedback_destroy(presentation->parts[i].feedback);
+    presentation->discarded = TRUE;
+    wayland_hwnd_dmabuf_presentation_complete(presentation);
+}
+
+static struct wayland_hwnd_dmabuf_presentation *
+wayland_hwnd_dmabuf_prepare_presentation(
+        struct wayland_hwnd_dmabuf_surface *surface,
+        struct wl_surface *const *wl_surfaces, unsigned int count)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
+    struct wayland_hwnd_dmabuf_presentation *presentation;
+    size_t size;
+    unsigned int i;
+    int channel_fd;
+
+    if (!buffer || !(buffer->desc.flags & HWND_DMABUF_FLAG_PRESENTATION_FEEDBACK))
+        return NULL;
+    if (!count || !process_wayland.wp_presentation || surface->channel_fd < 0 ||
+        (channel_fd = dup(surface->channel_fd)) < 0)
+    {
+        wayland_hwnd_dmabuf_discard_presentation_desc(surface, &buffer->desc);
+        return NULL;
+    }
+
+    size = offsetof(struct wayland_hwnd_dmabuf_presentation, parts) +
+           count * sizeof(presentation->parts[0]);
+    if (!(presentation = calloc(1, size)))
+    {
+        close(channel_fd);
+        wayland_hwnd_dmabuf_discard_presentation_desc(surface, &buffer->desc);
+        return NULL;
+    }
+    presentation->channel_fd = channel_fd;
+    presentation->producer_unique_id = buffer->desc.producer_unique_id;
+    presentation->release_token = buffer->desc.release_token;
+    presentation->frame_seq = buffer->desc.frame_seq;
+    presentation->image_id = buffer->desc.image_id;
+    presentation->ring_generation = buffer->desc.ring_generation;
+    presentation->part_count = presentation->remaining = count;
+    presentation->timing_valid = TRUE;
+
+    for (i = 0; i < count; i++)
+    {
+        struct wayland_hwnd_dmabuf_presentation_part *part = &presentation->parts[i];
+
+        part->presentation = presentation;
+        part->feedback = wp_presentation_feedback(process_wayland.wp_presentation,
+                                                  wl_surfaces[i]);
+        if (!part->feedback ||
+            wp_presentation_feedback_add_listener(part->feedback,
+                                                  &hwnd_dmabuf_presentation_listener,
+                                                  part))
+        {
+            if (part->feedback) wp_presentation_feedback_destroy(part->feedback);
+            part->feedback = NULL;
+            wayland_hwnd_dmabuf_cancel_presentation(presentation);
+            return NULL;
+        }
+    }
+    return presentation;
 }
 
 static void wayland_hwnd_dmabuf_surface_clear_slices(struct wayland_hwnd_dmabuf_surface *surface);
@@ -1206,7 +1439,8 @@ err:
     return NULL;
 }
 
-static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf_surface *surface)
+static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
+        struct wayland_hwnd_dmabuf_surface *surface, BOOL request_feedback)
 {
     struct wayland_hwnd_dmabuf_slice_commit
     {
@@ -1218,6 +1452,7 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf
     struct wayland_hwnd_dmabuf_frame_sync frame_sync;
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
     struct wayland_hwnd_dmabuf_slice *slice;
+    struct wl_surface *feedback_surfaces[WAYLAND_DMABUF_MAX_SLICES] = {0};
     unsigned int count = 0, i;
     BOOL ret = FALSE;
 
@@ -1232,6 +1467,7 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf
         if (count == surface->slice_count) goto done;
         commit = &commits[count++];
         commit->slice = slice;
+        feedback_surfaces[count - 1] = slice->wl_surface;
         wayland_hwnd_dmabuf_color_surface_sync(
             &slice->color_surface, slice->wl_surface, &buffer->desc);
         if (!(commit->wl_buffer = wayland_hwnd_dmabuf_buffer_create_slice_wl_buffer(buffer)))
@@ -1249,12 +1485,17 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf
         }
     }
 
+    if (count != surface->slice_count) goto done;
+
     for (i = 0; i < count; i++)
         if (!wayland_hwnd_dmabuf_stage_commit_sync(&commits[i].sync))
         {
             wayland_hwnd_dmabuf_surface_disable_syncobj(surface, TRUE);
             goto done;
         }
+
+    if (request_feedback)
+        wayland_hwnd_dmabuf_prepare_presentation(surface, feedback_surfaces, count);
 
     for (i = 0; i < count; i++)
     {
@@ -1327,6 +1568,8 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
         pthread_mutex_unlock(&process_wayland.pointer.mutex);
     }
 
+    if (surface->current && !surface->current_committed)
+        wayland_hwnd_dmabuf_discard_presentation_desc(surface, &surface->current->desc);
     wl_list_for_each_safe(buffer, buffer_next, &surface->buffers, link)
         wayland_hwnd_dmabuf_buffer_reap(buffer);
     wayland_hwnd_dmabuf_surface_clear_slices(surface);
@@ -3965,7 +4208,7 @@ wayland_hwnd_dmabuf_surface_apply_slices(struct wayland_hwnd_dmabuf_surface *sur
     {
         wl_surface_attach(surface->wl_surface, NULL, 0, 0);
         wl_surface_commit(surface->wl_surface);
-        if (!wayland_hwnd_dmabuf_surface_attach_slices(surface)) goto failed;
+        if (!wayland_hwnd_dmabuf_surface_attach_slices(surface, attach_frame)) goto failed;
     }
     return WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED;
 
@@ -4671,10 +4914,17 @@ static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *su
     buffer->alpha_mode = desc->alpha_mode;
     buffer->desc.flags &= ~(HWND_DMABUF_FLAG_COLOR_SPACE |
                             HWND_DMABUF_FLAG_LAYERED_COMPOSITE |
-                            HWND_DMABUF_FLAG_ALPHA_MODIFIER);
+                            HWND_DMABUF_FLAG_ALPHA_MODIFIER |
+                            HWND_DMABUF_FLAG_PRESENTATION_FEEDBACK);
     buffer->desc.flags |= desc->flags & (HWND_DMABUF_FLAG_COLOR_SPACE |
                                          HWND_DMABUF_FLAG_LAYERED_COMPOSITE |
-                                         HWND_DMABUF_FLAG_ALPHA_MODIFIER);
+                                         HWND_DMABUF_FLAG_ALPHA_MODIFIER |
+                                         HWND_DMABUF_FLAG_PRESENTATION_FEEDBACK);
+    buffer->desc.frame_seq = desc->frame_seq;
+    buffer->desc.release_token = desc->release_token;
+    buffer->desc.producer_unique_id = desc->producer_unique_id;
+    buffer->desc.image_id = desc->image_id;
+    buffer->desc.ring_generation = desc->ring_generation;
     buffer->desc.color_space = desc->color_space;
     buffer->dirty_count = min(desc->dirty_count, HWND_DMABUF_MAX_DIRTY_RECTS);
     memcpy(buffer->dirty_rects, desc->dirty_rects, sizeof(buffer->dirty_rects));
@@ -4729,6 +4979,8 @@ static void wayland_hwnd_dmabuf_drop_current_frame(struct wayland_hwnd_dmabuf_su
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
 
     if (!buffer) return;
+    if (!surface->current_committed)
+        wayland_hwnd_dmabuf_discard_presentation_desc(surface, &buffer->desc);
     wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
     wayland_hwnd_dmabuf_buffer_send_release(buffer, flags, buffer->stable_slot);
     surface->current = NULL;
@@ -4838,6 +5090,7 @@ static void wayland_hwnd_dmabuf_retire_frame(struct wayland_hwnd_dmabuf_surface 
         else flags = HWND_DMABUF_RELEASE_FAILED;
     }
     if (fd >= 0) close(fd);
+    wayland_hwnd_dmabuf_discard_presentation_desc(surface, desc);
     wayland_hwnd_dmabuf_send_release(surface, desc->producer_unique_id, desc->release_token,
                                      flags, desc->image_id, desc->ring_generation);
 }
@@ -4910,9 +5163,12 @@ retry:
             if (fd >= 0) close(fd);
             if (sync_fd >= 0) close(sync_fd);
             if (desc.release_token)
+            {
+                wayland_hwnd_dmabuf_discard_presentation_desc(surface, &desc);
                 wayland_hwnd_dmabuf_send_release(surface, desc.producer_unique_id, desc.release_token,
                                                  HWND_DMABUF_RELEASE_FAILED,
                                                  desc.image_id, desc.ring_generation);
+            }
             continue;
         }
         if (have_pending)
@@ -4961,6 +5217,7 @@ retry:
 
     if (!buffer)
     {
+        wayland_hwnd_dmabuf_discard_presentation_desc(surface, &pdesc);
         wayland_hwnd_dmabuf_send_release(surface, pdesc.producer_unique_id, pdesc.release_token,
                                          HWND_DMABUF_RELEASE_FAILED,
                                          pdesc.image_id, pdesc.ring_generation);
@@ -5279,6 +5536,11 @@ commit_current:
         &direct->color_surface, surface->wl_surface, &direct->current->desc);
     wayland_hwnd_dmabuf_color_surface_take_pending_commit(direct->color_surface);
     if (have_commit_sync) wayland_hwnd_dmabuf_commit_sync(&commit_sync);
+    if (have_commit_sync)
+    {
+        struct wl_surface *wl_surface = surface->wl_surface;
+        wayland_hwnd_dmabuf_prepare_presentation(direct, &wl_surface, 1);
+    }
     wayland_surface_commit(surface);
     if (!direct->current_committed)
     {
@@ -5647,6 +5909,12 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
             wayland_hwnd_dmabuf_color_surface_take_pending_commit(
                 dmabuf_surface->color_surface);
             if (have_commit_sync) wayland_hwnd_dmabuf_commit_sync(&commit_sync);
+            if (attached_frame && !dmabuf_surface->sliced)
+            {
+                struct wl_surface *wl_surface = dmabuf_surface->wl_surface;
+                wayland_hwnd_dmabuf_prepare_presentation(
+                    dmabuf_surface, &wl_surface, 1);
+            }
             wl_surface_commit(dmabuf_surface->wl_surface);
             if (attached_frame && !dmabuf_surface->sliced)
                 wayland_hwnd_dmabuf_consume_acquire_fence(dmabuf_surface->current);

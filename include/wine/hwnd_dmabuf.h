@@ -22,6 +22,7 @@
 
 #define HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC     0x00000001
 #define HWND_DMABUF_HOST_CAP_CONSUMER_STATE    0x00000002
+#define HWND_DMABUF_HOST_CAP_PRESENTATION_FEEDBACK 0x00000004
 
 enum hwnd_dmabuf_wake_flags
 {
@@ -67,6 +68,11 @@ typedef struct
     unsigned int     image_id;
     unsigned int     ring_generation;
     unsigned int     reserved;
+    unsigned int     frame_seq;
+    unsigned int     presentation_flags;
+    unsigned __int64 presented_ns;
+    unsigned __int64 refresh_ns;
+    unsigned __int64 refresh_count;
 } hwnd_dmabuf_release_t;
 
 static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_list( HWND host_hwnd,

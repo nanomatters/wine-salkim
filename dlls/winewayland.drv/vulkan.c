@@ -614,6 +614,8 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void 
     caps->flags |= HWND_DMABUF_HOST_CAP_CONSUMER_STATE;
     if (wayland_syncobj_available() || process_wayland.zwp_linux_explicit_synchronization_v1)
         caps->flags |= HWND_DMABUF_HOST_CAP_EXPLICIT_SYNC;
+    if (process_wayland.wp_presentation)
+        caps->flags |= HWND_DMABUF_HOST_CAP_PRESENTATION_FEEDBACK;
     *format_modifier_count = count;
     return HWND_DMABUF_OK;
 }
