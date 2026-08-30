@@ -6931,6 +6931,154 @@ static BOOL wayland_client_surface_is_presentation_scaled(struct client_surface 
     return ret;
 }
 
+static UINT64 wayland_timespec_to_ns(const struct timespec *time)
+{
+    return (UINT64)time->tv_sec * 1000000000 + time->tv_nsec;
+}
+
+static BOOL wayland_presentation_time_to_monotonic(UINT64 source_ns, UINT64 *monotonic_ns)
+{
+    struct timespec source_now, monotonic_now;
+    INT64 offset;
+    clockid_t clock_id;
+
+    if (!ReadAcquire(&process_wayland.presentation_clock_valid)) return FALSE;
+    clock_id = process_wayland.presentation_clock_id;
+    if (clock_id == CLOCK_MONOTONIC)
+    {
+        *monotonic_ns = source_ns;
+        return TRUE;
+    }
+    if (clock_gettime(clock_id, &source_now) ||
+        clock_gettime(CLOCK_MONOTONIC, &monotonic_now))
+        return FALSE;
+
+    offset = (INT64)wayland_timespec_to_ns(&monotonic_now) -
+             (INT64)wayland_timespec_to_ns(&source_now);
+    if (offset < 0 && source_ns < (UINT64)-offset) return FALSE;
+    *monotonic_ns = source_ns + offset;
+    return TRUE;
+}
+
+static BOOL wayland_presentation_feedback_claim(
+        struct client_surface *client, struct wp_presentation_feedback *feedback)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+
+    return InterlockedCompareExchangePointer(
+            (void **)&surface->presentation_feedback, NULL, feedback) == feedback;
+}
+
+static void presentation_feedback_handle_sync_output(
+        void *data, struct wp_presentation_feedback *feedback, struct wl_output *wl_output)
+{
+}
+
+static void presentation_feedback_handle_presented(
+        void *data, struct wp_presentation_feedback *feedback,
+        uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec,
+        uint32_t refresh, uint32_t seq_hi, uint32_t seq_lo, uint32_t flags)
+{
+    struct client_surface *client = data;
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    UINT64 source_ns, presented_ns, refresh_count;
+    UINT presentation_flags = 0;
+
+    if (!wayland_presentation_feedback_claim(client, feedback)) return;
+    source_ns = (((UINT64)tv_sec_hi << 32) | tv_sec_lo) * 1000000000 + tv_nsec;
+    refresh_count = ((UINT64)seq_hi << 32) | seq_lo;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_VSYNC)
+        presentation_flags |= CLIENT_SURFACE_PRESENTATION_VSYNC;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK)
+        presentation_flags |= CLIENT_SURFACE_PRESENTATION_HW_CLOCK;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION)
+        presentation_flags |= CLIENT_SURFACE_PRESENTATION_HW_COMPLETION;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY)
+        presentation_flags |= CLIENT_SURFACE_PRESENTATION_ZERO_COPY;
+    if (wayland_presentation_time_to_monotonic(source_ns, &presented_ns))
+    {
+        client_surface_set_presentation_timing(client, presented_ns, refresh,
+                                               refresh_count, presentation_flags);
+        TRACE("%s presented at %s ns, refresh %u ns, flags %#x\n",
+              debugstr_client_surface(client), wine_dbgstr_longlong(presented_ns),
+              refresh, flags);
+    }
+    wp_presentation_feedback_destroy(feedback);
+    InterlockedExchange(&surface->presentation_feedback_pending, FALSE);
+    client_surface_release(client);
+}
+
+static void presentation_feedback_handle_discarded(
+        void *data, struct wp_presentation_feedback *feedback)
+{
+    struct client_surface *client = data;
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+
+    if (!wayland_presentation_feedback_claim(client, feedback)) return;
+    wp_presentation_feedback_destroy(feedback);
+    InterlockedExchange(&surface->presentation_feedback_pending, FALSE);
+    client_surface_release(client);
+}
+
+static const struct wp_presentation_feedback_listener presentation_feedback_listener =
+{
+    presentation_feedback_handle_sync_output,
+    presentation_feedback_handle_presented,
+    presentation_feedback_handle_discarded,
+};
+
+static BOOL wayland_client_surface_prepare_presentation_feedback(
+        struct client_surface *client)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wp_presentation_feedback *feedback;
+    struct wl_surface *wl_surface;
+
+    if (!process_wayland.wp_presentation) return FALSE;
+    if (InterlockedCompareExchange(&surface->presentation_feedback_pending,
+                                   TRUE, FALSE))
+        return FALSE;
+
+    wl_surface = ReadAcquire(&surface->direct_toplevel) ?
+                 surface->direct_wl_surface : surface->wl_surface;
+    if (!wl_surface)
+    {
+        InterlockedExchange(&surface->presentation_feedback_pending, FALSE);
+        return FALSE;
+    }
+
+    client_surface_add_ref(client);
+    feedback = wp_presentation_feedback(process_wayland.wp_presentation, wl_surface);
+    if (!feedback ||
+        wp_presentation_feedback_add_listener(feedback,
+                                              &presentation_feedback_listener, client))
+    {
+        if (feedback) wp_presentation_feedback_destroy(feedback);
+        InterlockedExchange(&surface->presentation_feedback_pending, FALSE);
+        client_surface_release(client);
+        return FALSE;
+    }
+    InterlockedExchangePointer((void **)&surface->presentation_feedback, feedback);
+    return TRUE;
+}
+
+static void wayland_client_surface_finish_presentation_feedback(
+        struct client_surface *client, BOOL submitted)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wp_presentation_feedback *feedback;
+
+    if (submitted) return;
+    feedback = InterlockedExchangePointer((void **)&surface->presentation_feedback, NULL);
+    if (!feedback) return;
+
+    /* The request may already have been flushed by another thread. Libwayland
+     * keeps a zombie proxy to absorb any event that crossed this destroy. */
+    wp_presentation_feedback_destroy(feedback);
+    InterlockedExchange(&surface->presentation_feedback_pending, FALSE);
+    client_surface_release(client);
+}
+
 void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
@@ -6972,6 +7120,8 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
     .destroy = wayland_client_surface_destroy,
     .detach = wayland_client_surface_detach,
     .update = wayland_client_surface_update,
+    .prepare_presentation_feedback = wayland_client_surface_prepare_presentation_feedback,
+    .finish_presentation_feedback = wayland_client_surface_finish_presentation_feedback,
     .present = wayland_client_surface_present,
     .get_presentation_rects = wayland_client_surface_get_presentation_rects,
     .is_presentation_scaled = wayland_client_surface_is_presentation_scaled,

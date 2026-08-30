@@ -49,6 +49,7 @@ struct xkb_compose_table;
 #include "ext-data-control-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
+#include "presentation-time-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #include "xdg-toplevel-tag-v1-client-protocol.h"
@@ -332,6 +333,9 @@ struct wayland
     struct xdg_wm_base *xdg_wm_base;
     struct wl_shm *wl_shm;
     struct wp_viewporter *wp_viewporter;
+    struct wp_presentation *wp_presentation;
+    clockid_t presentation_clock_id;
+    LONG presentation_clock_valid;
     struct wl_subcompositor *wl_subcompositor;
     struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
     struct wp_linux_drm_syncobj_manager_v1 *wp_linux_drm_syncobj_manager_v1;
@@ -596,6 +600,10 @@ struct wayland_client_surface
     LONG has_presented;
     LONG attachment_generation;
     LONG updated_attachment_generation;
+    /* Cadence consumers only need the latest sample, so keep at most one
+     * presentation feedback request in flight for each client surface. */
+    LONG presentation_feedback_pending;
+    struct wp_presentation_feedback *presentation_feedback;
     struct list fullscreen_requests;
     UINT64 fullscreen_active_owner;
     struct wayland_visual_constraint visual_constraint;

@@ -247,6 +247,32 @@ static inline void push_dc_driver( PHYSDEV *dev, PHYSDEV physdev, const struct g
 /* support for client surfaces */
 
 struct client_surface;
+struct client_surface_presentation_timing_listener;
+
+enum client_surface_presentation_flags
+{
+    CLIENT_SURFACE_PRESENTATION_VSYNC         = 0x1,
+    CLIENT_SURFACE_PRESENTATION_HW_CLOCK      = 0x2,
+    CLIENT_SURFACE_PRESENTATION_HW_COMPLETION = 0x4,
+    CLIENT_SURFACE_PRESENTATION_ZERO_COPY     = 0x8,
+};
+
+struct client_surface_presentation_timing
+{
+    UINT64 sample_serial;
+    UINT64 presented_ns;
+    UINT64 refresh_ns;
+    UINT64 refresh_count;
+    UINT flags;
+};
+
+struct client_surface_presentation_timing_listener
+{
+    struct list entry;
+    /* Called with the client surface presentation mutex held. */
+    void (*changed)( struct client_surface_presentation_timing_listener *listener );
+};
+
 struct client_surface_funcs
 {
     void (*destroy)( struct client_surface *surface );
@@ -254,6 +280,10 @@ struct client_surface_funcs
     void (*detach)( struct client_surface *surface );
     /* update the surface to match its window state */
     void (*update)( struct client_surface *surface );
+    /* request feedback for the next native presentation commit */
+    BOOL (*prepare_presentation_feedback)( struct client_surface *surface );
+    /* finish the request, cancelling feedback when the present was not submitted */
+    void (*finish_presentation_feedback)( struct client_surface *surface, BOOL submitted );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
     void (*present)( struct client_surface *surface, HDC hdc );
     /* return the externally-owned presentation surface and content rectangles */
@@ -268,6 +298,7 @@ struct client_surface
     struct list                        entry;          /* entry in win32u managed list */
     LONG                               ref;            /* reference count */
     LONG                               busy_ref;       /* count of drawables/swapchains referencing this surface */
+    LONG                               presentation_timing_requests; /* consumers of native timing feedback */
     HWND                               hwnd;           /* window the surface was created for */
     LONG                               updated;        /* has been moved / resized / reparented */
     LONG                               offscreen;      /* client window is offscreen */
@@ -275,6 +306,8 @@ struct client_surface
     LONG                               presentation_generation; /* invalidates swapchains with an obsolete presentation target */
     pthread_mutex_t                    presentation_mutex; /* protects presentation state and active host calls */
     pthread_cond_t                     presentation_cond;
+    struct list                        presentation_timing_listeners;
+    struct client_surface_presentation_timing presentation_timing;
     unsigned int                       presentation_wait_count;
     BOOL                               presentation_retiring;
     BOOL                               presentation_suspended;
@@ -299,7 +332,23 @@ W32KAPI BOOL client_surface_prepare_presentation_retirement( struct client_surfa
 W32KAPI void client_surface_drain_present_waits( struct client_surface *surface );
 W32KAPI void client_surface_cancel_presentation_retirement( struct client_surface *surface );
 W32KAPI void client_surface_complete_presentation_retirement( struct client_surface *surface );
+W32KAPI BOOL client_surface_prepare_presentation_feedback( struct client_surface *surface );
+W32KAPI void client_surface_finish_presentation_feedback( struct client_surface *surface,
+                                                          BOOL submitted );
 W32KAPI void client_surface_present( struct client_surface *surface );
+W32KAPI void client_surface_request_presentation_timing( struct client_surface *surface );
+W32KAPI void client_surface_release_presentation_timing( struct client_surface *surface );
+W32KAPI void client_surface_set_presentation_timing(
+        struct client_surface *surface, UINT64 presented_ns, UINT64 refresh_ns,
+        UINT64 refresh_count, UINT flags );
+W32KAPI BOOL client_surface_get_presentation_timing(
+        struct client_surface *surface, struct client_surface_presentation_timing *timing );
+W32KAPI void client_surface_add_presentation_timing_listener(
+        struct client_surface *surface,
+        struct client_surface_presentation_timing_listener *listener );
+W32KAPI void client_surface_remove_presentation_timing_listener(
+        struct client_surface *surface,
+        struct client_surface_presentation_timing_listener *listener );
 W32KAPI void client_surface_update( struct client_surface *surface );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );

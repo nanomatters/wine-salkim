@@ -6656,6 +6656,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_device *device = queue->device;
     VkResult res = VK_ERROR_OUT_OF_HOST_MEMORY;
     struct swapchain **present_swapchains;
+    BOOL presentation_feedbacks_buffer[16], *presentation_feedbacks = presentation_feedbacks_buffer;
     VkResult *present_results;
     VkSwapchainKHR *swapchains;
     uint32_t host_indices_buffer[16], *host_indices = host_indices_buffer;
@@ -6793,6 +6794,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         host_results = host_count <= ARRAY_SIZE(host_results_buffer) ? host_results_buffer
                                                                      : mem_alloc( &pool, host_count * sizeof(*host_results) );
         if (!host_results) goto failed;
+        if (host_count > ARRAY_SIZE(presentation_feedbacks_buffer) &&
+            !(presentation_feedbacks = mem_alloc( &pool, host_count * sizeof(*presentation_feedbacks) )))
+            goto failed;
+        memset( presentation_feedbacks, 0, host_count * sizeof(*presentation_feedbacks) );
         for (uint32_t i = 0; i < host_count; i++) host_results[i] = VK_SUCCESS;
         host_info.pResults = host_results;
         for (uint32_t i = 0; i < host_count; i++)
@@ -6876,6 +6881,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             host_info.waitSemaphoreCount = present_info->waitSemaphoreCount;
             host_info.pWaitSemaphores = present_info->pWaitSemaphores;
         }
+        for (uint32_t i = 0; i < host_count; i++)
+            presentation_feedbacks[i] = client_surface_prepare_presentation_feedback(
+                    present_swapchains[host_indices[i]]->surface->client );
         vulkan_queue_lock( queue );
         host_res = device->p_vkQueuePresentKHR( queue->host.queue, &host_info );
         vulkan_queue_unlock( queue );
@@ -6891,6 +6899,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         for (uint32_t i = 0; i < host_count; i++)
             present_results[host_indices[i]] =
                 present_result_was_enqueued( host_res ) ? host_results[i] : host_res;
+        for (uint32_t i = 0; i < host_count; i++)
+            if (presentation_feedbacks[i])
+                client_surface_finish_presentation_feedback(
+                        present_swapchains[host_indices[i]]->surface->client,
+                        present_results[host_indices[i]] >= VK_SUCCESS );
 
         if (!present_waits_submitted) skip_managed = TRUE;
         if (host_res < VK_SUCCESS && res >= VK_SUCCESS) res = host_res;

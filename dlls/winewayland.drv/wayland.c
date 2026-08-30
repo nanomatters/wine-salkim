@@ -87,6 +87,27 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener =
     xdg_wm_base_handle_ping
 };
 
+static void presentation_handle_clock_id(void *data, struct wp_presentation *presentation,
+                                         uint32_t clock_id)
+{
+    struct timespec time;
+
+    if (clock_gettime((clockid_t)clock_id, &time))
+    {
+        WARN("presentation clock %u is not available\n", clock_id);
+        return;
+    }
+
+    process_wayland.presentation_clock_id = (clockid_t)clock_id;
+    WriteRelease(&process_wayland.presentation_clock_valid, TRUE);
+    TRACE("presentation clock id %u\n", clock_id);
+}
+
+static const struct wp_presentation_listener presentation_listener =
+{
+    presentation_handle_clock_id,
+};
+
 /**********************************************************************
  *          wl_seat handling
  */
@@ -634,6 +655,14 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_viewporter =
             wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
     }
+    else if (strcmp(interface, "wp_presentation") == 0)
+    {
+        process_wayland.wp_presentation =
+            wl_registry_bind(registry, id, &wp_presentation_interface,
+                             version < 2 ? version : 2);
+        wp_presentation_add_listener(process_wayland.wp_presentation,
+                                     &presentation_listener, NULL);
+    }
     else if (strcmp(interface, "wl_subcompositor") == 0)
     {
         process_wayland.wl_subcompositor =
@@ -894,6 +923,9 @@ BOOL wayland_process_init(void)
         ERR("Wayland compositor doesn't support wp_viewporter\n");
         return FALSE;
     }
+
+    if (!process_wayland.wp_presentation)
+        TRACE("Wayland compositor doesn't support optional wp_presentation\n");
 
     /* Check for optional globals. */
     if (!process_wayland.zwp_pointer_constraints_v1)

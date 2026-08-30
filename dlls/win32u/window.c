@@ -276,6 +276,15 @@ void *free_user_handle( HANDLE handle, unsigned short type )
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces );
 
+static void client_surface_notify_presentation_timing_locked( struct client_surface *surface )
+{
+    struct client_surface_presentation_timing_listener *listener;
+
+    LIST_FOR_EACH_ENTRY( listener, &surface->presentation_timing_listeners,
+                         struct client_surface_presentation_timing_listener, entry )
+        listener->changed( listener );
+}
+
 static void client_surface_detach_locked( struct client_surface *surface )
 {
     if (!surface->hwnd) return;
@@ -300,6 +309,8 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->presentation_wait_count );
         assert( !surface->presentation_retiring );
         assert( !surface->presentation_update_pending );
+        assert( !surface->presentation_timing_requests );
+        assert( list_empty( &surface->presentation_timing_listeners ) );
         pthread_cond_destroy( &surface->presentation_cond );
         pthread_mutex_destroy( &surface->presentation_mutex );
         free( surface );
@@ -354,6 +365,7 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
     surface->ref = 1;
     surface->hwnd = hwnd;
     list_init( &surface->entry );
+    list_init( &surface->presentation_timing_listeners );
 
     TRACE( "created %s\n", debugstr_client_surface( surface ) );
     return surface;
@@ -512,6 +524,21 @@ void client_surface_complete_presentation_retirement( struct client_surface *sur
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
+BOOL client_surface_prepare_presentation_feedback( struct client_surface *surface )
+{
+    if (ReadAcquire( &surface->presentation_timing_requests ) &&
+        surface->funcs->prepare_presentation_feedback)
+        return surface->funcs->prepare_presentation_feedback( surface );
+    return FALSE;
+}
+
+void client_surface_finish_presentation_feedback( struct client_surface *surface,
+                                                  BOOL submitted )
+{
+    if (surface->funcs->finish_presentation_feedback)
+        surface->funcs->finish_presentation_feedback( surface, submitted );
+}
+
 void client_surface_present( struct client_surface *surface )
 {
     HDC hdc = 0;
@@ -525,6 +552,62 @@ void client_surface_present( struct client_surface *surface )
         if (hdc) NtUserReleaseDC( hwnd, hdc );
     }
     pthread_mutex_unlock( &surfaces_lock );
+}
+
+void client_surface_request_presentation_timing( struct client_surface *surface )
+{
+    InterlockedIncrement( &surface->presentation_timing_requests );
+}
+
+void client_surface_release_presentation_timing( struct client_surface *surface )
+{
+    LONG count = InterlockedDecrement( &surface->presentation_timing_requests );
+
+    assert( count >= 0 );
+}
+
+void client_surface_set_presentation_timing( struct client_surface *surface,
+                                             UINT64 presented_ns, UINT64 refresh_ns,
+                                             UINT64 refresh_count, UINT flags )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    surface->presentation_timing.presented_ns = presented_ns;
+    surface->presentation_timing.refresh_ns = refresh_ns;
+    surface->presentation_timing.refresh_count = refresh_count;
+    surface->presentation_timing.flags = flags;
+    if (!++surface->presentation_timing.sample_serial)
+        ++surface->presentation_timing.sample_serial;
+    client_surface_notify_presentation_timing_locked( surface );
+    pthread_mutex_unlock( &surface->presentation_mutex );
+}
+
+BOOL client_surface_get_presentation_timing(
+        struct client_surface *surface, struct client_surface_presentation_timing *timing )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    *timing = surface->presentation_timing;
+    pthread_mutex_unlock( &surface->presentation_mutex );
+    return timing->sample_serial != 0;
+}
+
+void client_surface_add_presentation_timing_listener(
+        struct client_surface *surface,
+        struct client_surface_presentation_timing_listener *listener )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    list_init( &listener->entry );
+    list_add_tail( &surface->presentation_timing_listeners, &listener->entry );
+    pthread_mutex_unlock( &surface->presentation_mutex );
+}
+
+void client_surface_remove_presentation_timing_listener(
+        struct client_surface *surface,
+        struct client_surface_presentation_timing_listener *listener )
+{
+    pthread_mutex_lock( &surface->presentation_mutex );
+    list_remove( &listener->entry );
+    list_init( &listener->entry );
+    pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
 void client_surface_update( struct client_surface *surface )

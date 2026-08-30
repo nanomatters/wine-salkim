@@ -261,6 +261,8 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
     struct wayland_client_surface *surface = impl_from_client_surface(base->client);
     struct wl_callback *callback;
+    BOOL feedback_prepared;
+    BOOL presented;
     LONG generation = ReadAcquire(&base->client->presentation_generation);
 
     if (!client_surface_begin_present_wait(base->client, generation)) return TRUE;
@@ -294,7 +296,10 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
             InterlockedExchangePointer((void **)&surface->wl_callback, callback);
         }
     }
-    funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
+    feedback_prepared = client_surface_prepare_presentation_feedback(base->client);
+    presented = funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
+    if (feedback_prepared)
+        client_surface_finish_presentation_feedback(base->client, presented);
     client_surface_end_present_wait(base->client);
 
     return TRUE;
