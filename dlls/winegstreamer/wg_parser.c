@@ -1118,6 +1118,12 @@ static void free_stream(struct wg_parser_stream *stream)
         if (stream->tags[i])
             g_free(stream->tags[i]);
     }
+
+    if (stream->codec_caps)
+        gst_caps_unref(stream->codec_caps);
+    if (stream->current_caps)
+        gst_caps_unref(stream->current_caps);
+
     free(stream);
 }
 
