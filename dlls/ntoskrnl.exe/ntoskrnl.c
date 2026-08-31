@@ -3207,9 +3207,13 @@ PVOID WINAPI MmMapLockedPages( MDL *mdl, KPROCESSOR_MODE mode )
 PVOID WINAPI  MmMapLockedPagesSpecifyCache(PMDLX MemoryDescriptorList, KPROCESSOR_MODE AccessMode, MEMORY_CACHING_TYPE CacheType,
                                            PVOID BaseAddress, ULONG BugCheckOnFailure, MM_PAGE_PRIORITY Priority)
 {
-    FIXME("(%p, %u, %u, %p, %lu, %u): stub\n", MemoryDescriptorList, AccessMode, CacheType, BaseAddress, BugCheckOnFailure, Priority);
+    TRACE("(%p, %u, %u, %p, %lu, %u)\n", MemoryDescriptorList, AccessMode, CacheType,
+          BaseAddress, BugCheckOnFailure, Priority);
 
-    return NULL;
+    if (BaseAddress) FIXME("requested base address %p ignored\n", BaseAddress);
+
+    /* Mappings remain in the driver host process and are not shared with clients. */
+    return MmMapLockedPages( MemoryDescriptorList, AccessMode );
 }
 
 /***********************************************************************
