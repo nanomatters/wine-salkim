@@ -29,6 +29,10 @@
 #include "rtlsupportapi.h"
 #include "wow64win_private.h"
 
+NTSTATUS WINAPI wow64___wine_get_display_backend( UINT *args )
+{
+    return __wine_get_display_backend();
+}
 static void DECLSPEC_NORETURN stub_syscall( const char *name )
 {
     EXCEPTION_RECORD record;

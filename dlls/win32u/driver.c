@@ -1462,6 +1462,16 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     }
 }
 
+enum wine_display_backend WINAPI __wine_get_display_backend(void)
+{
+    const struct user_driver_funcs *driver = load_driver();
+
+    if (driver->pHasWindowManager( "waylanddrv" )) return WINE_DISPLAY_BACKEND_WAYLAND;
+    if (driver->pHasWindowManager( "xwayland" )) return WINE_DISPLAY_BACKEND_XWAYLAND;
+    if (driver->pHasWindowManager( "x11drv" )) return WINE_DISPLAY_BACKEND_X11;
+    return WINE_DISPLAY_BACKEND_UNKNOWN;
+}
+
 /******************************************************************************
  *		NtGdiExtEscape   (win32u.@)
  *
