@@ -240,7 +240,8 @@ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manag
 {
     struct pci_id pci_id = {0};
 
-    TRACE("\n");
+    if (!wayland_dmabuf_get_main_device_pci_id(&pci_id))
+        TRACE("compositor main device PCI identity unavailable\n");
 
     device_manager->add_gpu(NULL, &pci_id, NULL, param);
 }

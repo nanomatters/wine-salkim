@@ -707,6 +707,7 @@ struct wayland_surface
 };
 
 BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier);
+BOOL wayland_dmabuf_get_main_device_pci_id(struct pci_id *pci_id);
 BOOL wayland_vulkan_proxy_create_surface(const struct vulkan_instance *instance,
                                          struct wl_surface *wl_surface,
                                          VkSurfaceKHR *surface, VkResult *result);
