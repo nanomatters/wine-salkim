@@ -507,7 +507,7 @@ static void test_current_thread(BOOL is_system)
     PETHREAD thread;
     const char *file_name;
     NTSTATUS ret;
-    ULONG len;
+    ULONG len, session_id;
     WCHAR *p, *end;
 
     current = IoGetCurrentProcess();
@@ -549,6 +549,21 @@ static void test_current_thread(BOOL is_system)
 
     id = PsGetProcessInheritedFromUniqueProcessId(current);
     ok(id == (HANDLE)info.InheritedFromUniqueProcessId, "unexpected process id %p\n", id);
+
+    session_id = 0xdeadbeef;
+    ret = ZwQueryInformationProcess(process_handle, ProcessSessionInformation, &session_id, sizeof(session_id), NULL);
+    ok(!ret, "ZwQueryInformationProcess failed: %#lx\n", ret);
+    if (!ret)
+    {
+        ok(PsGetProcessSessionId(current) == session_id, "got session id %lu, expected %lu\n",
+           PsGetProcessSessionId(current), session_id);
+        ok(PsGetCurrentProcessSessionId() == session_id, "got current session id %lu, expected %lu\n",
+           PsGetCurrentProcessSessionId(), session_id);
+    }
+
+    /* The system process reports session 0 on Windows. */
+    todo_wine ok(!PsGetProcessSessionId(*pPsInitialSystemProcess), "got session id %lu for the system process\n",
+                 PsGetProcessSessionId(*pPsInitialSystemProcess));
 
     if (!is_system)
     {
