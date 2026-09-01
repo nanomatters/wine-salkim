@@ -4227,6 +4227,7 @@ BOOL X11DRV_HasWindowManager( const char *name )
     struct x11drv_thread_data *data = x11drv_init_thread_data();
     int opcode, event, error;
 
+    if (!strcmp( name, "x11drv" )) return TRUE;
     if (!strcmp( name, "xwayland" )) return XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error );
     if (!strcmp( name, "xwayland_glx_nvidia" ))
         return XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error ) && glx_renderer

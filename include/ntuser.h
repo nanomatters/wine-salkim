@@ -44,6 +44,16 @@ typedef enum MONITOR_DPI_TYPE
     MDT_WINE_RAW_DPI    = 0x10001,
 } MONITOR_DPI_TYPE;
 
+enum wine_display_backend
+{
+    WINE_DISPLAY_BACKEND_UNKNOWN = 0,
+    WINE_DISPLAY_BACKEND_WAYLAND = 1,
+    WINE_DISPLAY_BACKEND_X11 = 2,
+    WINE_DISPLAY_BACKEND_XWAYLAND = 3,
+};
+
+W32KAPI enum wine_display_backend WINAPI __wine_get_display_backend(void);
+
 typedef NTSTATUS (WINAPI *ntuser_callback)( void *args, ULONG len );
 NTSYSAPI NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len );
 
