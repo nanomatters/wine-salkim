@@ -3221,7 +3221,9 @@ PVOID WINAPI  MmMapLockedPagesSpecifyCache(PMDLX MemoryDescriptorList, KPROCESSO
  */
 void WINAPI MmUnmapLockedPages( void *base, MDL *mdl )
 {
-    FIXME( "(%p %p_\n", base, mdl );
+    TRACE( "%p %p\n", base, mdl );
+
+    mdl->MdlFlags &= ~MDL_MAPPED_TO_SYSTEM_VA;
 }
 
 /***********************************************************************
