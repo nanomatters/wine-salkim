@@ -1215,7 +1215,7 @@ static BOOL egldrv_describe_pixel_format( int format, struct wgl_pixel_format *d
     struct egl_platform *egl = &display_egl;
     int count = egl->config_count;
 
-    if (--format < 0 || format > ARRAY_SIZE(pixel_format_flags) * count) return FALSE;
+    if (--format < 0 || format >= ARRAY_SIZE(pixel_format_flags) * count) return FALSE;
     return describe_egl_config( egl->configs[format % count], desc, pixel_format_flags[format / count] );
 }
 
