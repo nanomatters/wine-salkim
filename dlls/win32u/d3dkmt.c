@@ -54,6 +54,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3dkmt);
 
 C_ASSERT( sizeof(D3DKMT_WINE_GPU_TELEMETRY) == D3DKMT_WINE_GPU_TELEMETRY_V1_SIZE );
+C_ASSERT( sizeof(D3DKMT_WINE_CPU_TELEMETRY) == D3DKMT_WINE_CPU_TELEMETRY_V1_SIZE );
 
 /* D3DKMT runtime descriptors */
 
@@ -197,6 +198,21 @@ enum d3dkmt_telemetry_path
     D3DKMT_TELEMETRY_PATH_COUNT,
 };
 
+struct d3dkmt_cpu_energy_path
+{
+    char *energy;
+    char *range;
+    char *limit;
+    ULONGLONG previous_energy;
+    ULONGLONG previous_time;
+};
+
+struct d3dkmt_cpu_clock_path
+{
+    char *current;
+    UINT weight;
+};
+
 struct d3dkmt_adapter
 {
     struct d3dkmt_object obj;
@@ -231,6 +247,30 @@ struct d3dkmt_adapter
     LONG volatile telemetry_pcie_width;
     LONG volatile telemetry_pcie_max_generation;
     LONG volatile telemetry_pcie_max_width;
+    struct d3dkmt_cpu_energy_path *cpu_energy_paths;
+    UINT cpu_energy_path_count;
+    char **cpu_power_limit_paths;
+    UINT cpu_power_limit_path_count;
+    char **cpu_temperature_paths;
+    UINT cpu_temperature_path_count;
+    struct d3dkmt_cpu_clock_path *cpu_clock_paths;
+    UINT cpu_clock_path_count;
+    ULONG cpu_maximum_clock;
+    ULONGLONG cpu_previous_total;
+    ULONGLONG cpu_previous_idle;
+    BOOL telemetry_backend_attempted;
+    BOOL telemetry_backend_available;
+    BOOL cpu_telemetry_backend_attempted;
+    BOOL cpu_telemetry_backend_available;
+    LONG volatile cpu_telemetry_requests;
+    LONG volatile cpu_telemetry_sequence;
+    LONG volatile cpu_telemetry_valid;
+    LONG64 volatile cpu_telemetry_power;
+    LONG volatile cpu_telemetry_power_limit;
+    LONG volatile cpu_telemetry_temperature;
+    LONG volatile cpu_telemetry_utilization;
+    LONG volatile cpu_telemetry_average_clock;
+    LONG volatile cpu_telemetry_maximum_clock;
 };
 
 struct d3dkmt_device
@@ -882,6 +922,252 @@ static BOOL find_hwmon_labeled_value_path( const char *root, const char *label, 
     return FALSE;
 }
 
+static BOOL append_cpu_path( char ***paths, UINT *count, const char *path )
+{
+    char **new_paths;
+    char *copy;
+
+    if (!(copy = strdup( path ))) return FALSE;
+    if (!(new_paths = realloc( *paths, (*count + 1) * sizeof(**paths) )))
+    {
+        free( copy );
+        return FALSE;
+    }
+    new_paths[*count] = copy;
+    *paths = new_paths;
+    ++*count;
+    return TRUE;
+}
+
+static BOOL append_cpu_energy_path( struct d3dkmt_adapter *adapter, const char *root )
+{
+    struct d3dkmt_cpu_energy_path *new_paths, path = {0};
+    char buffer[PATH_MAX];
+    LONGLONG value;
+    int len;
+
+    len = snprintf( buffer, sizeof(buffer), "%s/energy_uj", root );
+    if (len < 0 || len >= sizeof(buffer) || !read_sysfs_value( buffer, &value ) || value < 0 ||
+        !(path.energy = strdup( buffer )))
+        return FALSE;
+
+    len = snprintf( buffer, sizeof(buffer), "%s/max_energy_range_uj", root );
+    if (len >= 0 && len < sizeof(buffer) && read_sysfs_value( buffer, &value ) && value > 0)
+        path.range = strdup( buffer );
+
+    len = snprintf( buffer, sizeof(buffer), "%s/constraint_0_power_limit_uw", root );
+    if (len >= 0 && len < sizeof(buffer) && read_sysfs_value( buffer, &value ) && value > 0)
+        path.limit = strdup( buffer );
+
+    if (!(new_paths = realloc( adapter->cpu_energy_paths,
+                               (adapter->cpu_energy_path_count + 1) * sizeof(*new_paths) )))
+    {
+        free( path.energy );
+        free( path.range );
+        free( path.limit );
+        return FALSE;
+    }
+    new_paths[adapter->cpu_energy_path_count++] = path;
+    adapter->cpu_energy_paths = new_paths;
+    return TRUE;
+}
+
+static UINT count_cpu_list( const char *list )
+{
+    const char *cursor = list;
+    unsigned long first, last;
+    char *end;
+    UINT count = 0;
+
+    while (*cursor)
+    {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') ++cursor;
+        if (!*cursor) break;
+        errno = 0;
+        first = strtoul( cursor, &end, 10 );
+        if (errno || end == cursor) break;
+        cursor = end;
+        last = first;
+        if (*cursor == '-')
+        {
+            errno = 0;
+            last = strtoul( cursor + 1, &end, 10 );
+            if (errno || end == cursor + 1 || last < first) break;
+            cursor = end;
+        }
+        if (last - first + 1 > UINT_MAX - count) return UINT_MAX;
+        count += last - first + 1;
+    }
+    return count;
+}
+
+static BOOL append_cpu_clock_path( struct d3dkmt_adapter *adapter, const char *root )
+{
+    struct d3dkmt_cpu_clock_path *new_paths, path = {0};
+    char buffer[PATH_MAX], cpus[4096];
+    LONGLONG value;
+    int len;
+
+    len = snprintf( buffer, sizeof(buffer), "%s/scaling_cur_freq", root );
+    if (len < 0 || len >= sizeof(buffer) || !read_sysfs_value( buffer, &value ) || value < 0 ||
+        !(path.current = strdup( buffer )))
+        return FALSE;
+
+    len = snprintf( buffer, sizeof(buffer), "%s/cpuinfo_max_freq", root );
+    if (len >= 0 && len < sizeof(buffer) && read_sysfs_value( buffer, &value ) && value > 0)
+    {
+        ULONG maximum = min( (ULONGLONG)value, UINT32_MAX );
+        adapter->cpu_maximum_clock = max( adapter->cpu_maximum_clock, maximum );
+    }
+
+    len = snprintf( buffer, sizeof(buffer), "%s/related_cpus", root );
+    if (len >= 0 && len < sizeof(buffer) && read_sysfs_line( buffer, cpus, sizeof(cpus) ))
+        path.weight = count_cpu_list( cpus );
+    if (!path.weight) path.weight = 1;
+
+    if (!(new_paths = realloc( adapter->cpu_clock_paths,
+                               (adapter->cpu_clock_path_count + 1) * sizeof(*new_paths) )))
+    {
+        free( path.current );
+        return FALSE;
+    }
+    new_paths[adapter->cpu_clock_path_count++] = path;
+    adapter->cpu_clock_paths = new_paths;
+    return TRUE;
+}
+
+static BOOL find_cpu_temperature_path( const char *root, char *path, size_t size )
+{
+    static const char *const exact_labels[] = {"Tctl", "Tdie"};
+    char label_path[PATH_MAX], label[64];
+    LONGLONG value;
+    UINT pass, i;
+    int len;
+
+    for (pass = 0; pass < 3; ++pass)
+    {
+        for (i = 1; i <= 64; ++i)
+        {
+            len = snprintf( label_path, sizeof(label_path), "%s/temp%u_label", root, i );
+            if (len < 0 || len >= sizeof(label_path) ||
+                !read_sysfs_line( label_path, label, sizeof(label) ))
+                continue;
+            if (pass < ARRAY_SIZE(exact_labels) && strcmp( label, exact_labels[pass] )) continue;
+            if (pass == ARRAY_SIZE(exact_labels) && strncmp( label, "Package id ", 11 )) continue;
+            len = snprintf( path, size, "%s/temp%u_input", root, i );
+            if (len >= 0 && len < size && read_sysfs_value( path, &value ) && value >= 0) return TRUE;
+        }
+    }
+
+    len = snprintf( path, size, "%s/temp1_input", root );
+    return len >= 0 && len < size && read_sysfs_value( path, &value ) && value >= 0;
+}
+
+static void init_cpu_hwmon_paths( struct d3dkmt_adapter *adapter )
+{
+    static const char *const cpu_hwmon_names[] = {"k10temp", "zenpower", "coretemp"};
+    char root[PATH_MAX], path[PATH_MAX], name[64];
+    struct dirent *entry;
+    DIR *dir;
+    UINT i;
+    int len;
+
+    if (!(dir = opendir( "/sys/class/hwmon" ))) return;
+    while ((entry = readdir( dir )))
+    {
+        if (entry->d_name[0] == '.') continue;
+        len = snprintf( root, sizeof(root), "/sys/class/hwmon/%s", entry->d_name );
+        if (len < 0 || len >= sizeof(root)) continue;
+        len = snprintf( path, sizeof(path), "%s/name", root );
+        if (len < 0 || len >= sizeof(path) || !read_sysfs_line( path, name, sizeof(name) )) continue;
+        for (i = 0; i < ARRAY_SIZE(cpu_hwmon_names); ++i)
+            if (!strcmp( name, cpu_hwmon_names[i] )) break;
+        if (i == ARRAY_SIZE(cpu_hwmon_names)) continue;
+
+        if (find_cpu_temperature_path( root, path, sizeof(path) ))
+            append_cpu_path( &adapter->cpu_temperature_paths,
+                             &adapter->cpu_temperature_path_count, path );
+    }
+    closedir( dir );
+}
+
+static BOOL init_cpu_powercap_provider( struct d3dkmt_adapter *adapter, const char *provider )
+{
+    char root[PATH_MAX], path[PATH_MAX], name[64];
+    struct dirent *entry;
+    BOOL found = FALSE;
+    DIR *dir;
+    int len;
+
+    if (!(dir = opendir( "/sys/class/powercap" ))) return FALSE;
+    while ((entry = readdir( dir )))
+    {
+        if (strncmp( entry->d_name, provider, strlen( provider ) )) continue;
+        len = snprintf( root, sizeof(root), "/sys/class/powercap/%s", entry->d_name );
+        if (len < 0 || len >= sizeof(root)) continue;
+        len = snprintf( path, sizeof(path), "%s/name", root );
+        if (len < 0 || len >= sizeof(path) || !read_sysfs_line( path, name, sizeof(name) ) ||
+            strncmp( name, "package-", 8 ))
+            continue;
+        found = TRUE;
+        if (!append_cpu_energy_path( adapter, root ))
+        {
+            LONGLONG value;
+
+            len = snprintf( path, sizeof(path), "%s/constraint_0_power_limit_uw", root );
+            if (len >= 0 && len < sizeof(path) && read_sysfs_value( path, &value ) && value > 0)
+                append_cpu_path( &adapter->cpu_power_limit_paths,
+                                 &adapter->cpu_power_limit_path_count, path );
+        }
+    }
+    closedir( dir );
+    return found;
+}
+
+static void init_cpu_powercap_paths( struct d3dkmt_adapter *adapter )
+{
+    static const char *const providers[] = {"amd-rapl:", "intel-rapl:", "intel-rapl-mmio:"};
+    UINT i;
+
+    for (i = 0; i < ARRAY_SIZE(providers); ++i)
+        if (init_cpu_powercap_provider( adapter, providers[i] )) return;
+}
+
+static void init_cpu_clock_paths( struct d3dkmt_adapter *adapter )
+{
+    const char *base = "/sys/devices/system/cpu/cpufreq";
+    char root[PATH_MAX];
+    struct dirent *entry;
+    DIR *dir;
+    int len;
+
+    if (!(dir = opendir( base ))) return;
+    while ((entry = readdir( dir )))
+    {
+        if (strncmp( entry->d_name, "policy", 6 )) continue;
+        len = snprintf( root, sizeof(root), "%s/%s", base, entry->d_name );
+        if (len >= 0 && len < sizeof(root)) append_cpu_clock_path( adapter, root );
+    }
+    closedir( dir );
+}
+
+static BOOL init_cpu_telemetry_backend( struct d3dkmt_adapter *adapter )
+{
+    char buffer[256];
+
+    init_cpu_hwmon_paths( adapter );
+    init_cpu_powercap_paths( adapter );
+    init_cpu_clock_paths( adapter );
+
+    TRACE( "CPU telemetry energy %u, temperature %u, clock %u\n",
+           adapter->cpu_energy_path_count,
+           adapter->cpu_temperature_path_count, adapter->cpu_clock_path_count );
+
+    return read_sysfs_line( "/proc/stat", buffer, sizeof(buffer) ) ||
+           adapter->cpu_energy_path_count || adapter->cpu_temperature_path_count ||
+           adapter->cpu_clock_path_count;
+}
+
 typedef void *nvml_device_t;
 typedef int nvml_return_t;
 
@@ -1043,6 +1329,171 @@ static ULONGLONG monotonic_time_ns(void)
 
     if (clock_gettime( CLOCK_MONOTONIC, &time )) return 0;
     return (ULONGLONG)time.tv_sec * 1000000000 + time.tv_nsec;
+}
+
+static BOOL query_cpu_power( struct d3dkmt_adapter *adapter, ULONGLONG *power )
+{
+    ULONGLONG now = monotonic_time_ns(), total = 0;
+    BOOL valid = FALSE;
+    LONGLONG value;
+    UINT i;
+
+    if (!now) return FALSE;
+    for (i = 0; i < adapter->cpu_energy_path_count; ++i)
+    {
+        struct d3dkmt_cpu_energy_path *path = adapter->cpu_energy_paths + i;
+        ULONGLONG energy, elapsed, delta, domain_power;
+        LONGLONG range;
+        double converted;
+
+        if (!read_sysfs_value( path->energy, &value ) || value < 0) continue;
+        energy = value;
+        if (!path->previous_time || now <= path->previous_time)
+        {
+            path->previous_energy = energy;
+            path->previous_time = now;
+            continue;
+        }
+
+        elapsed = now - path->previous_time;
+        if (energy >= path->previous_energy) delta = energy - path->previous_energy;
+        else if (path->range && read_sysfs_value( path->range, &range ) && range > 0 &&
+                 path->previous_energy <= (ULONGLONG)range && energy <= (ULONGLONG)range)
+            delta = (ULONGLONG)range - path->previous_energy + energy;
+        else
+        {
+            path->previous_energy = energy;
+            path->previous_time = now;
+            continue;
+        }
+
+        converted = (double)delta * 1000000000.0 / elapsed;
+        domain_power = converted < UINT64_MAX ? (ULONGLONG)(converted + 0.5) : UINT64_MAX;
+        if (domain_power > UINT64_MAX - total) total = UINT64_MAX;
+        else total += domain_power;
+        path->previous_energy = energy;
+        path->previous_time = now;
+        valid = TRUE;
+    }
+
+    if (valid) *power = total;
+    return valid;
+}
+
+static BOOL query_cpu_power_limit( struct d3dkmt_adapter *adapter, ULONG *power_limit )
+{
+    ULONGLONG total = 0;
+    BOOL valid = FALSE;
+    LONGLONG value;
+    UINT i;
+
+    if (adapter->cpu_power_limit_path_count)
+    {
+        for (i = 0; i < adapter->cpu_power_limit_path_count; ++i)
+        {
+            if (!read_sysfs_value( adapter->cpu_power_limit_paths[i], &value ) || value <= 0) continue;
+            if ((ULONGLONG)value > UINT64_MAX - total) total = UINT64_MAX;
+            else total += value;
+            valid = TRUE;
+        }
+    }
+    if (!valid)
+    {
+        for (i = 0; i < adapter->cpu_energy_path_count; ++i)
+        {
+            if (!adapter->cpu_energy_paths[i].limit ||
+                !read_sysfs_value( adapter->cpu_energy_paths[i].limit, &value ) || value <= 0)
+                continue;
+            if ((ULONGLONG)value > UINT64_MAX - total) total = UINT64_MAX;
+            else total += value;
+            valid = TRUE;
+        }
+    }
+
+    if (valid) *power_limit = min( (total + 500) / 1000, UINT32_MAX );
+    return valid;
+}
+
+static BOOL query_cpu_temperature( struct d3dkmt_adapter *adapter, ULONG *temperature )
+{
+    ULONGLONG maximum = 0;
+    BOOL valid = FALSE;
+    LONGLONG value;
+    UINT i;
+
+    for (i = 0; i < adapter->cpu_temperature_path_count; ++i)
+    {
+        if (!read_sysfs_value( adapter->cpu_temperature_paths[i], &value ) || value < 0) continue;
+        maximum = max( maximum, (ULONGLONG)value );
+        valid = TRUE;
+    }
+    if (valid) *temperature = min( (maximum + 50) / 100, UINT32_MAX );
+    return valid;
+}
+
+static BOOL read_cpu_times( ULONGLONG *total, ULONGLONG *idle )
+{
+    unsigned long long user, nice, system, idle_time, iowait, irq, softirq, steal;
+    char buffer[256], name[8];
+    int count;
+
+    if (!read_sysfs_line( "/proc/stat", buffer, sizeof(buffer) )) return FALSE;
+    count = sscanf( buffer, "%7s %llu %llu %llu %llu %llu %llu %llu %llu",
+                    name, &user, &nice, &system, &idle_time, &iowait, &irq, &softirq, &steal );
+    if (count < 5 || strcmp( name, "cpu" )) return FALSE;
+    if (count < 6) iowait = 0;
+    if (count < 7) irq = 0;
+    if (count < 8) softirq = 0;
+    if (count < 9) steal = 0;
+    *idle = idle_time + iowait;
+    *total = user + nice + system + *idle + irq + softirq + steal;
+    return TRUE;
+}
+
+static BOOL query_cpu_utilization( struct d3dkmt_adapter *adapter, ULONG *utilization )
+{
+    ULONGLONG total, idle, delta_total, delta_idle, busy;
+
+    if (!read_cpu_times( &total, &idle )) return FALSE;
+    if (!adapter->cpu_previous_total || total <= adapter->cpu_previous_total ||
+        idle < adapter->cpu_previous_idle)
+    {
+        adapter->cpu_previous_total = total;
+        adapter->cpu_previous_idle = idle;
+        return FALSE;
+    }
+
+    delta_total = total - adapter->cpu_previous_total;
+    delta_idle = min( idle - adapter->cpu_previous_idle, delta_total );
+    busy = delta_total - delta_idle;
+    adapter->cpu_previous_total = total;
+    adapter->cpu_previous_idle = idle;
+    *utilization = min( (busy * 100 + delta_total / 2) / delta_total, 100u );
+    return TRUE;
+}
+
+static BOOL query_cpu_clock( struct d3dkmt_adapter *adapter, ULONG *average, ULONG *maximum )
+{
+    ULONGLONG weighted = 0, weight = 0;
+    BOOL valid = FALSE;
+    LONGLONG value;
+    UINT i;
+
+    for (i = 0; i < adapter->cpu_clock_path_count; ++i)
+    {
+        const struct d3dkmt_cpu_clock_path *path = adapter->cpu_clock_paths + i;
+
+        if (read_sysfs_value( path->current, &value ) && value >= 0)
+        {
+            weighted += (ULONGLONG)value * path->weight;
+            weight += path->weight;
+            valid = TRUE;
+        }
+    }
+
+    if (valid) *average = min( (weighted + weight / 2) / weight, UINT32_MAX );
+    *maximum = adapter->cpu_maximum_clock;
+    return valid;
 }
 
 static BOOL update_energy_power( struct d3dkmt_adapter *adapter, ULONGLONG energy, ULONGLONG *power )
@@ -1313,6 +1764,22 @@ static void free_adapter_telemetry_paths( struct d3dkmt_adapter *adapter )
 
     for (i = 0; i < ARRAY_SIZE(adapter->telemetry_paths); ++i)
         free( adapter->telemetry_paths[i] );
+    for (i = 0; i < adapter->cpu_energy_path_count; ++i)
+    {
+        free( adapter->cpu_energy_paths[i].energy );
+        free( adapter->cpu_energy_paths[i].range );
+        free( adapter->cpu_energy_paths[i].limit );
+    }
+    free( adapter->cpu_energy_paths );
+    for (i = 0; i < adapter->cpu_power_limit_path_count; ++i)
+        free( adapter->cpu_power_limit_paths[i] );
+    free( adapter->cpu_power_limit_paths );
+    for (i = 0; i < adapter->cpu_temperature_path_count; ++i)
+        free( adapter->cpu_temperature_paths[i] );
+    free( adapter->cpu_temperature_paths );
+    for (i = 0; i < adapter->cpu_clock_path_count; ++i)
+        free( adapter->cpu_clock_paths[i].current );
+    free( adapter->cpu_clock_paths );
 }
 
 static void telemetry_write64( LONG64 volatile *target, ULONGLONG value )
@@ -1350,6 +1817,20 @@ static void publish_adapter_telemetry( struct d3dkmt_adapter *adapter,
     InterlockedIncrement( &adapter->telemetry_sequence );
 }
 
+static void publish_cpu_telemetry( struct d3dkmt_adapter *adapter,
+                                   const D3DKMT_WINE_CPU_TELEMETRY *sample )
+{
+    InterlockedIncrement( &adapter->cpu_telemetry_sequence );
+    telemetry_write64( &adapter->cpu_telemetry_power, sample->PowerMicrowatts );
+    InterlockedExchange( &adapter->cpu_telemetry_power_limit, sample->PowerLimitMilliwatts );
+    InterlockedExchange( &adapter->cpu_telemetry_temperature, sample->TemperatureDeciCelsius );
+    InterlockedExchange( &adapter->cpu_telemetry_utilization, sample->UtilizationPercent );
+    InterlockedExchange( &adapter->cpu_telemetry_average_clock, sample->AverageClockKHz );
+    InterlockedExchange( &adapter->cpu_telemetry_maximum_clock, sample->MaximumClockKHz );
+    InterlockedExchange( &adapter->cpu_telemetry_valid, sample->Valid );
+    InterlockedIncrement( &adapter->cpu_telemetry_sequence );
+}
+
 static void sample_adapter_telemetry( struct d3dkmt_adapter *adapter )
 {
     ULONG requests = ReadAcquire( &adapter->telemetry_requests );
@@ -1380,17 +1861,51 @@ static void sample_adapter_telemetry( struct d3dkmt_adapter *adapter )
     publish_adapter_telemetry( adapter, &sample );
 }
 
+static void sample_cpu_telemetry( struct d3dkmt_adapter *adapter )
+{
+    ULONG requests = ReadAcquire( &adapter->cpu_telemetry_requests );
+    D3DKMT_WINE_CPU_TELEMETRY sample = {0};
+
+    if ((requests & D3DKMT_WINE_CPU_TELEMETRY_POWER) &&
+        query_cpu_power( adapter, &sample.PowerMicrowatts ))
+        sample.Valid |= D3DKMT_WINE_CPU_TELEMETRY_POWER;
+    if ((requests & D3DKMT_WINE_CPU_TELEMETRY_POWER_LIMIT) &&
+        query_cpu_power_limit( adapter, &sample.PowerLimitMilliwatts ))
+        sample.Valid |= D3DKMT_WINE_CPU_TELEMETRY_POWER_LIMIT;
+    if ((requests & D3DKMT_WINE_CPU_TELEMETRY_TEMPERATURE) &&
+        query_cpu_temperature( adapter, &sample.TemperatureDeciCelsius ))
+        sample.Valid |= D3DKMT_WINE_CPU_TELEMETRY_TEMPERATURE;
+    if ((requests & D3DKMT_WINE_CPU_TELEMETRY_UTILIZATION) &&
+        query_cpu_utilization( adapter, &sample.UtilizationPercent ))
+        sample.Valid |= D3DKMT_WINE_CPU_TELEMETRY_UTILIZATION;
+    if ((requests & D3DKMT_WINE_CPU_TELEMETRY_CLOCK) &&
+        query_cpu_clock( adapter, &sample.AverageClockKHz, &sample.MaximumClockKHz ))
+        sample.Valid |= D3DKMT_WINE_CPU_TELEMETRY_CLOCK;
+
+    publish_cpu_telemetry( adapter, &sample );
+}
+
 static void *adapter_telemetry_thread( void *arg )
 {
     struct d3dkmt_adapter *adapter = arg;
 
-    if (!init_adapter_telemetry_backend( adapter )) goto done;
     while (!ReadAcquire( &adapter->telemetry_stop ))
     {
         ULONGLONG start = monotonic_time_ns(), now, remaining_ns;
         ULONG delay_ms = D3DKMT_TELEMETRY_INTERVAL_MS;
 
-        sample_adapter_telemetry( adapter );
+        if (!adapter->telemetry_backend_attempted && ReadAcquire( &adapter->telemetry_requests ))
+        {
+            adapter->telemetry_backend_attempted = TRUE;
+            adapter->telemetry_backend_available = init_adapter_telemetry_backend( adapter );
+        }
+        if (!adapter->cpu_telemetry_backend_attempted && ReadAcquire( &adapter->cpu_telemetry_requests ))
+        {
+            adapter->cpu_telemetry_backend_attempted = TRUE;
+            adapter->cpu_telemetry_backend_available = init_cpu_telemetry_backend( adapter );
+        }
+        if (adapter->telemetry_backend_available) sample_adapter_telemetry( adapter );
+        if (adapter->cpu_telemetry_backend_available) sample_cpu_telemetry( adapter );
         if (start && (now = monotonic_time_ns()) >= start)
         {
             remaining_ns = (ULONGLONG)D3DKMT_TELEMETRY_INTERVAL_MS * 1000000;
@@ -1406,7 +1921,7 @@ static void *adapter_telemetry_thread( void *arg )
             while (ret < 0 && errno == EINTR && !ReadAcquire( &adapter->telemetry_stop ));
             if (ret < 0)
             {
-                WARN( "GPU telemetry poll failed, error %d.\n", errno );
+                WARN( "Telemetry poll failed, error %d.\n", errno );
                 break;
             }
         }
@@ -1420,10 +1935,11 @@ static void *adapter_telemetry_thread( void *arg )
 #endif
     }
 
-done:
     {
-        D3DKMT_WINE_GPU_TELEMETRY sample = {0};
-        publish_adapter_telemetry( adapter, &sample );
+        D3DKMT_WINE_GPU_TELEMETRY gpu_sample = {0};
+        D3DKMT_WINE_CPU_TELEMETRY cpu_sample = {0};
+        publish_adapter_telemetry( adapter, &gpu_sample );
+        publish_cpu_telemetry( adapter, &cpu_sample );
     }
     return NULL;
 }
@@ -1439,14 +1955,14 @@ static void start_adapter_telemetry( struct d3dkmt_adapter *adapter )
 #ifdef HAVE_SYS_EVENTFD_H
     if ((adapter->telemetry_event = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK )) < 0)
     {
-        WARN( "Failed to create GPU telemetry event, error %d.\n", errno );
+        WARN( "Failed to create telemetry event, error %d.\n", errno );
         adapter->telemetry_disabled = TRUE;
         goto done;
     }
 #endif
     if ((err = pthread_create( &adapter->telemetry_thread, NULL, adapter_telemetry_thread, adapter )))
     {
-        WARN( "Failed to create GPU telemetry thread, error %d.\n", err );
+        WARN( "Failed to create telemetry thread, error %d.\n", err );
         if (adapter->telemetry_event >= 0) close( adapter->telemetry_event );
         adapter->telemetry_event = -1;
         adapter->telemetry_disabled = TRUE;
@@ -1474,7 +1990,7 @@ static void stop_adapter_telemetry( struct d3dkmt_adapter *adapter )
     InterlockedExchange( &adapter->telemetry_stop, TRUE );
     if (adapter->telemetry_event >= 0 && write( adapter->telemetry_event, &value, sizeof(value) ) < 0 &&
         errno != EAGAIN)
-        WARN( "Failed to wake GPU telemetry thread, error %d.\n", errno );
+        WARN( "Failed to wake telemetry thread, error %d.\n", errno );
     thread = adapter->telemetry_thread;
     pthread_mutex_unlock( &adapter->telemetry_lock );
 
@@ -1558,6 +2074,58 @@ static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
     return STATUS_SUCCESS;
 }
 
+static void read_cpu_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_CPU_TELEMETRY *data )
+{
+    D3DKMT_WINE_CPU_TELEMETRY sample = {0};
+    UINT requested = data->Requested;
+    ULONG sequence;
+    UINT i;
+
+    for (i = 0; i < 3; ++i)
+    {
+        sequence = ReadAcquire( &adapter->cpu_telemetry_sequence );
+        if (sequence & 1) continue;
+        sample.Valid = ReadAcquire( &adapter->cpu_telemetry_valid );
+        sample.PowerMicrowatts = telemetry_read64( &adapter->cpu_telemetry_power );
+        sample.PowerLimitMilliwatts = ReadAcquire( &adapter->cpu_telemetry_power_limit );
+        sample.TemperatureDeciCelsius = ReadAcquire( &adapter->cpu_telemetry_temperature );
+        sample.UtilizationPercent = ReadAcquire( &adapter->cpu_telemetry_utilization );
+        sample.AverageClockKHz = ReadAcquire( &adapter->cpu_telemetry_average_clock );
+        sample.MaximumClockKHz = ReadAcquire( &adapter->cpu_telemetry_maximum_clock );
+        if (sequence == ReadAcquire( &adapter->cpu_telemetry_sequence ))
+        {
+            sample.Requested = requested;
+            sample.Valid &= requested;
+            *data = sample;
+            return;
+        }
+    }
+}
+
+static NTSTATUS query_wine_cpu_telemetry( struct d3dkmt_adapter *adapter,
+                                          D3DKMT_WINE_CPU_TELEMETRY *data )
+{
+    UINT requested = data->Requested;
+    UINT supported = D3DKMT_WINE_CPU_TELEMETRY_POWER | D3DKMT_WINE_CPU_TELEMETRY_POWER_LIMIT |
+                     D3DKMT_WINE_CPU_TELEMETRY_TEMPERATURE |
+                     D3DKMT_WINE_CPU_TELEMETRY_UTILIZATION | D3DKMT_WINE_CPU_TELEMETRY_CLOCK;
+
+    memset( data, 0, sizeof(*data) );
+    data->Requested = requested;
+    if (requested & supported)
+    {
+        InterlockedOr( &adapter->cpu_telemetry_requests, requested & supported );
+        start_adapter_telemetry( adapter );
+        read_cpu_telemetry( adapter, data );
+    }
+
+    TRACE( "CPU requested %#x valid %#x power %llu/%u temperature %u load %u clock %u/%u\n",
+           requested, data->Valid, (unsigned long long)data->PowerMicrowatts,
+           data->PowerLimitMilliwatts, data->TemperatureDeciCelsius, data->UtilizationPercent,
+           data->AverageClockKHz, data->MaximumClockKHz );
+    return STATUS_SUCCESS;
+}
+
 /******************************************************************************
  *           NtGdiDdDDIQueryAdapterInfo    (win32u.@)
  */
@@ -1603,6 +2171,20 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
         if (!(adapter = get_d3dkmt_object_locked( desc->hAdapter, D3DKMT_ADAPTER )))
             status = STATUS_INVALID_PARAMETER;
         else status = query_wine_gpu_telemetry( adapter, data );
+        pthread_mutex_unlock( &d3dkmt_lock );
+        return status;
+    }
+    case KMTQAITYPE_WINE_CPU_TELEMETRY:
+    {
+        D3DKMT_WINE_CPU_TELEMETRY *data = desc->pPrivateDriverData;
+        NTSTATUS status;
+
+        if (desc->PrivateDriverDataSize < D3DKMT_WINE_CPU_TELEMETRY_V1_SIZE)
+            return STATUS_INVALID_PARAMETER;
+        pthread_mutex_lock( &d3dkmt_lock );
+        if (!(adapter = get_d3dkmt_object_locked( desc->hAdapter, D3DKMT_ADAPTER )))
+            status = STATUS_INVALID_PARAMETER;
+        else status = query_wine_cpu_telemetry( adapter, data );
         pthread_mutex_unlock( &d3dkmt_lock );
         return status;
     }
