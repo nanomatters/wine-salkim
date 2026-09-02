@@ -247,6 +247,7 @@ struct d3dkmt_adapter
     LONG volatile telemetry_pcie_width;
     LONG volatile telemetry_pcie_max_generation;
     LONG volatile telemetry_pcie_max_width;
+    LONG volatile telemetry_thread_error;
     struct d3dkmt_cpu_energy_path *cpu_energy_paths;
     UINT cpu_energy_path_count;
     char **cpu_power_limit_paths;
@@ -1159,10 +1160,6 @@ static BOOL init_cpu_telemetry_backend( struct d3dkmt_adapter *adapter )
     init_cpu_powercap_paths( adapter );
     init_cpu_clock_paths( adapter );
 
-    TRACE( "CPU telemetry energy %u, temperature %u, clock %u\n",
-           adapter->cpu_energy_path_count,
-           adapter->cpu_temperature_path_count, adapter->cpu_clock_path_count );
-
     return read_sysfs_line( "/proc/stat", buffer, sizeof(buffer) ) ||
            adapter->cpu_energy_path_count || adapter->cpu_temperature_path_count ||
            adapter->cpu_clock_path_count;
@@ -1314,11 +1311,6 @@ static BOOL init_adapter_telemetry_backend( struct d3dkmt_adapter *adapter )
 
     for (i = 0; i < ARRAY_SIZE(adapter->telemetry_paths); ++i)
         have_path |= !!adapter->telemetry_paths[i];
-
-    TRACE( "adapter %#x telemetry PCI %04x:%02x:%02x.%u vendor %#x NVML %u sysfs %u\n",
-           adapter->obj.local, adapter->telemetry_pci.pciDomain, adapter->telemetry_pci.pciBus,
-           adapter->telemetry_pci.pciDevice, adapter->telemetry_pci.pciFunction,
-           adapter->telemetry_vendor_id, have_nvml, have_path );
 
     return have_nvml || have_path;
 }
@@ -1921,7 +1913,7 @@ static void *adapter_telemetry_thread( void *arg )
             while (ret < 0 && errno == EINTR && !ReadAcquire( &adapter->telemetry_stop ));
             if (ret < 0)
             {
-                WARN( "Telemetry poll failed, error %d.\n", errno );
+                InterlockedExchange( &adapter->telemetry_thread_error, errno );
                 break;
             }
         }
@@ -2040,6 +2032,14 @@ static void read_adapter_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_
     }
 }
 
+static void report_telemetry_thread_error( struct d3dkmt_adapter *adapter )
+{
+    LONG error;
+
+    if ((error = InterlockedExchange( &adapter->telemetry_thread_error, 0 )))
+        WARN( "Telemetry poll failed, error %d.\n", error );
+}
+
 static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
                                           D3DKMT_WINE_GPU_TELEMETRY *data )
 {
@@ -2062,6 +2062,8 @@ static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
         start_adapter_telemetry( adapter );
         read_adapter_telemetry( adapter, data );
     }
+
+    report_telemetry_thread_error( adapter );
 
     TRACE( "adapter %#x requested %#x valid %#x power %llu/%u temperature %u load %u/%u "
            "clock %u/%u vram %llu/%llu PCIe %u x%u/%u x%u\n",
@@ -2118,6 +2120,8 @@ static NTSTATUS query_wine_cpu_telemetry( struct d3dkmt_adapter *adapter,
         start_adapter_telemetry( adapter );
         read_cpu_telemetry( adapter, data );
     }
+
+    report_telemetry_thread_error( adapter );
 
     TRACE( "CPU requested %#x valid %#x power %llu/%u temperature %u load %u clock %u/%u\n",
            requested, data->Valid, (unsigned long long)data->PowerMicrowatts,
