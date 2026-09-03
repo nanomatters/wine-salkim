@@ -1889,6 +1889,14 @@ class VkStruct(Sequence):
 
         members = filter(is_api_supported, struct.findall("member"))
         members = [VkMember.from_xml(registry, member, returnedonly) for member in members]
+
+        # Don't flag dynamic arrays with input/output lengths as returnedonly.
+        for member in filter(lambda m: m.returnedonly, members):
+            for length in filter(lambda m: m.name == member.dyn_array_len, members):
+                length.returnedonly = False
+            if member.is_dynamic_array():
+                member.returnedonly = False
+
         return VkStruct(registry, name, members, returnedonly, structextends, union=union)
 
     def set_order(self, order, structs):
