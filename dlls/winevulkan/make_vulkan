@@ -1836,7 +1836,6 @@ class VkStruct(Sequence):
         self.registry = registry
         self.name = name
         self.members = members
-        self.returnedonly = returnedonly
         self.structextends = structextends
         self.required = False
         self.alias = alias
@@ -1909,6 +1908,10 @@ class VkStruct(Sequence):
     @property
     def extension(self):
         return self.registry.types[self.name]["extension"]
+
+    @property
+    def returnedonly(self):
+        return all(m.returnedonly for m in self.members)
 
     @property
     def struct_extensions(self):
@@ -2051,7 +2054,7 @@ class VkStruct(Sequence):
             # for non-pointer members, check for returnedonly and const attributes
             if not m.is_pointer() or m.type == "void":
                 if direction == Direction.INPUT:
-                    if self.returnedonly:
+                    if m.returnedonly:
                         continue
                 else:
                     if is_const or m.is_const():
@@ -2146,7 +2149,7 @@ class StructConversionFunction(object):
         else:
             if m.name == "pNext":
                 return True
-            if m.name != "sType" and struct.returnedonly and not m.needs_conversion(
+            if m.name != "sType" and m.returnedonly and not m.needs_conversion(
                     self.conv, self.unwrap, Direction.INPUT, self.const):
                 return False
         return True
