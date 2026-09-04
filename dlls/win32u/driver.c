@@ -1462,14 +1462,24 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     }
 }
 
-enum wine_display_backend WINAPI __wine_get_display_backend(void)
+UINT WINAPI __wine_get_display_backend(void)
 {
     const struct user_driver_funcs *driver = load_driver();
+    UINT backend;
 
-    if (driver->pHasWindowManager( "waylanddrv" )) return WINE_DISPLAY_BACKEND_WAYLAND;
-    if (driver->pHasWindowManager( "xwayland" )) return WINE_DISPLAY_BACKEND_XWAYLAND;
-    if (driver->pHasWindowManager( "x11drv" )) return WINE_DISPLAY_BACKEND_X11;
-    return WINE_DISPLAY_BACKEND_UNKNOWN;
+    C_ASSERT( (CLIENT_SURFACE_PRESENTATION_ZERO_COPY << WINE_DISPLAY_FEEDBACK_PRESENTATION_SHIFT) ==
+              WINE_DISPLAY_FEEDBACK_DIRECT_SCANOUT );
+
+    if (driver->pHasWindowManager( "waylanddrv" )) backend = WINE_DISPLAY_BACKEND_WAYLAND;
+    else if (driver->pHasWindowManager( "xwayland" )) backend = WINE_DISPLAY_BACKEND_XWAYLAND;
+    else if (driver->pHasWindowManager( "x11drv" )) backend = WINE_DISPLAY_BACKEND_X11;
+    else backend = WINE_DISPLAY_BACKEND_UNKNOWN;
+
+    if (backend == WINE_DISPLAY_BACKEND_WAYLAND)
+        backend |= client_surface_query_display_feedback()
+                   << WINE_DISPLAY_FEEDBACK_PRESENTATION_SHIFT;
+
+    return backend;
 }
 
 /******************************************************************************

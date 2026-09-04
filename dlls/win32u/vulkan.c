@@ -5000,6 +5000,7 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     int channel_fd_dup = -1, send_sync_fd = -1;
     enum wine_managed_consumer_state consumer_state;
     BOOL send_frame = FALSE, send_fd = FALSE, need_feedback, request_feedback;
+    BOOL display_feedback_requested;
     RECT client_rect;
     VkResult res = VK_SUCCESS;
 
@@ -5076,8 +5077,10 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
 
     managed->present_id++;
     frame_seq = (uint32_t)managed->present_id;
+    display_feedback_requested = client_surface_take_display_feedback_request();
     need_feedback = application_present_id ||
-                    ReadAcquire( &surface->client->presentation_timing_requests );
+                    ReadAcquire( &surface->client->presentation_timing_requests ) ||
+                    display_feedback_requested;
     request_feedback = need_feedback && managed->presentation_feedback;
     if (need_feedback &&
         (res = managed_add_feedback_locked(

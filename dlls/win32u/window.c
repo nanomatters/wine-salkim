@@ -648,7 +648,9 @@ void client_surface_complete_presentation_retirement( struct client_surface *sur
 
 BOOL client_surface_prepare_presentation_feedback( struct client_surface *surface )
 {
-    if (ReadAcquire( &surface->presentation_timing_requests ) &&
+    BOOL feedback_requested = client_surface_take_display_feedback_request();
+
+    if ((ReadAcquire( &surface->presentation_timing_requests ) || feedback_requested) &&
         surface->funcs->prepare_presentation_feedback)
         return surface->funcs->prepare_presentation_feedback( surface );
     return FALSE;
@@ -688,6 +690,21 @@ void client_surface_release_presentation_timing( struct client_surface *surface 
     assert( count >= 0 );
 }
 
+static LONG display_feedback;
+static LONG display_feedback_requested;
+
+UINT client_surface_query_display_feedback(void)
+{
+    InterlockedExchange( &display_feedback_requested, TRUE );
+    return ReadAcquire( &display_feedback );
+}
+
+BOOL client_surface_take_display_feedback_request(void)
+{
+    return ReadAcquire( &display_feedback_requested ) &&
+           InterlockedCompareExchange( &display_feedback_requested, FALSE, TRUE );
+}
+
 void client_surface_set_presentation_timing( struct client_surface *surface,
                                              UINT64 presented_ns, UINT64 refresh_ns,
                                              UINT64 refresh_count, UINT flags )
@@ -700,6 +717,7 @@ void client_surface_set_presentation_timing( struct client_surface *surface,
     if (!++surface->presentation_timing.sample_serial)
         ++surface->presentation_timing.sample_serial;
     client_surface_notify_presentation_timing_locked( surface );
+    WriteRelease( &display_feedback, flags );
     pthread_mutex_unlock( &surface->presentation_mutex );
 }
 

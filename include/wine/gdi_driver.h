@@ -338,6 +338,8 @@ W32KAPI void client_surface_finish_presentation_feedback( struct client_surface 
 W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI void client_surface_request_presentation_timing( struct client_surface *surface );
 W32KAPI void client_surface_release_presentation_timing( struct client_surface *surface );
+W32KAPI UINT client_surface_query_display_feedback(void);
+W32KAPI BOOL client_surface_take_display_feedback_request(void);
 W32KAPI void client_surface_set_presentation_timing(
         struct client_surface *surface, UINT64 presented_ns, UINT64 refresh_ns,
         UINT64 refresh_count, UINT flags );

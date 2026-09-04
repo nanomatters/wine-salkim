@@ -52,8 +52,15 @@ enum wine_display_backend
     WINE_DISPLAY_BACKEND_XWAYLAND = 3,
 };
 
+#define WINE_DISPLAY_BACKEND_MASK                0x000000ff
+#define WINE_DISPLAY_FEEDBACK_PRESENTATION_SHIFT 8
+#define WINE_DISPLAY_FEEDBACK_VSYNC              0x00000100
+#define WINE_DISPLAY_FEEDBACK_HW_CLOCK           0x00000200
+#define WINE_DISPLAY_FEEDBACK_HW_COMPLETION      0x00000400
+#define WINE_DISPLAY_FEEDBACK_DIRECT_SCANOUT     0x00000800
+
 W32KAPI BOOL WINAPI __wine_activate_window_flip_presenter(HWND hwnd, UINT id);
-W32KAPI enum wine_display_backend WINAPI __wine_get_display_backend(void);
+W32KAPI UINT WINAPI __wine_get_display_backend(void);
 W32KAPI BOOL WINAPI __wine_has_window_flip_presenter(HWND hwnd);
 W32KAPI UINT WINAPI __wine_register_window_flip_presenter(HWND hwnd);
 W32KAPI BOOL WINAPI __wine_unregister_window_flip_presenter(HWND hwnd, UINT id);
