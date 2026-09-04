@@ -447,8 +447,6 @@ struct wine_managed_swapchain
     BOOL lost;                      /* consumer channel died, force swapchain recreate */
     struct wine_managed_consumer *consumer;
     VkFence present_fence;          /* per-frame render-complete fence (export gate) */
-    PFN_vkWaitForFences p_vkWaitForFences;
-    PFN_vkResetFences p_vkResetFences;
     BOOL explicit_sync;
     BOOL presentation_feedback;
     struct client_surface *client_surface; /* borrowed from the owning swapchain */
@@ -4157,8 +4155,6 @@ static VkResult managed_swapchain_alloc( struct vulkan_device *device,
     managed->usage = create_info->imageUsage;
     managed->client_surface = surface->client;
     if (device->queue_count) managed->signal_queue = device->queues;
-    managed->p_vkWaitForFences = device->p_vkWaitForFences;
-    managed->p_vkResetFences = device->p_vkResetFences;
 
 #ifdef HAVE_SYS_EVENTFD_H
     if ((managed->wake_fd = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK )) < 0)
@@ -6667,7 +6663,7 @@ static void *win32u_vk_find_struct_(void *s, VkStructureType t)
     return NULL;
 }
 
-/* Consume present waits and signal a present fence before managed or discarded presents. */
+/* Consume present waits and signal a present fence before managed presents. */
 static VkResult present_consume_waits( struct vulkan_device *device, struct vulkan_queue *queue,
                                        struct wine_managed_swapchain *managed, VkFence signal_fence,
                                        const VkSemaphore *semaphores, uint32_t count,
@@ -6680,7 +6676,7 @@ static VkResult present_consume_waits( struct vulkan_device *device, struct vulk
     uint32_t i;
     BOOL lock_device;
 
-    if (!fence && managed && managed->present_fence && managed->p_vkWaitForFences && managed->p_vkResetFences)
+    if (!fence && managed && managed->present_fence)
         fence = managed->present_fence;
     if (!count && !fence) return VK_SUCCESS;
     if (count > ARRAY_SIZE(stack_stages) && !(stages = malloc( count * sizeof(*stages) )))
@@ -6699,8 +6695,8 @@ static VkResult present_consume_waits( struct vulkan_device *device, struct vulk
     else vulkan_queue_unlock( queue );
     if (res == VK_SUCCESS && wait_for_completion && fence)
     {
-        res = managed->p_vkWaitForFences( device->host.device, 1, &fence, VK_TRUE, UINT64_MAX );
-        if (res == VK_SUCCESS) res = managed->p_vkResetFences( device->host.device, 1, &fence );
+        res = device->p_vkWaitForFences( device->host.device, 1, &fence, VK_TRUE, UINT64_MAX );
+        if (res == VK_SUCCESS) res = device->p_vkResetFences( device->host.device, 1, &fence );
     }
     if (stages != stack_stages) free( stages );
     return res;
@@ -7128,8 +7124,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
     present_info->pWaitSemaphores = host_wait_semaphores;
 
-    /* Host swapchains feed the real host present. Managed swapchains publish
-     * cross-process dmabufs instead. */
+    /* Host swapchains use host WSI. Wine-managed swapchains publish
+     * cross-process dmabufs. */
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = present_swapchains[i];
@@ -7287,9 +7283,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
     if (out_of_date && res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
 
-    /* A discarded present still consumes its waits and signals its present
-     * fences. Otherwise a binary semaphore stays signaled and a caller
-     * waiting to retire the rejected presentation can block forever. */
+    /* Rejected presents still consume their waits and signal present fences.
+     * Otherwise a binary semaphore stays signaled and a caller waiting to
+     * retire the rejected presentation can block forever. */
     if (!host_count && !first_managed)
     {
         for (uint32_t i = 0; i < present_info->swapchainCount; i++)
@@ -7333,7 +7329,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = present_swapchains[i];
         UINT64 application_present_id = 0;
         VkResult managed_res;
-        VkFence fence;
         int sync_fd = -1;
 
         if (!swapchain) continue;
@@ -7348,13 +7343,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         if (skip_managed)
         {
-            if (present_waits_submitted &&
-                (fence = get_present_fence( present_fence_info, i )))
-            {
-                VkResult fence_res = present_consume_waits( device, queue, NULL, fence,
-                                                            NULL, 0, FALSE );
-                if (fence_res < VK_SUCCESS && res >= VK_SUCCESS) res = fence_res;
-            }
             present_results[i] = managed_sync_res < VK_SUCCESS ? managed_sync_res : res;
             continue;
         }
@@ -7370,14 +7358,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                                            present_info->pImageIndices[i],
                                            managed_present_waits_consumed, sync_fd,
                                            application_present_id );
-
-        /* Managed swapchains have no host present to signal this fence. */
-        if ((fence = get_present_fence( present_fence_info, i )))
-        {
-            VkResult fence_res = present_consume_waits( device, queue, NULL, fence, NULL, 0, FALSE );
-
-            if (fence_res < VK_SUCCESS && managed_res >= VK_SUCCESS) managed_res = fence_res;
-        }
 
         present_results[i] = managed_res;
         if (managed_res < VK_SUCCESS && res >= VK_SUCCESS) res = managed_res;
@@ -7400,6 +7380,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
+    /* Publish successful visible presents before signaling managed present
+     * fences, which may let the application destroy their swapchains. */
+    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+    {
+        struct swapchain *swapchain = present_swapchains[i];
+
+        if (!swapchain || present_results[i] < VK_SUCCESS) continue;
+        client_surface_present( swapchain->surface->client );
+    }
+
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = present_swapchains[i];
@@ -7410,8 +7400,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (!swapchain) continue;
         if (swapchain_res < VK_SUCCESS) continue;
         surface = swapchain->surface;
-        client_surface_present( surface->client );
-
         if (swapchain->managed) continue; /* managed already set its own result */
         if (!get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
         {
@@ -7429,6 +7417,27 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
             present_results[i] = VK_SUBOPTIMAL_KHR;
             if (!res) res = VK_SUBOPTIMAL_KHR;
+        }
+    }
+
+    /* Managed swapchains have no host present to signal application fences.
+     * Signal them after all internal access to the presented swapchains. */
+    if (!skip_managed || present_waits_submitted)
+    {
+        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+        {
+            struct swapchain *swapchain = present_swapchains[i];
+            VkFence fence;
+            VkResult fence_res;
+
+            if (!swapchain || !swapchain->managed ||
+                !(fence = get_present_fence( present_fence_info, i )))
+                continue;
+
+            fence_res = present_consume_waits( device, queue, NULL, fence, NULL, 0, FALSE );
+            if (fence_res < VK_SUCCESS && present_results[i] >= VK_SUCCESS)
+                present_results[i] = fence_res;
+            if (fence_res < VK_SUCCESS && res >= VK_SUCCESS) res = fence_res;
         }
     }
 
