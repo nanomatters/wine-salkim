@@ -92,14 +92,14 @@ static void wayland_vk_proxy_init(void)
     if (!(proxy_display = p_XOpenDisplay(NULL))) goto failed;
 
     /* Resolve Xlib through RTLD_DEFAULT so the overlay observes the same
-     * display and window that it later records for the Vulkan surface. The
-     * window is presentable Xlib state, but rendering is translated to the
-     * Wayland surface before reaching the driver. */
+     * display and window that it later records for the Vulkan surface. Keep
+     * the mapped proxy input-only so it cannot expose drawable contents;
+     * rendering is translated to the Wayland surface before reaching the driver. */
     attrs.override_redirect = True;
     attrs.event_mask = FocusChangeMask | KeyPressMask | KeyReleaseMask |
                        PointerMotionMask | ButtonPressMask | ButtonReleaseMask;
     proxy_window = p_XCreateWindow(proxy_display, p_XDefaultRootWindow(proxy_display),
-                                   -10000, -10000, 32, 32, 0, CopyFromParent, InputOutput,
+                                   -10000, -10000, 32, 32, 0, CopyFromParent, InputOnly,
                                    CopyFromParent, CWOverrideRedirect | CWEventMask, &attrs);
     if (!proxy_window) goto failed;
 
