@@ -772,15 +772,18 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcontext,
                                    EXCEPTION_RECORD *rec, CONTEXT *context )
 {
+    CHPE_V2_CPU_AREA_INFO *chpe = data->teb->ChpeV2CpuAreaInfo;
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
-    NTSTATUS status;
 
-    status = send_debug_event( data, rec, context, TRUE, TRUE );
-    if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
+    if (!chpe || !chpe->InSimulation)
     {
-        restore_context( context, sigcontext );
-        return;
+        NTSTATUS status = send_debug_event( data, rec, context, TRUE, TRUE );
+        if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
+        {
+            restore_context( context, sigcontext );
+            return;
+        }
     }
 
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
