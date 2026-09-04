@@ -283,6 +283,11 @@ static void wayland_win_data_update_restore_rect(struct wayland_win_data *data,
 
 static BOOL wayland_window_style_allows_fullscreen(DWORD style)
 {
+    /* Custom-decorated applications may combine WS_POPUP with the complete
+     * overlapped-window style while sizing an ordinary window to the monitor. */
+    if ((style & (WS_POPUP | WS_OVERLAPPEDWINDOW)) ==
+        (WS_POPUP | WS_OVERLAPPEDWINDOW))
+        return FALSE;
     if (!(style & WS_POPUP) &&
         (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
         return FALSE;
@@ -391,13 +396,8 @@ BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
         return TRUE;
 
     if (!data->is_fullscreen) return FALSE;
-    if (!(style & WS_POPUP) &&
-        (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
-        return FALSE;
     if (data->has_present_rect) return TRUE;
-    if (!(style & (WS_CAPTION | WS_THICKFRAME))) return TRUE;
-    /* Framed borderless: win32u checked the client rect. */
-    return (style & WS_POPUP) && !(style & WS_MAXIMIZE);
+    return wayland_window_style_allows_fullscreen(style);
 }
 
 static BOOL wayland_win_data_retargets_fullscreen(const struct wayland_win_data *data,
