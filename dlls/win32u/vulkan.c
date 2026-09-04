@@ -4612,6 +4612,7 @@ static VkResult managed_acquire( struct vulkan_device *device, struct swapchain 
         uint32_t count = 0, i;
         int poll_timeout = -1, ret;
 
+        if (swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
         slot = ~0u;
         pthread_mutex_lock( &managed->lock );
         managed_drain_releases( managed );
@@ -5230,11 +5231,57 @@ static VkResult acquire_swapchain_fullscreen( struct swapchain *swapchain )
     return res;
 }
 
+static BOOL commit_client_swapchain( struct swapchain *swapchain )
+{
+    return !swapchain_is_out_of_date( swapchain );
+}
+
+/* Complete creation of a swapchain backed by Wine-managed images. The caller
+ * holds surface->host_lock and owns the pending client-surface reference. */
+static VkResult finish_managed_swapchain_create(
+        VkDevice client_device, struct vulkan_instance *instance,
+        struct surface *surface, struct swapchain *swapchain,
+        struct wine_managed_swapchain *managed, BOOL topology_updated,
+        LONG generation_before_update, BOOL automatic_fullscreen,
+        VkSwapchainKHR *ret )
+{
+    VkResult res;
+
+    vulkan_object_init( &swapchain->obj.obj, (UINT_PTR)VK_NULL_HANDLE );
+    swapchain->surface = surface;
+    swapchain->extents = managed->extents;
+    swapchain->managed = managed;
+    swapchain->presentation_generation = get_swapchain_presentation_generation(
+            surface, topology_updated, generation_before_update );
+    instance->p_insert_object( instance, &swapchain->obj.obj );
+    set_window_pixel_format( surface->hwnd, -1, TRUE );
+    TRACE( "hwnd %p -> cross-process dmabuf producer swapchain %p\n",
+           surface->hwnd, swapchain );
+    pthread_mutex_unlock( &surface->host_lock );
+
+    if (!commit_client_swapchain( swapchain ))
+    {
+        win32u_vkDestroySwapchainKHR( client_device,
+                                      swapchain->obj.client.swapchain, NULL );
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    if (automatic_fullscreen && (res = acquire_swapchain_fullscreen( swapchain )))
+    {
+        win32u_vkDestroySwapchainKHR( client_device,
+                                      swapchain->obj.client.swapchain, NULL );
+        return res;
+    }
+
+    *ret = swapchain->obj.client.swapchain;
+    return VK_SUCCESS;
+}
+
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
     VkSwapchainPresentScalingCreateInfoEXT scaling = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT};
-    struct swapchain *swapchain, *old_swapchain = swapchain_from_handle( create_info->oldSwapchain );
+    struct swapchain *swapchain = NULL;
+    struct swapchain *old_swapchain = swapchain_from_handle( create_info->oldSwapchain );
     struct surface *surface = surface_from_handle( create_info->surface );
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct vulkan_physical_device *physical_device = device->physical_device;
@@ -5250,12 +5297,13 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSwapchainKHR host_swapchain;
     VkColorSpaceKHR mapped_color_space;
     uint32_t format_count = 0;
-    VkSurfaceFormatKHR *formats;
+    VkSurfaceFormatKHR *formats = NULL;
     RECT client_rect, fullscreen_rect;
     UINT64 fullscreen_owner = 0;
     VkResult res;
     BOOL topology_updated = FALSE;
     BOOL automatic_fullscreen = FALSE;
+    BOOL fullscreen_prepared = FALSE;
     BOOL compositor_scaling;
     BOOL use_fshack;
     BOOL lite;
@@ -5267,8 +5315,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    if (surface->client && !(updated_host = surface_host_create( VK_NULL_HANDLE )))
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    InterlockedIncrement( &surface->client->busy_ref );
+    generation_before_update = ReadAcquire( &surface->client->presentation_generation );
+
+    if (!(updated_host = surface_host_create( VK_NULL_HANDLE )))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto failed_create;
+    }
 
     fullscreen_info = find_vk_struct( (void *)create_info->pNext,
                                       VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT );
@@ -5284,14 +5338,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     {
         if (!driver_funcs->p_vulkan_surface_fullscreen)
         {
-            free( updated_host );
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
+            res = VK_ERROR_EXTENSION_NOT_PRESENT;
+            goto failed_create;
         }
         if (!fullscreen_win32_info ||
             !get_fullscreen_monitor_rect( fullscreen_win32_info->hmonitor, &fullscreen_rect ))
         {
-            free( updated_host );
-            return VK_ERROR_INITIALIZATION_FAILED;
+            res = VK_ERROR_INITIALIZATION_FAILED;
+            goto failed_create;
         }
     }
     else
@@ -5317,10 +5371,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             &fullscreen_info_driver );
         pthread_mutex_unlock( &surface->fullscreen_lock );
         if (res)
-        {
-            free( updated_host );
-            return res;
-        }
+            goto failed_create;
+        fullscreen_prepared = TRUE;
         TRACE( "surface %p prepared %s fullscreen owner %s for monitor %s\n",
                surface, automatic_fullscreen ? "automatic" : "application-controlled",
                wine_dbgstr_longlong( fullscreen_owner ), wine_dbgstr_rect( &fullscreen_rect ) );
@@ -5330,8 +5382,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     {
         clear_fullscreen_owner( surface, old_swapchain->fullscreen_owner );
     }
-
-    generation_before_update = ReadAcquire( &surface->client->presentation_generation );
 
     pthread_mutex_lock( &surface->host_lock );
 
@@ -5357,13 +5407,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             client_surface_drain_present_waits( surface->client );
             pthread_mutex_lock( &surface->host_lock );
         }
-        if (res)
-        {
-            pthread_mutex_unlock( &surface->host_lock );
-            free( updated_host );
-            clear_fullscreen_owner( surface, fullscreen_owner );
-            return res;
-        }
+        if (res) goto failed_locked;
 
         if (topology_updated)
         {
@@ -5375,9 +5419,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             list_add_tail( &surface->host_surfaces, &updated_host->entry );
             surface->obj.host.surface = updated_host->handle;
             surface_host_release_if_unused( instance, surface, previous_host );
+            updated_host = NULL;
             old_swapchain = NULL;
         }
-        else free( updated_host );
+        else
+        {
+            free( updated_host );
+            updated_host = NULL;
+        }
     }
 
     if (surface) create_info_host.surface = surface_host_handle( surface );
@@ -5386,12 +5435,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface_host_handle( surface ), &capabilities );
-    if (res)
-    {
-        pthread_mutex_unlock( &surface->host_lock );
-        clear_fullscreen_owner( surface, fullscreen_owner );
-        return res;
-    }
+    if (res) goto failed_locked;
 
     mapped_color_space =
         driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
@@ -5430,9 +5474,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     if (!(swapchain = calloc( 1, sizeof(*swapchain) )))
     {
-        pthread_mutex_unlock( &surface->host_lock );
-        clear_fullscreen_owner( surface, fullscreen_owner );
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto failed_locked;
     }
 
     swapchain->fullscreen_policy = fullscreen_policy;
@@ -5502,10 +5545,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             {
                 ERR( "Swapchain does not support storage images for colorspace %u\n",
                      create_info->imageColorSpace );
-                pthread_mutex_unlock( &surface->host_lock );
-                free( swapchain );
-                clear_fullscreen_owner( surface, fullscreen_owner );
-                return VK_ERROR_INITIALIZATION_FAILED;
+                res = VK_ERROR_INITIALIZATION_FAILED;
+                goto failed_locked;
             }
         }
 
@@ -5520,10 +5561,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                                        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT )))
         {
             ERR( "Cannot preserve format %u for fullscreen scaling\n", create_info->imageFormat );
-            pthread_mutex_unlock( &surface->host_lock );
-            free( swapchain );
-            clear_fullscreen_owner( surface, fullscreen_owner );
-            return VK_ERROR_INITIALIZATION_FAILED;
+            res = VK_ERROR_INITIALIZATION_FAILED;
+            goto failed_locked;
         }
         if (swapchain->upscaler.color_mode == FS_HACK_COLOR_RAW &&
             swapchain->upscaler.linear_filter &&
@@ -5542,32 +5581,17 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         BOOL found = FALSE;
 
         res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device, surface_host_handle( surface ), &format_count, NULL );
-        if (res)
-        {
-            pthread_mutex_unlock( &surface->host_lock );
-            free( swapchain );
-            clear_fullscreen_owner( surface, fullscreen_owner );
-            return res;
-        }
+        if (res) goto failed_locked;
 
         if (!(formats = calloc( format_count, sizeof(*formats) )))
         {
-            pthread_mutex_unlock( &surface->host_lock );
-            free( swapchain );
-            clear_fullscreen_owner( surface, fullscreen_owner );
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto failed_locked;
         }
 
         res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device, surface_host_handle( surface ), &format_count, formats );
 
-        if (res)
-        {
-            pthread_mutex_unlock( &surface->host_lock );
-            free( formats );
-            free( swapchain );
-            clear_fullscreen_owner( surface, fullscreen_owner );
-            return res;
-        }
+        if (res) goto failed_locked;
 
     again:
         for (unsigned i = 0; i < format_count; i++)
@@ -5592,12 +5616,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         }
 
         free( formats );
+        formats = NULL;
     }
 
     swapchain->has_alpha = !(create_info_host.compositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
     if (swapchain->has_alpha) surface->alpha_swapchain_count++;
     surface_update_client_alpha( surface );
-    InterlockedIncrement( &surface->client->busy_ref );
 
     /* Interpose a managed cross-process producer only when the window advertises
      * HWND dmabuf caps (an off-screen child whose toplevel has no wl_surface) and
@@ -5619,30 +5643,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
             res = managed_swapchain_create( device, surface, &managed_info, &managed );
             if (res == VK_SUCCESS && managed)
-            {
-                /* host.swapchain stays VK_NULL_HANDLE for managed swapchains. */
-                vulkan_object_init( &swapchain->obj.obj, (UINT_PTR)VK_NULL_HANDLE );
-                swapchain->surface = surface;
-                swapchain->extents = managed->extents;
-                swapchain->managed = managed;
-                swapchain->presentation_generation = get_swapchain_presentation_generation(
-                        surface, topology_updated, generation_before_update );
-                instance->p_insert_object( instance, &swapchain->obj.obj );
-                set_window_pixel_format( surface->hwnd, -1, TRUE );
-                TRACE( "hwnd %p -> wine-managed swapchain %p (cross-process dmabuf producer)\n",
-                       surface->hwnd, swapchain );
-                pthread_mutex_unlock( &surface->host_lock );
-
-                if (automatic_fullscreen && (res = acquire_swapchain_fullscreen( swapchain )))
-                {
-                    win32u_vkDestroySwapchainKHR( client_device,
-                                                  swapchain->obj.client.swapchain, NULL );
-                    return res;
-                }
-
-                *ret = swapchain->obj.client.swapchain;
-                return VK_SUCCESS;
-            }
+                return finish_managed_swapchain_create(
+                        client_device, instance, surface, swapchain, managed,
+                        topology_updated, generation_before_update,
+                        automatic_fullscreen, ret );
             /* Any failure -> fall through to the host swapchain path (never fail). */
             TRACE( "managed swapchain build failed (res %d) for hwnd %p, using host swapchain\n",
                    res, surface->hwnd );
@@ -5660,19 +5664,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     }
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
-    {
-        if (swapchain->has_alpha)
-        {
-            if (surface->alpha_swapchain_count) surface->alpha_swapchain_count--;
-            else ERR( "surface %p alpha swapchain count underflow\n", surface );
-            surface_update_client_alpha( surface );
-        }
-        pthread_mutex_unlock( &surface->host_lock );
-        InterlockedDecrement( &surface->client->busy_ref );
-        free( swapchain );
-        clear_fullscreen_owner( surface, fullscreen_owner );
-        return res;
-    }
+        goto failed_locked;
 
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
@@ -5708,6 +5700,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
               debugstr_vkextent2d(&swapchain->host_extents) );
     }
 
+    if (!commit_client_swapchain( swapchain ))
+    {
+        win32u_vkDestroySwapchainKHR( client_device, swapchain->obj.client.swapchain, NULL );
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
     if (automatic_fullscreen && (res = acquire_swapchain_fullscreen( swapchain )))
     {
         win32u_vkDestroySwapchainKHR( client_device, swapchain->obj.client.swapchain, NULL );
@@ -5718,6 +5716,22 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
+
+failed_locked:
+    if (swapchain && swapchain->has_alpha)
+    {
+        if (surface->alpha_swapchain_count) surface->alpha_swapchain_count--;
+        else ERR( "surface %p alpha swapchain count underflow\n", surface );
+        surface_update_client_alpha( surface );
+    }
+    pthread_mutex_unlock( &surface->host_lock );
+failed_create:
+    free( formats );
+    free( swapchain );
+    free( updated_host );
+    if (fullscreen_prepared) clear_fullscreen_owner( surface, fullscreen_owner );
+    InterlockedDecrement( &surface->client->busy_ref );
+    return res;
 }
 
 void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,

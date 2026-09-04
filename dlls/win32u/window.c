@@ -292,6 +292,9 @@ static void client_surface_detach_locked( struct client_surface *surface )
     list_remove( &surface->entry );
     surface->funcs->detach( surface );
     surface->hwnd = NULL;
+    pthread_mutex_lock( &surface->presentation_mutex );
+    InterlockedIncrement( &surface->presentation_generation );
+    pthread_mutex_unlock( &surface->presentation_mutex );
 }
 
 static void client_surface_release_locked( struct client_surface *surface )
