@@ -92,6 +92,7 @@ enum wayland_window_message
     WM_WAYLAND_SET_FOREGROUND,
     WM_WAYLAND_DMABUF_FRAME,
     WM_WAYLAND_EXPOSE,
+    WM_WAYLAND_MINIMIZE,
 };
 
 #define WAYLAND_ACTIVATION_TOKEN_MAGIC 0x54434158 /* XACT */
@@ -692,6 +693,7 @@ struct wayland_surface
     BOOL carrier_attached;
     BOOL carrier_opaque;
     BOOL carrier_single_pixel;
+    BOOL minimize_queued;
     int carrier_width, carrier_height;
     HRGN child_region;
     HWND clip_producer;

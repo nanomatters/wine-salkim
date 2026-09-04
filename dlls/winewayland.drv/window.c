@@ -962,12 +962,6 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         skip_fullscreen:
             if (output) wayland_output_release(output);
         }
-        if (window->minimized && !surface->comitted.minimized)
-        {
-            xdg_toplevel_set_minimized(surface->xdg_toplevel);
-            surface->comitted.minimized = TRUE;
-        }
-
         if (configure_requested)
         {
             /* Reset the size hint since we don't want to poison the next
@@ -1527,6 +1521,19 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     continue_configure = wayland_win_data_configure_state_applied(data);
 
+    /* xdg-shell has no unminimize request. Defer minimizing until the
+     * application has finished processing the Win32 state change so a
+     * reentrant restore can cancel it. */
+    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
+        data->wayland_surface->window.minimized &&
+        !data->wayland_surface->comitted.minimized &&
+        !data->wayland_surface->minimize_queued)
+    {
+        data->wayland_surface->minimize_queued = TRUE;
+        if (!NtUserPostMessage(hwnd, WM_WAYLAND_MINIMIZE, 0, 0))
+            data->wayland_surface->minimize_queued = FALSE;
+    }
+
     wayland_win_data_release(data);
 
     if (previous_host && previous_host != external_host)
@@ -1844,6 +1851,28 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * window-thread lock order. */
         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
         return 0;
+    case WM_WAYLAND_MINIMIZE:
+    {
+        struct wayland_win_data *data;
+        struct wayland_surface *surface;
+
+        if ((data = wayland_win_data_get(hwnd)))
+        {
+            if ((surface = data->wayland_surface) && surface->minimize_queued)
+            {
+                surface->minimize_queued = FALSE;
+                if (wayland_surface_is_toplevel(surface) && surface->window.minimized &&
+                    !surface->comitted.minimized)
+                {
+                    xdg_toplevel_set_minimized(surface->xdg_toplevel);
+                    surface->comitted.minimized = TRUE;
+                    wl_display_flush(process_wayland.wl_display);
+                }
+            }
+            wayland_win_data_release(data);
+        }
+        return 0;
+    }
     case WM_WINE_MAP_NOTIFY_ICON_POINT:
         WAYLAND_MapNotifyIconPoint((POINT *)lp);
         return 0;
