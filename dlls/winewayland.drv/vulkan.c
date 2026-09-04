@@ -76,9 +76,10 @@ static struct wayland_client_surface *stash_client_surface(HWND hwnd,
         client_surface_add_ref(&surface->client);
         data->stashed_client = surface;
     }
-    else if ((ret = data->stashed_client) && !ReadAcquire(&ret->client.busy_ref))
+    else if ((ret = data->stashed_client) && ReadAcquire(&ret->client.ref) == 1 &&
+             !ReadAcquire(&ret->client.busy_ref))
     {
-        /* Transfer the stash reference to the new VkSurface. */
+        /* Transfer the stash's sole reference to the new VkSurface. */
         data->stashed_client = NULL;
         /* detach the client surface to ensure it is reparented */
         wayland_client_surface_attach(ret, NULL);
