@@ -275,6 +275,114 @@ void *free_user_handle( HANDLE handle, unsigned short type )
 
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces );
+static pthread_mutex_t flip_presenters_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list flip_presenters = LIST_INIT( flip_presenters );
+static UINT next_flip_presenter_id;
+
+/* Keep presentation-source state separate from WND state and tie it to the
+ * translation-layer object that registered it. */
+struct flip_presenter
+{
+    struct list entry;
+    HWND window;
+    UINT id;
+    BOOL active;
+};
+
+static BOOL is_presentation_window( HWND window )
+{
+    return window && is_current_process_window( window ) == window;
+}
+
+static struct flip_presenter *find_flip_presenter_locked( HWND window, UINT id )
+{
+    struct flip_presenter *presenter;
+
+    LIST_FOR_EACH_ENTRY( presenter, &flip_presenters, struct flip_presenter, entry )
+        if (presenter->window == window && presenter->id == id) return presenter;
+    return NULL;
+}
+
+UINT WINAPI __wine_register_window_flip_presenter( HWND window )
+{
+    struct flip_presenter *presenter;
+    UINT id = 0;
+
+    if (!(presenter = malloc( sizeof(*presenter) ))) return 0;
+
+    pthread_mutex_lock( &flip_presenters_lock );
+
+    if (!is_presentation_window( window )) goto done;
+
+    if (!(id = ++next_flip_presenter_id)) id = ++next_flip_presenter_id;
+    presenter->window = window;
+    presenter->id = id;
+    presenter->active = FALSE;
+    list_add_tail( &flip_presenters, &presenter->entry );
+    TRACE( "window %p registered flip presenter %u\n", window, id );
+    presenter = NULL;
+
+done:
+    pthread_mutex_unlock( &flip_presenters_lock );
+    free( presenter );
+    return id;
+}
+
+BOOL WINAPI __wine_activate_window_flip_presenter( HWND window, UINT id )
+{
+    struct flip_presenter *presenter;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &flip_presenters_lock );
+
+    if (is_presentation_window( window ) &&
+        (presenter = find_flip_presenter_locked( window, id )))
+    {
+        presenter->active = TRUE;
+        TRACE( "window %p activated flip presenter %u\n", window, id );
+        ret = TRUE;
+    }
+
+    pthread_mutex_unlock( &flip_presenters_lock );
+    return ret;
+}
+
+BOOL WINAPI __wine_unregister_window_flip_presenter( HWND window, UINT id )
+{
+    struct flip_presenter *presenter;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &flip_presenters_lock );
+
+    if ((presenter = find_flip_presenter_locked( window, id )))
+    {
+        list_remove( &presenter->entry );
+        free( presenter );
+        TRACE( "window %p unregistered flip presenter %u\n", window, id );
+        ret = TRUE;
+    }
+
+    pthread_mutex_unlock( &flip_presenters_lock );
+    return ret;
+}
+
+BOOL WINAPI __wine_has_window_flip_presenter( HWND window )
+{
+    struct flip_presenter *presenter;
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &flip_presenters_lock );
+
+    LIST_FOR_EACH_ENTRY( presenter, &flip_presenters, struct flip_presenter, entry )
+    {
+        if (presenter->window != window || !presenter->active) continue;
+        ret = is_presentation_window( window );
+        break;
+    }
+
+    pthread_mutex_unlock( &flip_presenters_lock );
+    return ret;
+}
 
 static void client_surface_notify_presentation_timing_locked( struct client_surface *surface )
 {
@@ -323,6 +431,7 @@ static void client_surface_release_locked( struct client_surface *surface )
 void detach_client_surfaces( HWND hwnd )
 {
     struct client_surface *surface, *next;
+    struct flip_presenter *presenter, *presenter_next;
 
     pthread_mutex_lock( &surfaces_lock );
 
@@ -330,6 +439,16 @@ void detach_client_surfaces( HWND hwnd )
         if (surface->hwnd == hwnd) client_surface_detach_locked( surface );
 
     pthread_mutex_unlock( &surfaces_lock );
+    pthread_mutex_lock( &flip_presenters_lock );
+
+    LIST_FOR_EACH_ENTRY_SAFE( presenter, presenter_next, &flip_presenters, struct flip_presenter, entry )
+    {
+        if (presenter->window != hwnd) continue;
+        list_remove( &presenter->entry );
+        free( presenter );
+    }
+
+    pthread_mutex_unlock( &flip_presenters_lock );
 }
 
 void update_client_surfaces( HWND hwnd )

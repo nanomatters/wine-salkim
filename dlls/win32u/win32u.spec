@@ -1,5 +1,9 @@
 @ extern -arch=win32 Wow64Transition __wine_syscall_dispatcher
+@ stdcall -syscall __wine_activate_window_flip_presenter(long long)
 @ stdcall -syscall __wine_get_display_backend()
+@ stdcall -syscall __wine_has_window_flip_presenter(long)
+@ stdcall -syscall __wine_register_window_flip_presenter(long)
+@ stdcall -syscall __wine_unregister_window_flip_presenter(long long)
 @ stub -syscall NtBindCompositionSurface
 @ stub -syscall NtCloseCompositionInputSink
 @ stub -syscall NtCompositionInputThread

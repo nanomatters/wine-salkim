@@ -52,7 +52,12 @@ enum wine_display_backend
     WINE_DISPLAY_BACKEND_XWAYLAND = 3,
 };
 
+W32KAPI BOOL WINAPI __wine_activate_window_flip_presenter(HWND hwnd, UINT id);
 W32KAPI enum wine_display_backend WINAPI __wine_get_display_backend(void);
+W32KAPI BOOL WINAPI __wine_has_window_flip_presenter(HWND hwnd);
+W32KAPI UINT WINAPI __wine_register_window_flip_presenter(HWND hwnd);
+W32KAPI BOOL WINAPI __wine_unregister_window_flip_presenter(HWND hwnd, UINT id);
+
 typedef NTSTATUS (WINAPI *ntuser_callback)( void *args, ULONG len );
 NTSYSAPI NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len );
 

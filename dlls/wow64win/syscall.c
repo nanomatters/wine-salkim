@@ -29,10 +29,41 @@
 #include "rtlsupportapi.h"
 #include "wow64win_private.h"
 
+NTSTATUS WINAPI wow64___wine_activate_window_flip_presenter( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    UINT id = get_ulong( &args );
+
+    return __wine_activate_window_flip_presenter( hwnd, id );
+}
+
 NTSTATUS WINAPI wow64___wine_get_display_backend( UINT *args )
 {
     return __wine_get_display_backend();
 }
+
+NTSTATUS WINAPI wow64___wine_has_window_flip_presenter( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+
+    return __wine_has_window_flip_presenter( hwnd );
+}
+
+NTSTATUS WINAPI wow64___wine_register_window_flip_presenter( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+
+    return __wine_register_window_flip_presenter( hwnd );
+}
+
+NTSTATUS WINAPI wow64___wine_unregister_window_flip_presenter( UINT *args )
+{
+    HWND hwnd = get_handle( &args );
+    UINT id = get_ulong( &args );
+
+    return __wine_unregister_window_flip_presenter( hwnd, id );
+}
+
 static void DECLSPEC_NORETURN stub_syscall( const char *name )
 {
     EXCEPTION_RECORD record;
