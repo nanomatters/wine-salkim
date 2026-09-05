@@ -1002,9 +1002,13 @@ static void load_graphics_driver( const WCHAR *driver, GUID *guid )
     BOOL null_driver = FALSE;
     HMODULE module = 0;
     HKEY hkey;
+    DWORD len;
     char error[80];
 
-    if (!driver)
+    /* Prefer explicit driver selection and launch overrides over the registry. */
+    if (driver) lstrcpynW( buffer, driver, ARRAY_SIZE( buffer ));
+    else if (!(len = GetEnvironmentVariableW( L"WINE_GRAPHICS_DRIVER", buffer, ARRAY_SIZE(buffer) )) ||
+             len >= ARRAY_SIZE(buffer))
     {
         lstrcpyW( buffer, default_driver );
 
@@ -1016,7 +1020,6 @@ static void load_graphics_driver( const WCHAR *driver, GUID *guid )
             RegCloseKey( hkey );
         }
     }
-    else lstrcpynW( buffer, driver, ARRAY_SIZE( buffer ));
 
     name = buffer;
     while (name)
