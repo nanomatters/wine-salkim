@@ -30,6 +30,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -46,6 +47,11 @@ static uint32_t next_output_id = 0;
 #define WAYLAND_OUTPUT_CHANGED_CLL          0x80
 #define WAYLAND_OUTPUT_CHANGED_REF_L        0x100
 #define WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L 0x200
+#define WAYLAND_OUTPUT_CHANGED_COLOR        0x400
+
+#define WAYLAND_OUTPUT_COLOR_FLAGS (WAYLAND_OUTPUT_CHANGED_PRIMARIES | WAYLAND_OUTPUT_CHANGED_FALL | \
+                                   WAYLAND_OUTPUT_CHANGED_CLL | WAYLAND_OUTPUT_CHANGED_REF_L | \
+                                   WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L)
 
 /**********************************************************************
  *          Output handling
@@ -193,29 +199,21 @@ static void wayland_output_done(struct wayland_output *output)
         output->current.logical_h = output->pending.logical_h;
     }
 
-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_PRIMARIES)
+    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_COLOR)
     {
-        output->current.primaries = output->pending.primaries;
-    }
-
-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_FALL)
-    {
-        output->current.max_fall = output->pending.max_fall;
-    }
-
-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_CLL)
-    {
-        output->current.max_cll = output->pending.max_cll;
-    }
-
-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L)
-    {
-        output->current.max_target_lum = output->pending.max_target_lum;
-    }
-
-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_REF_L)
-    {
-        output->current.ref_lum = output->pending.ref_lum;
+        /* Image descriptions are complete snapshots. Clear fields absent from
+         * the new description, including parametric fields for ICC profiles. */
+        output->current.primaries = output->pending_flags & WAYLAND_OUTPUT_CHANGED_PRIMARIES ?
+                output->pending.primaries : (struct wayland_primaries){0};
+        output->current.max_fall = output->pending_flags & WAYLAND_OUTPUT_CHANGED_FALL ?
+                output->pending.max_fall : 0;
+        output->current.max_cll = output->pending_flags & WAYLAND_OUTPUT_CHANGED_CLL ?
+                output->pending.max_cll : 0;
+        output->current.max_target_lum = output->pending_flags & WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L ?
+                output->pending.max_target_lum : 0;
+        output->current.ref_lum = output->pending_flags & WAYLAND_OUTPUT_CHANGED_REF_L ?
+                output->pending.ref_lum : 0;
+        output->pending_flags &= ~WAYLAND_OUTPUT_COLOR_FLAGS;
     }
 
     output->current.supports_hdr = FALSE;
@@ -230,7 +228,8 @@ static void wayland_output_done(struct wayland_output *output)
         }
     }
 
-    output->pending_flags = 0;
+    /* wl_output.done may arrive while image description events are pending. */
+    output->pending_flags &= WAYLAND_OUTPUT_COLOR_FLAGS;
 
     /* Ensure the logical dimensions have sane values. */
     if ((!output->current.logical_w || !output->current.logical_h) &&
@@ -380,6 +379,10 @@ static void wayland_image_description_info_v1_done(void *data,
                                               struct wp_image_description_info_v1 *info)
 {
     struct wayland_output *output = data;
+
+    wp_image_description_info_v1_destroy(info);
+    output->wp_image_description_info_v1 = NULL;
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_COLOR;
     wayland_output_done(output);
 }
 
@@ -387,6 +390,8 @@ static void wayland_image_description_info_v1_icc_file(void *data,
                                                   struct wp_image_description_info_v1 *info,
                                                   int32_t icc, uint32_t icc_size)
 {
+    /* ICC profiles are not parsed yet. Release the supplied descriptor. */
+    close(icc);
 }
 
 static void wayland_image_description_info_v1_primaries_named(void *data,
@@ -550,6 +555,7 @@ static void wayland_image_description_v1_ready2(void *user_data,
         ERR("Failed to allocate image description info object!\n");
         return;
     }
+    output->pending_flags &= ~WAYLAND_OUTPUT_COLOR_FLAGS;
     wp_image_description_info_v1_add_listener(
         output->wp_image_description_info_v1,
         &image_description_info_listener, output);
