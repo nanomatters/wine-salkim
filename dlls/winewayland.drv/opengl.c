@@ -43,6 +43,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 #include <wayland-egl.h>
 
 #include "wine/opengl_driver.h"
+#include "wine/wayland_opengl_overlay.h"
 
 #ifndef EGL_SYNC_NATIVE_FENCE_ANDROID
 #define EGL_SYNC_NATIVE_FENCE_ANDROID 0x3144
@@ -51,6 +52,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 static const struct egl_platform *egl;
 static const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs wayland_drawable_funcs;
+static wine_wayland_opengl_overlay_swap_func overlay_swap_buffers;
 
 /* Original (win32u) driver proc-address resolver, chained from
  * wayland_get_proc_address so that names other than the WINE dmabuf-export
@@ -130,6 +132,7 @@ struct wayland_gl_drawable
 {
     struct opengl_drawable base;
     struct wl_egl_window *wl_egl_window;
+    int width, height;
     BOOL swap_interval_initialized;
 };
 
@@ -160,6 +163,8 @@ static void wayland_gl_drawable_sync_size(struct wayland_gl_drawable *gl)
     if (client_width == 0 || client_height == 0) client_width = client_height = 1;
 
     wl_egl_window_resize(gl->wl_egl_window, client_width, client_height, 0, 0);
+    gl->width = client_width;
+    gl->height = client_height;
     client_surface_set_presentation_size(gl->base.client, client_width, client_height);
 }
 
@@ -201,6 +206,8 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struc
     NtCreateEvent(&client->throttle, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, TRUE);
 
     if (!(gl->wl_egl_window = wl_egl_window_create(client->wl_surface, rect.right, rect.bottom))) goto err;
+    gl->width = rect.right;
+    gl->height = rect.bottom;
     client_surface_set_presentation_size(&client->client, rect.right, rect.bottom);
     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
     set_client_surface(hwnd, client);
@@ -218,6 +225,16 @@ err:
 
 static void wayland_init_egl_platform(struct egl_platform *platform)
 {
+    const char *env = getenv("PROTON_WAYLAND_OPENGL_OVERLAY");
+    const char *overlay = getenv("PROTON_WAYLAND_STEAM_OVERLAY");
+
+    /* The optional preload adapts Steam's GLX hook without changing the EGL
+     * context or the Wayland surface used by the game. */
+    if (env && *env && strcmp(env, "0") && overlay && *overlay && strcmp(overlay, "0"))
+    {
+        overlay_swap_buffers = dlsym(RTLD_DEFAULT, WINE_WAYLAND_OPENGL_OVERLAY_SYMBOL);
+        if (!overlay_swap_buffers) WARN("Native OpenGL overlay preload is unavailable.\n");
+    }
     platform->type = EGL_PLATFORM_WAYLAND_KHR;
     platform->native_display = process_wayland.wl_display;
     platform->force_pbuffer_formats = TRUE;
@@ -297,7 +314,11 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
         }
     }
     feedback_prepared = client_surface_prepare_presentation_feedback(base->client);
-    presented = funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
+    if (overlay_swap_buffers)
+        presented = overlay_swap_buffers(egl->display, gl->base.surface, gl->width, gl->height,
+                                          funcs->p_eglSwapBuffers);
+    else
+        presented = funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
     if (feedback_prepared)
         client_surface_finish_presentation_feedback(base->client, presented);
     client_surface_end_present_wait(base->client);

@@ -301,8 +301,11 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
     struct wine_wayland_external_input_event event;
+    struct wayland_win_data *win_data;
     INPUT input = {0};
     BOOL external_input_active;
+    POINT screen;
+    double surface_x, surface_y;
     HWND hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
@@ -341,6 +344,8 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     external_input_active = pointer->external_input_active;
     if (external_input_active)
     {
+        screen.x = pointer->frame.x;
+        screen.y = pointer->frame.y;
         event = (struct wine_wayland_external_input_event)
         {
             .size = sizeof(event),
@@ -362,6 +367,20 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
         pointer->popup_serial_time = wayland_time_ms();
     }
     pthread_mutex_unlock(&pointer->mutex);
+
+    /* A click can be the first pointer event after overlay activation. Derive
+     * its coordinates and current presentation size without requiring motion. */
+    if (external_input_active && (win_data = wayland_win_data_get(hwnd)))
+    {
+        if (win_data->wayland_surface)
+        {
+            wayland_surface_coords_from_screen(win_data->wayland_surface, win_data,
+                    screen.x, screen.y, &surface_x, &surface_y);
+            wayland_surface_coords_to_external_input(win_data->wayland_surface, win_data,
+                    surface_x, surface_y, &event.x, &event.y, &event.width, &event.height);
+        }
+        wayland_win_data_release(win_data);
+    }
 
     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
 
