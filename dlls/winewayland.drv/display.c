@@ -279,8 +279,9 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
     if (monitor.edid_len)
         panel_hdr_supported = wayland_output_edid_supports_hdr(monitor.edid, monitor.edid_len);
     else
-        /* Without a real EDID, use compositor HDR support as a best-effort panel hint. */
-        panel_hdr_supported = wayland_color_manager_may_support_hdr();
+        /* Without a real EDID, use the output's HDR state, retaining the
+         * compositor capability hint for outputs currently in SDR. */
+        panel_hdr_supported = output->supports_hdr || wayland_color_manager_may_support_hdr();
 
     monitor.hdr_supported = panel_hdr_supported && wayland_color_manager_can_present_bt2100();
     desktop_hdr_enabled = output->supports_hdr;

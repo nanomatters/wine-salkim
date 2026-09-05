@@ -216,16 +216,15 @@ static void wayland_output_done(struct wayland_output *output)
         output->pending_flags &= ~WAYLAND_OUTPUT_COLOR_FLAGS;
     }
 
-    output->current.supports_hdr = FALSE;
-    if (wayland_color_manager_may_support_hdr())
+    /* Desktop HDR depends on the output's luminance headroom, not support for
+     * scRGB or extended target volumes when creating image descriptions. */
+    output->current.supports_hdr = output->current.ref_lum &&
+                                  output->current.max_target_lum > output->current.ref_lum;
+    if (output->current.supports_hdr && !wayland_color_manager_can_present_bt2100() &&
+        !warned_no_bt2100)
     {
-        output->current.supports_hdr = output->current.max_target_lum > output->current.ref_lum;
-        if (output->current.supports_hdr && !wayland_color_manager_can_present_bt2100() &&
-            !warned_no_bt2100)
-        {
-            warned_no_bt2100 = TRUE;
-            WARN("Compositor cannot present Windows BT.2100, HDR10 ST2084 may look broken\n");
-        }
+        warned_no_bt2100 = TRUE;
+        WARN("Compositor cannot present Windows BT.2100, HDR10 ST2084 may look broken\n");
     }
 
     /* wl_output.done may arrive while image description events are pending. */
