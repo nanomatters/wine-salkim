@@ -3151,7 +3151,7 @@ static BOOL session_is_output_nodes_state(struct media_session *session, enum ob
     return TRUE;
 }
 
-static enum object_state session_get_object_state_for_event(MediaEventType event)
+static enum object_state session_get_object_state_for_event(struct media_session *session, MediaEventType event)
 {
     switch (event)
     {
@@ -3165,9 +3165,15 @@ static enum object_state session_get_object_state_for_event(MediaEventType event
         case MEStreamPaused:
         case MEStreamSinkPaused:
             return OBJ_STATE_PAUSED;
+        case MEStreamSinkStopped:
+            /* MEStreamSinkStopped may be sent when starting a new topology because of the sequence (which occurs in native):
+             * media sink SetPresentationClock() -> AddClockStateSink() -> callback Invoke() -> OnClockStop().
+             * Callback notification is suppressed for the first topology because the clock state is MFCLOCK_STATE_INVALID. */
+            if (session->command_state == COMMAND_STATE_PREROLLING_SINKS || session->command_state == COMMAND_STATE_STARTING_SINKS)
+                return OBJ_STATE_INVALID;
+            /* fall through */
         case MESourceStopped:
         case MEStreamStopped:
-        case MEStreamSinkStopped:
             return OBJ_STATE_STOPPED;
         case MEStreamSinkPrerolled:
             return OBJ_STATE_PREROLLED;
@@ -3241,7 +3247,7 @@ static void session_set_source_object_state(struct media_session *session, IUnkn
     DWORD i, count;
     HRESULT hr;
 
-    if ((state = session_get_object_state_for_event(event_type)) == OBJ_STATE_INVALID)
+    if ((state = session_get_object_state_for_event(session, event_type)) == OBJ_STATE_INVALID)
         return;
 
     switch (event_type)
@@ -3430,7 +3436,7 @@ static void session_set_sink_stream_state(struct media_session *session, IMFStre
     HRESULT hr = S_OK;
     BOOL changed;
 
-    if ((state = session_get_object_state_for_event(event_type)) == OBJ_STATE_INVALID)
+    if ((state = session_get_object_state_for_event(session, event_type)) == OBJ_STATE_INVALID)
         return;
 
     if (!(changed = session_set_node_object_state(session, (IUnknown *)stream, MF_TOPOLOGY_OUTPUT_NODE, state)))
