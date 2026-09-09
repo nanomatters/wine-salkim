@@ -3125,20 +3125,27 @@ PHYSICAL_ADDRESS WINAPI MmGetPhysicalAddress(void *virtual_address)
 
 PHYSICAL_MEMORY_RANGE *WINAPI MmGetPhysicalMemoryRanges(void)
 {
-    static volatile LONG once;
-    static PHYSICAL_MEMORY_RANGE range;
     SYSTEM_BASIC_INFORMATION info;
+    PHYSICAL_MEMORY_RANGE *ranges;
+    NTSTATUS status;
 
     TRACE("\n");
 
-    if (!InterlockedCompareExchange(&once, 1, 0))
+    if ((status = NtQuerySystemInformation(SystemBasicInformation, &info, sizeof(info), NULL)))
     {
-        NtQuerySystemInformation(SystemBasicInformation, &info, sizeof(info), NULL);
-        range.BaseAddress.QuadPart = info.MmLowestPhysicalPage;
-        range.NumberOfBytes.QuadPart = info.MmNumberOfPhysicalPages * info.PageSize;
+        WARN("failed to query system information, status %#lx\n", status);
+        return NULL;
     }
 
-    return &range;
+    if (!(ranges = ExAllocatePool(NonPagedPool, 2 * sizeof(*ranges))))
+        return NULL;
+
+    /* FIXME: Report the correct size in one range instead of actual hardware ranges. */
+    ranges[0].BaseAddress.QuadPart = (ULONGLONG)info.MmLowestPhysicalPage * info.PageSize;
+    ranges[0].NumberOfBytes.QuadPart = (ULONGLONG)info.MmNumberOfPhysicalPages * info.PageSize;
+    memset(&ranges[1], 0, sizeof(ranges[1]));
+
+    return ranges;
 }
 
 /***********************************************************************
