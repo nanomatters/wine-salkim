@@ -2644,6 +2644,15 @@ PACCESS_TOKEN WINAPI PsReferencePrimaryToken( PEPROCESS process )
     return ret;
 }
 
+/*********************************************************************
+ *           PsDereferencePrimaryToken    (NTOSKRNL.@)
+ */
+void WINAPI PsDereferencePrimaryToken( PACCESS_TOKEN token )
+{
+    TRACE("%p\n", token);
+    ObDereferenceObject(token);
+}
+
 static void *create_thread_object( HANDLE handle )
 {
     THREAD_BASIC_INFORMATION info;
