@@ -45,6 +45,8 @@
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 static LONG wayland_surface_serial_counter;
+static BOOL slicing_enabled = TRUE;
+static pthread_once_t slicing_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t hwnd_dmabuf_input_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct wl_list hwnd_dmabuf_input_surfaces =
 {
@@ -84,6 +86,19 @@ struct wayland_child_visibility_info
     RECT rect;
     unsigned int rect_count;
 };
+
+static void init_slicing(void)
+{
+    const char *env = getenv("PROTON_WAYLAND_SLICING");
+
+    slicing_enabled = !env || strcmp(env, "0");
+}
+
+static BOOL window_slicing_enabled(void)
+{
+    pthread_once(&slicing_once, init_slicing);
+    return slicing_enabled;
+}
 
 /* Keep only complete 4x4 cells inside a complex shape. Erode by three pixels
  * first, so rounding cannot expose pixels outside the original region. This
@@ -157,7 +172,7 @@ static HRGN create_child_region(HRGN shape_region)
     HRGN region;
 
     if (!shape_region) return 0;
-    if ((region = create_coarse_shape_region(shape_region))) return region;
+    if (window_slicing_enabled() && (region = create_coarse_shape_region(shape_region))) return region;
     if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0))) return 0;
 
     if (NtGdiCombineRgn(region, shape_region, 0, RGN_COPY) == ERROR)
@@ -4643,11 +4658,13 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
     struct wayland_hwnd_dmabuf_geometry geometry;
     enum wayland_hwnd_dmabuf_configure_result ret;
     BOOL alpha_changed;
+    BOOL slicing = window_slicing_enabled();
 
     wayland_hwnd_dmabuf_surface_update_effective_alpha(surface, container, info);
     alpha_changed = wayland_hwnd_dmabuf_surface_sync_alpha(surface);
 
-    if (container)
+    /* With slicing disabled, use the existing single-surface geometry path. */
+    if (slicing && container)
     {
         ret = wayland_hwnd_dmabuf_surface_configure_hosted_slices(
                 surface, container, info, sibling, attach_frame);
@@ -4661,7 +4678,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
 
     /* A host surface is also the parent of its producer surfaces, so it must
      * remain a single wl_surface. */
-    if (!container && !surface->host_surface)
+    if (slicing && !container && !surface->host_surface)
     {
         ret = wayland_hwnd_dmabuf_surface_configure_slices(parent, surface, info, sibling,
                                                            attach_frame);
