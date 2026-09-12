@@ -82,7 +82,7 @@ void process_hud_key( UINT vkey, DWORD flags )
                  !(desktop_shm->keystate[VK_RWIN] & 0x80);
 
     if (!status && toggle)
-        InterlockedXor( &hud_display_feedback, WINE_DISPLAY_FEEDBACK_HUD_HIDDEN );
+        InterlockedXor( &hud_display_feedback, WINE_DISPLAY_FEEDBACK_HUD_VISIBILITY );
 }
 
 static const WCHAR keyboard_layouts_keyW[] =

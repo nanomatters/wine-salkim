@@ -59,8 +59,8 @@ enum wine_display_backend
 #define WINE_DISPLAY_FEEDBACK_HW_COMPLETION      0x00000400
 #define WINE_DISPLAY_FEEDBACK_DIRECT_SCANOUT     0x00000800
 
-/* Process-local HUD control bit, independent of presentation feedback flags. */
-#define WINE_DISPLAY_FEEDBACK_HUD_HIDDEN         0x00010000
+/* Process-local HUD toggle parity, not visibility or a consumable event. */
+#define WINE_DISPLAY_FEEDBACK_HUD_VISIBILITY     0x00010000
 
 W32KAPI BOOL WINAPI __wine_activate_window_flip_presenter(HWND hwnd, UINT id);
 W32KAPI UINT WINAPI __wine_get_display_backend(void);
