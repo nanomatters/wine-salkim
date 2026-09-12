@@ -342,6 +342,8 @@ struct wayland_hwnd_dmabuf_surface
     enum wayland_hwnd_dmabuf_consumer_state consumer_state;
     struct wl_surface *stack_bottom;
     struct wl_surface *slice_layout_sibling;
+    RECT *slice_source_rects, *slice_cover_rects;
+    unsigned int slice_source_count, slice_cover_count;
     struct wayland_visual_constraint visual_constraint;
 };
 
@@ -1112,6 +1114,9 @@ static void wayland_hwnd_dmabuf_surface_clear_slices(struct wayland_hwnd_dmabuf_
     surface->slice_count = 0;
     surface->stack_bottom = surface->wl_surface;
     surface->slice_layout_sibling = NULL;
+    free(surface->slice_source_rects);
+    free(surface->slice_cover_rects);
+    surface->slice_source_rects = surface->slice_cover_rects = NULL;
 }
 
 static BOOL wayland_hwnd_dmabuf_surface_slice_layout_matches(
@@ -1318,6 +1323,32 @@ static RECT *wayland_hwnd_dmabuf_try_cover_slice_rects(const RECT *rects,
     return NULL;
 }
 
+/* Cache the pure region reduction, including cases where it cannot reduce the
+ * input. Clipping happens before this and viewport mapping still happens after
+ * it, so geometry and buffer-size changes cannot leave stale mapped slices.
+ * The returned rectangles are borrowed from the input or the surface. */
+static RECT *wayland_hwnd_dmabuf_surface_get_slice_rects(
+        struct wayland_hwnd_dmabuf_surface *surface, RECT *rects, unsigned int *count)
+{
+    size_t size = *count * sizeof(*rects);
+
+    if (*count <= 1 || *count > WAYLAND_DMABUF_COVER_MAX_RECTS) return rects;
+    if (!surface->slice_source_rects || surface->slice_source_count != *count ||
+        memcmp(surface->slice_source_rects, rects, size))
+    {
+        free(surface->slice_source_rects);
+        free(surface->slice_cover_rects);
+        surface->slice_source_rects = malloc(size);
+        if (surface->slice_source_rects) memcpy(surface->slice_source_rects, rects, size);
+        surface->slice_source_count = surface->slice_cover_count = *count;
+        surface->slice_cover_rects = wayland_hwnd_dmabuf_try_cover_slice_rects(
+                rects, &surface->slice_cover_count);
+    }
+
+    *count = surface->slice_cover_count;
+    return surface->slice_cover_rects ? surface->slice_cover_rects : rects;
+}
+
 static UINT32 wayland_hwnd_dmabuf_surface_alpha_multiplier(
         const struct wayland_hwnd_dmabuf_surface *surface)
 {
@@ -1473,11 +1504,19 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
         feedback_surfaces[count - 1] = slice->wl_surface;
         wayland_hwnd_dmabuf_color_surface_sync(
             &slice->color_surface, slice->wl_surface, &buffer->desc);
-        if (!(commit->wl_buffer = wayland_hwnd_dmabuf_buffer_create_slice_wl_buffer(buffer)))
-            goto done;
-        if (frame_sync.backend != WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ &&
-            !(commit->slice_buffer = calloc(1, sizeof(*commit->slice_buffer))))
-            goto done;
+        if (frame_sync.backend == WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
+        {
+            /* Explicit releases are per surface commit, not per wl_buffer.
+             * Share the retained import without sharing release points. */
+            if (!(commit->wl_buffer = buffer->wl_buffer)) goto done;
+        }
+        else
+        {
+            if (!(commit->wl_buffer = wayland_hwnd_dmabuf_buffer_create_slice_wl_buffer(buffer)))
+                goto done;
+            if (!(commit->slice_buffer = calloc(1, sizeof(*commit->slice_buffer))))
+                goto done;
+        }
         if (!wayland_hwnd_dmabuf_prepare_commit_sync(
                 &frame_sync, slice->wl_surface, &slice->syncobj_surface,
                 &slice->explicit_sync, &commit->sync))
@@ -1500,6 +1539,7 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
     if (request_feedback)
         wayland_hwnd_dmabuf_prepare_presentation(surface, feedback_surfaces, count);
 
+    /* Account for every slice before the compositor can release the first one. */
     for (i = 0; i < count; i++)
     {
         struct wayland_hwnd_dmabuf_slice_commit *commit = &commits[i];
@@ -1515,18 +1555,18 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
         }
         else
             wayland_hwnd_dmabuf_commit_sync(&commit->sync);
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        struct wayland_hwnd_dmabuf_slice_commit *commit = &commits[i];
+
         wl_surface_attach(commit->slice->wl_surface, commit->wl_buffer, 0, 0);
         wl_surface_damage_buffer(commit->slice->wl_surface, 0, 0,
                                  buffer->width, buffer->height);
         wayland_hwnd_dmabuf_color_surface_take_pending_commit(commit->slice->color_surface);
         wl_surface_commit(commit->slice->wl_surface);
-        if (frame_sync.backend == WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
-        {
-            wl_buffer_destroy(commit->wl_buffer);
-            commit->wl_buffer = NULL;
-        }
-        else
-            commit->wl_buffer = NULL;
+        commit->wl_buffer = NULL;
     }
 
     wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
@@ -1537,7 +1577,8 @@ done:
     {
         wayland_hwnd_dmabuf_cancel_commit_sync(&commits[i].sync);
         free(commits[i].slice_buffer);
-        if (commits[i].wl_buffer) wl_buffer_destroy(commits[i].wl_buffer);
+        if (commits[i].wl_buffer && frame_sync.backend != WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
+            wl_buffer_destroy(commits[i].wl_buffer);
     }
     free(commits);
     return ret;
@@ -4301,7 +4342,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
 {
     RECT child_rect = wine_server_get_rect(info->client), clipped, client, dst;
     struct wayland_hwnd_dmabuf_slice_geometry layout[WAYLAND_DMABUF_MAX_SLICES];
-    RECT *visible_rects, *covered_rects = NULL;
+    RECT *visible_rects;
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
     struct wayland_child_visibility_info visibility;
     RGNDATA *data;
@@ -4356,11 +4397,9 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
         free(data);
         return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
     }
-    if ((covered_rects = wayland_hwnd_dmabuf_try_cover_slice_rects(visible_rects, &count)))
-        visible_rects = covered_rects;
+    visible_rects = wayland_hwnd_dmabuf_surface_get_slice_rects(surface, visible_rects, &count);
     if (count > WAYLAND_DMABUF_MAX_SLICES)
     {
-        free(covered_rects);
         free(data);
         return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
     }
@@ -4387,7 +4426,6 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
         layout[i].source_width = wl_fixed_from_double(sw);
         layout[i].source_height = wl_fixed_from_double(sh);
     }
-    free(covered_rects);
     free(data);
 
     return wayland_hwnd_dmabuf_surface_apply_slices(
@@ -4405,7 +4443,7 @@ wayland_hwnd_dmabuf_surface_configure_hosted_slices(
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
     RECT child_rect = wine_server_get_rect(info->client);
     RECT child_bounds, child_frame, container_visible;
-    RECT *visible_rects = NULL, *covered_rects = NULL, *rect, *end;
+    RECT *visible_rects = NULL, *rect, *end;
     HRGN visible_region = 0;
     RGNDATA *data = NULL;
     int child_width, child_height;
@@ -4452,8 +4490,7 @@ wayland_hwnd_dmabuf_surface_configure_hosted_slices(
     }
     if (!count) goto done;
 
-    if ((covered_rects = wayland_hwnd_dmabuf_try_cover_slice_rects(visible_rects, &count)))
-        visible_rects = covered_rects;
+    visible_rects = wayland_hwnd_dmabuf_surface_get_slice_rects(surface, visible_rects, &count);
     if (count == 1)
     {
         RECT local = visible_rects[0];
@@ -4489,7 +4526,6 @@ fully_visible:
              WAYLAND_HWNDDMABUF_CONFIGURE_NOT_APPLICABLE;
 
 done:
-    free(covered_rects);
     free(data);
     if (visible_region) NtGdiDeleteObjectApp(visible_region);
     return result;
