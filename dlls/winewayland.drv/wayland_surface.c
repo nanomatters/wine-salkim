@@ -85,11 +85,79 @@ struct wayland_child_visibility_info
     unsigned int rect_count;
 };
 
+/* Keep only complete 4x4 cells inside a complex shape. Erode by three pixels
+ * first, so rounding cannot expose pixels outside the original region. This
+ * runs on shape updates, before child clipping and input share the result. */
+static HRGN create_coarse_shape_region(HRGN shape_region)
+{
+    RGNDATA *data = NULL, *result_data = NULL;
+    HRGN region = 0, shifted = 0, result = 0;
+    unsigned int original_count, count = 0, i, axis, step;
+    RECT *rects;
+
+    if (!(data = get_region_data(shape_region))) goto done;
+    original_count = data->rdh.nCount;
+    if (original_count <= 1) goto done;
+    if (data->rdh.rcBound.left < INT_MIN + 3 || data->rdh.rcBound.top < INT_MIN + 3 ||
+        data->rdh.rcBound.right > INT_MAX - 3 || data->rdh.rcBound.bottom > INT_MAX - 3)
+        goto done;
+    free(data);
+    data = NULL;
+
+    if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0)) ||
+        !(shifted = NtGdiCreateRectRgn(0, 0, 0, 0))) goto done;
+    if (NtGdiCombineRgn(region, shape_region, 0, RGN_COPY) == ERROR) goto done;
+
+    /* Intersect offsets 0..1, then 0..3, along each axis. */
+    for (axis = 0; axis < 2; axis++)
+        for (step = 1; step <= 2; step *= 2)
+            if (NtGdiCombineRgn(shifted, region, 0, RGN_COPY) == ERROR ||
+                NtGdiOffsetRgn(shifted, axis ? 0 : -(int)step, axis ? -(int)step : 0) == ERROR ||
+                NtGdiCombineRgn(region, region, shifted, RGN_AND) == ERROR)
+                goto done;
+
+    if (!(data = get_region_data(region))) goto done;
+    rects = (RECT *)data->Buffer;
+    for (i = 0; i < data->rdh.nCount; i++)
+    {
+        RECT rect = rects[i];
+
+        rect.left = ((LONGLONG)rect.left + 3) & ~3ll;
+        rect.top = ((LONGLONG)rect.top + 3) & ~3ll;
+        rect.right = ((LONGLONG)rect.right + 3) & ~3ll;
+        rect.bottom = ((LONGLONG)rect.bottom + 3) & ~3ll;
+        if (!IsRectEmpty(&rect)) rects[count++] = rect;
+    }
+    if (!count) goto done;
+    data->rdh.nCount = count;
+    data->rdh.nRgnSize = count * sizeof(*rects);
+    if (!(result = NtGdiExtCreateRegion(NULL, sizeof(data->rdh) + data->rdh.nRgnSize, data)))
+        goto done;
+
+    /* Do not lose detail unless the region needs fewer rectangles. */
+    if (!(result_data = get_region_data(result)) ||
+        result_data->rdh.nCount >= original_count)
+    {
+        NtGdiDeleteObjectApp(result);
+        result = 0;
+    }
+    else TRACE("4-pixel shape grid: %u -> %u rectangles\n",
+               original_count, result_data->rdh.nCount);
+
+done:
+    free(result_data);
+    free(data);
+    if (shifted) NtGdiDeleteObjectApp(shifted);
+    if (region) NtGdiDeleteObjectApp(region);
+    return result;
+}
+
 static HRGN create_child_region(HRGN shape_region)
 {
     HRGN region;
 
     if (!shape_region) return 0;
+    if ((region = create_coarse_shape_region(shape_region))) return region;
     if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0))) return 0;
 
     if (NtGdiCombineRgn(region, shape_region, 0, RGN_COPY) == ERROR)
@@ -176,9 +244,10 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
 
     assert(window_surface);
     shape_region = window_surface->shape_region;
-    wayland_surface_sync_shape_input_region(surface, shape_region, exstyle);
     wayland_surface_set_region_constraints(surface, shape_region, window_surface->clip_region,
                                            window_surface->clip_producer);
+    wayland_surface_sync_shape_input_region(surface,
+            surface->child_region ? surface->child_region : shape_region, exstyle);
 }
 
 static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
