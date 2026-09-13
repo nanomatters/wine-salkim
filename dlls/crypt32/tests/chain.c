@@ -121,6 +121,88 @@ static void testCreateCertChainEngine(void)
     CertCloseStore(store, 0);
 }
 
+static void test_chain_engine_config_layouts(void)
+{
+    static const struct
+    {
+        DWORD size;
+        BOOL exclusive_root;
+    } tests[] =
+    {
+        {sizeof(CERT_CHAIN_ENGINE_CONFIG_NO_EXCLUSIVE_ROOT), FALSE},
+        {FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags), FALSE},
+        {FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags), TRUE},
+        {sizeof(CERT_CHAIN_ENGINE_CONFIG), FALSE},
+        {sizeof(CERT_CHAIN_ENGINE_CONFIG), TRUE},
+    };
+    CERT_CHAIN_PARA para = { sizeof(para) };
+    CERT_CHAIN_ENGINE_CONFIG invalid = { 0 }, *config;
+    PCCERT_CHAIN_CONTEXT chain;
+    PCCERT_CONTEXT cert;
+    HCERTCHAINENGINE engine;
+    HCERTSTORE store;
+    SYSTEM_INFO info;
+    DWORD old_protect, i;
+    BYTE *memory;
+    BOOL ret;
+
+    GetSystemInfo(&info);
+    memory = VirtualAlloc(NULL, info.dwPageSize * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!memory, "VirtualAlloc failed: %lu\n", GetLastError());
+    if (!memory) return;
+    ret = VirtualProtect(memory + info.dwPageSize, info.dwPageSize, PAGE_NOACCESS, &old_protect);
+    ok(ret, "VirtualProtect failed: %lu\n", GetLastError());
+    if (!ret) goto done;
+
+    store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    ok(!!store, "CertOpenStore failed: %lu\n", GetLastError());
+    if (!store) goto done;
+    ret = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING, selfSignedCert,
+        sizeof(selfSignedCert), CERT_STORE_ADD_ALWAYS, &cert);
+    ok(ret, "CertAddEncodedCertificateToStore failed: %lu\n", GetLastError());
+    if (!ret) goto close_store;
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("size %lu, exclusive root %d", tests[i].size, tests[i].exclusive_root);
+        /* Put the end of each layout against a guard page to catch reads of newer fields. */
+        config = (CERT_CHAIN_ENGINE_CONFIG *)(memory + info.dwPageSize - tests[i].size);
+        memset(config, 0, tests[i].size);
+        config->cbSize = tests[i].size;
+        if (tests[i].exclusive_root) config->hExclusiveRoot = store;
+        engine = NULL;
+        ret = CertCreateCertificateChainEngine(config, &engine);
+        ok(ret, "CertCreateCertificateChainEngine failed: %08lx\n", GetLastError());
+        if (ret)
+        {
+            ret = CertGetCertificateChain(engine, cert, NULL, NULL, &para,
+                CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, NULL, &chain);
+            ok(ret, "CertGetCertificateChain failed: %08lx\n", GetLastError());
+            if (ret)
+            {
+                ok(!!(chain->TrustStatus.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) == !tests[i].exclusive_root,
+                    "Unexpected root trust status %08lx\n", chain->TrustStatus.dwErrorStatus);
+                CertFreeCertificateChain(chain);
+            }
+            CertFreeCertificateChainEngine(engine);
+        }
+        winetest_pop_context();
+    }
+
+    invalid.cbSize = sizeof(invalid) + sizeof(void *);
+    SetLastError(0xdeadbeef);
+    ret = CertCreateCertificateChainEngine(&invalid, &engine);
+    ok(!ret && GetLastError() == E_INVALIDARG,
+        "Invalid layout accepted: ret %d, error %08lx\n", ret, GetLastError());
+    if (ret) CertFreeCertificateChainEngine(engine);
+
+    CertFreeCertificateContext(cert);
+close_store:
+    CertCloseStore(store, 0);
+done:
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 static const BYTE bigCert[] = { 0x30, 0x7a, 0x02, 0x01, 0x01, 0x30, 0x02, 0x06,
  0x00, 0x30, 0x15, 0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13,
  0x0a, 0x4a, 0x75, 0x61, 0x6e, 0x20, 0x4c, 0x61, 0x6e, 0x67, 0x00, 0x30, 0x22,
@@ -5570,6 +5652,7 @@ static void test_chain_engine_cache_update(void)
 START_TEST(chain)
 {
     testCreateCertChainEngine();
+    test_chain_engine_config_layouts();
     testVerifyCertChainPolicy();
     testGetCertChain();
     test_CERT_CHAIN_PARA_cbSize();
