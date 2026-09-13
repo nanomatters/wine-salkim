@@ -477,7 +477,15 @@ UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,
 
         p[0] = 2;
         p[1] = 3;
-        p[2] = 0xb;
+        p[2] = 0xf;
+
+        p += 4;
+
+        /* Match the RGB BT.2100 presentation support exposed by Wine. */
+        p[0] = (0x7 << 5) | 0x3;
+        p[1] = 5; /* Colorimetry Data Block */
+        p[2] = 0x80; /* BT.2020 RGB */
+        p[3] = 0;
 
         p += 4;
 
