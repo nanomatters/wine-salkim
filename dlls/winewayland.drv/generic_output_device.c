@@ -268,6 +268,7 @@ static BOOL output_name_is_drm_connector(const char *output_name)
     static const char *const prefixes[] =
     {
         "DP",
+        "HDMI",
         "HDMI-A",
         "HDMI-B",
         "eDP",
@@ -302,7 +303,12 @@ static BOOL drm_sysfs_entry_matches_output(const char *entry, const char *output
     if (!isdigit((unsigned char)*p)) return FALSE;
     while (isdigit((unsigned char)*p)) p++;
 
-    return *p++ == '-' && !strcmp(p, output_name);
+    if (*p++ != '-') return FALSE;
+    if (!strcmp(p, output_name)) return TRUE;
+
+    /* Mutter names HDMI-A connectors HDMI, retaining the connector number. */
+    return !strncmp(output_name, "HDMI-", 5) && !strncmp(p, "HDMI-A-", 7) &&
+           !strcmp(p + 7, output_name + 5);
 }
 
 UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned char **edid)
