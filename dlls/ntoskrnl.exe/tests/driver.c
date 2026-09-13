@@ -498,12 +498,14 @@ static NTSTATUS wait_single_handle(HANDLE handle, ULONGLONG timeout)
 
 static void test_current_thread(BOOL is_system)
 {
+    UNICODE_STRING image, *image_name, *expect_name;
     PROCESS_BASIC_INFORMATION info;
     DISPATCHER_HEADER *header;
     HANDLE process_handle, id;
     PEPROCESS current;
     PETHREAD thread;
     NTSTATUS ret;
+    ULONG len;
 
     current = IoGetCurrentProcess();
     ok(current != NULL, "Expected current process to be non-NULL\n");
@@ -536,13 +538,53 @@ static void test_current_thread(BOOL is_system)
 
     ret = ObOpenObjectByPointer(current, OBJ_KERNEL_HANDLE, NULL, PROCESS_QUERY_INFORMATION, NULL, KernelMode, &process_handle);
     ok(!ret, "ObOpenObjectByPointer failed: %#lx\n", ret);
+    if (ret) return;
 
     ret = ZwQueryInformationProcess(process_handle, ProcessBasicInformation, &info, sizeof(info), NULL);
     ok(!ret, "ZwQueryInformationProcess failed: %#lx\n", ret);
+    if (ret) goto done;
 
     id = PsGetProcessInheritedFromUniqueProcessId(current);
     ok(id == (HANDLE)info.InheritedFromUniqueProcessId, "unexpected process id %p\n", id);
 
+    if (!is_system)
+    {
+        ret = ZwQueryInformationProcess(process_handle, ProcessImageFileName, &image, sizeof(image), &len);
+        ok(ret == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", ret);
+        if (ret != STATUS_INFO_LENGTH_MISMATCH) goto done;
+        expect_name = ExAllocatePool(PagedPool, len);
+        ok(!!expect_name, "ExAllocatePool failed\n");
+        if (!expect_name) goto done;
+
+        ret = ZwQueryInformationProcess(process_handle, ProcessImageFileName, expect_name, len, NULL);
+        ok(!ret, "ZwQueryInformationProcess failed: %#lx\n", ret);
+        if (!ret)
+        {
+            image_name = NULL;
+            ret = SeLocateProcessImageName(current, &image_name);
+            ok(!ret, "SeLocateProcessImageName failed: %#lx\n", ret);
+            if (!ret)
+            {
+                ok(!!image_name, "got NULL image name\n");
+                if (image_name)
+                {
+                    ok(RtlEqualUnicodeString(image_name, expect_name, FALSE), "got %.*ls, expected %.*ls\n",
+                       (int)(image_name->Length / sizeof(WCHAR)), image_name->Buffer,
+                       (int)(expect_name->Length / sizeof(WCHAR)), expect_name->Buffer);
+
+                    ok(image_name->MaximumLength == image_name->Length + sizeof(WCHAR), "got length %u, maximum %u\n",
+                       image_name->Length, image_name->MaximumLength);
+                    ok(!image_name->Buffer[image_name->Length / sizeof(WCHAR)], "got %#x\n",
+                       image_name->Buffer[image_name->Length / sizeof(WCHAR)]);
+
+                    ExFreePool(image_name);
+                }
+            }
+        }
+        ExFreePool(expect_name);
+    }
+
+done:
     ret = ZwClose(process_handle);
     ok(!ret, "ZwClose failed: %#lx\n", ret);
 }
