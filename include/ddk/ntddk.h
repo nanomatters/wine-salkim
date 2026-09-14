@@ -297,6 +297,7 @@ PHYSICAL_MEMORY_RANGE * WINAPI MmGetPhysicalMemoryRanges(void);
 BOOLEAN   WINAPI MmIsAddressValid(void *);
 NTSTATUS  WINAPI PsGetContextThread(PETHREAD,CONTEXT*,KPROCESSOR_MODE);
 HANDLE    WINAPI PsGetProcessId(PEPROCESS);
+const char * WINAPI PsGetProcessImageFileName(PEPROCESS);
 void *    WINAPI PsGetProcessSectionBaseAddress(PEPROCESS);
 HANDLE    WINAPI PsGetThreadId(PETHREAD);
 HANDLE    WINAPI PsGetThreadProcessId(PETHREAD);

@@ -2476,13 +2476,38 @@ NTSTATUS WINAPI FsRtlRegisterUncProvider(PHANDLE MupHandle, PUNICODE_STRING Redi
 }
 
 
+static void get_process_image_file_name( HANDLE handle, PEPROCESS process )
+{
+    UNICODE_STRING *image;
+    WCHAR *p, *end;
+    ULONG len;
+
+    if (NtQueryInformationProcess(handle, ProcessImageFileName, NULL, 0, &len) != STATUS_INFO_LENGTH_MISMATCH)
+        return;
+
+    len += sizeof(WCHAR) + sizeof(UNICODE_STRING);
+
+    if (!(image = malloc(len)))
+        return;
+
+    if (!NtQueryInformationProcess(handle, ProcessImageFileName, image, len, NULL))
+    {
+        end = image->Buffer + image->Length / sizeof(WCHAR);
+        p = end;
+
+        while (p > image->Buffer && p[-1] != '\\')
+            p--;
+
+        if (!RtlUnicodeToMultiByteN(process->image_name, sizeof(process->image_name) - 1,
+                                    &len, p, (end - p) * sizeof(WCHAR)))
+            process->image_name[len] = 0;
+    }
+    free(image);
+}
+
 static void *create_process_object( HANDLE handle )
 {
-    char *p;
-    ULONG len;
     PEPROCESS process;
-    ANSI_STRING fullImageNameA;
-    UNICODE_STRING *fullImageNameW = NULL;
 
     if (!(process = alloc_kernel_object( PsProcessType, handle, sizeof(*process), 0 ))) return NULL;
 
@@ -2492,27 +2517,7 @@ static void *create_process_object( HANDLE handle )
     NtQueryInformationProcess( handle, ProcessSessionInformation, &process->session_id, sizeof(process->session_id), NULL );
     NtQueryInformationProcess( handle, ProcessTimes, &process->times, sizeof(process->times), NULL );
 
-    /* get full image name */
-    NtQueryInformationProcess( handle, ProcessImageFileNameWin32, fullImageNameW, 0, &len );
-    fullImageNameW = malloc(len + sizeof(WCHAR));
-    if (!fullImageNameW) return NULL;
-    fullImageNameW->MaximumLength = len + sizeof(WCHAR);
-    NtQueryInformationProcess( handle, ProcessImageFileNameWin32, fullImageNameW, len, &len );
-    RtlUnicodeStringToAnsiString(&fullImageNameA, fullImageNameW, TRUE);
-    if (!fullImageNameA.Buffer) return NULL;
-    /* generate short name */
-    for (p = fullImageNameA.Buffer + fullImageNameA.Length - 1; p >= fullImageNameA.Buffer; p--)
-    {
-        if (*p == '\\')
-        {
-            ++p;
-            break;
-        }
-    }
-    memcpy(process->imageName, p, min(fullImageNameA.Buffer + fullImageNameA.Length - p, sizeof(process->imageName)));
-    RtlFreeAnsiString(&fullImageNameA);
-    free(fullImageNameW);
-
+    get_process_image_file_name(handle, process);
     IsWow64Process( handle, &process->wow64 );
 
     return process;
@@ -2607,8 +2612,8 @@ LONGLONG WINAPI PsGetProcessCreateTimeQuadPart( PEPROCESS process )
  */
 const char *WINAPI PsGetProcessImageFileName( PEPROCESS process )
 {
-    TRACE("%p -> %s\n", process, debugstr_an(process->imageName, sizeof(process->imageName)));
-    return process->imageName;
+    TRACE("%p -> %s\n", process, debugstr_a(process->image_name));
+    return process->image_name;
 }
 
 /*********************************************************************
