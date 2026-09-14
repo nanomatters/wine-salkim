@@ -3051,6 +3051,20 @@ static void test_topology_loader(void)
             .expected_result = S_OK, .decoder_class = CLSID_CMSH264DecoderMFT,
             .flags = LOADER_ADD_TEST_MFT | LOADER_EXPECT_MFT_INPUT_ENUMERATED,
         },
+        {
+            /* I420 -> test MFT -> RGB32, complete the partial output type from the input. */
+            .input_types = {&video_i420_1280}, .output_types = {&video_video_processor_1280_rgb32},
+            .sink_method = MF_CONNECT_DIRECT, .source_method = -1,
+            .mft_output_types = {&video_video_processor_rgb32},
+            .expected_result = S_OK, .flags = LOADER_ADD_TEST_MFT,
+        },
+        {
+            /* Keep the frame size explicitly advertised by the transform. */
+            .input_types = {&video_i420_1280}, .output_types = {&video_video_processor_1024_rgb32},
+            .sink_method = MF_CONNECT_DIRECT, .source_method = -1,
+            .mft_output_types = {&video_video_processor_1024_rgb32},
+            .expected_result = S_OK, .flags = LOADER_ADD_TEST_MFT,
+        },
     };
 
     IMFTopologyNode *src_node, *sink_node, *src_node2, *sink_node2, *mft_node;
@@ -3759,7 +3773,11 @@ todo_wine {
         for (j = 0; j < ARRAY_SIZE(optional_mft_types) && optional_mft_types[j]; ++j)
             IMFMediaType_Release(optional_mft_types[j]);
         for (j = 0; j < ARRAY_SIZE(mft_output_types) && mft_output_types[j]; ++j)
+        {
+            /* The loader must complete a copy, not the transform's advertised media type. */
+            check_media_type(mft_output_types[j], *test->mft_output_types[j], -1);
             IMFMediaType_Release(mft_output_types[j]);
+        }
 
         winetest_pop_context();
     }
@@ -3786,6 +3804,178 @@ todo_wine {
     ok(hr == S_OK, "Shutdown failure, hr %#lx.\n", hr);
 
     IMFSampleGrabberSinkCallback_Release(grabber_callback);
+}
+
+static void test_topology_loader_resizer(void)
+{
+    static const media_type_desc input_desc =
+    {
+        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
+        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_YV12),
+        ATTR_RATIO(MF_MT_FRAME_SIZE, 1280, 720),
+        ATTR_RATIO(MF_MT_FRAME_RATE, 30, 1),
+        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1),
+        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1),
+    };
+    IMFSampleGrabberSinkCallback *callback;
+    IMFTopologyNode *source_node, *resizer_node, *sink_node, *node, *upstream;
+    IMFMediaType *input, *output, *type;
+    IMFTopology *topology, *resolved;
+    IMFPresentationDescriptor *pd;
+    IMFStreamDescriptor *sd;
+    IMFStreamSink *stream;
+    IMFMediaSource *source;
+    IMFActivate *activate;
+    IMFMediaSink *sink;
+    IMFTransform *resizer;
+    IMFTopoLoader *loader;
+    UINT64 size, expected_size;
+    unsigned int i;
+    DWORD index;
+    TOPOID sink_id;
+    GUID subtype;
+    HRESULT hr;
+
+    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = MFCreateTopoLoader(&loader);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    callback = create_test_grabber_callback();
+
+    for (i = 0; i < 2; ++i)
+    {
+        winetest_push_context("output type %s", i ? "configured" : "unset");
+
+        hr = CoCreateInstance(&CLSID_CResizerDMO, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform, (void **)&resizer);
+        if (FAILED(hr))
+        {
+            win_skip("Video resizer is unavailable, hr %#lx.\n", hr);
+            winetest_pop_context();
+            break;
+        }
+
+        hr = MFCreateMediaType(&input);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        init_media_type(input, input_desc, -1);
+        hr = MFCreateMediaType(&output);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFMediaType_SetGUID(output, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFMediaType_SetGUID(output, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        expected_size = (UINT64)1280 << 32 | 720;
+        if (i)
+        {
+            /* An explicitly selected output size must not be replaced by the input size. */
+            expected_size = (UINT64)640 << 32 | 360;
+            hr = MFCreateMediaType(&type);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            init_media_type(type, input_desc, -1);
+            hr = IMFMediaType_SetUINT64(type, &MF_MT_FRAME_SIZE, expected_size);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = IMFTransform_SetInputType(resizer, 0, input, 0);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = IMFTransform_SetOutputType(resizer, 0, type, 0);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            IMFMediaType_Release(type);
+        }
+
+        hr = MFCreateSampleGrabberSinkActivate(output, callback, &activate);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFActivate_ActivateObject(activate, &IID_IMFMediaSink, (void **)&sink);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFMediaSink_GetStreamSinkByIndex(sink, 0, &stream);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        create_descriptors(1, &input, &input_desc, &pd, &sd);
+        source = create_test_source(pd);
+        hr = MFCreateTopology(&topology);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE, &source_node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        init_source_node(source, -1, source_node, pd, sd);
+        hr = MFCreateTopologyNode(MF_TOPOLOGY_TRANSFORM_NODE, &resizer_node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFTopologyNode_SetObject(resizer_node, (IUnknown *)resizer);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE, &sink_node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        init_sink_node(stream, MF_CONNECT_ALLOW_CONVERTER, sink_node);
+        hr = IMFTopologyNode_GetTopoNodeID(sink_node, &sink_id);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFTopology_AddNode(topology, source_node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFTopology_AddNode(topology, resizer_node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFTopology_AddNode(topology, sink_node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFTopologyNode_ConnectOutput(source_node, 0, resizer_node, 0);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFTopologyNode_ConnectOutput(resizer_node, 0, sink_node, 0);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        /* Like GRANDIA, leave the grabber's RGB32 type partial and insert the resizer explicitly. */
+        hr = IMFTopoLoader_Load(loader, topology, &resolved, NULL);
+        ok(hr == S_OK, "Failed to resolve resizer topology, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = IMFTransform_GetOutputCurrentType(resizer, 0, &type);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            size = 0;
+            hr = IMFMediaType_GetUINT64(type, &MF_MT_FRAME_SIZE, &size);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            ok(size == expected_size, "Unexpected resizer frame size %#I64x.\n", size);
+            hr = IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            ok(IsEqualGUID(&subtype, &MFVideoFormat_YV12), "Unexpected subtype %s.\n", debugstr_guid(&subtype));
+            IMFMediaType_Release(type);
+
+            hr = IMFTopology_GetNodeByID(resolved, sink_id, &node);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = IMFTopologyNode_GetInput(node, 0, &upstream, &index);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = MFGetTopoNodeCurrentType(upstream, index, TRUE, &type);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            size = 0;
+            hr = IMFMediaType_GetUINT64(type, &MF_MT_FRAME_SIZE, &size);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            ok(size == expected_size, "Unexpected converter frame size %#I64x.\n", size);
+            hr = IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            ok(IsEqualGUID(&subtype, &MFVideoFormat_RGB32), "Unexpected subtype %s.\n", debugstr_guid(&subtype));
+            IMFMediaType_Release(type);
+            IMFTopologyNode_Release(upstream);
+            IMFTopologyNode_Release(node);
+            IMFTopology_Release(resolved);
+        }
+
+        /* Completing the negotiated type must not modify the caller's partial type. */
+        hr = IMFMediaType_GetUINT64(output, &MF_MT_FRAME_SIZE, &size);
+        ok(hr == MF_E_ATTRIBUTENOTFOUND, "Unexpected hr %#lx.\n", hr);
+
+        IMFTopology_Release(topology);
+        IMFTopologyNode_Release(source_node);
+        IMFTopologyNode_Release(resizer_node);
+        IMFTopologyNode_Release(sink_node);
+        IMFMediaSource_Release(source);
+        IMFPresentationDescriptor_Release(pd);
+        IMFStreamDescriptor_Release(sd);
+        IMFStreamSink_Release(stream);
+        IMFMediaSink_Release(sink);
+        hr = IMFActivate_ShutdownObject(activate);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        IMFActivate_Release(activate);
+        IMFTransform_Release(resizer);
+        IMFMediaType_Release(input);
+        IMFMediaType_Release(output);
+        winetest_pop_context();
+    }
+
+    IMFSampleGrabberSinkCallback_Release(callback);
+    IMFTopoLoader_Release(loader);
+    hr = MFShutdown();
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 }
 
 static void test_topology_loader_evr(void)
@@ -4594,6 +4784,7 @@ START_TEST(topology)
     test_topology();
     test_topology_tee_node();
     test_topology_loader();
+    test_topology_loader_resizer();
     test_topology_loader_evr();
     test_topology_loader_d3d();
     test_topology_loader_d3d9(MFTOPOLOGY_DXVA_DEFAULT);

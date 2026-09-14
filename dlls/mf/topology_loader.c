@@ -763,11 +763,25 @@ static HRESULT topology_branch_foreach_up_types(IMFTopology *topology, enum conn
 static HRESULT topology_branch_connect(IMFTopology *topology, enum connect_method method_mask,
         struct topology_branch *branch, IMFMediaType *upstream, BOOL force_enumerate)
 {
+    IMFMediaType *input_type = NULL;
     HRESULT hr = MF_E_INVALIDMEDIATYPE;
+    DWORD input_count, output_count;
     UINT32 up_method, down_method;
+    IMFTransform *transform;
 
     TRACE("topology %p, method_mask %#x, branch %s, upstream %s.\n", topology, method_mask, debugstr_topology_branch(branch),
             debugstr_media_type(upstream));
+
+    /* Explicit transforms can enumerate partial output types too. Use their negotiated input type,
+     * but do not guess which input to use for transforms with multiple input streams. */
+    if (!upstream && topology_node_get_type(branch->up.node) == MF_TOPOLOGY_TRANSFORM_NODE
+            && SUCCEEDED(topology_node_get_object(branch->up.node, &IID_IMFTransform, (void **)&transform)))
+    {
+        if (SUCCEEDED(IMFTransform_GetStreamCount(transform, &input_count, &output_count)) && input_count == 1
+                && SUCCEEDED(IMFTransform_GetInputCurrentType(transform, 0, &input_type)))
+            upstream = input_type;
+        IMFTransform_Release(transform);
+    }
 
     if (FAILED(IMFTopologyNode_GetUINT32(branch->down.node, &MF_TOPONODE_CONNECT_METHOD, &down_method)))
         down_method = MF_CONNECT_ALLOW_DECODER;
@@ -789,6 +803,8 @@ static HRESULT topology_branch_connect(IMFTopology *topology, enum connect_metho
             hr = topology_branch_foreach_up_types(topology, CONNECT_DECODER, branch, upstream, force_enumerate);
     }
 
+    if (input_type)
+        IMFMediaType_Release(input_type);
     TRACE("returning %#lx\n", hr);
     return hr;
 }
