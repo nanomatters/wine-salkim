@@ -1749,6 +1749,94 @@ static void test_hmac(void) {
     ok(!result && GetLastError() == NTE_BAD_KEY, "%08lx\n", GetLastError());
 }
 
+static void test_hmac_sha256(void)
+{
+    static const struct
+    {
+        DWORD key_size;
+        const char *data;
+        BYTE digest[32];
+    } tests[] =
+    {
+        /* RFC 4231, test cases 2 and 6. */
+        {4, "what do ya want for nothing?",
+         {0x5b,0xdc,0xc1,0x46,0xbf,0x60,0x75,0x4e,0x6a,0x04,0x24,0x26,0x08,0x95,0x75,0xc7,
+          0x5a,0x00,0x3f,0x08,0x9d,0x27,0x39,0x83,0x9d,0xec,0x58,0xb9,0x64,0xec,0x38,0x43}},
+        {131, "Test Using Larger Than Block-Size Key - Hash Key First",
+         {0x60,0xe4,0x31,0x59,0x1e,0xe0,0xb6,0x7f,0x0d,0x8a,0x26,0xaa,0xcb,0xf5,0xb7,0x7f,
+          0x8e,0x0b,0xc6,0x21,0x37,0x28,0xc5,0x14,0x05,0x46,0x04,0x0f,0x0e,0xe3,0x7f,0x54}},
+    };
+    static const ALG_ID invalid_algs[] = {0xdeadbeef, CALG_RC4, CALG_HMAC};
+    struct
+    {
+        BLOBHEADER header;
+        DWORD size;
+        BYTE key[131];
+    } blob = {{PLAINTEXTKEYBLOB, CUR_BLOB_VERSION, 0, CALG_RC2}};
+    HMAC_INFO info = {0};
+    HCRYPTKEY key;
+    HCRYPTHASH hash;
+    BYTE digest[32];
+    DWORD size, hash_size;
+    unsigned int i, j;
+    BOOL ret;
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("test %u", i);
+        blob.size = tests[i].key_size;
+        if (i) memset(blob.key, 0xaa, blob.size);
+        else memcpy(blob.key, "Jefe", blob.size);
+        ret = CryptImportKey(hProv, (BYTE *)&blob, sizeof(BLOBHEADER) + sizeof(DWORD) + blob.size,
+                             0, CRYPT_IPSEC_HMAC_KEY, &key);
+        ok(ret, "CryptImportKey failed, error %#lx.\n", GetLastError());
+        if (!ret) goto next;
+
+        ret = CryptCreateHash(hProv, CALG_HMAC, key, 0, &hash);
+        ok(ret, "CryptCreateHash failed, error %#lx.\n", GetLastError());
+        if (!ret) goto destroy_key;
+
+        info.HashAlgid = CALG_SHA_256;
+        ret = CryptSetHashParam(hash, HP_HMAC_INFO, (BYTE *)&info, 0);
+        ok(ret, "CryptSetHashParam failed, error %#lx.\n", GetLastError());
+        if (!ret) goto destroy_hash;
+        size = sizeof(hash_size);
+        hash_size = 0;
+        ret = CryptGetHashParam(hash, HP_HASHSIZE, (BYTE *)&hash_size, &size, 0);
+        ok(ret, "CryptGetHashParam failed, error %#lx.\n", GetLastError());
+        ok(hash_size == sizeof(digest), "Unexpected hash size %lu.\n", hash_size);
+        /* Avoid dereferencing an uninitialized hash on older Wine. */
+        if (!ret || hash_size != sizeof(digest)) goto destroy_hash;
+
+        ret = CryptHashData(hash, (const BYTE *)tests[i].data, 1, 0);
+        ok(ret, "CryptHashData failed, error %#lx.\n", GetLastError());
+        for (j = 0; j < ARRAY_SIZE(invalid_algs); ++j)
+        {
+            info.HashAlgid = invalid_algs[j];
+            SetLastError(0xdeadbeef);
+            ret = CryptSetHashParam(hash, HP_HMAC_INFO, (BYTE *)&info, 0);
+            ok(!ret && GetLastError() == NTE_BAD_ALGID, "Algorithm %#x: ret %d, error %#lx.\n",
+               info.HashAlgid, ret, GetLastError());
+            if (ret) goto destroy_hash;
+        }
+        /* Rejected algorithms must not invalidate the in-progress hash. */
+        ret = CryptHashData(hash, (const BYTE *)tests[i].data + 1, strlen(tests[i].data) - 1, 0);
+        ok(ret, "CryptHashData failed, error %#lx.\n", GetLastError());
+        size = sizeof(digest);
+        ret = CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0);
+        ok(ret, "CryptGetHashParam failed, error %#lx.\n", GetLastError());
+        ok(size == sizeof(digest), "Unexpected digest size %lu.\n", size);
+        ok(!memcmp(digest, tests[i].digest, sizeof(digest)), "Unexpected HMAC-SHA256 digest.\n");
+
+    destroy_hash:
+        CryptDestroyHash(hash);
+    destroy_key:
+        CryptDestroyKey(key);
+    next:
+        winetest_pop_context();
+    }
+}
+
 static void test_mac(void) {
     HCRYPTKEY hKey;
     HCRYPTHASH hHash;
@@ -4216,6 +4304,7 @@ START_TEST(rsaenh)
             test_import_private();
         }
         test_hmac();
+        test_hmac_sha256();
         test_mac();
         test_block_cipher_modes();
         test_verify_signature();
@@ -4240,6 +4329,7 @@ START_TEST(rsaenh)
     test_aes(192);
     test_aes(256);
     test_sha2();
+    test_hmac_sha256();
     test_key_derivation("AES");
     test_rc2_import();
     clean_up_aes_environment();

@@ -686,18 +686,14 @@ static inline BOOL init_hash(CRYPTHASH *pCryptHash) {
     {
         case CALG_HMAC:
             if (pCryptHash->pHMACInfo) { 
-                const PROV_ENUMALGS_EX *pAlgInfo;
-                
-                pAlgInfo = get_algid_info(pCryptHash->hProv, pCryptHash->pHMACInfo->HashAlgid);
-                if (!pAlgInfo)
+                /* HMAC supports hashes which the provider does not expose directly. */
+                if (!init_hash_impl(pCryptHash->pHMACInfo->HashAlgid, &pCryptHash->hash) ||
+                    !pCryptHash->hash.desc)
                 {
-                    /* A number of hash algorithms (e. g., _SHA256) are supported for HMAC even for providers
-                     * which don't list the algorithm, so print a fixme here. */
-                    FIXME("Hash algroithm %#x not found.\n", pCryptHash->pHMACInfo->HashAlgid);
+                    SetLastError(NTE_BAD_ALGID);
                     return FALSE;
                 }
-                pCryptHash->dwHashSize = pAlgInfo->dwDefaultLen >> 3;
-                init_hash_impl(pCryptHash->pHMACInfo->HashAlgid, &pCryptHash->hash);
+                pCryptHash->dwHashSize = pCryptHash->hash.desc->hashsize;
                 update_hash_impl(&pCryptHash->hash, pCryptHash->pHMACInfo->pbInnerString,
                                  pCryptHash->pHMACInfo->cbInnerString);
             }
@@ -4738,6 +4734,7 @@ BOOL WINAPI RSAENH_CPSetHashParam(HCRYPTPROV hProv, HCRYPTHASH hHash, DWORD dwPa
 {
     CRYPTHASH *pCryptHash;
     CRYPTKEY *pCryptKey;
+    struct hash hash;
     DWORD i;
 
     TRACE("(hProv=%08Ix, hHash=%08Ix, dwParam=%08lx, pbData=%p, dwFlags=%08lx)\n",
@@ -4763,6 +4760,12 @@ BOOL WINAPI RSAENH_CPSetHashParam(HCRYPTPROV hProv, HCRYPTHASH hHash, DWORD dwPa
     
     switch (dwParam) {
         case HP_HMAC_INFO:
+            if (!init_hash_impl(((PHMAC_INFO)pbData)->HashAlgid, &hash) || !hash.desc)
+            {
+                SetLastError(NTE_BAD_ALGID);
+                return FALSE;
+            }
+
             free_hmac_info(pCryptHash->pHMACInfo);
             if (!copy_hmac_info(&pCryptHash->pHMACInfo, (PHMAC_INFO)pbData)) return FALSE;
 
@@ -4774,27 +4777,10 @@ BOOL WINAPI RSAENH_CPSetHashParam(HCRYPTPROV hProv, HCRYPTHASH hHash, DWORD dwPa
             }
 
             if (pCryptKey->aiAlgid == CALG_HMAC && !pCryptKey->dwKeyLen) {
-                HCRYPTHASH hKeyHash;
-                DWORD keyLen;
-
-                if (!RSAENH_CPCreateHash(hProv, ((PHMAC_INFO)pbData)->HashAlgid, 0, 0,
-                    &hKeyHash))
-                    return FALSE;
-                if (!RSAENH_CPHashData(hProv, hKeyHash, pCryptKey->blobHmacKey.pbData,
-                    pCryptKey->blobHmacKey.cbData, 0))
-                {
-                    RSAENH_CPDestroyHash(hProv, hKeyHash);
-                    return FALSE;
-                }
-                keyLen = sizeof(pCryptKey->abKeyValue);
-                if (!RSAENH_CPGetHashParam(hProv, hKeyHash, HP_HASHVAL, pCryptKey->abKeyValue,
-                    &keyLen, 0))
-                {
-                    RSAENH_CPDestroyHash(hProv, hKeyHash);
-                    return FALSE;
-                }
-                pCryptKey->dwKeyLen = keyLen;
-                RSAENH_CPDestroyHash(hProv, hKeyHash);
+                if (pCryptKey->blobHmacKey.cbData)
+                    update_hash_impl(&hash, pCryptKey->blobHmacKey.pbData, pCryptKey->blobHmacKey.cbData);
+                finalize_hash_impl(&hash, pCryptKey->abKeyValue, hash.desc->hashsize);
+                pCryptKey->dwKeyLen = hash.desc->hashsize;
             }
             for (i=0; i<RSAENH_MIN(pCryptKey->dwKeyLen,pCryptHash->pHMACInfo->cbInnerString); i++) {
                 pCryptHash->pHMACInfo->pbInnerString[i] ^= pCryptKey->abKeyValue[i];
