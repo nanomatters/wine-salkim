@@ -2444,6 +2444,7 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDev
     struct surface *surface = surface_from_handle( surface_info->surface );
     VkPhysicalDeviceSurfaceInfo2KHR surface_info_host = *surface_info;
     VkSurfaceCapabilitiesFullScreenExclusiveEXT *fullscreen_capabilities;
+    VkPresentTimingSurfaceCapabilitiesEXT *timing_capabilities;
     struct vulkan_surface_fullscreen_info fullscreen_info_driver;
     struct vulkan_instance *instance = physical_device->instance;
     VkBool32 fullscreen_supported = VK_FALSE;
@@ -2452,6 +2453,8 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDev
     fullscreen_capabilities = (VkSurfaceCapabilitiesFullScreenExclusiveEXT *)
         find_vk_struct( capabilities->pNext,
                         VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT );
+    timing_capabilities = find_vk_struct( capabilities->pNext,
+                                          VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT );
 
     if (!surface || !NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
     if (fullscreen_capabilities && surface->client &&
@@ -2486,6 +2489,22 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDev
 done:
     if (!res && fullscreen_capabilities)
         fullscreen_capabilities->fullScreenExclusiveSupported = fullscreen_supported;
+    if (!res && timing_capabilities && physical_device->extensions.has_VK_EXT_external_memory_dma_buf)
+    {
+        hwnd_dmabuf_host_caps_t dmabuf_caps = {0};
+        UINT count = 0;
+
+        /* Surfaces eligible for managed dmabuf presentation cannot promise the
+         * host's timing queries or scheduled presents. Use the same probe as
+         * swapchain creation, before a managed swapchain exists. */
+        if (hwnd_dmabuf_get_caps( surface->hwnd, &dmabuf_caps, NULL, 0, &count ) == HWND_DMABUF_OK && count)
+        {
+            timing_capabilities->presentTimingSupported = VK_FALSE;
+            timing_capabilities->presentAtAbsoluteTimeSupported = VK_FALSE;
+            timing_capabilities->presentAtRelativeTimeSupported = VK_FALSE;
+            timing_capabilities->presentStageQueries = 0;
+        }
+    }
     return res;
 }
 
