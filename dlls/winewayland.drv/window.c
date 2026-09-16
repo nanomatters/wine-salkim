@@ -1306,9 +1306,12 @@ BOOL wayland_is_menu_popup_candidate(HWND hwnd)
     return is_menu_popup_candidate_style(style, exstyle);
 }
 
-static HWND get_menu_popup_owner(HWND hwnd, HWND owner_hint)
+static HWND get_popup_owner(HWND hwnd, HWND owner_hint)
 {
     HWND owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
+    HWND ancestor;
+
+    if (NtUserGetAncestor(hwnd, GA_ROOT) != hwnd) return NULL;
 
     if (!owner) owner = owner_hint;
     if (!owner || owner == hwnd || owner == NtUserGetDesktopWindow() ||
@@ -1322,13 +1325,20 @@ static HWND get_menu_popup_owner(HWND hwnd, HWND owner_hint)
     if ((DWORD)(ULONG_PTR)NtUserQueryWindow(owner, WindowProcess) != GetCurrentProcessId())
         return NULL;
 
+    /* A positional hint must not put a window below one of its own popups. */
+    for (ancestor = owner; ancestor; ancestor = NtUserGetWindowRelative(ancestor, GW_OWNER))
+    {
+        ancestor = NtUserGetAncestor(ancestor, GA_ROOT);
+        if (!ancestor || ancestor == hwnd) return NULL;
+    }
+
     return owner;
 }
 
 BOOL wayland_is_menu_popup(HWND hwnd)
 {
     if (!wayland_is_menu_popup_candidate(hwnd)) return FALSE;
-    return get_menu_popup_owner(hwnd, NULL) != NULL;
+    return get_popup_owner(hwnd, NULL) != NULL;
 }
 
 static BOOL is_layer_shell_menu_popup(HWND hwnd)
@@ -1455,14 +1465,14 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     DWORD exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
     BOOL frameless = NtUserGetProp(hwnd, frameless_window_prop) != NULL;
     BOOL client_rect_in_toplevel_valid;
-    BOOL managed, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL managed = FALSE, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL continue_configure = FALSE;
     BOOL foreground = NtUserGetForegroundWindow() == hwnd;
     HWND previous_host = NULL;
     HWND external_host = NULL;
-    HWND overlay_owner = get_owned_overlay_owner(hwnd, window_owner, style, exstyle);
-    BOOL owned_overlay = overlay_owner != NULL;
+    HWND overlay_owner = NULL;
+    BOOL owned_overlay = FALSE;
     BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
     RECT present_rect = {0};
     BOOL has_present_rect;
@@ -1488,28 +1498,37 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     has_present_rect = fullscreen && NtUserGetPresentRect(hwnd, &present_rect, -1);
 
-    /* Get the managed state with win_data unlocked, as is_window_managed
-     * may need to query win_data information about other HWNDs and thus
-     * acquire the lock itself internally. */
-    menu_popup_owner = wayland_is_menu_popup_candidate(hwnd) ? get_menu_popup_owner(hwnd, owner_hint) : NULL;
-    managed = is_window_managed(hwnd, menu_popup_owner, swp_flags, fullscreen);
-    if (owned_overlay)
+    /* SetParent does not update WS_CHILD/WS_POPUP. Preserve the real parent
+     * before considering popup owners or positional hints. */
+    if (root == hwnd)
     {
-        managed = FALSE;
-        toplevel = overlay_owner;
-    }
-    else if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
-    {
-        managed = FALSE;
-        toplevel = NULL;
-        use_layer_shell = TRUE;
-    }
-    else if (!managed && surface)
-    {
-        toplevel = NULL;
-        owner = menu_popup_owner ? menu_popup_owner : owner_hint;
-        use_layer_shell = owner && process_wayland.zwlr_layer_shell_v1 &&
-                          is_layer_shell_menu_popup(hwnd);
+        HWND popup_owner = get_popup_owner(hwnd, owner_hint);
+
+        /* Get the managed state with win_data unlocked, as is_window_managed
+         * may need to query win_data information about other HWNDs and thus
+         * acquire the lock itself internally. */
+        menu_popup_owner = wayland_is_menu_popup_candidate(hwnd) ? popup_owner : NULL;
+        managed = is_window_managed(hwnd, menu_popup_owner, swp_flags, fullscreen);
+        overlay_owner = get_owned_overlay_owner(hwnd, window_owner, style, exstyle);
+        owned_overlay = overlay_owner != NULL;
+        if (owned_overlay)
+        {
+            managed = FALSE;
+            toplevel = overlay_owner;
+        }
+        else if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
+        {
+            managed = FALSE;
+            toplevel = NULL;
+            use_layer_shell = TRUE;
+        }
+        else if (!managed && surface)
+        {
+            toplevel = NULL;
+            owner = popup_owner;
+            use_layer_shell = owner && process_wayland.zwlr_layer_shell_v1 &&
+                              is_layer_shell_menu_popup(hwnd);
+        }
     }
 
     client_rect_in_toplevel_valid =
