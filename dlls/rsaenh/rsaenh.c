@@ -4803,8 +4803,7 @@ BOOL WINAPI RSAENH_CPSetHashParam(HCRYPTPROV hProv, HCRYPTHASH hHash, DWORD dwPa
                 pCryptHash->pHMACInfo->pbOuterString[i] ^= pCryptKey->abKeyValue[i];
             }
             
-            init_hash(pCryptHash);
-            return TRUE;
+            return init_hash(pCryptHash);
 
         case HP_HASHVAL:
             memcpy(pCryptHash->abHashValue, pbData, pCryptHash->dwHashSize);
