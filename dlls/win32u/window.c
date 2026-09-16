@@ -2421,7 +2421,7 @@ static void update_surface_region( HWND hwnd )
 {
     WND *win = get_win_ptr( hwnd );
     struct window_surface *surface;
-    HRGN region, shape = 0;
+    HRGN region = 0, shape = 0, gdi_over = 0;
     HWND surface_producer = 0;
     DWORD ex_style;
     RECT visible;
@@ -2436,49 +2436,41 @@ static void update_surface_region( HWND hwnd )
      * holding the USER lock while entering the driver's window-data lock. */
     user_check_not_lock();
 
-    if (get_window_region( hwnd, WINDOW_REGION_SHAPE, &shape, &visible, NULL ))
-    {
-        window_surface_clear_clip_producer( surface );
-        goto done;
-    }
+    if (get_window_region( hwnd, WINDOW_REGION_SHAPE, &shape, &visible, NULL )) goto failed;
     if (shape)
     {
         region = NtGdiCreateRectRgn( 0, 0, visible.right - visible.left, visible.bottom - visible.top );
         NtGdiCombineRgn( shape, shape, region, RGN_AND );
         if (ex_style & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
         NtGdiDeleteObjectApp( region );
+        region = 0;
     }
-    window_surface_set_shape( surface, shape );
 
     if (get_window_region( hwnd, WINDOW_REGION_SURFACE, &region, &visible,
-                           &surface_producer ))
-    {
-        window_surface_clear_clip_producer( surface );
-        goto done;
-    }
-    if (!region) window_surface_set_clip( surface, shape, surface_producer );
-    else
+                           &surface_producer )) goto failed;
+    if (region)
     {
         if (NtGdiOffsetRgn( region, -visible.left, -visible.top ) == ERROR)
             surface_producer = 0;
         if (shape && NtGdiCombineRgn( region, region, shape, RGN_AND ) == ERROR)
             surface_producer = 0;
-        window_surface_set_clip( surface, region, surface_producer );
-        NtGdiDeleteObjectApp( region );
     }
 
-    if (get_window_region( hwnd, WINDOW_REGION_GDI_OVER_PRODUCER, &region, &visible,
-                           NULL )) goto done;
-    if (region)
+    if (get_window_region( hwnd, WINDOW_REGION_GDI_OVER_PRODUCER, &gdi_over, &visible,
+                           NULL )) goto failed;
+    if (gdi_over)
     {
-        NtGdiOffsetRgn( region, -visible.left, -visible.top );
-        if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
-        window_surface_set_gdi_over_producer_region( surface, region );
-        NtGdiDeleteObjectApp( region );
+        NtGdiOffsetRgn( gdi_over, -visible.left, -visible.top );
+        if (shape) NtGdiCombineRgn( gdi_over, gdi_over, shape, RGN_AND );
     }
-    else window_surface_set_gdi_over_producer_region( surface, 0 );
+    window_surface_set_regions( surface, shape, region ? region : shape, surface_producer, gdi_over );
+    goto done;
 
+failed:
+    window_surface_clear_clip_producer( surface );
 done:
+    if (gdi_over) NtGdiDeleteObjectApp( gdi_over );
+    if (region) NtGdiDeleteObjectApp( region );
     if (shape) NtGdiDeleteObjectApp( shape );
     window_surface_release( surface );
 }

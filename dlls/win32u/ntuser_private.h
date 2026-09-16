@@ -224,6 +224,8 @@ HICON alloc_cursoricon_handle( BOOL is_icon );
 extern void free_dce( struct dce *dce, HWND hwnd, struct list *drawables );
 extern void invalidate_dce( WND *win, const RECT *old_rect );
 extern BOOL is_cache_dc( HDC hdc );
+extern void window_surface_set_regions( struct window_surface *surface, HRGN shape_region, HRGN clip_region,
+                                        HWND clip_producer, HRGN gdi_over_producer_region );
 
 /* message.c */
 extern void check_for_events( UINT flags );

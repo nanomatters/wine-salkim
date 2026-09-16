@@ -856,6 +856,14 @@ static BOOL wayland_host_surface_update(
     {
         wayland_gdi_overlay_union_pending(producer, copy_region);
     }
+    /* An externally hosted window still needs a carrier when its GDI pixels
+     * are fully clipped by producer children. Publish the new, zero-initialized
+     * backing even with no visible pixels, including after a resize. */
+    if (new_slots)
+    {
+        NtGdiSetRectRgn(copy_region, 0, 0, src->width, src->height);
+        wayland_gdi_overlay_union_pending(producer, copy_region);
+    }
     if (!producer->pending_region)
     {
         ret = TRUE;

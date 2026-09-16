@@ -1350,13 +1350,10 @@ static void window_surface_notify_clip( struct window_surface *surface )
     }
 }
 
-W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region,
-                                      HWND clip_producer )
+static BOOL set_surface_clip( struct window_surface *surface, HRGN clip_region, HWND clip_producer )
 {
-    BOOL changed;
+    BOOL changed = surface->clip_producer != clip_producer;
 
-    window_surface_lock( surface );
-    changed = surface->clip_producer != clip_producer;
     surface->clip_producer = clip_producer;
 
     if (!clip_region && surface->clip_region)
@@ -1378,8 +1375,14 @@ W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_
         changed = TRUE;
     }
 
-    if (changed) window_surface_notify_clip( surface );
+    return changed;
+}
 
+W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region,
+                                      HWND clip_producer )
+{
+    window_surface_lock( surface );
+    if (set_surface_clip( surface, clip_region, clip_producer )) window_surface_notify_clip( surface );
     window_surface_unlock( surface );
 }
 
@@ -1394,11 +1397,9 @@ W32KAPI void window_surface_clear_clip_producer( struct window_surface *surface 
     window_surface_unlock( surface );
 }
 
-W32KAPI void window_surface_set_gdi_over_producer_region( struct window_surface *surface, HRGN region )
+static BOOL set_surface_gdi_over_producer_region( struct window_surface *surface, HRGN region )
 {
     BOOL changed = FALSE;
-
-    window_surface_lock( surface );
 
     if (!region && surface->gdi_over_producer_region)
     {
@@ -1439,15 +1440,21 @@ W32KAPI void window_surface_set_gdi_over_producer_region( struct window_surface 
         changed = TRUE;
     }
 
-    window_surface_unlock( surface );
+    return changed;
+}
 
+W32KAPI void window_surface_set_gdi_over_producer_region( struct window_surface *surface, HRGN region )
+{
+    BOOL changed;
+
+    window_surface_lock( surface );
+    changed = set_surface_gdi_over_producer_region( surface, region );
+    window_surface_unlock( surface );
     if (changed) window_surface_flush( surface );
 }
 
-W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
+static void set_surface_shape_region( struct window_surface *surface, HRGN shape_region )
 {
-    window_surface_lock( surface );
-
     if (!shape_region && surface->shape_region)
     {
         NtGdiDeleteObjectApp( surface->shape_region );
@@ -1460,9 +1467,30 @@ W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shap
         NtGdiCombineRgn( surface->shape_region, shape_region, 0, RGN_COPY );
         surface->bounds = surface->rect;
     }
+}
 
+W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
+{
+    window_surface_lock( surface );
+    set_surface_shape_region( surface, shape_region );
     window_surface_unlock( surface );
+    window_surface_flush( surface );
+}
 
+void window_surface_set_regions( struct window_surface *surface, HRGN shape_region, HRGN clip_region,
+                                 HWND clip_producer, HRGN gdi_over_producer_region )
+{
+    BOOL clip_changed;
+
+    /* Install the complete region state before notifying or flushing the driver.
+     * In particular, a new GDI host must not publish pixels over a child producer
+     * while its punch-through clip is still unset. */
+    window_surface_lock( surface );
+    set_surface_shape_region( surface, shape_region );
+    clip_changed = set_surface_clip( surface, clip_region, clip_producer );
+    set_surface_gdi_over_producer_region( surface, gdi_over_producer_region );
+    if (clip_changed) window_surface_notify_clip( surface );
+    window_surface_unlock( surface );
     window_surface_flush( surface );
 }
 
