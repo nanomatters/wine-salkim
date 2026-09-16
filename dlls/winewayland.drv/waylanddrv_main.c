@@ -26,6 +26,9 @@
 
 #include <stdlib.h>
 #include <errno.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -36,6 +39,25 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 char *process_name = NULL;
 static char *process_activate_token;
+static int dmabuf_epoll_fd = -1;
+
+/* The event contains an identity, not a surface pointer: it may outlive both
+ * the registration and the HWND. Callers serialize changes with win_data_mutex. */
+BOOL wayland_surface_monitor_fd(struct wayland_surface *surface, int fd)
+{
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET};
+
+    event.data.u64 = (UINT64)(UINT32)surface->serial << 32 | HandleToULong(surface->hwnd);
+    if (!epoll_ctl(dmabuf_epoll_fd, EPOLL_CTL_ADD, fd, &event)) return TRUE;
+    ERR("Failed to monitor frame fd %d for hwnd %p: %s\n", fd, surface->hwnd, strerror(errno));
+    return FALSE;
+}
+
+void wayland_surface_unmonitor_fd(int fd)
+{
+    /* Explicitly remove it: buffer/feedback objects may retain dup'd fds. */
+    epoll_ctl(dmabuf_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+}
 
 static UINT WAYLAND_GetForeignGdiSurfaceCaps(void)
 {
@@ -147,13 +169,57 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
     wayland_init_process_name();
     wayland_init_activation_token();
 
+    if ((dmabuf_epoll_fd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto err;
     if (!wayland_process_init()) goto err;
 
     return 0;
 
 err:
+    if (dmabuf_epoll_fd >= 0) close(dmabuf_epoll_fd);
+    dmabuf_epoll_fd = -1;
     __wine_set_user_driver(NULL, WINE_GDI_DRIVER_VERSION);
     return STATUS_UNSUCCESSFUL;
+}
+
+static int dispatch_events(void)
+{
+    struct wl_display *display = process_wayland.wl_display;
+    struct wl_event_queue *queue = process_wayland.wl_event_queue;
+    struct pollfd fds[2] = {{wl_display_get_fd(display), POLLIN}, {dmabuf_epoll_fd, POLLIN}};
+    struct epoll_event events[32];
+    int ret, count, i;
+
+    while (wl_display_prepare_read_queue(display, queue))
+        if (wl_display_dispatch_queue_pending(display, queue) < 0) return -1;
+
+    if (wl_display_flush(display) < 0)
+    {
+        if (errno != EAGAIN)
+        {
+            wl_display_cancel_read(display);
+            return -1;
+        }
+        fds[0].events |= POLLOUT;
+    }
+
+    ret = poll(fds, ARRAY_SIZE(fds), -1);
+    if (ret < 0 || !(fds[0].revents & (POLLIN | POLLERR | POLLHUP)))
+        wl_display_cancel_read(display);
+    else if (wl_display_read_events(display) < 0)
+        return -1;
+    if (ret < 0) return errno == EINTR ? 0 : -1;
+
+    /* Release the prepared read before dispatching anything that can take
+     * driver locks or issue Wayland requests, including frame imports. */
+    if (wl_display_dispatch_queue_pending(display, queue) < 0) return -1;
+    if (!(fds[1].revents & POLLIN)) return 0;
+
+    count = epoll_wait(dmabuf_epoll_fd, events, ARRAY_SIZE(events), 0);
+    if (count < 0) return errno == EINTR ? 0 : -1;
+    for (i = 0; i < count; i++)
+        wayland_surface_dispatch_dmabuf(ULongToHandle((UINT32)events[i].data.u64),
+                                        events[i].data.u64 >> 32);
+    return 0;
 }
 
 static NTSTATUS waylanddrv_unix_read_events(void *arg)
@@ -162,13 +228,12 @@ static NTSTATUS waylanddrv_unix_read_events(void *arg)
     uint32_t id, proto_err;
     const struct wl_interface *interface;
 
-    while (wl_display_dispatch_queue(process_wayland.wl_display,
-                                     process_wayland.wl_event_queue) != -1)
-        continue;
+    while (dispatch_events() != -1) continue;
     /* This function only returns on a fatal error, e.g., if our connection
      * to the Wayland server is lost. */
 
     error = wl_display_get_error(process_wayland.wl_display);
+    if (!error) error = errno;
 
     if (error == EPROTO)
     {

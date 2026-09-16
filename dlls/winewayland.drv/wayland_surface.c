@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -43,6 +44,7 @@
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+WINE_DECLARE_DEBUG_CHANNEL(dmabuf);
 
 static LONG wayland_surface_serial_counter;
 static BOOL slicing_enabled = TRUE;
@@ -341,6 +343,7 @@ struct wayland_hwnd_dmabuf_buffer
     int channel_fd;    /* dup of surface->channel_fd for sending release tokens */
     int data_fd;       /* dup of the producer backing fd, for per-slice wrappers */
     int acquire_fd;    /* sync_file for the current frame, consumed at commit */
+    BOOL acquire_monitored;
     struct wayland_syncobj_buffer *syncobj;
     LONG ignore_wl_release;
 };
@@ -413,7 +416,6 @@ struct wayland_hwnd_dmabuf_surface
     BOOL direct;
     BOOL sliced;
     BOOL syncobj_failed;
-    BOOL logged_blocking_sync;
     unsigned long long last_seen_ms; /* tick when last present in the producer list */
     int committed_width, committed_height;
     RECT host_visible_rect;
@@ -766,6 +768,8 @@ static BOOL wayland_hwnd_dmabuf_ensure_legacy_sync(
 static void wayland_hwnd_dmabuf_consume_acquire_fence(struct wayland_hwnd_dmabuf_buffer *buffer)
 {
     if (buffer->acquire_fd < 0) return;
+    if (buffer->acquire_monitored) wayland_surface_unmonitor_fd(buffer->acquire_fd);
+    buffer->acquire_monitored = FALSE;
     close(buffer->acquire_fd);
     buffer->acquire_fd = -1;
 }
@@ -853,6 +857,8 @@ static void wayland_hwnd_dmabuf_send_presentation_result(
     if ((err = wayland_hwnd_dmabuf_channel_send_release(channel_fd, &rel)))
         WARN("failed to return presentation feedback for frame %u, error %d\n",
              frame_seq, err);
+    TRACE_(dmabuf)("feedback-return producer=%s frame=%u discarded=%u error=%d\n",
+                   wine_dbgstr_longlong(producer_unique_id), frame_seq, discarded, err);
 }
 
 static void wayland_hwnd_dmabuf_discard_presentation_desc(
@@ -1037,6 +1043,7 @@ static void wayland_hwnd_dmabuf_buffer_reap(struct wayland_hwnd_dmabuf_buffer *b
 {
     struct wayland_hwnd_dmabuf_surface *surface = buffer->surface;
 
+    wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
     if (surface && surface->current == buffer)
     {
         surface->current = NULL;
@@ -1558,7 +1565,8 @@ err:
 }
 
 static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
-        struct wayland_hwnd_dmabuf_surface *surface, BOOL request_feedback)
+        struct wayland_hwnd_dmabuf_surface *surface, BOOL request_feedback,
+        struct wayland_hwnd_dmabuf_frame_sync *frame_sync)
 {
     struct wayland_hwnd_dmabuf_slice_commit
     {
@@ -1567,7 +1575,7 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
         struct wayland_hwnd_dmabuf_commit_sync sync;
         struct wl_buffer *wl_buffer;
     } *commits;
-    struct wayland_hwnd_dmabuf_frame_sync frame_sync;
+    struct wayland_hwnd_dmabuf_frame_sync local_sync;
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
     struct wayland_hwnd_dmabuf_slice *slice;
     struct wl_surface *feedback_surfaces[WAYLAND_DMABUF_MAX_SLICES] = {0};
@@ -1575,7 +1583,12 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
     BOOL ret = FALSE;
 
     if (!buffer) return FALSE;
-    if (!wayland_hwnd_dmabuf_prepare_frame_sync(surface, &frame_sync)) return FALSE;
+    if (!frame_sync)
+    {
+        /* Geometry-only reattachment of an already committed frame. */
+        frame_sync = &local_sync;
+        if (!wayland_hwnd_dmabuf_prepare_frame_sync(surface, frame_sync)) return FALSE;
+    }
     if (!(commits = calloc(surface->slice_count, sizeof(*commits)))) return FALSE;
 
     wl_list_for_each(slice, &surface->slices, link)
@@ -1588,7 +1601,7 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
         feedback_surfaces[count - 1] = slice->wl_surface;
         wayland_hwnd_dmabuf_color_surface_sync(
             &slice->color_surface, slice->wl_surface, &buffer->desc);
-        if (frame_sync.backend == WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
+        if (frame_sync->backend == WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
         {
             /* Explicit releases are per surface commit, not per wl_buffer.
              * Share the retained import without sharing release points. */
@@ -1602,10 +1615,10 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
                 goto done;
         }
         if (!wayland_hwnd_dmabuf_prepare_commit_sync(
-                &frame_sync, slice->wl_surface, &slice->syncobj_surface,
+                frame_sync, slice->wl_surface, &slice->syncobj_surface,
                 &slice->explicit_sync, &commit->sync))
         {
-            if (frame_sync.backend == WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
+            if (frame_sync->backend == WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
                 wayland_hwnd_dmabuf_surface_disable_syncobj(surface, TRUE);
             goto done;
         }
@@ -1655,13 +1668,17 @@ static BOOL wayland_hwnd_dmabuf_surface_attach_slices(
 
     wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
     ret = count == surface->slice_count && count;
+    if (ret && request_feedback)
+        TRACE_(dmabuf)("commit-slices hwnd=%p producer=%s frame=%u parts=%u\n",
+                       surface->hwnd, wine_dbgstr_longlong(buffer->desc.producer_unique_id),
+                       buffer->desc.frame_seq, count);
 
 done:
     for (i = 0; i < count; i++)
     {
         wayland_hwnd_dmabuf_cancel_commit_sync(&commits[i].sync);
         free(commits[i].slice_buffer);
-        if (commits[i].wl_buffer && frame_sync.backend != WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
+        if (commits[i].wl_buffer && frame_sync->backend != WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
             wl_buffer_destroy(commits[i].wl_buffer);
     }
     free(commits);
@@ -1723,7 +1740,11 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
         !wayland_hwnd_dmabuf_surface_send_consumer_state(surface,
                 HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
         surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
-    if (surface->channel_fd >= 0) close(surface->channel_fd);
+    if (surface->channel_fd >= 0)
+    {
+        wayland_surface_unmonitor_fd(surface->channel_fd);
+        close(surface->channel_fd);
+    }
     free(surface);
 }
 
@@ -4389,7 +4410,7 @@ static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabu
 static enum wayland_hwnd_dmabuf_configure_result
 wayland_hwnd_dmabuf_surface_apply_slices(struct wayland_hwnd_dmabuf_surface *surface,
         struct wl_surface *sibling, const struct wayland_hwnd_dmabuf_slice_geometry *layout,
-        unsigned int count, BOOL attach_frame)
+        unsigned int count, BOOL attach_frame, struct wayland_hwnd_dmabuf_frame_sync *frame_sync)
 {
     BOOL layout_matches = wayland_hwnd_dmabuf_surface_slice_layout_matches(
             surface, sibling, layout, count);
@@ -4411,7 +4432,7 @@ wayland_hwnd_dmabuf_surface_apply_slices(struct wayland_hwnd_dmabuf_surface *sur
     {
         wl_surface_attach(surface->wl_surface, NULL, 0, 0);
         wl_surface_commit(surface->wl_surface);
-        if (!wayland_hwnd_dmabuf_surface_attach_slices(surface, attach_frame)) goto failed;
+        if (!wayland_hwnd_dmabuf_surface_attach_slices(surface, attach_frame, frame_sync)) goto failed;
     }
     return WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED;
 
@@ -4422,7 +4443,8 @@ failed:
 
 static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_configure_slices(
         struct wayland_surface *parent, struct wayland_hwnd_dmabuf_surface *surface,
-        const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling, BOOL attach_frame)
+        const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling, BOOL attach_frame,
+        struct wayland_hwnd_dmabuf_frame_sync *frame_sync)
 {
     RECT child_rect = wine_server_get_rect(info->client), clipped, client, dst;
     struct wayland_hwnd_dmabuf_slice_geometry layout[WAYLAND_DMABUF_MAX_SLICES];
@@ -4513,7 +4535,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
     free(data);
 
     return wayland_hwnd_dmabuf_surface_apply_slices(
-            surface, sibling, layout, count, attach_frame);
+            surface, sibling, layout, count, attach_frame, frame_sync);
 }
 
 static enum wayland_hwnd_dmabuf_configure_result
@@ -4521,7 +4543,7 @@ wayland_hwnd_dmabuf_surface_configure_hosted_slices(
         struct wayland_hwnd_dmabuf_surface *surface,
         struct wayland_hwnd_dmabuf_surface *container,
         const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling,
-        BOOL attach_frame)
+        BOOL attach_frame, struct wayland_hwnd_dmabuf_frame_sync *frame_sync)
 {
     struct wayland_hwnd_dmabuf_slice_geometry layout[WAYLAND_DMABUF_MAX_SLICES];
     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
@@ -4601,7 +4623,7 @@ wayland_hwnd_dmabuf_surface_configure_hosted_slices(
     }
 
     result = wayland_hwnd_dmabuf_surface_apply_slices(
-            surface, sibling, layout, count, attach_frame);
+            surface, sibling, layout, count, attach_frame, frame_sync);
     goto done;
 
 fully_visible:
@@ -4653,7 +4675,8 @@ static BOOL wayland_hwnd_dmabuf_surface_sync_alpha(
 static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_configure(
         struct wayland_surface *parent, struct wayland_hwnd_dmabuf_surface *surface,
         struct wayland_hwnd_dmabuf_surface *container,
-        const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling, BOOL attach_frame)
+        const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling, BOOL attach_frame,
+        struct wayland_hwnd_dmabuf_frame_sync *frame_sync)
 {
     struct wayland_hwnd_dmabuf_geometry geometry;
     enum wayland_hwnd_dmabuf_configure_result ret;
@@ -4667,7 +4690,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
     if (slicing && container)
     {
         ret = wayland_hwnd_dmabuf_surface_configure_hosted_slices(
-                surface, container, info, sibling, attach_frame);
+                surface, container, info, sibling, attach_frame, frame_sync);
         if (ret != WAYLAND_HWNDDMABUF_CONFIGURE_NOT_APPLICABLE)
         {
             if (alpha_changed && ret == WAYLAND_HWNDDMABUF_CONFIGURE_NOOP)
@@ -4681,7 +4704,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
     if (slicing && !container && !surface->host_surface)
     {
         ret = wayland_hwnd_dmabuf_surface_configure_slices(parent, surface, info, sibling,
-                                                           attach_frame);
+                                                           attach_frame, frame_sync);
         if (ret != WAYLAND_HWNDDMABUF_CONFIGURE_FAILED)
         {
             if (alpha_changed && ret == WAYLAND_HWNDDMABUF_CONFIGURE_NOOP)
@@ -4731,6 +4754,11 @@ static void wayland_hwnd_dmabuf_surface_claim_channel(struct wayland_hwnd_dmabuf
     if (wine_server_handle_to_fd(handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL))
         fd = -1;
     NtClose(handle);
+    if (fd >= 0 && !wayland_surface_monitor_fd(surface->parent, fd))
+    {
+        close(fd);
+        fd = -1;
+    }
     surface->channel_fd = fd;
     if (fd >= 0) TRACE("hwnd=%p claimed %s socket channel fd %d\n", surface->hwnd,
                        surface->gdi_overlay ? "gdi overlay" : "dmabuf", fd);
@@ -4970,6 +4998,27 @@ static BOOL wayland_hwnd_dmabuf_buffer_enable_wl_release(
     return TRUE;
 }
 
+/* The compositor/implicit-sync paths normally consume the acquire fence.
+ * If neither can, wait for fd readiness without blocking event dispatch. */
+static BOOL wayland_hwnd_dmabuf_acquire_ready(struct wayland_hwnd_dmabuf_surface *surface)
+{
+    struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
+    struct pollfd pfd = {buffer->acquire_fd, POLLIN};
+    int ret;
+
+    do ret = poll(&pfd, 1, 0);
+    while (ret < 0 && errno == EINTR);
+    if (!ret)
+    {
+        if (!buffer->acquire_monitored)
+            buffer->acquire_monitored = wayland_surface_monitor_fd(surface->parent, buffer->acquire_fd);
+        return FALSE;
+    }
+    if (buffer->acquire_monitored) wayland_surface_unmonitor_fd(buffer->acquire_fd);
+    buffer->acquire_monitored = FALSE;
+    return ret > 0 && (pfd.revents & POLLIN) && !(pfd.revents & (POLLERR | POLLNVAL));
+}
+
 static BOOL wayland_hwnd_dmabuf_prepare_frame_sync(
         struct wayland_hwnd_dmabuf_surface *surface,
         struct wayland_hwnd_dmabuf_frame_sync *sync)
@@ -5017,12 +5066,7 @@ static BOOL wayland_hwnd_dmabuf_prepare_frame_sync(
     if (!wayland_hwnd_dmabuf_desc_is_shm(&buffer->desc) &&
         wayland_dmabuf_import_sync_file(buffer->data_fd, buffer->acquire_fd))
         return TRUE;
-    if (!surface->logged_blocking_sync)
-    {
-        WARN("hwnd=%p waiting for acquire fences on the present thread\n", surface->hwnd);
-        surface->logged_blocking_sync = TRUE;
-    }
-    return wayland_sync_file_wait(buffer->acquire_fd);
+    return wayland_hwnd_dmabuf_acquire_ready(surface);
 }
 
 static BOOL wayland_hwnd_dmabuf_prepare_commit_sync(
@@ -5124,7 +5168,7 @@ static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *su
     buffer->dirty_count = min(desc->dirty_count, HWND_DMABUF_MAX_DIRTY_RECTS);
     memcpy(buffer->dirty_rects, desc->dirty_rects, sizeof(buffer->dirty_rects));
     buffer->release_flags = HWND_DMABUF_RELEASE_ORPHANED;
-    if (buffer->acquire_fd >= 0) close(buffer->acquire_fd);
+    wayland_hwnd_dmabuf_consume_acquire_fence(buffer);
     buffer->acquire_fd = acquire_fd;
     surface->current = buffer;
     surface->frame_seq = desc->frame_seq;
@@ -5320,7 +5364,8 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
     BOOL retried = FALSE;
     int pfd = -1, psync_fd = -1, fd, sync_fd, r;
 
-    *attached_frame = FALSE;
+    /* A frame deferred for an acquire fence still needs its first commit. */
+    *attached_frame = surface->current && !surface->current_committed;
     memset(&pdesc, 0, sizeof(pdesc));
 
 retry:
@@ -5341,6 +5386,8 @@ retry:
         BOOL host_frame = (desc.flags & HWND_DMABUF_FLAG_HOST_SURFACE) != 0;
         BOOL expect_host_frame = surface->gdi_overlay && surface->host_surface;
 
+        TRACE_(dmabuf)("receive hwnd=%p producer=%s frame=%u\n", surface->hwnd,
+                       wine_dbgstr_longlong(desc.producer_unique_id), desc.frame_seq);
         /* Placement comes from frame info; only GDI carriers encode it here. */
         if (!desc_valid || !format_supported || overlay_frame != surface->gdi_overlay ||
             host_frame != expect_host_frame)
@@ -5366,6 +5413,13 @@ retry:
             }
             continue;
         }
+        /* Retire an uncommitted frame before importing any newer slots: a
+         * producer/generation change can evict its buffer from the cache. */
+        if (surface->current && !surface->current_committed)
+        {
+            wayland_hwnd_dmabuf_drop_current_frame(surface, HWND_DMABUF_RELEASE_DROPPED);
+            *attached_frame = FALSE;
+        }
         if (have_pending)
         {
             wayland_hwnd_dmabuf_retire_frame(surface, &pdesc, pfd);
@@ -5378,6 +5432,7 @@ retry:
     }
     if (r < 0)
     {
+        wayland_surface_unmonitor_fd(surface->channel_fd);
         close(surface->channel_fd);
         surface->channel_fd = -1;
         surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
@@ -5613,12 +5668,6 @@ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *sur
         wayland_hwnd_dmabuf_surface_destroy(surface->direct_dmabuf_surface);
 }
 
-static void wayland_surface_clear_dmabuf_children(struct wayland_surface *surface)
-{
-    wayland_surface_destroy_dmabuf_surfaces(surface);
-    surface->dmabuf_bottom = NULL;
-}
-
 static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface,
                                                  struct wayland_win_data *data,
                                                  const hwnd_dmabuf_frame_info_t *frames,
@@ -5634,6 +5683,12 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
     int width, height;
 
     if (wayland_surface_has_external_commit_owner(surface)) return FALSE;
+
+    /* Keep an established child presenter instead of replacing its consumer
+     * just because direct presentation became possible. In particular, an
+     * opened replacement producer may not have submitted a frame yet. */
+    if (!surface->direct_dmabuf_surface && !wl_list_empty(&surface->hwnd_dmabuf_surfaces))
+        return FALSE;
 
     if (!process_wayland.zwp_linux_dmabuf_v1)
     {
@@ -5651,6 +5706,7 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
     {
         if ((direct = surface->direct_dmabuf_surface) && direct->current)
         {
+            if (!direct->current_committed) return TRUE;
             direct->seen = TRUE;
             direct->last_seen_ms = now;
             goto commit_current;
@@ -5658,8 +5714,6 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
         wayland_surface_clear_direct_dmabuf(surface, data);
         return FALSE;
     }
-
-    wayland_surface_clear_dmabuf_children(surface);
 
     if (!(direct = surface->direct_dmabuf_surface) &&
         !(direct = wayland_hwnd_dmabuf_surface_create_direct(surface, (HWND)(UINT_PTR)frames[0].hwnd)))
@@ -5708,8 +5762,14 @@ commit_current:
 
     if (!direct->current_committed)
     {
-        if (!wayland_hwnd_dmabuf_prepare_frame_sync(direct, &frame_sync) ||
-            !wayland_hwnd_dmabuf_prepare_commit_sync(
+        if (!wayland_hwnd_dmabuf_prepare_frame_sync(direct, &frame_sync))
+        {
+            if (direct->current->acquire_monitored) return TRUE;
+            wayland_hwnd_dmabuf_drop_current_frame(direct, HWND_DMABUF_RELEASE_FAILED);
+            wayland_surface_clear_direct_dmabuf(surface, data);
+            return FALSE;
+        }
+        if (!wayland_hwnd_dmabuf_prepare_commit_sync(
                     &frame_sync, surface->wl_surface,
                     wayland_hwnd_dmabuf_syncobj_slot(direct),
                     &direct->explicit_sync, &commit_sync) ||
@@ -5739,6 +5799,9 @@ commit_current:
     wayland_surface_commit(surface);
     if (!direct->current_committed)
     {
+        TRACE_(dmabuf)("commit-direct hwnd=%p producer=%s frame=%u\n",
+                       direct->hwnd, wine_dbgstr_longlong(direct->current->desc.producer_unique_id),
+                       direct->current->desc.frame_seq);
         wayland_hwnd_dmabuf_consume_acquire_fence(direct->current);
         if (frame_sync.backend != WAYLAND_HWNDDMABUF_SYNC_SYNCOBJ)
             wayland_hwnd_dmabuf_buffer_add_commit_ref(direct->current);
@@ -5909,7 +5972,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         wayland_surface_activate_hwnd_dmabuf_consumers(surface);
     }
 
-    /* Import is driven by producer wakes (WM_WAYLAND_DMABUF_FRAME) at the producer's
+    /* Import is driven by readable producer channels at the producer's
      * self-paced rate, regardless of whether our toplevel is presented. We do not pace
      * to a frame callback on our surface: the compositor stops firing it when the surface
      * is not in front, stalling delivery while another window (e.g. a game) is active. */
@@ -5947,6 +6010,16 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                 return;
             }
         }
+    }
+
+    /* A queued configure is not a presentation barrier. Reuse the accepted
+     * configuration until the window thread processes its replacement, while
+     * still enforcing the initial configure and strict fullscreen sizes. */
+    if (!wayland_surface_has_external_commit_owner(surface) &&
+        !wayland_surface_reconfigure(surface))
+    {
+        if (frames != stack_frames) free(frames);
+        return;
     }
 
     data = wayland_win_data_get_nolock(surface->hwnd);
@@ -6009,10 +6082,10 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                         wayland_hwnd_dmabuf_container_composites_children(container)))
                     any_new = TRUE;
                 if (dmabuf_surface->suppressed) continue;
-                if (dmabuf_surface->current &&
+                if (dmabuf_surface->current && dmabuf_surface->current_committed &&
                     (configure_result = wayland_hwnd_dmabuf_surface_configure(
                             surface, dmabuf_surface, container, &frames[i], frame_sibling,
-                            FALSE)) !=
+                            FALSE, NULL)) !=
                     WAYLAND_HWNDDMABUF_CONFIGURE_FAILED)
                 {
                     if (configure_result == WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED)
@@ -6058,10 +6131,16 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
             any_new = TRUE;
         if (dmabuf_surface->suppressed) continue;
         if (!dmabuf_surface->current) continue;
+        if (attached_frame && !wayland_hwnd_dmabuf_prepare_frame_sync(dmabuf_surface, &frame_sync))
+        {
+            if (!dmabuf_surface->current->acquire_monitored)
+                wayland_hwnd_dmabuf_drop_current_frame(dmabuf_surface, HWND_DMABUF_RELEASE_FAILED);
+            continue;
+        }
         if (attached_frame) wayland_hwnd_dmabuf_attach_current(dmabuf_surface);
         if ((configure_result = wayland_hwnd_dmabuf_surface_configure(
                 surface, dmabuf_surface, container, &frames[i], frame_sibling,
-                attached_frame)) ==
+                attached_frame, attached_frame ? &frame_sync : NULL)) ==
             WAYLAND_HWNDDMABUF_CONFIGURE_FAILED)
         {
             TRACE("hwnd=%p child=%p configure failed frame_seq=%u\n",
@@ -6079,8 +6158,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         {
             if (attached_frame && !dmabuf_surface->sliced)
             {
-                if (!wayland_hwnd_dmabuf_prepare_frame_sync(dmabuf_surface, &frame_sync) ||
-                    !wayland_hwnd_dmabuf_prepare_commit_sync(
+                if (!wayland_hwnd_dmabuf_prepare_commit_sync(
                             &frame_sync, dmabuf_surface->wl_surface,
                             &dmabuf_surface->syncobj_surface,
                             &dmabuf_surface->explicit_sync, &commit_sync) ||
@@ -6112,7 +6190,13 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
             }
             wl_surface_commit(dmabuf_surface->wl_surface);
             if (attached_frame && !dmabuf_surface->sliced)
+            {
+                TRACE_(dmabuf)("commit-child hwnd=%p producer=%s frame=%u\n",
+                               dmabuf_surface->hwnd,
+                               wine_dbgstr_longlong(dmabuf_surface->current->desc.producer_unique_id),
+                               dmabuf_surface->current->desc.frame_seq);
                 wayland_hwnd_dmabuf_consume_acquire_fence(dmabuf_surface->current);
+            }
             any_new = TRUE;
         }
         else
@@ -6179,9 +6263,29 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                                      data->client_surface->stack_above_parent);
     }
 
-    if (any_new)
-        wayland_surface_commit_pending_state(surface);
+    /* Reconfiguration may have staged parent geometry even without a frame. */
+    wayland_surface_commit_pending_state(surface);
     if (frames != stack_frames) free(frames);
+}
+
+/* Frame delivery must make progress even when the window thread is inside an
+ * application callback waiting for its renderer. Only access driver state here;
+ * do not enter the window_surface flush path or send application messages. */
+void wayland_surface_dispatch_dmabuf(HWND hwnd, UINT32 serial)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    BOOL had_content, refresh_state = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    if ((surface = data->wayland_surface) && (UINT32)surface->serial == serial)
+    {
+        had_content = wayland_surface_has_hwnd_dmabuf_content(surface);
+        wayland_surface_update_hwnd_dmabufs(surface);
+        refresh_state = had_content != wayland_surface_has_hwnd_dmabuf_content(surface);
+    }
+    wayland_win_data_release(data);
+    if (refresh_state) NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
 }
 
 /**********************************************************************

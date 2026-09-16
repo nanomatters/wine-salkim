@@ -1016,6 +1016,9 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
                                  BOOL overlay_content, HRGN clip_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 void ensure_window_surface_contents(HWND hwnd);
+BOOL wayland_surface_monitor_fd(struct wayland_surface *surface, int fd);
+void wayland_surface_unmonitor_fd(int fd);
+void wayland_surface_dispatch_dmabuf(HWND hwnd, UINT32 serial);
 void wayland_window_init(void);
 
 /**********************************************************************

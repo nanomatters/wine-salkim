@@ -1433,11 +1433,19 @@ static void hwnd_dmabuf_release_gdi_overlay_server_channel( struct window *win )
     }
 }
 
-/* Pending producers are also listed so parents do not snapshot their GDI host
- * while the producer is still allocating its first exportable images. */
-static int hwnd_dmabuf_is_listed( struct window *win )
+static int hwnd_dmabuf_has_producer( struct window *win )
 {
     return win->dmabuf_producer_count || win->dmabuf_pending_count || win->gdi_overlay_producer_count;
+}
+
+/* A client reserved for GPU drawing stays listed between swapchains. Its
+ * opened flags describe the current producer, while visibility and geometry
+ * belong to the window. This lets consumers retain content across a recreate
+ * without mistaking a missing producer for a hidden window. */
+static int hwnd_dmabuf_is_listed( struct window *win )
+{
+    return hwnd_dmabuf_has_producer( win ) ||
+           (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT));
 }
 
 static struct window *hwnd_dmabuf_get_owner( struct window *win )
@@ -1547,7 +1555,7 @@ static int hwnd_dmabuf_has_single_local_frame( struct window *root )
     unsigned int count = 0;
 
     for (win = root; win; win = hwnd_dmabuf_next_tree_window( root, win ))
-        if (hwnd_dmabuf_is_listed( win ) && is_visible( win ) && ++count > 1) return 0;
+        if (hwnd_dmabuf_has_producer( win ) && is_visible( win ) && ++count > 1) return 0;
     return count == 1;
 }
 

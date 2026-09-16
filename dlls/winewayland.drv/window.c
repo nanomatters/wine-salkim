@@ -38,6 +38,7 @@
 #include "wine/hwnd_dmabuf.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+WINE_DECLARE_DEBUG_CHANNEL(dmabuf);
 
 
 static int wayland_win_data_cmp_rb(const void *key,
@@ -54,8 +55,6 @@ static int wayland_win_data_cmp_rb(const void *key,
 
 static pthread_mutex_t win_data_mutex;
 static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
-static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd);
-static BOOL window_surface_has_queued_configure(HWND hwnd);
 static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd);
 
 static const WCHAR frameless_window_prop[] =
@@ -1842,22 +1841,14 @@ static void wayland_configure_window(HWND hwnd)
         wayland_win_data_release(data);
     }
 
+    TRACE_(dmabuf)("resize-begin hwnd=%p rect=%s flags=%#x\n", hwnd, wine_dbgstr_rect(&rect), flags);
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+    TRACE_(dmabuf)("resize-end hwnd=%p\n", hwnd);
 
-    /* Ack/promote the processed configure if rawpos did not flush it. */
-    if ((data = wayland_win_data_get(hwnd)))
-    {
-        surface = data->wayland_surface;
-        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
-            surface->xdg_surface && surface->processing.serial &&
-            surface->processing.processed)
-        {
-            wayland_win_data_release(data);
-            /* Preserve flush lock order: surface before win_data. */
-            ensure_window_surface_contents(hwnd);
-        }
-        else wayland_win_data_release(data);
-    }
+    /* rawpos may already have acknowledged the configure while flushing GDI.
+     * Still update retained producer geometry; a replacement frame need not
+     * arrive while the application recreates its swapchain. No locks are held. */
+    ensure_window_surface_contents(hwnd);
 }
 
 /**********************************************************************
@@ -1932,9 +1923,6 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
 
-        if (window_surface_has_queued_configure(hwnd))
-            wayland_configure_window(hwnd);
-
         if ((wp & HWND_DMABUF_WAKE_REANNOUNCE) &&
             (data = wayland_win_data_get(hwnd)))
         {
@@ -1943,11 +1931,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             wayland_win_data_release(data);
         }
 
-        if (window_surface_configure_blocks_dmabuf(hwnd))
-            return 0;
-
         /* A producer published a frame for a descendant of this toplevel.
-         * Import it in the process that owns the toplevel's wayland surface. */
+         * Import it without entering application resize callbacks. Configures
+         * have their own message and must not starve frame delivery. */
         had_dmabuf_content = window_surface_has_hwnd_dmabuf_content(hwnd);
         ensure_window_surface_contents(hwnd);
         if (had_dmabuf_content != window_surface_has_hwnd_dmabuf_content(hwnd))
@@ -2491,43 +2477,6 @@ static BOOL window_client_surface_attached(struct wayland_win_data *data)
 static BOOL window_client_surface_pending_first_frame(struct wayland_win_data *data)
 {
     return data->client_surface && !ReadAcquire(&data->client_surface->has_presented);
-}
-
-static BOOL window_surface_has_queued_configure(HWND hwnd)
-{
-    struct wayland_win_data *data;
-    struct wayland_surface *surface;
-    BOOL ret = FALSE;
-
-    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
-    surface = data->wayland_surface;
-    if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
-        surface->xdg_surface && surface->queued.serial)
-        ret = TRUE;
-    wayland_win_data_release(data);
-
-    return ret;
-}
-
-static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd)
-{
-    struct wayland_win_data *data;
-    struct wayland_surface *surface;
-    BOOL ret = FALSE;
-
-    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
-    surface = data->wayland_surface;
-    if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->xdg_surface)
-    {
-        /* Keep producer frames flowing while a maximize/restore SysCommand is
-         * pending. Only an actual unconfigured parent blocks dmabuf commits. */
-        ret = surface->queued.serial ||
-              (surface->processing.serial && !surface->processing.processed &&
-               !surface->current.serial);
-    }
-    wayland_win_data_release(data);
-
-    return ret;
 }
 
 static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)

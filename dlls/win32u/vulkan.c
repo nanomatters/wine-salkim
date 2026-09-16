@@ -52,6 +52,7 @@
 #include "fsr_spv.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+WINE_DECLARE_DEBUG_CHANNEL(dmabuf);
 
 static PFN_vkGetDeviceProcAddr p_vkGetDeviceProcAddr;
 static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
@@ -4810,6 +4811,9 @@ static BOOL managed_complete_feedback_locked(
         struct wine_managed_feedback *feedback = &managed->feedbacks[i];
 
         if (feedback->frame_seq != frame_seq) continue;
+        TRACE_(dmabuf)( "feedback-complete hwnd=%p producer=%s frame=%u present=%s\n",
+                        managed->hwnd, wine_dbgstr_longlong(managed->producer_unique_id), frame_seq,
+                        wine_dbgstr_longlong(feedback->present_id) );
         if (feedback->present_id > managed->completed_application_present_id)
             managed->completed_application_present_id = feedback->present_id;
         memmove( feedback, feedback + 1,
@@ -5150,6 +5154,9 @@ static VkResult managed_present( struct vulkan_device *device, struct swapchain 
     {
         int serr = hwnd_dmabuf_channel_send( managed->channel_fd, &desc,
                                              channel_fd_dup, send_sync_fd );
+        TRACE_(dmabuf)( "send hwnd=%p producer=%s frame=%u present=%s error=%d\n",
+                        managed->hwnd, wine_dbgstr_longlong(desc.producer_unique_id), frame_seq,
+                        wine_dbgstr_longlong(application_present_id), serr );
         if (serr)
         {
             BOOL fatal = dmabuf_send_error_is_fatal( serr );
