@@ -1106,7 +1106,7 @@ static BOOL is_managed(HWND hwnd)
     return ret;
 }
 
-static HWND *build_hwnd_list(void)
+static HWND *build_hwnd_list(HWND parent)
 {
     NTSTATUS status;
     HWND *list;
@@ -1115,7 +1115,7 @@ static HWND *build_hwnd_list(void)
     for (;;)
     {
         if (!(list = malloc(count * sizeof(*list)))) return NULL;
-        status = NtUserBuildHwndList(0, 0, 0, 0, 0, count, list, &count);
+        status = NtUserBuildHwndList(0, parent, !!parent, 0, 0, count, list, &count);
         if (!status) return list;
         free(list);
         if (status != STATUS_BUFFER_TOO_SMALL) return NULL;
@@ -1128,7 +1128,7 @@ static BOOL has_owned_popups(HWND hwnd)
     UINT i;
     BOOL ret = FALSE;
 
-    if (!(list = build_hwnd_list())) return FALSE;
+    if (!(list = build_hwnd_list(NULL))) return FALSE;
 
     for (i = 0; list[i] != HWND_BOTTOM; i++)
     {
@@ -1426,6 +1426,9 @@ BOOL wayland_window_is_externally_hosted(HWND hwnd, HWND *host)
     {
         owner = NtUserGetAncestor(owner, GA_ROOT);
         if (!owner || owner == root || owner == NtUserGetDesktopWindow()) break;
+        /* Ownership does not make an owned window follow its owner's visibility.
+         * A hidden owner cannot host subsurfaces; keep this tree independent. */
+        if (!NtUserIsWindowVisible(owner)) break;
         owner_process = (DWORD)(ULONG_PTR)NtUserQueryWindow(owner, WindowProcess);
         if (!owner_process) break;
         if (owner_process != process)
@@ -1436,6 +1439,34 @@ BOOL wayland_window_is_externally_hosted(HWND hwnd, HWND *host)
         root = owner;
     }
     return FALSE;
+}
+
+static void queue_external_host_updates(HWND hwnd, BOOL children)
+{
+    HWND *list, owner;
+    UINT i;
+
+    /* Owned roots re-evaluate their host and propagate a changed host through
+     * their own trees. Do not wait for another process while changing roles. */
+    if ((list = build_hwnd_list(NULL)))
+    {
+        for (i = 0; list[i] != HWND_BOTTOM; i++)
+        {
+            owner = NtUserGetWindowRelative(list[i], GW_OWNER);
+            if (owner && NtUserGetAncestor(owner, GA_ROOT) == hwnd)
+                NtUserPostMessage(list[i], WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+        }
+        free(list);
+    }
+
+    /* Child surfaces use the root's owner chain too, including children in
+     * other processes. Refresh them when that chain changes presentation host. */
+    if (children && (list = build_hwnd_list(hwnd)))
+    {
+        for (i = 0; list[i] != HWND_BOTTOM; i++)
+            NtUserPostMessage(list[i], WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+        free(list);
+    }
 }
 
 BOOL wayland_window_get_effective_alpha(HWND hwnd, BYTE *alpha)
@@ -1507,6 +1538,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL managed = FALSE, visible = NtUserIsWindowVisible(hwnd), fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL continue_configure = FALSE;
+    BOOL update_owned;
     BOOL foreground = NtUserGetForegroundWindow() == hwnd;
     HWND previous_host = NULL;
     HWND external_host = NULL;
@@ -1617,6 +1649,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         data->explicitly_hidden = FALSE;
     visible = visible && !data->explicitly_hidden;
 
+    update_owned = hwnd == root && (data->visible != visible || data->owner != window_owner ||
+                                   previous_host != external_host);
     data->rects = *new_rects;
     data->toplevel = owned_overlay ? overlay_owner : root;
     data->owner = window_owner;
@@ -1687,6 +1721,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         NtUserPostMessage(previous_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
     if (externally_hosted)
         NtUserPostMessage(external_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
+    if (update_owned)
+        queue_external_host_updates(hwnd, previous_host != external_host);
 
     if (continue_configure) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
 

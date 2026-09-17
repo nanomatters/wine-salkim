@@ -1570,6 +1570,9 @@ static int hwnd_dmabuf_collect_owned_frames( struct window *host, struct window 
 
     if (depth == ARRAY_SIZE(collector->owners)) return 1;
     if (!host->desktop || !host->desktop->top_window) return 1;
+    /* Hidden owners do not hide their owned windows. Those trees present
+     * independently instead of exporting frames to an unmapped host. */
+    if (!is_visible( owner )) return 1;
     collector->owners[depth] = owner;
     LIST_FOR_EACH_ENTRY( win, &host->desktop->top_window->children, struct window, entry )
     {
