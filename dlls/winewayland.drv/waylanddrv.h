@@ -901,6 +901,8 @@ BOOL wayland_is_menu_popup(HWND hwnd);
 BOOL wayland_window_is_externally_hosted(HWND hwnd, HWND *host);
 BOOL wayland_window_get_effective_alpha(HWND hwnd, BYTE *alpha);
 HWND wayland_keyboard_get_input_hwnd(HWND surface_hwnd, HWND foreground);
+HWND wayland_keyboard_get_focus_owner(HWND hwnd);
+BOOL wayland_window_has_popup_grab(HWND hwnd);
 void wayland_window_surface_set_external_host(struct window_surface *surface, HWND host);
 BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
 void wayland_set_layer_menu_hwnd(HWND hwnd);

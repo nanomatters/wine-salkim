@@ -775,6 +775,7 @@ static BOOL window_is_owned_by(HWND hwnd, HWND owner)
 HWND wayland_keyboard_get_input_hwnd(HWND surface_hwnd, HWND foreground)
 {
     /* Owner queries may enter win32u and must run without driver locks held. */
+    surface_hwnd = wayland_keyboard_get_focus_owner(surface_hwnd);
     if (foreground && window_is_owned_by(foreground, surface_hwnd)) return foreground;
     return surface_hwnd;
 }
@@ -977,7 +978,7 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
     input_hwnd = wayland_keyboard_get_input_hwnd(hwnd, NtUserGetForegroundWindow());
     /* Input language follows Win32 focus while surface state remains tied to the Wayland toplevel. */
     NtUserPostMessage(input_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
-    NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+    NtUserPostMessage(wayland_keyboard_get_focus_owner(hwnd), WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
 
@@ -1040,7 +1041,8 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
 
     if (wayland_is_layer_menu_hwnd(hwnd))
         wayland_cancel_layer_menu(hwnd);
-    else if (input_hwnd == foreground || wayland_is_menu_popup(hwnd))
+    else if ((input_hwnd == foreground || wayland_is_menu_popup(hwnd)) &&
+             !wayland_window_has_popup_grab(wayland_keyboard_get_focus_owner(hwnd)))
     {
         if (!(NtUserGetWindowLongW(input_hwnd, GWL_STYLE) & WS_MINIMIZE))
             send_message(input_hwnd, WM_CANCELMODE, 0, 0);
@@ -1049,7 +1051,7 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
     if (input_hwnd == foreground)
     {
         if (!wayland_disable_focus_loss())
-            NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+            NtUserPostMessage(wayland_keyboard_get_focus_owner(hwnd), WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
     }
 }
 

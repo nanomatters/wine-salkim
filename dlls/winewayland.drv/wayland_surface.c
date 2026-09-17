@@ -2040,10 +2040,9 @@ static void xdg_popup_handle_done(void *private, struct xdg_popup *xdg_popup)
     struct wayland_surface *surface;
     struct wayland_win_data *data;
     HWND hwnd = private;
+    BOOL grabbed = FALSE;
 
-    /* Recreate the popup if the compositor dismissed it for some reason.
-     * The protocol does not explicitly prohibit this from occuring on ungrabbed popups. */
-    WARN("Compositor dismissed popup hwnd=%p\n", hwnd);
+    TRACE("Compositor dismissed popup hwnd=%p\n", hwnd);
 
     /* the protocol requires us to destroy the xdg_popup */
     xdg_popup_destroy(xdg_popup);
@@ -2051,11 +2050,24 @@ static void xdg_popup_handle_done(void *private, struct xdg_popup *xdg_popup)
     if (!(data = wayland_win_data_get(hwnd))) return;
     if ((surface = data->wayland_surface) && surface->xdg_popup == xdg_popup)
     {
+        grabbed = surface->xdg_popup_grabbed;
         surface->xdg_popup = NULL;
         wayland_surface_clear_role(surface);
     }
     wayland_win_data_release(data);
 
+    if (grabbed)
+    {
+        HWND owner = wayland_keyboard_get_focus_owner(hwnd);
+
+        /* This is the compositor's dismissal of the menu, not a request to
+         * map it again. End tracking on the owning window thread. */
+        NtUserPostMessage(owner, WM_CANCELMODE, 0, 0);
+        NtUserPostMessage(owner, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+        return;
+    }
+
+    /* Ungrabbed popups may still be wanted by the application. */
     update_window_state(hwnd);
     NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
 }

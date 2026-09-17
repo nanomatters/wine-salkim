@@ -1340,6 +1340,46 @@ BOOL wayland_is_menu_popup(HWND hwnd)
     return get_popup_owner(hwnd, NULL) != NULL;
 }
 
+HWND wayland_keyboard_get_focus_owner(HWND hwnd)
+{
+    HWND owner;
+
+    /* Win32 menus retain their owner's focus, even when a Wayland popup grab
+     * moves keyboard focus to the menu. Use the HWND ownership so this also
+     * works after popup_done has destroyed the Wayland role. */
+    while (wayland_is_popup_menu_class(hwnd) && !wayland_is_layer_menu_hwnd(hwnd) &&
+           (owner = get_popup_owner(hwnd, NULL)))
+        hwnd = owner;
+
+    return hwnd;
+}
+
+BOOL wayland_window_has_popup_grab(HWND hwnd)
+{
+    struct wayland_win_data *data, *owner_data;
+    struct wayland_surface *surface;
+    BOOL grabbed = FALSE;
+
+    pthread_mutex_lock(&win_data_mutex);
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        surface = data->wayland_surface;
+        while (surface && wayland_surface_is_popup(surface) && surface->xdg_popup_grabbed)
+        {
+            if (surface->hwnd == hwnd || surface->owner_hwnd == hwnd)
+            {
+                grabbed = TRUE;
+                goto done;
+            }
+            owner_data = wayland_win_data_get_nolock(surface->owner_hwnd);
+            surface = owner_data ? owner_data->wayland_surface : NULL;
+        }
+    }
+done:
+    pthread_mutex_unlock(&win_data_mutex);
+    return grabbed;
+}
+
 static BOOL is_layer_shell_menu_popup(HWND hwnd)
 {
     return wayland_is_menu_popup_candidate(hwnd) && wayland_is_popup_menu_class(hwnd);
@@ -2417,7 +2457,12 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
     pthread_mutex_lock(&keyboard->mutex);
     focused_hwnd = keyboard->focused_hwnd;
     pthread_mutex_unlock(&keyboard->mutex);
+    focused_hwnd = wayland_keyboard_get_focus_owner(focused_hwnd);
     surface_focused = focused_hwnd == hwnd;
+
+    /* A leave/enter pair may be processed by different window-thread turns.
+     * A live popup grab keeps its owner active until popup_done or teardown. */
+    if (!focused_hwnd && wayland_window_has_popup_grab(hwnd)) return ret;
 
     /* A host surface represents the foreground window in its owned tree. */
     if (!focused_hwnd && old_foreground == wayland_keyboard_get_input_hwnd(hwnd, old_foreground))
