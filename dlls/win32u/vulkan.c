@@ -463,6 +463,7 @@ struct swapchain
     struct surface *surface;
     struct surface_host *host_surface;
     LONG presentation_generation;
+    LONG occluded;                 /* once out of date, a swapchain cannot become usable again */
     VkExtent2D extents;
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
     BOOL has_alpha;
@@ -550,13 +551,29 @@ static void surface_update_client_alpha( struct surface *surface )
             surface->client );
 }
 
-static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
+static BOOL surface_is_occluded( const struct surface *surface )
+{
+    struct client_surface *client = surface->client;
+
+    return client->funcs->is_occluded && client->funcs->is_occluded( client );
+}
+
+static BOOL swapchain_is_out_of_date( struct swapchain *swapchain )
 {
     LONG generation;
 
-    if (!swapchain->surface) return FALSE;
     generation = ReadAcquire( &swapchain->surface->client->presentation_generation );
-    return swapchain->presentation_generation != generation;
+    if (swapchain->presentation_generation != generation || ReadAcquire( &swapchain->occluded )) return TRUE;
+
+    /* Occlusion does not detach the native surface or change Win32 geometry.
+     * Latch it per swapchain so a rejected acquire/present remains out of date
+     * after visibility returns. Managed producers have their own suspend path. */
+    if (!swapchain->managed && surface_is_occluded( swapchain->surface ))
+    {
+        InterlockedExchange( &swapchain->occluded, TRUE );
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static void swapchain_apply_color_description( struct swapchain *swapchain )
@@ -2365,6 +2382,10 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
     /* Update the image extents to match what the Win32 WSI would provide. */
     /* FIXME: handle DPI scaling, somehow */
     get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
+    /* Compositor suspension covers hidden windows and display-off states.
+     * DXGI presenters can then return OCCLUDED and poll for visibility without
+     * changing the application's geometry or sending minimize/restore commands. */
+    if (surface_is_occluded( surface )) SetRectEmpty( &client_rect );
     capabilities->minImageExtent.width = client_rect.right - client_rect.left;
     capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
     capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
@@ -2458,7 +2479,7 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDev
                                           VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT );
 
     if (!surface || !NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
-    if (fullscreen_capabilities && surface->client &&
+    if (fullscreen_capabilities &&
         driver_funcs->p_vulkan_surface_fullscreen_supported &&
         get_surface_fullscreen_info( surface, surface_info->pNext, &fullscreen_info_driver ))
         fullscreen_supported = driver_funcs->p_vulkan_surface_fullscreen_supported(
@@ -5909,6 +5930,43 @@ static VkResult win32u_vkReleaseFullScreenExclusiveModeEXT( VkDevice,
     return res;
 }
 
+/* Keep host waits interruptible across presentation changes. */
+#define WINE_VK_PRESENT_WAIT_SLICE_NS (100 * 1000000ull)
+
+static VkResult swapchain_acquire_next_image( struct vulkan_device *device, struct swapchain *swapchain,
+                                              const VkAcquireNextImageInfoKHR *info, BOOL acquire2,
+                                              uint32_t *image_index )
+{
+    BOOL poll_visibility = !!swapchain->surface->client->funcs->is_occluded;
+    BOOL infinite = info->timeout == UINT64_MAX;
+    uint64_t remaining = info->timeout, start = 0;
+    VkAcquireNextImageInfoKHR slice_info = *info;
+    VkResult res;
+
+    if (poll_visibility && !infinite && remaining > WINE_VK_PRESENT_WAIT_SLICE_NS)
+        start = managed_monotonic_time_ns();
+    for (;;)
+    {
+        slice_info.timeout = poll_visibility ? min( remaining, WINE_VK_PRESENT_WAIT_SLICE_NS ) : remaining;
+        if (acquire2)
+            res = device->p_vkAcquireNextImage2KHR( device->host.device, &slice_info, image_index );
+        else
+            res = device->p_vkAcquireNextImageKHR( device->host.device, slice_info.swapchain,
+                                                   slice_info.timeout, slice_info.semaphore,
+                                                   slice_info.fence, image_index );
+        if (res != VK_TIMEOUT || !poll_visibility) return res;
+
+        /* No image or semaphore signal was acquired on timeout. Check for
+         * occlusion before waiting again, without holding any driver locks. */
+        if (swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
+        if (infinite) continue;
+        if (!start) return VK_TIMEOUT;
+        remaining = managed_monotonic_time_ns() - start;
+        if (remaining >= info->timeout) return VK_TIMEOUT;
+        remaining = info->timeout - remaining;
+    }
+}
+
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
                                                uint32_t *image_index )
 {
@@ -5936,7 +5994,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
     acquire_info_host.fence = fence ? fence->host.fence : 0;
-    res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+    res = swapchain_acquire_next_image( device, swapchain, &acquire_info_host, TRUE, image_index );
 
     if (!res && swapchain_presentation_config_changed( swapchain, &compositor_scaling ))
     {
@@ -5964,6 +6022,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     struct vulkan_fence *fence = client_fence ? vulkan_fence_from_handle( client_fence ) : NULL;
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    VkAcquireNextImageInfoKHR acquire_info = {.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR};
     struct surface *surface;
     BOOL compositor_scaling;
     RECT client_rect;
@@ -5980,9 +6039,11 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
                                 semaphore ? semaphore->host.semaphore : 0,
                                 fence ? fence->host.fence : 0, image_index );
 
-    res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
-                                              semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
-                                              image_index );
+    acquire_info.swapchain = swapchain->obj.host.swapchain;
+    acquire_info.timeout = timeout;
+    acquire_info.semaphore = semaphore ? semaphore->host.semaphore : 0;
+    acquire_info.fence = fence ? fence->host.fence : 0;
+    res = swapchain_acquire_next_image( device, swapchain, &acquire_info, FALSE, image_index );
 
     if (!res && swapchain_presentation_config_changed( swapchain, &compositor_scaling ))
     {
@@ -6014,8 +6075,6 @@ static BOOL should_skip_wait( HWND hwnd )
     return FALSE;
 }
 
-/* Keep host waits interruptible across presentation changes. */
-#define WINE_VK_PRESENT_WAIT_SLICE_NS (100 * 1000000ull)
 /* Recover infinite waits when presentation feedback stalls. */
 #define WINE_VK_PRESENT_WAIT_STALL_NS (3000 * 1000000ull)
 

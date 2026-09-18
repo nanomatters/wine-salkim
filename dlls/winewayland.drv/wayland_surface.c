@@ -7700,6 +7700,51 @@ done:
     if (refresh_state) NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
 }
 
+static BOOL wayland_client_surface_is_occluded(struct client_surface *base)
+{
+    struct wayland_client_surface *client = impl_from_client_surface(base);
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    BOOL occluded = FALSE;
+    HWND hwnd;
+
+    /* The first buffer must be allowed to map the window. */
+    if (!ReadAcquire(&client->has_presented)) return FALSE;
+
+    wayland_win_data_lock();
+    /* Unattached clients, including cross-process dmabuf producers, have no
+     * local presentation target whose visibility we can query. */
+    hwnd = client->toplevel;
+    data = wayland_win_data_get_nolock(hwnd);
+    if (!data || !(surface = data->wayland_surface) ||
+        surface->wl_surface != client->toplevel_wl_surface)
+        goto done;
+
+    /* Follow the actual Wayland presentation hierarchy, not Win32 ownership.
+     * An independently mapped owned toplevel has its own visibility. */
+    for (;;)
+    {
+        if (wayland_surface_is_toplevel(surface))
+        {
+            occluded = wayland_surface_repaint_suspended(surface);
+            break;
+        }
+        if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
+            hwnd = surface->toplevel_hwnd;
+        else if (wayland_surface_is_popup(surface))
+            hwnd = surface->owner_hwnd;
+        else
+            break;
+        if (!(data = wayland_win_data_get_nolock(hwnd)) ||
+            !(surface = data->wayland_surface))
+            break;
+    }
+
+done:
+    wayland_win_data_unlock();
+    return occluded;
+}
+
 static const struct client_surface_funcs wayland_client_surface_funcs =
 {
     .destroy = wayland_client_surface_destroy,
@@ -7710,6 +7755,7 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
     .present = wayland_client_surface_present,
     .get_presentation_rects = wayland_client_surface_get_presentation_rects,
     .is_presentation_scaled = wayland_client_surface_is_presentation_scaled,
+    .is_occluded = wayland_client_surface_is_occluded,
 };
 
 static void wayland_client_surface_set_content_type(struct wayland_client_surface *client)

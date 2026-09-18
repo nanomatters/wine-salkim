@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 113
+#define WINE_GDI_DRIVER_VERSION 114
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -290,6 +290,8 @@ struct client_surface_funcs
     BOOL (*get_presentation_rects)( struct client_surface *surface, RECT *host, RECT *dst );
     /* return whether the native client surface handles presentation scaling */
     BOOL (*is_presentation_scaled)( struct client_surface *surface );
+    /* optional, query compositor visibility without changing window or surface state */
+    BOOL (*is_occluded)( struct client_surface *surface );
 };
 
 struct client_surface
