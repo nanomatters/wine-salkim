@@ -199,6 +199,17 @@ static int fill_arrays_with_format(uint8_t *planes[4], int strides[4], AVBufferR
         memcpy(strides, new_strides, sizeof(new_strides));
     }
 
+    /* YV12 stores V before U, unlike FFmpeg's YUV420P layout. */
+    if (format->guidFormat.Data1 == MAKEFOURCC('Y','V','1','2'))
+    {
+        uint8_t *plane = planes[1];
+        int stride = strides[1];
+        planes[1] = planes[2];
+        planes[2] = plane;
+        strides[1] = strides[2];
+        strides[2] = stride;
+    }
+
     if ((format->videoInfo.VideoFlags & MFVideoFlag_BottomUpLinearRep) && pitch <= 0)
     {
         planes[0] = planes[0] + strides[0] * (format->videoInfo.dwHeight - 1);
