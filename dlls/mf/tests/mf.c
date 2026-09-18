@@ -994,6 +994,7 @@ struct test_stream_sink
     IUnknown *device_manager;
 
     IMFMediaEventQueue *event_queue;
+    HANDLE marker_event;
 };
 
 static struct test_stream_sink *impl_from_IMFStreamSink(IMFStreamSink *iface)
@@ -1155,6 +1156,15 @@ static HRESULT WINAPI test_stream_sink_ProcessSample(IMFStreamSink *iface, IMFSa
 static HRESULT WINAPI test_stream_sink_PlaceMarker(IMFStreamSink *iface, MFSTREAMSINK_MARKER_TYPE marker_type,
         const PROPVARIANT *marker_value, const PROPVARIANT *context)
 {
+    struct test_stream_sink *sink = impl_from_IMFStreamSink(iface);
+
+    if (sink->marker_event)
+    {
+        ok(marker_type == MFSTREAMSINK_MARKER_ENDOFSEGMENT, "Unexpected marker %u.\n", marker_type);
+        SetEvent(sink->marker_event);
+        return S_OK;
+    }
+
     ok(0, "Unexpected call.\n");
     return E_NOTIMPL;
 }
@@ -1577,6 +1587,7 @@ struct test_media_stream
     BOOL is_new;
     BOOL test_expect;
     BOOL delay_sample;
+    BOOL end_of_stream;
     IMFSample *delayed_sample;
     LONG refcount;
 };
@@ -1679,6 +1690,9 @@ static HRESULT WINAPI test_media_stream_RequestSample(IMFMediaStream *iface, IUn
     IMFMediaBuffer *buffer;
     IMFSample *sample;
     HRESULT hr;
+
+    if (stream->end_of_stream)
+        return IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEEndOfStream, &GUID_NULL, S_OK, NULL);
 
     if (stream->test_expect)
     {
@@ -8736,6 +8750,223 @@ static void test_media_session_seek(void)
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 }
 
+struct end_of_presentation_clock_sink
+{
+    IMFClockStateSink IMFClockStateSink_iface;
+    IMFStreamSink *stream;
+};
+
+static HRESULT end_of_presentation_clock_event(IMFClockStateSink *iface, MediaEventType type)
+{
+    struct end_of_presentation_clock_sink *sink = CONTAINING_RECORD(iface,
+            struct end_of_presentation_clock_sink, IMFClockStateSink_iface);
+
+    return IMFStreamSink_QueueEvent(sink->stream, type, &GUID_NULL, S_OK, NULL);
+}
+
+static HRESULT WINAPI end_of_presentation_clock_start(IMFClockStateSink *iface, MFTIME time, LONGLONG offset)
+{
+    return end_of_presentation_clock_event(iface, MEStreamSinkStarted);
+}
+
+static HRESULT WINAPI end_of_presentation_clock_stop(IMFClockStateSink *iface, MFTIME time)
+{
+    return end_of_presentation_clock_event(iface, MEStreamSinkStopped);
+}
+
+static HRESULT WINAPI end_of_presentation_clock_pause(IMFClockStateSink *iface, MFTIME time)
+{
+    return end_of_presentation_clock_event(iface, MEStreamSinkPaused);
+}
+
+static HRESULT WINAPI end_of_presentation_clock_restart(IMFClockStateSink *iface, MFTIME time)
+{
+    return end_of_presentation_clock_event(iface, MEStreamSinkStarted);
+}
+
+static const IMFClockStateSinkVtbl end_of_presentation_clock_vtbl =
+{
+    test_seek_clock_sink_QueryInterface,
+    test_seek_clock_sink_AddRef,
+    test_seek_clock_sink_Release,
+    end_of_presentation_clock_start,
+    end_of_presentation_clock_stop,
+    end_of_presentation_clock_pause,
+    end_of_presentation_clock_restart,
+    test_seek_clock_sink_OnClockSetRate,
+};
+
+static void test_media_session_end_of_presentation(void)
+{
+    enum { REPLAY, STOP, CLOSE };
+    static const struct
+    {
+        BOOL sink_first, paused;
+        unsigned int command;
+    }
+    tests[] =
+    {
+        {FALSE, FALSE, REPLAY},
+        {TRUE,  FALSE, REPLAY},
+        {FALSE, TRUE,  REPLAY},
+        {FALSE, FALSE, STOP},
+        {FALSE, FALSE, CLOSE},
+        {FALSE, TRUE,  STOP},
+        {FALSE, TRUE,  CLOSE},
+    };
+    struct end_of_presentation_clock_sink clock_sink = {{&end_of_presentation_clock_vtbl}};
+    IMFPresentationClock *presentation_clock;
+    struct test_stream_sink *stream_sink;
+    struct test_media_sink *media_sink;
+    struct test_source *media_source;
+    struct test_handler *handler;
+    IMFAsyncCallback *callback;
+    IMFMediaSession *session;
+    IMFMediaSource *source;
+    IMFTopology *topology;
+    PROPVARIANT value;
+    IMFClock *clock;
+    unsigned int i;
+    HRESULT hr;
+    DWORD ret;
+
+    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("test %u", i);
+        memset(&actual_object_state_record, 0, sizeof(actual_object_state_record));
+        handler = create_test_handler();
+        media_sink = create_test_media_sink(&handler->IMFMediaTypeHandler_iface);
+        IMFMediaTypeHandler_Release(&handler->IMFMediaTypeHandler_iface);
+        stream_sink = impl_from_IMFStreamSink(media_sink->stream);
+        stream_sink->marker_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        clock_sink.stream = media_sink->stream;
+        source = create_test_source(TRUE);
+        media_source = impl_test_source_from_IMFMediaSource(source);
+        callback = create_test_callback(TRUE);
+        PropVariantInit(&value);
+
+        hr = MFCreateMediaSession(NULL, &session);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        topology = create_test_topology_unk(source, (IUnknown *)media_sink->stream, NULL, NULL);
+        hr = IMFMediaSession_SetTopology(session, 0, topology);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        IMFTopology_Release(topology);
+        hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        PropVariantClear(&value);
+
+        hr = IMFMediaSession_GetClock(session, &clock);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFClock_QueryInterface(clock, &IID_IMFPresentationClock, (void **)&presentation_clock);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        IMFClock_Release(clock);
+        hr = IMFPresentationClock_AddClockStateSink(presentation_clock, &clock_sink.IMFClockStateSink_iface);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        SET_EXPECT(test_media_sink_GetPresentationClock);
+        SET_EXPECT(test_media_sink_SetPresentationClock);
+        SET_EXPECT(test_media_sink_GetStreamSinkCount);
+        hr = IMFMediaSession_Start(session, NULL, &value);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 1000, &value);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        if (tests[i].paused)
+        {
+            hr = IMFMediaSession_Pause(session);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = wait_media_event_until_blocking(session, callback, MESessionPaused, 1000, &value);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        }
+
+        media_source->streams[0]->end_of_stream = TRUE;
+        hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkRequestSample, &GUID_NULL, S_OK, NULL);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        ret = WaitForSingleObject(stream_sink->marker_event, 1000);
+        ok(ret == WAIT_OBJECT_0, "Marker was not placed, ret %lu.\n", ret);
+        if (tests[i].sink_first)
+        {
+            hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK, NULL);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            /* A later event on the same queue confirms that the marker was handled. */
+            hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkScrubSampleComplete, &GUID_NULL, S_OK, NULL);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = wait_media_event_until_blocking(session, callback, MESessionScrubSampleComplete, 1000, &value);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        }
+        hr = IMFMediaSource_QueueEvent(source, MEEndOfPresentation, &GUID_NULL, S_OK, NULL);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = wait_media_event_until_blocking(session, callback, MEEndOfPresentation, 1000, &value);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        SET_EXPECT(test_stream_sink_Flush);
+        if (tests[i].command == REPLAY)
+        {
+            hr = IMFMediaSession_Start(session, NULL, &value);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            if (!tests[i].sink_first)
+            {
+                hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 100, &value);
+                ok(hr == (tests[i].paused ? S_OK : WAIT_TIMEOUT), "Unexpected start status %#lx.\n", hr);
+                hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK, NULL);
+                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            }
+            hr = wait_media_event_until_blocking(session, callback, MESessionEnded, 1000, &value);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            if (tests[i].paused)
+            {
+                hr = IMFMediaSession_Start(session, NULL, &value);
+                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            }
+            hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 1000, &value);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            ok(actual_object_state_record.state_count &&
+                    actual_object_state_record.states[actual_object_state_record.state_count - 1] == SOURCE_START,
+                    "Replay did not start the source.\n");
+        }
+        else
+        {
+            hr = tests[i].command == STOP ? IMFMediaSession_Stop(session) : IMFMediaSession_Close(session);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            if (!tests[i].paused)
+            {
+                hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK, NULL);
+                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+                hr = wait_media_event_until_blocking(session, callback, MESessionEnded, 1000, &value);
+                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            }
+            hr = wait_media_event_until_blocking(session, callback,
+                    tests[i].command == STOP ? MESessionStopped : MESessionClosed, 1000, &value);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        }
+        CHECK_CALLED(test_stream_sink_Flush);
+        CLEAR_CALLED(test_media_sink_GetPresentationClock);
+        CLEAR_CALLED(test_media_sink_SetPresentationClock);
+        CLEAR_CALLED(test_media_sink_GetStreamSinkCount);
+
+        hr = IMFPresentationClock_RemoveClockStateSink(presentation_clock, &clock_sink.IMFClockStateSink_iface);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        IMFPresentationClock_Release(presentation_clock);
+        CloseHandle(stream_sink->marker_event);
+        hr = IMFMediaSession_Shutdown(session);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        hr = IMFMediaSource_Shutdown(source);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        IMFAsyncCallback_Release(callback);
+        IMFMediaSession_Release(session);
+        IMFMediaSource_Release(source);
+        IMFMediaSink_Release(&media_sink->IMFMediaSink_iface);
+        PropVariantClear(&value);
+        winetest_pop_context();
+    }
+
+    hr = MFShutdown();
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+}
+
 static void test_media_session_invalid_topology(void)
 {
     IMFAsyncCallback *callback;
@@ -9148,6 +9379,7 @@ START_TEST(mf)
     test_media_session_source_shutdown();
     test_media_session_thinning();
     test_media_session_seek();
+    test_media_session_end_of_presentation();
     test_media_session_sink_shutdown();
     test_async_transform();
 }
