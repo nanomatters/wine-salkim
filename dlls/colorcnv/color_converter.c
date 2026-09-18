@@ -96,11 +96,27 @@ static enum AVPixelFormat pixel_format_from_video_subtype(const GUID *subtype)
     return AV_PIX_FMT_NONE;
 }
 
-static void video_frame_init_aperture(AVFrame *frame, const MFVIDEOFORMAT *format)
+static void video_frame_crop_to_aperture(AVFrame *frame, const MFVIDEOFORMAT *format,
+        const MFVIDEOFORMAT *output_format)
 {
-    /* unlike the video processor, color converter doesn't really support aperture */
-    frame->width = format->videoInfo.dwWidth;
-    frame->height = format->videoInfo.dwHeight;
+    const MFVideoArea *aperture = &format->videoInfo.MinimumDisplayAperture;
+
+    /* The resizer hides the display aperture, but retains the geometric one. */
+    if (!aperture->Area.cx || !aperture->Area.cy)
+        aperture = &format->videoInfo.GeometricAperture;
+
+    /* Only a zero-offset aperture matching the output can be cropped without resizing. */
+    if (!aperture->OffsetX.value && !aperture->OffsetX.fract
+            && !aperture->OffsetY.value && !aperture->OffsetY.fract
+            && aperture->Area.cx > 0 && aperture->Area.cy > 0
+            && aperture->Area.cx <= format->videoInfo.dwWidth
+            && aperture->Area.cy <= format->videoInfo.dwHeight
+            && aperture->Area.cx == output_format->videoInfo.dwWidth
+            && aperture->Area.cy == output_format->videoInfo.dwHeight)
+    {
+        frame->width = aperture->Area.cx;
+        frame->height = aperture->Area.cy;
+    }
 }
 
 static void media_buffer_release(void *opaque, uint8_t *data)
@@ -230,7 +246,6 @@ static BOOL video_frame_wrap_buffer(AVFrame *frame, const MFVIDEOFORMAT *format,
     TRACE("frame %p, info %p, buffer %p\n", frame, format, buffer);
 
     video_frame_init_from_format(frame, format);
-    video_frame_init_aperture(frame, format);
 
     if ((size = fill_arrays_with_format(frame->data, frame->linesize, buffer, format, pitch)) < 0)
         return size;
@@ -474,6 +489,7 @@ static HRESULT color_convert_process_input(struct color_convert *impl, const DMO
         av_frame_move_ref(&impl->current_frame, &impl->input_frame);
     }
     av_buffer_unref(&buffer);
+    video_frame_crop_to_aperture(&impl->current_frame, &impl->input_format, &impl->output_format);
 
     if (SUCCEEDED(hr = IMediaBuffer_QueryInterface(input->pBuffer, &IID_IMFSample, (void **)&sample)))
     {
@@ -595,12 +611,11 @@ static HRESULT color_convert_init(struct color_convert *impl)
     video_frame_init_from_format(&impl->input_frame, &impl->input_format);
     if ((ret = av_frame_get_buffer(&impl->input_frame, 0)) < 0)
         goto failed;
-    video_frame_init_aperture(&impl->input_frame, &impl->input_format);
+    video_frame_crop_to_aperture(&impl->input_frame, &impl->input_format, &impl->output_format);
 
     video_frame_init_from_format(&impl->output_frame, &impl->output_format);
     if ((ret = av_frame_get_buffer(&impl->output_frame, 0)) < 0)
         goto failed;
-    video_frame_init_aperture(&impl->output_frame, &impl->output_format);
 
     av_opt_set(impl->context, "sws_flags", "neighbor", 0);
     av_opt_set_int(impl->context, "threads", 0, 0);
