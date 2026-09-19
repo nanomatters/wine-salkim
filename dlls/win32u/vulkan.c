@@ -6781,7 +6781,7 @@ static VkResult present_consume_waits( struct vulkan_device *device, struct vulk
     VkFence fence = signal_fence;
     VkResult res;
     uint32_t i;
-    BOOL lock_device;
+    BOOL lock_device, submitted;
 
     if (!fence && managed && managed->present_fence)
         fence = managed->present_fence;
@@ -6796,6 +6796,7 @@ static VkResult present_consume_waits( struct vulkan_device *device, struct vulk
     if (lock_device) vulkan_device_lock_queues( device );
     else vulkan_queue_lock( queue );
     res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, fence );
+    submitted = res == VK_SUCCESS;
     if (res == VK_SUCCESS && wait_for_completion && !fence)
         res = device->p_vkDeviceWaitIdle( device->host.device );
     if (lock_device) vulkan_device_unlock_queues( device );
@@ -6806,6 +6807,9 @@ static VkResult present_consume_waits( struct vulkan_device *device, struct vulk
         if (res == VK_SUCCESS) res = device->p_vkResetFences( device->host.device, 1, &fence );
     }
     if (stages != stack_stages) free( stages );
+    /* A failed completion wait or fence reset cannot undo the submit. */
+    if (submitted && (res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY))
+        return VK_ERROR_DEVICE_LOST;
     return res;
 }
 
@@ -6948,6 +6952,15 @@ static BOOL present_result_was_enqueued( VkResult result )
     return result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR ||
            result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR ||
            result == full_screen_exclusive_lost || result == present_timing_queue_full;
+}
+
+static VkResult present_result_after_submission( VkResult result, BOOL submitted )
+{
+    /* Recoverable present OOM must leave application synchronization untouched.
+     * Once Wine has submitted work, it can no longer provide that guarantee. */
+    if (submitted && (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY))
+        return VK_ERROR_DEVICE_LOST;
+    return result;
 }
 
 static VkResult repack_present_pnext( struct mempool *pool, VkPresentInfoKHR *host_info,
@@ -7153,6 +7166,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     BOOL skip_managed = FALSE;
     BOOL managed_present_waits_consumed = FALSE;
     BOOL present_waits_submitted = FALSE;
+    BOOL internal_work_submitted = FALSE;
     BOOL managed_sync_complete = FALSE;
     BOOL all_managed_explicit = TRUE;
     BOOL explicit_submit = FALSE;
@@ -7322,6 +7336,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit_info, VK_NULL_HANDLE );
         vulkan_queue_unlock( queue );
         if (res < VK_SUCCESS) goto failed;
+        internal_work_submitted = TRUE;
 
         present_info->waitSemaphoreCount = 1;
         present_info->pWaitSemaphores = &blit_sema;
@@ -7341,6 +7356,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         if (explicit_submit)
         {
+            internal_work_submitted = TRUE;
             present_waits_submitted = TRUE;
             managed_present_waits_consumed = TRUE;
             if (host_count)
@@ -7383,6 +7399,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             if (consume_res < VK_SUCCESS && host_res >= VK_SUCCESS) host_res = consume_res;
         }
 
+        host_res = present_result_after_submission( host_res, internal_work_submitted );
+
         for (uint32_t i = 0; i < host_count; i++)
             present_results[host_indices[i]] =
                 present_result_was_enqueued( host_res ) ? host_results[i] : host_res;
@@ -7397,7 +7415,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                         present_swapchains[host_indices[i]]->surface->client,
                         present_results[host_indices[i]] >= VK_SUCCESS );
 
-        if (!present_waits_submitted) skip_managed = TRUE;
+        if (!present_waits_submitted || host_res == VK_ERROR_DEVICE_LOST) skip_managed = TRUE;
         if (host_res < VK_SUCCESS && res >= VK_SUCCESS) res = host_res;
         else if (host_res == VK_SUBOPTIMAL_KHR && res == VK_SUCCESS) res = host_res;
     }
@@ -7424,6 +7442,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 res = cres;
                 break;
             }
+            internal_work_submitted = TRUE;
         }
     }
 
@@ -7563,8 +7582,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     if (present_info->pResults)
-        memcpy( present_info->pResults, present_results,
-                present_info->swapchainCount * sizeof(*present_results) );
+        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+            present_info->pResults[i] = present_result_after_submission(
+                    present_results[i], internal_work_submitted || present_waits_submitted );
 
     if (TRACE_ON( fps ))
     {
@@ -7590,7 +7610,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 failed:
     end_host_present_waits( present_swapchains, host_indices, &host_wait_count );
     mem_free( &pool );
-    return res;
+    return present_result_after_submission( res, internal_work_submitted || present_waits_submitted );
 }
 
 static LARGE_INTEGER *get_nt_timeout( LARGE_INTEGER *time, DWORD timeout )
