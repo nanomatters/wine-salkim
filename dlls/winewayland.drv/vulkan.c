@@ -40,6 +40,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
+static BOOL invalid_layer_order;
 
 /* The native Steam overlay only reaches an X11 input method when it records an
  * X11 window for the presenting surface. Create the surface through the Xlib
@@ -55,7 +56,7 @@ static BOOL wayland_vulkan_steam_overlay_enabled(void)
         env = getenv("PROTON_WAYLAND_STEAM_OVERLAY");
         enabled = env && *env != '0';
     }
-    return enabled;
+    return enabled && !invalid_layer_order;
 }
 
 static struct wayland_client_surface *stash_client_surface(HWND hwnd,
@@ -430,13 +431,11 @@ static UINT wayland_get_vulkan_instance_layers(const char *const **layers)
     static const char *const names[] =
     {
         "VK_LAYER_WINELAND_translate_x86_64",
-        "VK_LAYER_MANGOHUD_overlay_x86_64",
     };
 #elif defined(__i386__)
     static const char *const names[] =
     {
         "VK_LAYER_WINELAND_translate_i386",
-        "VK_LAYER_MANGOHUD_overlay_x86",
     };
 #else
     (void)layers;
@@ -444,19 +443,69 @@ static UINT wayland_get_vulkan_instance_layers(const char *const **layers)
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
-    const char *mangohud;
-
     if (!wayland_vulkan_steam_overlay_enabled()) return 0;
-    mangohud = getenv("MANGOHUD");
-    if (mangohud && !strcmp(mangohud, "1"))
-    {
-        /* MangoHud must follow the translation layer to observe the real
-         * Wayland surface instead of Steam's Xlib proxy. */
-        *layers = names;
-        return ARRAY_SIZE(names);
-    }
     *layers = names;
-    return ARRAY_SIZE(names) - 1;
+    return ARRAY_SIZE(names);
+#endif
+}
+
+/* Check the actual Unix loader, including in a 32-bit child of a 64-bit launch.
+ * Loader settings expose the configured order through layer enumeration. Do not
+ * use the Xlib proxy if the runtime ignored or replaced that configuration. */
+static BOOL check_loader_layer_order(void *vulkan_handle)
+{
+#if defined(__x86_64__)
+    const char *steam_name = "VK_LAYER_VALVE_steam_overlay_64";
+    const char *translate_name = "VK_LAYER_WINELAND_translate_x86_64";
+#elif defined(__i386__)
+    const char *steam_name = "VK_LAYER_VALVE_steam_overlay_32";
+    const char *translate_name = "VK_LAYER_WINELAND_translate_i386";
+#else
+    return FALSE;
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+    PFN_vkEnumerateInstanceLayerProperties enumerate;
+    PFN_vkEnumerateInstanceVersion get_version;
+    VkLayerProperties *properties = NULL;
+    BOOL steam = FALSE, translate = FALSE;
+    uint32_t count, version, i, attempt;
+    VkResult res;
+
+    get_version = dlsym(vulkan_handle, "vkEnumerateInstanceVersion");
+    enumerate = dlsym(vulkan_handle, "vkEnumerateInstanceLayerProperties");
+    if (!get_version || !enumerate || get_version(&version) != VK_SUCCESS ||
+        version < VK_MAKE_VERSION(1, 4, 304)) return FALSE;
+
+    for (attempt = 0; attempt < 3; attempt++)
+    {
+        if (enumerate(&count, NULL) != VK_SUCCESS || !count) return FALSE;
+        if (!(properties = calloc(count, sizeof(*properties)))) return FALSE;
+        res = enumerate(&count, properties);
+        if (res == VK_SUCCESS) break;
+        free(properties);
+        properties = NULL;
+        if (res != VK_INCOMPLETE) return FALSE;
+    }
+    if (!properties) return FALSE;
+
+    for (i = 0; i < count; i++)
+    {
+        const char *name = properties[i].layerName;
+        if (!strcmp(name, "VK_LAYER_VALVE_steam_overlay_64") ||
+            !strcmp(name, "VK_LAYER_VALVE_steam_overlay_32"))
+        {
+            if (translate) break;
+            if (!strcmp(name, steam_name)) steam = TRUE;
+        }
+        else if (!strcmp(name, translate_name))
+        {
+            if (!steam) break;
+            translate = TRUE;
+        }
+        else if (!translate) break;
+    }
+    free(properties);
+    return i == count && steam && translate;
 #endif
 }
 
@@ -639,10 +688,20 @@ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
  */
 UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs)
 {
+    const char *env;
+
     if (version != WINE_VULKAN_DRIVER_VERSION)
     {
         ERR("version mismatch, win32u wants %u but driver has %u\n", version, WINE_VULKAN_DRIVER_VERSION);
         return STATUS_INVALID_PARAMETER;
+    }
+
+    env = getenv("PROTON_WAYLAND_VULKAN_LAYER_ORDER");
+    if (wayland_vulkan_steam_overlay_enabled() &&
+        (!env || strcmp(env, "1") || !check_loader_layer_order(vulkan_handle)))
+    {
+        WARN("Runtime Vulkan layer order is unavailable, disabling the Steam overlay bridge.\n");
+        invalid_layer_order = TRUE;
     }
 
     *driver_funcs = &wayland_vulkan_driver_funcs;
