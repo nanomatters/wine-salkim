@@ -6470,7 +6470,8 @@ static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapcha
     }
 }
 
-static VkCommandBuffer create_hack_cmd( struct vulkan_queue *queue, struct swapchain *swapchain, uint32_t queue_idx )
+static VkResult create_hack_cmd( struct vulkan_queue *queue, struct swapchain *swapchain,
+                                 uint32_t queue_idx, VkCommandBuffer *out )
 {
     VkCommandBufferAllocateInfo allocInfo = {0};
     VkCommandBuffer cmd;
@@ -6479,16 +6480,18 @@ static VkCommandBuffer create_hack_cmd( struct vulkan_queue *queue, struct swapc
     if (!swapchain->cmd_pools[queue_idx])
     {
         VkCommandPoolCreateInfo poolInfo = {0};
+        VkCommandPool pool;
 
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        poolInfo.queueFamilyIndex = queue_idx;
+        poolInfo.queueFamilyIndex = queue->info.queueFamilyIndex;
 
         if ((res = queue->device->p_vkCreateCommandPool( queue->device->host.device, &poolInfo, NULL,
-                                                         &swapchain->cmd_pools[queue_idx] )))
+                                                         &pool )))
         {
             ERR( "vkCreateCommandPool failed, res=%d\n", res );
-            return NULL;
+            return res;
         }
+        swapchain->cmd_pools[queue_idx] = pool;
     }
 
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -6499,10 +6502,11 @@ static VkCommandBuffer create_hack_cmd( struct vulkan_queue *queue, struct swapc
     if ((res = queue->device->p_vkAllocateCommandBuffers( queue->device->host.device, &allocInfo, &cmd )))
     {
         ERR( "vkAllocateCommandBuffers failed, res=%d\n", res );
-        return NULL;
+        return res;
     }
 
-    return cmd;
+    *out = cmd;
+    return VK_SUCCESS;
 }
 
 static void bind_pipeline( struct vulkan_device *device, VkCommandBuffer cmd, struct fs_comp_pipeline *pipeline,
@@ -7199,6 +7203,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_device *device = queue->device;
     VkResult res = VK_ERROR_OUT_OF_HOST_MEMORY;
     struct swapchain **present_swapchains;
+    uint32_t queue_idx = queue - device->queues;
     BOOL presentation_feedbacks_buffer[16], *presentation_feedbacks = presentation_feedbacks_buffer;
     VkResult *present_results;
     VkSwapchainKHR *swapchains;
@@ -7272,20 +7277,32 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         hack = &swapchain->fs_hack_images[present_info->pImageIndices[i]];
         blit_sema = hack->blit_finished;
 
-        if (!hack->cmd || hack->cmd_queue_idx != queue->info.queueFamilyIndex)
+        if (!hack->cmd || hack->cmd_queue_idx != queue_idx)
         {
-            if (hack->cmd) device->p_vkFreeCommandBuffers( queue->device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &hack->cmd );
-            if (!(queue->device->queue_props[queue->info.queueFamilyIndex].queueFlags & VK_QUEUE_COMPUTE_BIT)) goto failed; /* TODO */
+            struct fs_hack_image replacement = *hack;
 
-            if (!(hack->cmd = create_hack_cmd( queue, swapchain, queue->info.queueFamilyIndex )) ||
-                (swapchain->upscaler.is_fsr ? record_fsr_cmd(queue->device, swapchain, hack) : record_compute_cmd( queue->device, swapchain, hack )))
+            /* Pools are indexed by created queue, not by queue family. Family
+             * indices can exceed the number of queues the application created. */
+            if (!(device->queue_props[queue->info.queueFamilyIndex].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                goto failed_alloc; /* FIXME: support presentation queues without compute. */
+
+            replacement.cmd = VK_NULL_HANDLE;
+            replacement.cmd_queue_idx = queue_idx;
+            if ((res = create_hack_cmd( queue, swapchain, queue_idx, &replacement.cmd )) ||
+                (res = swapchain->upscaler.is_fsr ? record_fsr_cmd( device, swapchain, &replacement ) :
+                                                   record_compute_cmd( device, swapchain, &replacement )))
             {
-                device->p_vkFreeCommandBuffers( queue->device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &hack->cmd );
-                hack->cmd = NULL;
+                if (replacement.cmd)
+                    device->p_vkFreeCommandBuffers( device->host.device, swapchain->cmd_pools[queue_idx],
+                                                     1, &replacement.cmd );
                 goto failed;
             }
 
-            hack->cmd_queue_idx = queue->info.queueFamilyIndex;
+            if (hack->cmd)
+                device->p_vkFreeCommandBuffers( device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx],
+                                                 1, &hack->cmd );
+            hack->cmd = replacement.cmd;
+            hack->cmd_queue_idx = replacement.cmd_queue_idx;
         }
 
         blit_cmds[blit_count++] = hack->cmd;
