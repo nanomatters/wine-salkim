@@ -6988,6 +6988,26 @@ static VkResult present_result_after_submission( VkResult result, BOOL submitted
     return result;
 }
 
+static VkResult merge_present_results( VkResult result, VkResult next )
+{
+    static const VkResult present_timing_queue_full = (VkResult)-1000208000;
+
+    if (result == VK_SUCCESS) return next;
+    if (next == VK_SUCCESS) return result;
+    if (result == VK_ERROR_DEVICE_LOST || next == VK_ERROR_DEVICE_LOST) return VK_ERROR_DEVICE_LOST;
+
+    /* A failure to enqueue must not be hidden by a rejected presentation,
+     * which promises that the application's wait operations were enqueued. */
+    if (!present_result_was_enqueued( result )) return result;
+    if (!present_result_was_enqueued( next )) return next;
+    if (result == VK_ERROR_SURFACE_LOST_KHR || next == VK_ERROR_SURFACE_LOST_KHR) return VK_ERROR_SURFACE_LOST_KHR;
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || next == VK_ERROR_OUT_OF_DATE_KHR) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (result == present_timing_queue_full || next == present_timing_queue_full) return present_timing_queue_full;
+    if (result == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT || next == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+        return VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
+    return VK_SUBOPTIMAL_KHR;
+}
+
 static VkResult repack_present_pnext( struct mempool *pool, VkPresentInfoKHR *host_info,
                                       const VkPresentInfoKHR *present_info,
                                       const uint32_t *host_indices, uint32_t host_count )
@@ -7208,11 +7228,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
     if (!(swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*swapchains) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    if (!(present_swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*present_swapchains) ))) goto failed;
-    if (!(present_results = mem_alloc( &pool, present_info->swapchainCount * sizeof(*present_results) ))) goto failed;
-    if (!(blit_cmds = mem_alloc( &pool, present_info->swapchainCount * sizeof(blit_cmds) ))) goto failed;
+    if (!(present_swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*present_swapchains) ))) goto failed_alloc;
+    if (!(present_results = mem_alloc( &pool, present_info->swapchainCount * sizeof(*present_results) ))) goto failed_alloc;
+    if (!(blit_cmds = mem_alloc( &pool, present_info->swapchainCount * sizeof(blit_cmds) ))) goto failed_alloc;
     if (present_info->swapchainCount > ARRAY_SIZE(host_indices_buffer) &&
-        !(host_indices = mem_alloc( &pool, present_info->swapchainCount * sizeof(*host_indices) ))) goto failed;
+        !(host_indices = mem_alloc( &pool, present_info->swapchainCount * sizeof(*host_indices) ))) goto failed_alloc;
 
     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
     {
@@ -7270,7 +7290,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     if (present_info->waitSemaphoreCount &&
         !(host_wait_semaphores = mem_alloc( &pool, present_info->waitSemaphoreCount *
                                             sizeof(*host_wait_semaphores) )))
-        goto failed;
+        goto failed_alloc;
     for (uint32_t i = 0; i < present_info->waitSemaphoreCount; i++)
     {
         struct vulkan_semaphore *semaphore =
@@ -7314,16 +7334,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         host_info.pSwapchains = swapchains;
         image_indices = host_count <= ARRAY_SIZE(image_indices_buffer) ? image_indices_buffer
                                                                        : mem_alloc( &pool, host_count * sizeof(*image_indices) );
-        if (!image_indices) goto failed;
+        if (!image_indices) goto failed_alloc;
         if (host_count != present_info->swapchainCount &&
             (res = repack_present_pnext( &pool, &host_info, present_info, host_indices, host_count )))
             goto failed;
         host_results = host_count <= ARRAY_SIZE(host_results_buffer) ? host_results_buffer
                                                                      : mem_alloc( &pool, host_count * sizeof(*host_results) );
-        if (!host_results) goto failed;
+        if (!host_results) goto failed_alloc;
         if (host_count > ARRAY_SIZE(presentation_feedbacks_buffer) &&
             !(presentation_feedbacks = mem_alloc( &pool, host_count * sizeof(*presentation_feedbacks) )))
-            goto failed;
+            goto failed_alloc;
         memset( presentation_feedbacks, 0, host_count * sizeof(*presentation_feedbacks) );
         for (uint32_t i = 0; i < host_count; i++) host_results[i] = VK_SUCCESS;
         host_info.pResults = host_results;
@@ -7344,7 +7364,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         VkLatencySubmissionPresentIdNV latencySubmitInfo;
         VkPresentIdKHR *present_id;
 
-        if (!(stages = mem_alloc( &pool, sizeof(VkPipelineStageFlags) * present_info->waitSemaphoreCount ))) goto failed;
+        if (!(stages = mem_alloc( &pool, sizeof(VkPipelineStageFlags) * present_info->waitSemaphoreCount ))) goto failed_alloc;
         for (uint32_t i = 0; i < present_info->waitSemaphoreCount; ++i) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 
         /* blit user image to real image */
@@ -7373,8 +7393,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pWaitSemaphores = &blit_sema;
     }
 
-    res = fullscreen_lost ? VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT :
-          out_of_date ? VK_ERROR_OUT_OF_DATE_KHR : VK_SUCCESS;
+    res = out_of_date ? VK_ERROR_OUT_OF_DATE_KHR :
+          fullscreen_lost ? VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT : VK_SUCCESS;
 
     if (first_managed && all_managed_explicit &&
         !queue->managed_present_sync_unavailable)
@@ -7398,7 +7418,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
         if (managed_sync_res < VK_SUCCESS && explicit_submit)
         {
-            if (res >= VK_SUCCESS) res = managed_sync_res;
+            res = merge_present_results( res, managed_sync_res );
             skip_managed = TRUE;
         }
         else if (managed_sync_res < VK_SUCCESS)
@@ -7423,11 +7443,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         vulkan_queue_unlock( queue );
         if (present_result_was_enqueued( host_res ))
             present_waits_submitted = TRUE;
-        else if (explicit_submit)
+        else if (explicit_submit && host_res != VK_ERROR_DEVICE_LOST)
         {
             VkResult consume_res = present_consume_waits( device, queue, NULL, VK_NULL_HANDLE,
                                                           &managed_host_semaphore, 1, FALSE );
-            if (consume_res < VK_SUCCESS && host_res >= VK_SUCCESS) host_res = consume_res;
+            host_res = merge_present_results( host_res, consume_res );
         }
 
         host_res = present_result_after_submission( host_res, internal_work_submitted );
@@ -7447,11 +7467,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                         present_results[host_indices[i]] >= VK_SUCCESS );
 
         if (!present_waits_submitted || host_res == VK_ERROR_DEVICE_LOST) skip_managed = TRUE;
-        if (host_res < VK_SUCCESS && res >= VK_SUCCESS) res = host_res;
-        else if (host_res == VK_SUBOPTIMAL_KHR && res == VK_SUCCESS) res = host_res;
+        res = merge_present_results( res, host_res );
     }
-
-    if (out_of_date && res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
 
     /* Rejected presents still consume their waits and signal present fences.
      * Otherwise a binary semaphore stays signaled and a caller waiting to
@@ -7531,8 +7548,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                                            application_present_id );
 
         present_results[i] = managed_res;
-        if (managed_res < VK_SUCCESS && res >= VK_SUCCESS) res = managed_res;
-        else if (managed_res == VK_SUBOPTIMAL_KHR && res == VK_SUCCESS) res = VK_SUBOPTIMAL_KHR;
+        res = merge_present_results( res, managed_res );
     }
     if (managed_sync_fd >= 0) close( managed_sync_fd );
 
@@ -7547,7 +7563,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
             if (present_swapchains[i] || !(fence = get_present_fence( present_fence_info, i ))) continue;
             fence_res = present_consume_waits( device, queue, NULL, fence, NULL, 0, FALSE );
-            if (fence_res < VK_SUCCESS && res >= VK_SUCCESS) res = fence_res;
+            res = merge_present_results( res, fence_res );
         }
     }
 
@@ -7576,7 +7592,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         {
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
             present_results[i] = VK_ERROR_OUT_OF_DATE_KHR;
-            if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
+            res = merge_present_results( res, VK_ERROR_OUT_OF_DATE_KHR );
         }
         else if (swapchain_res)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
@@ -7587,7 +7603,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
             present_results[i] = VK_SUBOPTIMAL_KHR;
-            if (!res) res = VK_SUBOPTIMAL_KHR;
+            res = merge_present_results( res, VK_SUBOPTIMAL_KHR );
         }
     }
 
@@ -7608,14 +7624,19 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             fence_res = present_consume_waits( device, queue, NULL, fence, NULL, 0, FALSE );
             if (fence_res < VK_SUCCESS && present_results[i] >= VK_SUCCESS)
                 present_results[i] = fence_res;
-            if (fence_res < VK_SUCCESS && res >= VK_SUCCESS) res = fence_res;
+            res = merge_present_results( res, fence_res );
         }
     }
 
     if (present_info->pResults)
         for (uint32_t i = 0; i < present_info->swapchainCount; i++)
-            present_info->pResults[i] = present_result_after_submission(
-                    present_results[i], internal_work_submitted || present_waits_submitted );
+        {
+            if (!internal_work_submitted && !present_waits_submitted && !present_result_was_enqueued( res ))
+                present_info->pResults[i] = res;
+            else
+                present_info->pResults[i] = present_result_after_submission(
+                        present_results[i], internal_work_submitted || present_waits_submitted );
+        }
 
     if (TRACE_ON( fps ))
     {
@@ -7637,7 +7658,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             if (!start_time) start_time = time;
         }
     }
+    goto failed;
 
+failed_alloc:
+    res = VK_ERROR_OUT_OF_HOST_MEMORY;
 failed:
     end_host_present_waits( present_swapchains, host_indices, &host_wait_count );
     mem_free( &pool );
