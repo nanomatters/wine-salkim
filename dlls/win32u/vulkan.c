@@ -3600,6 +3600,7 @@ static VkResult win32u_vkLatencySleepNV(VkDevice device, VkSwapchainKHR swapchai
     struct swapchain *vk_swapchain = swapchain_from_handle(swapchain);
     VkLatencySleepInfoNV sleep_info_host = *pSleepInfo;
     struct vulkan_semaphore *semaphore;
+    VkResult res;
 
     semaphore = sleep_info_host.signalSemaphore ? vulkan_semaphore_from_handle(sleep_info_host.signalSemaphore) : NULL;
     sleep_info_host.signalSemaphore = semaphore ? semaphore->host.semaphore : 0;
@@ -3618,9 +3619,12 @@ static VkResult win32u_vkLatencySleepNV(VkDevice device, VkSwapchainKHR swapchai
             };
             UINT64 counter = 0;
 
-            if (!vk_device->p_vkGetSemaphoreCounterValue( vk_device->host.device, semaphore->host.semaphore, &counter ) &&
-                counter < sleep_info_host.value)
-                vk_device->p_vkSignalSemaphore( vk_device->host.device, &signal_info );
+            if ((res = vk_device->p_vkGetSemaphoreCounterValue( vk_device->host.device,
+                                                               semaphore->host.semaphore, &counter )))
+                return res;
+            if (counter < sleep_info_host.value &&
+                (res = vk_device->p_vkSignalSemaphore( vk_device->host.device, &signal_info )))
+                return res;
         }
         return (vk_swapchain && vk_swapchain->managed) ? VK_SUCCESS : VK_ERROR_OUT_OF_DATE_KHR;
     }
