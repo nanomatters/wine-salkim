@@ -139,7 +139,7 @@ static void *mem_alloc( struct mempool *pool, size_t size )
     }
     if (!(next = malloc( max( sizeof(*next), offsetof(struct mempool, mem[size]) ) ))) return NULL;
     next->next = pool->next;
-    next->mem_used = size;
+    next->mem_used = ROUND_SIZE( size, sizeof(UINT64) - 1 );
     pool->next = next;
     return next->mem;
 }
