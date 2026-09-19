@@ -94,7 +94,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 51
+#define WINE_VULKAN_DRIVER_VERSION 52
 
 struct vulkan_object
 {
@@ -204,7 +204,6 @@ struct vulkan_queue
     VkDeviceQueueInfo2 info;
     pthread_mutex_t mutex; /* serializes host access with Wine-injected queue work */
     VkSemaphore managed_present_semaphore;
-    VkSemaphore managed_host_semaphore;
     BOOL managed_present_sync_unavailable;
 };
 

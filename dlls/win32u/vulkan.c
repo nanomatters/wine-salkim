@@ -466,6 +466,8 @@ struct swapchain
     LONG occluded;                 /* once out of date, a swapchain cannot become usable again */
     VkExtent2D extents;
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
+    VkSemaphore *present_semaphores; /* mixed-present bridges, indexed by host swapchain image */
+    uint32_t present_semaphore_count;
     BOOL has_alpha;
     VkColorSpaceKHR color_space;
     BOOL uses_color_description;
@@ -1565,9 +1567,6 @@ static void win32u_vkDestroyDevice( VkDevice client_device, const VkAllocationCa
 
     for (i = 0; i < device->queue_count; i++)
     {
-        if (device->queues[i].managed_host_semaphore)
-            device->p_vkDestroySemaphore( device->host.device,
-                                          device->queues[i].managed_host_semaphore, NULL );
         if (device->queues[i].managed_present_semaphore)
             device->p_vkDestroySemaphore( device->host.device,
                                           device->queues[i].managed_present_semaphore, NULL );
@@ -5799,6 +5798,14 @@ failed_create:
     return res;
 }
 
+static void destroy_swapchain_present_semaphores( struct vulkan_device *device, struct swapchain *swapchain )
+{
+    for (uint32_t i = 0; i < swapchain->present_semaphore_count; i++)
+        if (swapchain->present_semaphores[i])
+            device->p_vkDestroySemaphore( device->host.device, swapchain->present_semaphores[i], NULL );
+    free( swapchain->present_semaphores );
+}
+
 void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
                                    const VkAllocationCallbacks *allocator )
 {
@@ -5811,6 +5818,7 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     if (!swapchain) return;
 
     clear_fullscreen_owner( swapchain->surface, swapchain->fullscreen_owner );
+    destroy_swapchain_present_semaphores( device, swapchain );
 
     if (swapchain->fshack.enabled && !swapchain->managed)
     {
@@ -6814,7 +6822,7 @@ static VkResult present_consume_waits( struct vulkan_device *device, struct vulk
 }
 
 /* Caller holds queue->mutex. */
-static VkResult queue_ensure_managed_present_semaphores( struct vulkan_queue *queue )
+static VkResult queue_ensure_managed_present_semaphore( struct vulkan_queue *queue )
 {
     struct vulkan_device *device = queue->device;
     VkExportSemaphoreCreateInfo export_info =
@@ -6827,29 +6835,15 @@ static VkResult queue_ensure_managed_present_semaphores( struct vulkan_queue *qu
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         .pNext = &export_info,
     };
-    VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     VkResult res;
 
     if (queue->managed_present_sync_unavailable) return VK_ERROR_FEATURE_NOT_PRESENT;
     if (queue->managed_present_semaphore) return VK_SUCCESS;
 
     if ((res = device->p_vkCreateSemaphore( device->host.device, &export_semaphore_info, NULL,
-                                            &queue->managed_present_semaphore )) ||
-        (res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info, NULL,
-                                            &queue->managed_host_semaphore )))
+                                            &queue->managed_present_semaphore )))
     {
-        if (queue->managed_host_semaphore)
-        {
-            device->p_vkDestroySemaphore( device->host.device,
-                                          queue->managed_host_semaphore, NULL );
-            queue->managed_host_semaphore = VK_NULL_HANDLE;
-        }
-        if (queue->managed_present_semaphore)
-        {
-            device->p_vkDestroySemaphore( device->host.device,
-                                          queue->managed_present_semaphore, NULL );
-            queue->managed_present_semaphore = VK_NULL_HANDLE;
-        }
+        queue->managed_present_semaphore = VK_NULL_HANDLE;
         queue->managed_present_sync_unavailable = TRUE;
         return res;
     }
@@ -6857,9 +6851,40 @@ static VkResult queue_ensure_managed_present_semaphores( struct vulkan_queue *qu
     return VK_SUCCESS;
 }
 
+static VkResult swapchain_get_present_semaphore( struct vulkan_device *device, struct swapchain *swapchain,
+                                                 uint32_t image_index, VkSemaphore *semaphore )
+{
+    VkSemaphoreCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkResult res;
+
+    if (!swapchain->present_semaphores)
+    {
+        uint32_t count;
+
+        if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
+                                                       &count, NULL ))) return res;
+        if (!(swapchain->present_semaphores = calloc( count, sizeof(*swapchain->present_semaphores) )))
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        swapchain->present_semaphore_count = count;
+    }
+
+    /* Waiting on the acquired image before presenting also retires its previous
+     * present wait. A queue-wide bridge has no such reuse dependency. */
+    if (image_index >= swapchain->present_semaphore_count) return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!swapchain->present_semaphores[image_index])
+    {
+        VkSemaphore created;
+
+        if ((res = device->p_vkCreateSemaphore( device->host.device, &info, NULL, &created ))) return res;
+        swapchain->present_semaphores[image_index] = created;
+    }
+    *semaphore = swapchain->present_semaphores[image_index];
+    return VK_SUCCESS;
+}
+
 static VkResult present_export_waits( struct vulkan_device *device, struct vulkan_queue *queue,
                                       const VkSemaphore *semaphores, uint32_t count,
-                                      BOOL signal_host, int *sync_fd, BOOL *submitted )
+                                      VkSemaphore host_semaphore, int *sync_fd, BOOL *submitted )
 {
     VkPipelineStageFlags stack_stages[16], *stages = stack_stages;
     VkSemaphore signal_semaphores[2];
@@ -6869,7 +6894,7 @@ static VkResult present_export_waits( struct vulkan_device *device, struct vulka
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .waitSemaphoreCount = count,
         .pWaitSemaphores = semaphores,
-        .signalSemaphoreCount = signal_host ? 2 : 1,
+        .signalSemaphoreCount = host_semaphore ? 2 : 1,
     };
     VkSemaphoreGetFdInfoKHR fd_info =
     {
@@ -6887,10 +6912,10 @@ static VkResult present_export_waits( struct vulkan_device *device, struct vulka
     submit.pWaitDstStageMask = stages;
 
     vulkan_queue_lock( queue );
-    if ((res = queue_ensure_managed_present_semaphores( queue )))
+    if ((res = queue_ensure_managed_present_semaphore( queue )))
         goto done;
     signal_semaphores[0] = queue->managed_present_semaphore;
-    signal_semaphores[1] = queue->managed_host_semaphore;
+    signal_semaphores[1] = host_semaphore;
     submit.pSignalSemaphores = signal_semaphores;
     fd_info.semaphore = queue->managed_present_semaphore;
     res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, VK_NULL_HANDLE );
@@ -7155,6 +7180,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     VkSwapchainKHR *swapchains;
     uint32_t host_indices_buffer[16], *host_indices = host_indices_buffer;
     VkSemaphore *host_wait_semaphores = NULL;
+    VkSemaphore managed_host_semaphore = VK_NULL_HANDLE;
     const VkSwapchainPresentFenceInfoKHR *present_fence_info =
         win32u_vk_find_struct( present_info, SWAPCHAIN_PRESENT_FENCE_INFO_KHR );
     const VkPresentIdKHR *present_id_info =
@@ -7306,6 +7332,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         host_info.pImageIndices = image_indices;
     }
 
+    if (host_count && first_managed && all_managed_explicit && !queue->managed_present_sync_unavailable &&
+        (res = swapchain_get_present_semaphore( device, present_swapchains[host_indices[0]],
+                                                 image_indices[0], &managed_host_semaphore )))
+        goto failed;
+
     if (blit_count)
     {
         VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -7351,7 +7382,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         managed_sync_res = present_export_waits( device, queue,
                                                  present_info->pWaitSemaphores,
                                                  present_info->waitSemaphoreCount,
-                                                 host_count != 0, &managed_sync_fd,
+                                                 managed_host_semaphore, &managed_sync_fd,
                                                  &explicit_submit );
 
         if (explicit_submit)
@@ -7362,7 +7393,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             if (host_count)
             {
                 host_info.waitSemaphoreCount = 1;
-                host_info.pWaitSemaphores = &queue->managed_host_semaphore;
+                host_info.pWaitSemaphores = &managed_host_semaphore;
             }
         }
         if (managed_sync_res < VK_SUCCESS && explicit_submit)
@@ -7395,7 +7426,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         else if (explicit_submit)
         {
             VkResult consume_res = present_consume_waits( device, queue, NULL, VK_NULL_HANDLE,
-                                                          &queue->managed_host_semaphore, 1, FALSE );
+                                                          &managed_host_semaphore, 1, FALSE );
             if (consume_res < VK_SUCCESS && host_res >= VK_SUCCESS) host_res = consume_res;
         }
 
