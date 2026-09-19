@@ -2325,13 +2325,12 @@ static void install_bpf(struct sigaction *sig_act)
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
-    int limited_va = (ULONG_PTR)syscall < NATIVE_SYSCALL_ADDRESS_START; /* limited VA space (e.g. android) */
-    void *mmap_hint;
     long (*test_syscall)(long sc_number);
     struct sock_fprog prog;
     NTSTATUS status;
 
-    if (!limited_va && (ULONG_PTR)sc_seccomp < NATIVE_SYSCALL_ADDRESS_START)
+    if ((ULONG_PTR)sc_seccomp < NATIVE_SYSCALL_ADDRESS_START
+            || (ULONG_PTR)syscall < NATIVE_SYSCALL_ADDRESS_START)
     {
         ERR_(seh)("Native libs are being loaded in low addresses, sc_seccomp %p, syscall %p, not installing seccomp.\n",
                 sc_seccomp, syscall);
@@ -2344,10 +2343,9 @@ static void install_bpf(struct sigaction *sig_act)
 
     sigaction(SIGSYS, sig_act, NULL);
 
-    mmap_hint = limited_va ? NULL : (void *)0x600000000000;
-    test_syscall = mmap(mmap_hint, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
+    test_syscall = mmap((void *)0x600000000000, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
             MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (!limited_va ? test_syscall != (void *)0x600000000000 : test_syscall == MAP_FAILED)
+    if (test_syscall != (void *)0x600000000000)
     {
         int ret;
 
