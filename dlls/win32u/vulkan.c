@@ -6096,12 +6096,16 @@ static VkResult swapchain_wait_for_present( struct vulkan_device *device, struct
 {
     struct client_surface *client = swapchain->surface->client;
     BOOL infinite = timeout == UINT64_MAX;
-    uint64_t stalled = 0;
+    uint64_t budget = infinite ? WINE_VK_PRESENT_WAIT_STALL_NS : timeout;
+    uint64_t remaining = budget;
+    BOOL sliced = budget > WINE_VK_PRESENT_WAIT_SLICE_NS;
+    uint64_t start = sliced ? managed_monotonic_time_ns() : 0;
     VkResult res;
 
     for (;;)
     {
-        uint64_t slice = min( timeout, WINE_VK_PRESENT_WAIT_SLICE_NS );
+        uint64_t slice = min( remaining, WINE_VK_PRESENT_WAIT_SLICE_NS );
+        uint64_t elapsed;
 
         if (swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
         if (!client_surface_begin_present_wait( client, swapchain->presentation_generation ))
@@ -6126,17 +6130,20 @@ static VkResult swapchain_wait_for_present( struct vulkan_device *device, struct
 
         if (should_skip_wait( swapchain->surface->hwnd )) return VK_SUCCESS;
 
-        if (infinite && (stalled += slice) >= WINE_VK_PRESENT_WAIT_STALL_NS)
+        if (!sliced) return VK_TIMEOUT;
+        elapsed = managed_monotonic_time_ns() - start;
+        if (elapsed >= budget)
         {
+            if (!infinite) return VK_TIMEOUT;
             client_surface_invalidate_presentation( client );
             WARN( "hwnd %p swapchain %p present wait stalled, returning VK_ERROR_OUT_OF_DATE_KHR\n",
                   swapchain->surface->hwnd, swapchain );
             return VK_ERROR_OUT_OF_DATE_KHR;
         }
 
-        if (infinite) continue;
-        if (timeout <= slice) return VK_TIMEOUT;
-        timeout -= slice;
+        /* Host waits can overshoot due to scheduling or timer granularity.
+         * Charge that time to the original deadline, not just the requested slice. */
+        remaining = budget - elapsed;
     }
 }
 
