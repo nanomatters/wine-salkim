@@ -1122,6 +1122,39 @@ static HWND *build_hwnd_list(HWND parent)
     }
 }
 
+/* An ancestor's move, visibility change or reparenting changes descendant
+ * state without sending WindowPosChanged to those descendants. Refresh their
+ * snapshots before win32u updates client surfaces. Query Win32 state without
+ * win_data_mutex held, preserving the user lock -> driver lock ordering. */
+static void refresh_child_window_state(HWND parent)
+{
+    struct wayland_win_data *data;
+    HWND *list, hwnd, toplevel;
+    RECT client_rect;
+    BOOL visible, rect_valid;
+    UINT i;
+
+    if (!NtUserGetWindowRelative(parent, GW_CHILD)) return;
+    if (!(list = build_hwnd_list(parent))) return;
+
+    for (i = 0; list[i] != HWND_BOTTOM; i++)
+    {
+        hwnd = list[i];
+        toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+        visible = NtUserIsWindowVisible(hwnd);
+        rect_valid = get_client_rect_in_toplevel(hwnd, toplevel, &client_rect);
+
+        if (!(data = wayland_win_data_get(hwnd))) continue;
+        data->toplevel = toplevel;
+        data->visible = visible && !data->explicitly_hidden;
+        data->client_rect_in_toplevel = client_rect;
+        data->client_rect_in_toplevel_valid = rect_valid;
+        wayland_win_data_release(data);
+    }
+
+    free(list);
+}
+
 static BOOL has_owned_popups(HWND hwnd)
 {
     HWND *list;
@@ -1716,6 +1749,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     wayland_win_data_release(data);
+
+    refresh_child_window_state(hwnd);
 
     if (previous_host && previous_host != external_host)
         NtUserPostMessage(previous_host, WM_WAYLAND_DMABUF_FRAME, 0, 0);
