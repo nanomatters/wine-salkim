@@ -29,12 +29,14 @@ struct test_device
     LONG ref;
     ULONG intrinsics;
     BOOL wmma, fp8;
+    LONG interop_queries;
 };
 
 static HRESULT WINAPI device_QueryInterface(IUnknown *iface, REFIID iid, void **out)
 {
     struct test_device *device = CONTAINING_RECORD(iface, struct test_device, IUnknown_iface);
 
+    if (IsEqualGUID(iid, &IID_ID3D12DXVKInteropDevice)) InterlockedIncrement(&device->interop_queries);
     *out = NULL;
     if (IsEqualGUID(iid, &IID_IUnknown)) *out = iface;
     else if (IsEqualGUID(iid, &IID_ID3D12DeviceExt3)) *out = &device->ID3D12DeviceExt3_iface;
@@ -93,6 +95,26 @@ static const ID3D12DeviceExt3Vtbl ext_vtbl =
 };
 
 static struct test_device device = {{&device_vtbl}, {&ext_vtbl}, 1};
+
+static void test_upgrade_probe(void)
+{
+    LONG queries = device.interop_queries;
+    IAmdExtFfxApi *ffx;
+    char env[16];
+    HRESULT hr;
+
+    hr = pAmdExtD3DCreateInterface(&device.IUnknown_iface, &IID_IAmdExtFfxApi, (void **)&ffx);
+    ok(hr == S_OK, "Create returned %#lx.\n", hr);
+    if (FAILED(hr)) return;
+    /* The fake device has no Vulkan interop. Automatic selection probes it once. */
+    SetLastError(ERROR_SUCCESS);
+    if (GetEnvironmentVariableA("FSR4_UPGRADE", env, sizeof(env)) || GetLastError() != ERROR_ENVVAR_NOT_FOUND)
+        ok(device.interop_queries == queries, "Explicit setting queried Vulkan interop.\n");
+    else
+        ok(device.interop_queries == queries + 1, "Automatic selection did not query Vulkan interop.\n");
+    IAmdExtFfxApi_Release(ffx);
+    ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
+}
 
 static void test_info_stubs(void)
 {
@@ -361,6 +383,7 @@ START_TEST(amdxc64)
         return;
     }
     test_disabled_provider();
+    test_upgrade_probe();
     test_creation_errors();
     test_interfaces();
     test_intrinsics();

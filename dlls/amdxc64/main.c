@@ -76,7 +76,6 @@ static BOOL is_rdna2(ID3D12Device *device)
     VkDevice vk_device;
     VkPhysicalDevice phys_device;
     VkPhysicalDeviceProperties2 prop = {0};
-    VkPhysicalDeviceDriverProperties driver_prop = {0};
     const char **extensions = NULL;
     UINT extension_count = 0;
     BOOL ret = FALSE;
@@ -88,8 +87,6 @@ static BOOL is_rdna2(ID3D12Device *device)
         goto fail;
 
     prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    prop.pNext = &driver_prop;
-    driver_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
 
     vkGetPhysicalDeviceProperties2(phys_device, &prop);
 
@@ -726,7 +723,8 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
         if (!(ffx = calloc(1, sizeof(*ffx)))) return E_OUTOFMEMORY;
         ffx->IAmdExtFfxApi_iface.lpVtbl = &AMDFSR4FFX_vtable;
         ffx->ref = 1;
-        ffx->rdna2 = is_rdna2((ID3D12Device *)outer);
+        InitOnceExecuteOnce(&config_once, init_upgrade_config, NULL, NULL);
+        ffx->rdna2 = fsr4_upgrade == UPGRADE_AUTO && is_rdna2((ID3D12Device *)outer);
         check_intrinsic_support((ID3D12Device *)outer, &ffx->fp8_supported, NULL, NULL);
         *obj = &ffx->IAmdExtFfxApi_iface;
         return S_OK;
