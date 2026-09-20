@@ -510,9 +510,6 @@ struct amd64_thread_data
     void                **instrumentation_callback; /* 0330 */
     DWORD                 fs;            /* 0338 WOW TEB selector */
     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
-    volatile char         sigusr1_blocked; /* 0340 */
-    volatile char         sigusr1_pending; /* 0341 */
-    volatile char         sigusr1_context_depth; /* 0342 */
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
@@ -521,13 +518,28 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fra
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
-C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, sigusr1_blocked ) == 0x340 );
-C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, sigusr1_pending ) == 0x341 );
-C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, sigusr1_context_depth ) == 0x342 );
 
 static inline struct amd64_thread_data *amd64_thread_data(void)
 {
     return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+}
+
+/* Keep local signal state in the last CPU data slot, away from upstream fields. */
+struct sigusr1_thread_data
+{
+    volatile char blocked;       /* 0368 */
+    volatile char pending;       /* 0369 */
+    volatile char context_depth; /* 036a */
+};
+
+C_ASSERT( sizeof(struct amd64_thread_data) <= offsetof( struct ntdll_thread_data, cpu_data[15] ));
+C_ASSERT( sizeof(struct sigusr1_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data[15]) );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, cpu_data[15] ) +
+          offsetof( struct sigusr1_thread_data, pending ) == 0x369 );
+
+static inline struct sigusr1_thread_data *sigusr1_thread_data( TEB *teb )
+{
+    return (struct sigusr1_thread_data *)&((struct ntdll_thread_data *)&teb->GdiTebBatch)->cpu_data[15];
 }
 
 static inline void update_instrumentation_rip( struct syscall_frame *frame )
@@ -1129,31 +1141,31 @@ void deferred_sigusr1(void);
 
 static inline void block_sigusr1(void)
 {
-    amd64_thread_data()->sigusr1_blocked++;
+    sigusr1_thread_data( NtCurrentTeb() )->blocked++;
 }
 
 static inline void unblock_sigusr1(void)
 {
-    if (!--amd64_thread_data()->sigusr1_blocked && amd64_thread_data()->sigusr1_pending)
+    if (!--sigusr1_thread_data( NtCurrentTeb() )->blocked && sigusr1_thread_data( NtCurrentTeb() )->pending)
         deferred_sigusr1();
 }
 
 static inline void abort_sigusr1_context_block(void)
 {
-    unsigned char depth = amd64_thread_data()->sigusr1_context_depth;
+    unsigned char depth = sigusr1_thread_data( NtCurrentTeb() )->context_depth;
 
     if (!depth) return;
-    amd64_thread_data()->sigusr1_context_depth = 0;
-    amd64_thread_data()->sigusr1_blocked -= depth;
+    sigusr1_thread_data( NtCurrentTeb() )->context_depth = 0;
+    sigusr1_thread_data( NtCurrentTeb() )->blocked -= depth;
 }
 
 #define CALL_SIGUSR1_PROTECTED(status, expression) \
     do \
     { \
         block_sigusr1(); \
-        amd64_thread_data()->sigusr1_context_depth++; \
+        sigusr1_thread_data( NtCurrentTeb() )->context_depth++; \
         status = (expression); \
-        amd64_thread_data()->sigusr1_context_depth--; \
+        sigusr1_thread_data( NtCurrentTeb() )->context_depth--; \
         unblock_sigusr1(); \
     } while (0)
 
@@ -2977,14 +2989,14 @@ void deferred_sigusr1(void)
     TRACE_(seh)( "handling deferred SIGUSR1\n" );
     do
     {
-        amd64_thread_data()->sigusr1_pending = 0;
+        sigusr1_thread_data( NtCurrentTeb() )->pending = 0;
         /* USR1 could arrive again immediately since we are not in signal context,
          * so block it. This must not enclose faultable user-buffer access because
          * the block is not depth-tracked. */
-        amd64_thread_data()->sigusr1_blocked++;
+        sigusr1_thread_data( NtCurrentTeb() )->blocked++;
         usr1_inside_syscall( &context );
-        amd64_thread_data()->sigusr1_blocked--;
-    } while (amd64_thread_data()->sigusr1_pending);
+        sigusr1_thread_data( NtCurrentTeb() )->blocked--;
+    } while (sigusr1_thread_data( NtCurrentTeb() )->pending);
 }
 
 /**********************************************************************
@@ -3011,7 +3023,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         RIP_sig(ucontext) < (ULONG_PTR)__wine_syscall_dispatcher_save_end_ptr)
     {
         TRACE_(seh)( "deferring SIGUSR1 during syscall entry (rip=%#lx)\n", (long)RIP_sig(ucontext) );
-        amd64_thread_data()->sigusr1_pending = 1;
+        sigusr1_thread_data( NtCurrentTeb() )->pending = 1;
         return;
     }
     if (RIP_sig(ucontext) >= (ULONG_PTR)__wine_syscall_dispatcher_return_ptr &&
@@ -3038,11 +3050,11 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         restore_context( &outside_context, ucontext );
         return;
     }
-    else if (amd64_thread_data()->sigusr1_blocked)
+    else if (sigusr1_thread_data( NtCurrentTeb() )->blocked)
     {
         TRACE_(seh)( "deferring SIGUSR1 during critical syscall (rip=%#lx, blocked=%d)\n",
-                     (long)RIP_sig(ucontext), amd64_thread_data()->sigusr1_blocked );
-        amd64_thread_data()->sigusr1_pending = 1;
+                     (long)RIP_sig(ucontext), sigusr1_thread_data( NtCurrentTeb() )->blocked );
+        sigusr1_thread_data( NtCurrentTeb() )->pending = 1;
         return;
     }
 
@@ -3291,9 +3303,9 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
 
     assert( thread_data->frame_size == frame_size );
     thread_data->instrumentation_callback = &instrumentation_callback;
-    thread_data->sigusr1_blocked = 0;
-    thread_data->sigusr1_pending = 0;
-    thread_data->sigusr1_context_depth = 0;
+    sigusr1_thread_data( teb )->blocked = 0;
+    sigusr1_thread_data( teb )->pending = 0;
+    sigusr1_thread_data( teb )->context_depth = 0;
 
 #if defined __linux__
     arch_prctl( ARCH_SET_GS, teb );
@@ -3563,7 +3575,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                     * SIGUSR1 is deferred. Handle it now.
                     */
                    "\n" __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_save_end") ":\n\t"
-                   "testb $1,0x341(%r13)\n\t"      /* amd64_thread_data()->sigusr1_pending */
+                   "testb $1,0x369(%r13)\n\t"      /* sigusr1_thread_data()->pending */
                    "jz 1f\n\t"
                    "pushq %r8\n\t"
                    "pushq %r9\n\t"
