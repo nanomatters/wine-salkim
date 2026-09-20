@@ -6379,28 +6379,30 @@ static BOOL wayland_surface_reconfigure_layer(struct wayland_surface *surface)
     return TRUE;
 }
 
-/* Owned windows stack above the owner's client content. */
+/* Select the outer edge of the parent's GDI and GPU content. */
 static struct wl_surface *wayland_surface_owner_content_anchor(
-        struct wayland_surface *surface, struct wayland_win_data *data)
+        struct wayland_surface *surface, struct wayland_win_data *data, BOOL below)
 {
     struct wayland_client_surface *client = data->client_surface;
 
-    if (client && client->wl_subsurface && client->stack_above_parent &&
+    if (client && client->wl_subsurface && client->stack_above_parent != below &&
         client->toplevel == surface->hwnd &&
         client->toplevel_wl_surface == surface->wl_surface)
         return client->wl_surface;
 
-    return surface->wl_surface;
+    return below ? wayland_surface_client_stack_anchor(surface) : surface->wl_surface;
 }
 
 static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface)
 {
+    struct wayland_win_data *data = wayland_win_data_get_nolock(surface->hwnd);
     struct wayland_win_data *sibling_data;
     struct wayland_win_data *toplevel_data;
     struct wayland_surface *sibling_surface;
     struct wayland_surface *toplevel_surface;
     struct wl_surface *stack_target;
     HWND sibling_hwnd;
+    BOOL below = data && data->subsurface_below_parent;
     POINT point;
 
     if (!(toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) ||
@@ -6423,13 +6425,16 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
     TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, point.x, point.y);
     wl_subsurface_set_position(surface->wl_subsurface, point.x, point.y);
 
-    /* Owned windows stack above their owner and follow Win32 sibling order. */
-    stack_target = wayland_surface_owner_content_anchor(toplevel_surface, toplevel_data);
+    /* Inferred background windows stack below all parent content. Other
+     * attached windows retain their above-parent placement. */
+    stack_target = wayland_surface_owner_content_anchor(toplevel_surface, toplevel_data, below);
     sibling_hwnd = surface->hwnd;
-    while ((sibling_hwnd = NtUserGetWindowRelative(sibling_hwnd, GW_HWNDNEXT)))
+    while ((sibling_hwnd = NtUserGetWindowRelative(sibling_hwnd, below ? GW_HWNDPREV : GW_HWNDNEXT)))
     {
+        if (sibling_hwnd == surface->toplevel_hwnd) break;
         if (!(sibling_data = wayland_win_data_get_nolock(sibling_hwnd)) ||
-            sibling_data->overlay_owner != surface->toplevel_hwnd ||
+            sibling_data->subsurface_parent != surface->toplevel_hwnd ||
+            sibling_data->subsurface_below_parent != below ||
             !(sibling_surface = sibling_data->wayland_surface) ||
             sibling_surface->role != WAYLAND_SURFACE_ROLE_SUBSURFACE ||
             !sibling_surface->wl_subsurface ||
@@ -6439,7 +6444,8 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
         stack_target = sibling_surface->wl_surface;
         break;
     }
-    wl_subsurface_place_above(surface->wl_subsurface, stack_target);
+    if (below) wl_subsurface_place_below(surface->wl_subsurface, stack_target);
+    else wl_subsurface_place_above(surface->wl_subsurface, stack_target);
     wayland_surface_mark_pending_commit(toplevel_surface);
     wayland_surface_commit_pending_state(toplevel_surface);
     memset(&surface->processing, 0, sizeof(surface->processing));

@@ -516,8 +516,8 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect);
     BOOL fullscreen = wayland_win_data_is_fullscreen(data);
 
-    if (data->virtual_desktop && data->overlay_owner && data->client_rect_in_toplevel_valid &&
-        (owner = wayland_win_data_get_nolock(data->overlay_owner)) && owner->wayland_surface &&
+    if (data->virtual_desktop && data->subsurface_parent && data->client_rect_in_toplevel_valid &&
+        (owner = wayland_win_data_get_nolock(data->subsurface_parent)) && owner->wayland_surface &&
         owner->wayland_surface->window.virtual_size.cx && owner->wayland_surface->window.virtual_size.cy)
         parent = &owner->wayland_surface->window;
 
@@ -727,7 +727,7 @@ static HWND get_owned_overlay_owner(HWND hwnd, HWND owner, DWORD style, DWORD ex
 }
 
 /* Caller holds win_data_mutex. */
-static void refresh_owned_overlays(HWND owner, BOOL wake_unbound)
+static void refresh_subsurface_windows(HWND owner, BOOL wake_unbound)
 {
     struct wayland_win_data *data;
 
@@ -735,7 +735,14 @@ static void refresh_owned_overlays(HWND owner, BOOL wake_unbound)
     {
         struct wayland_surface *surface;
 
-        if (data->overlay_owner != owner) continue;
+        if (data->subsurface_parent != owner) continue;
+        /* An inferred host may move, hide or change its own presentation
+         * parent without a position notification for this window. */
+        if (data->subsurface_below_parent && wake_unbound)
+        {
+            NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+            continue;
+        }
         data->client_rect_in_toplevel_valid =
             get_client_rect_in_toplevel(data->hwnd, owner,
                                         &data->client_rect_in_toplevel);
@@ -747,7 +754,7 @@ static void refresh_owned_overlays(HWND owner, BOOL wake_unbound)
             if (data->virtual_desktop)
             {
                 wayland_surface_commit_pending_state(surface);
-                refresh_owned_overlays(data->hwnd, FALSE);
+                refresh_subsurface_windows(data->hwnd, FALSE);
             }
         }
         else if (wake_unbound)
@@ -756,13 +763,13 @@ static void refresh_owned_overlays(HWND owner, BOOL wake_unbound)
 }
 
 /* Caller holds win_data_mutex. */
-static void queue_owned_overlay_updates(HWND owner)
+static void queue_subsurface_updates(HWND owner)
 {
     struct wayland_win_data *data;
 
     RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
     {
-        if (data->overlay_owner == owner)
+        if (data->subsurface_parent == owner)
             NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
     }
 }
@@ -775,7 +782,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
                                                     BOOL use_layer_shell,
                                                     struct window_surface *window_surface,
                                                     BOOL has_menu_popup_owner,
-                                                    BOOL owned_overlay,
+                                                    BOOL subsurface_window,
                                                     BOOL foreground,
                                                     BOOL *initial_state_committed)
 {
@@ -818,7 +825,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     if (!surface || !surface->window.visible)
         visible = visible && layer_set;
 
-    keep_toplevel_mapped = !owned_overlay && !owner_surface && !use_layer_shell &&
+    keep_toplevel_mapped = !subsurface_window && !owner_surface && !use_layer_shell &&
                            !toplevel_surface && should_keep_toplevel_mapped(
                                    surface, style, data->explicitly_hidden);
     fullscreen_target_active = surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
@@ -830,13 +837,13 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     if (keep_toplevel_mapped)
         visible = TRUE;
 
-    if (visible && !owned_overlay && !owner_surface && !use_layer_shell && !toplevel_surface &&
+    if (visible && !subsurface_window && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !wayland_output_layout_intersects_rect(&data->rects.window) &&
         !keep_toplevel_mapped && !fullscreen_target_active && !first_show_minimized)
         visible = FALSE;
 
     /* If the toplevel has no observable area, make it roleless. */
-    if (!visible || (owned_overlay && !toplevel_surface)) role = WAYLAND_SURFACE_ROLE_NONE;
+    if (!visible || (subsurface_window && !toplevel_surface)) role = WAYLAND_SURFACE_ROLE_NONE;
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
     else if (use_layer_shell && !IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_LAYER;
     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
@@ -1093,7 +1100,7 @@ void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data)
     wayland_win_data_update_wayland_state(data);
     if (data->virtual_desktop)
     {
-        refresh_owned_overlays(data->hwnd, FALSE);
+        refresh_subsurface_windows(data->hwnd, FALSE);
         wl_display_flush(process_wayland.wl_display);
     }
 }
@@ -1299,32 +1306,33 @@ static inline HWND get_active_window(void)
  */
 /* Owned, caption-less popups (menus, dropdowns, tooltips) become xdg_popups
  * anchored to their owner. A Wayland toplevel has no client-set position. */
-/* Reject owner cycles that can briefly appear during transition states. */
-static BOOL has_owner_cycle(HWND hwnd, struct wayland_surface *owner)
+static struct wayland_surface *get_surface_parent(struct wayland_surface *surface)
 {
-    struct wayland_win_data *grandparent_data;
-    struct wayland_surface *grandparent;
+    struct wayland_win_data *data;
+    HWND parent;
 
-    if (!wayland_surface_is_popup(owner)) return FALSE;
-    if (owner->owner_hwnd == hwnd) return TRUE;
-
-    if (!(grandparent_data = wayland_win_data_get_nolock(owner->owner_hwnd))) return FALSE;
-    if (!(grandparent = grandparent_data->wayland_surface)) return FALSE;
-    return has_owner_cycle(hwnd, grandparent);
+    if (!surface) return NULL;
+    if (wayland_surface_is_popup(surface)) parent = surface->owner_hwnd;
+    else if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE) parent = surface->toplevel_hwnd;
+    else return NULL;
+    data = wayland_win_data_get_nolock(parent);
+    return data ? data->wayland_surface : NULL;
 }
 
-/* Same for a subsurface's parent (toplevel_hwnd) chain. */
-static BOOL has_parent_cycle(HWND hwnd, struct wayland_surface *parent)
+/* Check mixed popup/subsurface trees too. Positional hints do not establish
+ * the acyclic hierarchy guaranteed by a real Win32 parent. */
+static BOOL has_surface_parent_cycle(HWND hwnd, struct wayland_surface *parent)
 {
-    struct wayland_win_data *grandparent_data;
-    struct wayland_surface *grandparent;
+    struct wayland_surface *fast = parent;
 
-    if (parent->role != WAYLAND_SURFACE_ROLE_SUBSURFACE) return FALSE;
-    if (parent->toplevel_hwnd == hwnd) return TRUE;
-
-    if (!(grandparent_data = wayland_win_data_get_nolock(parent->toplevel_hwnd))) return FALSE;
-    if (!(grandparent = grandparent_data->wayland_surface)) return FALSE;
-    return has_parent_cycle(hwnd, grandparent);
+    while (parent)
+    {
+        if (parent->hwnd == hwnd) return TRUE;
+        parent = get_surface_parent(parent);
+        fast = get_surface_parent(get_surface_parent(fast));
+        if (parent && parent == fast) return TRUE;
+    }
+    return FALSE;
 }
 
 /* Caption-less, sysmenu-less popups are menu-like transient windows. When they
@@ -1336,6 +1344,31 @@ BOOL wayland_is_menu_popup_candidate(HWND hwnd)
     DWORD exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
 
     return is_menu_popup_candidate_style(style, exstyle);
+}
+
+/* Positive means hwnd is above other, negative below, zero unknown. */
+static int get_window_z_order(HWND hwnd, HWND other)
+{
+    HWND *list;
+    unsigned int i;
+    int order = 0, result = 0;
+
+    if (!(list = build_hwnd_list(NULL))) return 0;
+    for (i = 0; list[i] != HWND_BOTTOM; i++)
+    {
+        if (list[i] == hwnd)
+        {
+            if (order) { result = order; break; }
+            order = 1;
+        }
+        else if (list[i] == other)
+        {
+            if (order) { result = order; break; }
+            order = -1;
+        }
+    }
+    free(list);
+    return result;
 }
 
 static HWND get_popup_owner(HWND hwnd, HWND owner_hint)
@@ -1365,6 +1398,25 @@ static HWND get_popup_owner(HWND hwnd, HWND owner_hint)
     }
 
     return owner;
+}
+
+/* Caller holds win_data_mutex. A host can move across an inferred popup in
+ * Z-order without a position notification for that popup. NOZORDER updates
+ * do not schedule this again. Include hints which were previously rejected. */
+static void queue_inferred_popup_updates(HWND changed)
+{
+    struct wayland_win_data *data;
+
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->hwnd == changed || data->owner || !data->visible ||
+            (data->toplevel != data->hwnd && !data->subsurface_parent) ||
+            !is_menu_popup_candidate_style(data->style, data->exstyle))
+            continue;
+        /* The host-specific refresh already notified these windows. */
+        if (data->subsurface_below_parent && data->subsurface_parent == changed) continue;
+        NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+    }
 }
 
 BOOL wayland_is_menu_popup(HWND hwnd)
@@ -1527,7 +1579,8 @@ void WAYLAND_DestroyWindow(HWND hwnd)
     TRACE("%p\n", hwnd);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
-    queue_owned_overlay_updates(hwnd);
+    queue_subsurface_updates(hwnd);
+    queue_inferred_popup_updates(hwnd);
     host = data->external_host;
     wayland_win_data_destroy(data);
 
@@ -1572,11 +1625,12 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
     BOOL continue_configure = FALSE;
     BOOL update_owned;
+    BOOL update_inferred;
     BOOL foreground = NtUserGetForegroundWindow() == hwnd;
     HWND previous_host = NULL;
     HWND external_host = NULL;
-    HWND overlay_owner = NULL;
-    BOOL owned_overlay = FALSE;
+    HWND subsurface_parent = NULL;
+    BOOL subsurface_below_parent = FALSE;
     BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
     RECT present_rect = {0};
     BOOL has_present_rect;
@@ -1608,17 +1662,32 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         HWND popup_owner = get_popup_owner(hwnd, owner_hint);
 
+        /* xdg_popups always stack above their parent. Preserve the actual
+         * Win32 order for inferred background helpers with a subsurface.
+         * Keep the popup fallback when the order cannot be determined. */
+        if (popup_owner && !window_owner && wayland_is_menu_popup_candidate(hwnd))
+        {
+            int order = get_window_z_order(hwnd, popup_owner);
+
+            if (order < 0)
+            {
+                subsurface_parent = popup_owner;
+                subsurface_below_parent = TRUE;
+                popup_owner = NULL;
+            }
+        }
+
         /* Get the managed state with win_data unlocked, as is_window_managed
          * may need to query win_data information about other HWNDs and thus
          * acquire the lock itself internally. */
         menu_popup_owner = wayland_is_menu_popup_candidate(hwnd) ? popup_owner : NULL;
         managed = is_window_managed(hwnd, menu_popup_owner, swp_flags, fullscreen);
-        overlay_owner = get_owned_overlay_owner(hwnd, window_owner, style, exstyle);
-        owned_overlay = overlay_owner != NULL;
-        if (owned_overlay)
+        if (!subsurface_parent)
+            subsurface_parent = get_owned_overlay_owner(hwnd, window_owner, style, exstyle);
+        if (subsurface_parent)
         {
             managed = FALSE;
-            toplevel = overlay_owner;
+            toplevel = subsurface_parent;
         }
         else if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
         {
@@ -1636,7 +1705,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     client_rect_in_toplevel_valid =
-        get_client_rect_in_toplevel(hwnd, owned_overlay ? overlay_owner : root,
+        get_client_rect_in_toplevel(hwnd, subsurface_parent ? subsurface_parent : root,
                                     &client_rect_in_toplevel);
 
     TRACE("hwnd %p toplevel %p window_owner %p role_owner %p owner_hint %p menu_owner %p "
@@ -1664,15 +1733,23 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* Cycles can occur during some transition states.
      * They can be corrected the next time their position updates (after the toplevel gets its role)
      * otherwise these windows will remain as toplevels. */
-    if (owner_surface && has_owner_cycle(hwnd, owner_surface))
+    if (owner_surface && has_surface_parent_cycle(hwnd, owner_surface))
     {
         ERR("hwnd=%p owner=%p forms a cycle!\n", hwnd, owner);
         owner_surface = NULL;
     }
-    if (toplevel_surface && has_parent_cycle(hwnd, toplevel_surface))
+    if (toplevel_surface && has_surface_parent_cycle(hwnd, toplevel_surface))
     {
         ERR("hwnd=%p parent=%p forms a cycle!\n", hwnd, toplevel);
         toplevel_surface = NULL;
+        if (subsurface_parent)
+        {
+            toplevel = root;
+            SetRectEmpty(&client_rect_in_toplevel);
+            client_rect_in_toplevel_valid = FALSE;
+        }
+        subsurface_parent = NULL;
+        subsurface_below_parent = FALSE;
     }
 
     /* Keep explicit hide intent across later position-only updates. */
@@ -1684,10 +1761,13 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     update_owned = hwnd == root && (data->visible != visible || data->owner != window_owner ||
                                    previous_host != external_host);
+    update_inferred = hwnd == root && (!(swp_flags & SWP_NOZORDER) ||
+                                      data->visible != visible || ((data->style ^ style) & WS_MINIMIZE));
     data->rects = *new_rects;
-    data->toplevel = owned_overlay ? overlay_owner : root;
+    data->toplevel = subsurface_parent ? subsurface_parent : root;
     data->owner = window_owner;
-    data->overlay_owner = overlay_owner;
+    data->subsurface_parent = subsurface_parent;
+    data->subsurface_below_parent = subsurface_below_parent;
     data->external_host = external_host;
     data->visible = visible;
     data->style = style;
@@ -1724,14 +1804,15 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
                                                      use_layer_shell, surface,
-                                                     menu_popup_owner != NULL, owned_overlay,
+                                                     menu_popup_owner != NULL, subsurface_parent != NULL,
                                                      foreground, &initial_state_committed))
     {
         if (!initial_state_committed) wayland_win_data_update_wayland_state(data);
     }
 
-    if (overlay_owner) refresh_owned_overlays(overlay_owner, FALSE);
-    refresh_owned_overlays(hwnd, TRUE);
+    if (subsurface_parent) refresh_subsurface_windows(subsurface_parent, FALSE);
+    refresh_subsurface_windows(hwnd, TRUE);
+    if (update_inferred) queue_inferred_popup_updates(hwnd);
 
     continue_configure = wayland_win_data_configure_state_applied(data);
 

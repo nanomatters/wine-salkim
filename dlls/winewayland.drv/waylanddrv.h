@@ -949,7 +949,9 @@ struct wayland_win_data
     /* Win32 state cached before taking win_data_mutex. */
     HWND toplevel;
     HWND owner;
-    HWND overlay_owner;
+    /* Presentation parent, independent of Win32 ownership. */
+    HWND subsurface_parent;
+    BOOL subsurface_below_parent;
     HWND external_host;
     WCHAR *window_text;
     BOOL visible;
