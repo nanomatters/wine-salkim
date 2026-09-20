@@ -94,6 +94,57 @@ static const ID3D12DeviceExt3Vtbl ext_vtbl =
 
 static struct test_device device = {{&device_vtbl}, {&ext_vtbl}, 1};
 
+static void test_wave_matrix(void)
+{
+    AmdExtWaveMatrixProperties properties[2], saved[2];
+    IAmdExtD3DFactory *factory;
+    IAmdExtD3DDevice8 *extension;
+    unsigned int fp8, i;
+    SIZE_T count;
+    HRESULT hr;
+
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtD3DFactory, (void **)&factory);
+    ok(hr == S_OK, "Factory returned %#lx.\n", hr);
+    if (FAILED(hr)) return;
+    for (fp8 = 0; fp8 < 2; ++fp8)
+    {
+        device.fp8 = fp8;
+        hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface,
+                &IID_IAmdExtD3DDevice8, (void **)&extension);
+        ok(hr == S_OK, "Create returned %#lx.\n", hr);
+        if (FAILED(hr)) continue;
+        device.fp8 = FALSE;
+        hr = IAmdExtD3DDevice8_GetWaveMatrixProperties(extension, NULL, properties);
+        ok(hr == E_INVALIDARG, "Null count returned %#lx.\n", hr);
+        for (i = 0; i < 3; ++i)
+        {
+            count = i;
+            hr = IAmdExtD3DDevice8_GetWaveMatrixProperties(extension, &count, NULL);
+            ok(hr == S_OK && count == fp8, "Count query %u returned %#lx, %Iu.\n", i, hr, count);
+            memset(properties, 0xa5, sizeof(properties));
+            memcpy(saved, properties, sizeof(saved));
+            count = i;
+            hr = IAmdExtD3DDevice8_GetWaveMatrixProperties(extension, &count, properties);
+            ok(hr == (fp8 && !i ? E_NOT_SUFFICIENT_BUFFER : S_OK), "Capacity %u returned %#lx.\n", i, hr);
+            ok(count == fp8, "Reported %Iu entries, expected %u.\n", count, fp8);
+            if (!fp8 || !i)
+                ok(!memcmp(properties, saved, sizeof(saved)), "Unexpected buffer write.\n");
+            else
+            {
+                ok(properties[0].mSize == 16 && properties[0].nSize == 16 && properties[0].kSize == 16,
+                        "Unexpected matrix dimensions.\n");
+                ok(properties[0].aType == AMD_EXT_WMMA_TYPE_FP8 && properties[0].bType == AMD_EXT_WMMA_TYPE_FP8 &&
+                        properties[0].cType == AMD_EXT_WMMA_TYPE_FP32 && properties[0].resultType == AMD_EXT_WMMA_TYPE_FP32 &&
+                        !properties[0].saturatingAccumulation, "Unexpected matrix types.\n");
+                ok(!memcmp(properties + 1, saved + 1, sizeof(saved[1])), "Wrote past returned entry.\n");
+            }
+        }
+        IAmdExtD3DDevice8_Release(extension);
+    }
+    IAmdExtD3DFactory_Release(factory);
+    ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
+}
+
 static void test_creation_errors(void)
 {
     static const IID *iids[] = {&IID_IAmdExtD3DShaderIntrinsics, &IID_IAmdExtD3DDevice8};
@@ -268,5 +319,6 @@ START_TEST(amdxc64)
     test_creation_errors();
     test_interfaces();
     test_intrinsics();
+    test_wave_matrix();
     FreeLibrary(module);
 }

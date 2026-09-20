@@ -568,32 +568,26 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_GetWaveMatrixProperties(IAmdExtD3DDev
                                                                    SIZE_T *pCount, AmdExtWaveMatrixProperties *pProperties)
 {
     struct AmdExtD3DDevice8 *this = impl_from_IAmdExtD3DDevice8(iface);
-    static AmdExtWaveMatrixProperties prop[1] =
+    static const AmdExtWaveMatrixProperties prop[1] =
     {
         {
             16, 16, 16, AMD_EXT_WMMA_TYPE_FP8, AMD_EXT_WMMA_TYPE_FP8,
             AMD_EXT_WMMA_TYPE_FP32, AMD_EXT_WMMA_TYPE_FP32, FALSE
         }
     };
+    SIZE_T capacity, count;
 
     TRACE("%p %p %p\n", iface, pCount, pProperties);
 
     if (!pCount) return E_INVALIDARG;
 
-    if (!this->fp8_supported)
-    {
-        *pCount = 0;
-        return S_OK;
-    }
-
-    if (*pCount >= sizeof(prop)/sizeof(prop[0]))
-    {
-        *pCount = sizeof(prop)/sizeof(prop[0]);
-        memcpy(pProperties, prop, sizeof(prop));
-        return S_OK;
-    }
-
-    return E_NOT_SUFFICIENT_BUFFER;
+    capacity = pProperties ? *pCount : 0;
+    count = this->fp8_supported ? ARRAY_SIZE(prop) : 0;
+    *pCount = count;
+    if (!pProperties || !count) return S_OK;
+    if (capacity < count) return E_NOT_SUFFICIENT_BUFFER;
+    memcpy(pProperties, prop, sizeof(prop));
+    return S_OK;
 }
 
 static const struct IAmdExtD3DDevice8Vtbl AmdExtD3DDevice8_vtable = {
