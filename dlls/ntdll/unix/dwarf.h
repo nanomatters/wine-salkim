@@ -959,7 +959,7 @@ static ULONG_PTR eval_expression( const unsigned char *p, CONTEXT *context,
 }
 
 /* apply the computed frame info to the actual context */
-static void apply_frame_state( CONTEXT *context, struct frame_state *state,
+static BOOL apply_frame_state( CONTEXT *context, struct frame_state *state,
                                const struct dwarf_eh_bases *bases )
 {
     unsigned int i;
@@ -978,7 +978,7 @@ static void apply_frame_state( CONTEXT *context, struct frame_state *state,
         cfa = *(ULONG_PTR *)get_context_reg( context, state->cfa_reg ) + state->cfa_offset;
         break;
     }
-    if (!cfa) return;
+    if (!cfa) return FALSE;
 
 #ifdef __x86_64__
     new_context.Rsp = cfa;
@@ -1010,7 +1010,10 @@ static void apply_frame_state( CONTEXT *context, struct frame_state *state,
             break;
         }
     }
+    /* A successful step must not leave the unwinder on the same frame. */
+    if (!memcmp( context, &new_context, sizeof(*context) )) return FALSE;
     *context = new_context;
+    return TRUE;
 }
 
 #endif /* NTDLL_DWARF_H_NO_UNWINDER */

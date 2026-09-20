@@ -737,7 +737,11 @@ static NTSTATUS dwarf_virtual_unwind( ULONG64 ip, ULONG64 *frame,CONTEXT *contex
            fde, fde->length, *handler, *handler_data, info.ip, code_end );
     execute_cfa_instructions( ptr, end, ip, &info, bases );
     *frame = context->Rsp;
-    apply_frame_state( context, &info.state, bases );
+    if (!apply_frame_state( context, &info.state, bases ))
+    {
+        WARN( "failed to unwind frame at rip=%016lx rsp=%016lx\n", context->Rip, context->Rsp );
+        return STATUS_BAD_STACK;
+    }
 
     TRACE( "next function rip=%016lx\n", context->Rip );
     TRACE( "  rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",

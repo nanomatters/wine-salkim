@@ -260,6 +260,11 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     for (;;)
     {
         status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context, need_backtrace( rec->ExceptionCode ) );
+        if (status == STATUS_BAD_STACK)
+        {
+            rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+            break;
+        }
         if (status != STATUS_SUCCESS) return status;
 
     unwind_done:
