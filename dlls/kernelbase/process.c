@@ -783,12 +783,29 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
         WCHAR exe_path[MAX_PATH], *p;
 
         WCHAR *new_env = RtlAllocateHeap( GetProcessHeap(), 0, params->EnvironmentSize );
+        if (!new_env)
+        {
+            HeapFree( GetProcessHeap(), 0, orig_app_name );
+            status = STATUS_NO_MEMORY;
+            goto done;
+        }
         memcpy(new_env, params->Environment, params->EnvironmentSize);
 
         RtlDestroyProcessParameters( params );
+        params = NULL;
 
         if (product_name && !strcmp( product_name, "Easy Anti-Cheat Bootstrapper (EOS)" ))
         {
+            /* Keep the compatibility state local to the child process tree. */
+            RtlInitUnicodeString( &name, L"PROTON_EAC_EOS_PROCESS" );
+            RtlInitUnicodeString( &value, L"1" );
+            if ((status = RtlSetEnvironmentVariable( &new_env, &name, &value )))
+            {
+                RtlFreeHeap( GetProcessHeap(), 0, new_env );
+                HeapFree( GetProcessHeap(), 0, orig_app_name );
+                goto done;
+            }
+
             /* EOS EAC bootstrapper will start the game process directly without using WINAPI, so env vars set on the
              * PE side will be lost. Preserve some critical ones. */
             sync_env_var_to_unix( new_env, "UPLAY_ARGUMENTS" );

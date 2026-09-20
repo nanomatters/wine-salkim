@@ -3286,7 +3286,7 @@ static void *mac_thread_gsbase(void)
 #endif
 
 #ifdef __linux__
-static uintptr_t libc_addr, libc_size;
+static uintptr_t syscall_dispatch_start, syscall_dispatch_size;
 
 static int libc_addr_cb( struct dl_phdr_info *info, size_t info_size, void *arg )
 {
@@ -3299,8 +3299,8 @@ static int libc_addr_cb( struct dl_phdr_info *info, size_t info_size, void *arg 
     if (restorer_addr < info->dlpi_addr || restorer_addr >= info->dlpi_addr + size)
         return 0;
 
-    libc_addr = info->dlpi_addr;
-    libc_size = size;
+    syscall_dispatch_start = info->dlpi_addr;
+    syscall_dispatch_size = size;
     TRACE_(seh)( "found signal trampoline in %s\n", info->dlpi_name);
     return 1;
 }
@@ -3367,6 +3367,7 @@ void signal_init_process( TEB *teb )
 #ifdef __linux__
     if (syscall_dispatch_enabled)
     {
+        const char *eos;
         struct sigaction act;
 
         if (sigaction( SIGSYS, NULL, &act ) == -1)
@@ -3378,6 +3379,24 @@ void signal_init_process( TEB *teb )
         {
             WARN_(seh)( "could not find library containing signal restorer trampoline\n" );
             syscall_dispatch_enabled = FALSE;
+        }
+        else if ((eos = getenv( "PROTON_EAC_EOS_PROCESS" )) && !strcmp( eos, "1" ))
+        {
+            const uintptr_t eos_native_start = 0x700100000000;
+
+            /* EOS uses high-address Linux syscall thunks, relying on the old seccomp
+             * address split. Execute them at their original stack and instruction,
+             * not from SIGSYS (which cannot forward clone or sigreturn correctly).
+             * This range is native-only for the EOS process tree, not for other games. */
+            if (syscall_dispatch_start < eos_native_start)
+                WARN_(seh)( "cannot enable EOS native syscall range with signal trampoline below %#lx\n",
+                            (unsigned long)eos_native_start );
+            else
+            {
+                syscall_dispatch_start = eos_native_start;
+                syscall_dispatch_size = ~(uintptr_t)0 - syscall_dispatch_start;
+                TRACE_(seh)( "enabled EOS native syscall range from %#lx\n", (unsigned long)eos_native_start );
+            }
         }
     }
 #endif
@@ -3420,7 +3439,8 @@ __attribute__((used)) void init_syscall_frame( LPTHREAD_START_ROUTINE entry, voi
         alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
     }
     if (syscall_dispatch_enabled && prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
-                                           libc_addr, libc_size, &thread_data->syscall_dispatch ) < 0)
+                                           syscall_dispatch_start, syscall_dispatch_size,
+                                           &thread_data->syscall_dispatch ) < 0)
         WARN_(seh)( "could not enable syscall user dispatch\n" );
 #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
     amd64_set_gsbase( teb );

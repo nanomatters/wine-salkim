@@ -1866,6 +1866,21 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
  */
 static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
 {
+    static const WCHAR eos_processW[] = {'P','R','O','T','O','N','_','E','A','C','_','E','O','S','_',
+                                        'P','R','O','C','E','S','S'};
+    const WCHAR *eos;
+
+    /* EOS also starts native children without CreateProcess. Preserve the child-only
+     * marker in the Unix environment, including for a 32-bit bootstrapper. */
+    eos = find_env_var( params->Environment, params->EnvironmentSize / sizeof(WCHAR),
+                        eos_processW, ARRAY_SIZE(eos_processW) );
+    if (eos && eos[ARRAY_SIZE(eos_processW) + 1] == '1' && !eos[ARRAY_SIZE(eos_processW) + 2] &&
+        setenv( "PROTON_EAC_EOS_PROCESS", "1", 1 ))
+    {
+        MESSAGE( "wine: could not preserve EOS process environment: %s\n", strerror(errno) );
+        exit(1);
+    }
+
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
     peb->OSMajorVersion             = 10;
