@@ -193,13 +193,21 @@ static BOOL WINAPI init_upgrade_config(INIT_ONCE *once, void *param, void **cont
 
 static BOOL WINAPI init_ffx_provider(INIT_ONCE *once, void *param, void **context)
 {
+    static LONG warned;
     HMODULE module;
 
-    if (!(module = LoadLibraryA("amdxcffx64"))) return FALSE;
+    if (!(module = LoadLibraryA("amdxcffx64")))
+    {
+        if (!InterlockedCompareExchange(&warned, 1, 0))
+            ERR("Failed to load FSR4 dll (amdxcffx64)!\n");
+        return FALSE;
+    }
 
     /* Returned providers contain callbacks into this module. Keep its reference. */
     update_provider_ex = (updateffxapi_pfn_ex)GetProcAddress(module, "UpdateFfxApiProviderEx");
     update_provider = (updateffxapi_pfn)GetProcAddress(module, "UpdateFfxApiProvider");
+    if (!update_provider_ex && !update_provider)
+        ERR("UpdateFfxApiProvider[Ex] symbol not found!\n");
     return TRUE;
 }
 
@@ -224,9 +232,10 @@ struct ffxExternalProvider
     pfnDispatch dispatch; /* 0x48 */
 };
 
-static void dump_provider(struct ffxExternalProvider *provider)
+static void dump_provider(struct ffxExternalProvider *provider, unsigned int size)
 {
-    if (!provider) return;
+    /* Do not interpret short or unknown layouts just for diagnostics. */
+    if (!TRACE_ON(amdxc) || !provider || size < sizeof(*provider) || provider->structVersion != 2) return;
 
     TRACE("returned provider: %lx %I64x %s\n",
           provider->structVersion, provider->descType,
@@ -257,17 +266,14 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
         (fsr4_upgrade == UPGRADE_AUTO && !this->rdna2)) return E_NOTIMPL;
 
     if (!InitOnceExecuteOnce(&provider_once, init_ffx_provider, NULL, NULL))
-    {
-        ERR("Failed to load FSR4 dll (amdxcffx64)!\n");
         return E_NOINTERFACE;
-    }
 
     if (update_provider_ex)
     {
         HRESULT ret = update_provider_ex(data, size, unk_data);
 
         TRACE("status: %lx\n", ret);
-        dump_provider(data);
+        if (SUCCEEDED(ret)) dump_provider(data, size);
 
         return ret;
     }
@@ -279,7 +285,10 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
         /* ensure user doesn't do dumb things on legacy amdxcffx64 */
         if (!this->fp8_supported)
         {
-            ERR("FSR4 not supported on this system!\n");
+            static LONG warned;
+
+            if (!InterlockedCompareExchange(&warned, 1, 0))
+                ERR("FSR4 not supported on this system!\n");
             return E_NOINTERFACE;
         }
 
@@ -288,12 +297,11 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
         ret = update_provider(data, size);
 
         TRACE("status: %lx\n", ret);
-        dump_provider(data);
+        if (SUCCEEDED(ret)) dump_provider(data, size);
 
         return ret;
     }
 
-    ERR("UpdateFfxApiProvider[Ex] symbol not found!\n");
     return E_NOINTERFACE;
 }
 
