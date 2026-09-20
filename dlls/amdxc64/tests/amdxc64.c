@@ -94,6 +94,51 @@ static const ID3D12DeviceExt3Vtbl ext_vtbl =
 
 static struct test_device device = {{&device_vtbl}, {&ext_vtbl}, 1};
 
+static void test_info_stubs(void)
+{
+    const AmdExtD3DShaderIntrinsicsInfo zero = {0};
+    AmdExtD3DShaderIntrinsicsInfo info;
+    AmdExtD3DGpuRtVersion version;
+    IAmdExtD3DShaderIntrinsics *intrinsics;
+    IAmdExtD3DDevice8 *extension;
+    IAmdExtD3DFactory *factory;
+    HRESULT hr;
+
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtD3DFactory, (void **)&factory);
+    ok(hr == S_OK, "Factory returned %#lx.\n", hr);
+    if (FAILED(hr)) return;
+    hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface,
+            &IID_IAmdExtD3DShaderIntrinsics, (void **)&intrinsics);
+    ok(hr == S_OK, "Create returned %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = IAmdExtD3DShaderIntrinsics_GetInfo(intrinsics, NULL);
+        ok(hr == E_INVALIDARG, "Null info returned %#lx.\n", hr);
+        memset(&info, 0xa5, sizeof(info));
+        hr = IAmdExtD3DShaderIntrinsics_GetInfo(intrinsics, &info);
+        ok(hr == E_NOTIMPL, "Unimplemented info returned %#lx.\n", hr);
+        ok(!memcmp(&info, &zero, sizeof(info)), "Info was not cleared.\n");
+        IAmdExtD3DShaderIntrinsics_Release(intrinsics);
+    }
+    hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface,
+            &IID_IAmdExtD3DDevice8, (void **)&extension);
+    ok(hr == S_OK, "Create returned %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        memset(&version, 0xa5, sizeof(version));
+        IAmdExtD3DDevice8_GetGpuRtInterfaceVersion(extension, &version);
+        ok(!version.major && !version.minor, "Unimplemented interface version was not cleared.\n");
+        memset(&version, 0xa5, sizeof(version));
+        IAmdExtD3DDevice8_GetGpuRtBinaryVersion(extension, &version);
+        ok(!version.major && !version.minor, "Unimplemented binary version was not cleared.\n");
+        IAmdExtD3DDevice8_GetGpuRtInterfaceVersion(extension, NULL);
+        IAmdExtD3DDevice8_GetGpuRtBinaryVersion(extension, NULL);
+        IAmdExtD3DDevice8_Release(extension);
+    }
+    IAmdExtD3DFactory_Release(factory);
+    ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
+}
+
 static void test_wave_matrix(void)
 {
     AmdExtWaveMatrixProperties properties[2], saved[2];
@@ -320,5 +365,6 @@ START_TEST(amdxc64)
     test_interfaces();
     test_intrinsics();
     test_wave_matrix();
+    test_info_stubs();
     FreeLibrary(module);
 }

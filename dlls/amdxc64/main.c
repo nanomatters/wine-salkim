@@ -350,7 +350,9 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DShaderIntrinsics_GetInfo(IAmdExtD3DShaderIntr
                                                             AmdExtD3DShaderIntrinsicsInfo *info)
 {
     FIXME("%p %p stub!\n", iface, info);
-    return S_OK;
+    if (!info) return E_INVALIDARG;
+    memset(info, 0, sizeof(*info));
+    return E_NOTIMPL;
 }
 
 HRESULT STDMETHODCALLTYPE AmdExtD3DShaderIntrinsics_CheckSupport(IAmdExtD3DShaderIntrinsics *iface,
@@ -548,12 +550,14 @@ void STDMETHODCALLTYPE AmdExtD3DDevice8_GetGpuRtInterfaceVersion(IAmdExtD3DDevic
                                                                  AmdExtD3DGpuRtVersion *pInterfaceVersion)
 {
     FIXME("%p %p stub!\n", iface, pInterfaceVersion);
+    if (pInterfaceVersion) memset(pInterfaceVersion, 0, sizeof(*pInterfaceVersion));
 }
 
 void STDMETHODCALLTYPE AmdExtD3DDevice8_GetGpuRtBinaryVersion(IAmdExtD3DDevice8 *iface,
                                                               AmdExtD3DGpuRtVersion *pBinaryVersion)
 {
     FIXME("%p %p stub!\n", iface, pBinaryVersion);
+    if (pBinaryVersion) memset(pBinaryVersion, 0, sizeof(*pBinaryVersion));
 }
 
 HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_CreateComputePipelineCrossCompile(IAmdExtD3DDevice8 *iface,
