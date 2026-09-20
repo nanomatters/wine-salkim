@@ -94,6 +94,50 @@ static const ID3D12DeviceExt3Vtbl ext_vtbl =
 
 static struct test_device device = {{&device_vtbl}, {&ext_vtbl}, 1};
 
+static void test_interfaces(void)
+{
+    static const IID *iids[] = {&IID_IAmdExtD3DFactory, &IID_IAmdExtFfxApi,
+            &IID_IAmdExtD3DShaderIntrinsics, &IID_IAmdExtD3DDevice8};
+    IAmdExtD3DFactory *factory;
+    IUnknown *object, *identity, *self, *out;
+    unsigned int i;
+    ULONG ref;
+    HRESULT hr;
+
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtD3DFactory, (void **)&factory);
+    ok(hr == S_OK, "Factory returned %#lx.\n", hr);
+    if (FAILED(hr)) return;
+    for (i = 0; i < ARRAY_SIZE(iids); ++i)
+    {
+        if (i < 2)
+            hr = pAmdExtD3DCreateInterface(&device.IUnknown_iface, iids[i], (void **)&object);
+        else
+            hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface, iids[i], (void **)&object);
+        ok(hr == S_OK, "Interface %u returned %#lx.\n", i, hr);
+        if (FAILED(hr)) continue;
+
+        hr = IUnknown_QueryInterface(object, &IID_IUnknown, NULL);
+        ok(hr == E_POINTER, "Null output returned %#lx.\n", hr);
+        out = (void *)0xdeadbeef;
+        hr = IUnknown_QueryInterface(object, &IID_ID3D12Device, (void **)&out);
+        ok(hr == E_NOINTERFACE && !out, "Unsupported query returned %#lx, %p.\n", hr, out);
+        hr = IUnknown_QueryInterface(object, &IID_IUnknown, (void **)&identity);
+        ok(hr == S_OK && identity == object, "Identity returned %#lx, %p, expected %p.\n", hr, identity, object);
+        if (SUCCEEDED(hr))
+        {
+            hr = IUnknown_QueryInterface(identity, iids[i], (void **)&self);
+            ok(hr == S_OK && self == object, "Self query returned %#lx, %p.\n", hr, self);
+            if (SUCCEEDED(hr)) IUnknown_Release(self);
+            ref = IUnknown_Release(identity);
+            ok(ref == 1, "Unbalanced reference count %lu.\n", ref);
+        }
+        ref = IUnknown_Release(object);
+        ok(ref == (i == 0 ? 1 : 0), "Final reference count %lu.\n", ref);
+    }
+    IAmdExtD3DFactory_Release(factory);
+    ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
+}
+
 static void test_intrinsics(void)
 {
     static const int groups[] =
@@ -185,6 +229,7 @@ START_TEST(amdxc64)
         return;
     }
     test_disabled_provider();
+    test_interfaces();
     test_intrinsics();
     FreeLibrary(module);
 }

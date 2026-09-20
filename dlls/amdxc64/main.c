@@ -146,7 +146,16 @@ ULONG STDMETHODCALLTYPE AMDFSR4FFX_Release(IAmdExtFfxApi *iface)
 
 HRESULT STDMETHODCALLTYPE AMDFSR4FFX_QueryInterface(IAmdExtFfxApi *iface, REFIID iid, void **obj)
 {
-    FIXME("%p %s %p", iface, debugstr_guid(iid), obj);
+    TRACE("%p %s %p\n", iface, debugstr_guid(iid), obj);
+
+    if (!obj) return E_POINTER;
+    *obj = NULL;
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAmdExtFfxApi))
+    {
+        *obj = iface;
+        IAmdExtFfxApi_AddRef(iface);
+        return S_OK;
+    }
 
     return E_NOINTERFACE;
 }
@@ -324,7 +333,15 @@ ULONG STDMETHODCALLTYPE AmdExtD3DShaderIntrinsics_Release(IAmdExtD3DShaderIntrin
 
 HRESULT STDMETHODCALLTYPE AmdExtD3DShaderIntrinsics_QueryInterface(IAmdExtD3DShaderIntrinsics *iface, REFIID iid, void **out)
 {
-    FIXME("%p %s %p stub!\n", iface, debugstr_guid(iid), out);
+    TRACE("%p %s %p\n", iface, debugstr_guid(iid), out);
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAmdExtD3DShaderIntrinsics))
+    {
+        *out = iface;
+        IAmdExtD3DShaderIntrinsics_AddRef(iface);
+        return S_OK;
+    }
     return E_NOINTERFACE;
 }
 
@@ -428,6 +445,14 @@ struct AmdExtD3DDevice8 *impl_from_IAmdExtD3DDevice8(IAmdExtD3DDevice8 *iface)
 HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_QueryInterface(IAmdExtD3DDevice8 *iface, REFIID iid, void **out)
 {
     TRACE("%p %s %p\n", iface, debugstr_guid(iid), out);
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAmdExtD3DDevice8))
+    {
+        *out = iface;
+        IAmdExtD3DDevice8_AddRef(iface);
+        return S_OK;
+    }
     return E_NOINTERFACE;
 }
 
@@ -651,6 +676,14 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *if
 HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_QueryInterface(IAmdExtD3DFactory *iface, REFIID iid, void **out)
 {
     TRACE("%p %s %p\n", iface, debugstr_guid(iid), out);
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAmdExtD3DFactory))
+    {
+        *out = iface;
+        IAmdExtD3DFactory_AddRef(iface);
+        return S_OK;
+    }
     return E_NOINTERFACE;
 }
 
