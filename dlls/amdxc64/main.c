@@ -44,7 +44,7 @@ static void check_intrinsic_support(ID3D12Device *device, BOOL *fp8, BOOL *p_wmm
     ID3D12DeviceExt3 *ext;
     const char *e;
     BOOL wmma;
-    static int once;
+    static LONG warned;
 
     if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DeviceExt3, (void **)&ext))) return;
 
@@ -54,7 +54,7 @@ static void check_intrinsic_support(ID3D12Device *device, BOOL *fp8, BOOL *p_wmm
     if (*fp8) TRACE("FSR4 FP8 supported!\n");
     if ((e = getenv("DXIL_SPIRV_CONFIG")) && !strcmp(e, "wmma_rdna3_workaround"))
     {
-        if ((*fp8 = wmma) && !once++)
+        if ((*fp8 = wmma) && !InterlockedCompareExchange(&warned, 1, 0))
             FIXME("FSR4 FP16 emulation is not recommended, please use FSR 4.1.1\n");
     }
     if (p_wmma) *p_wmma = wmma;
