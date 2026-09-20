@@ -1007,6 +1007,19 @@ BOOL WINAPI GetFileVersionInfoA( LPCSTR filename, DWORD handle, DWORD datasize, 
 }
 
 /***********************************************************************
+ *           GetFileVersionInfoByHandle      (kernelbase.@)
+ */
+BOOL WINAPI GetFileVersionInfoByHandle( DWORD flags, HANDLE file, void **data, DWORD *size )
+{
+    FIXME( "%#lx %p %p %p stub!\n", flags, file, data, size );
+
+    if (data) *data = NULL;
+    if (size) *size = 0;
+    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+    return FALSE;
+}
+
+/***********************************************************************
  *           VersionInfo16_FindChild             [internal]
  */
 static const VS_VERSION_INFO_STRUCT16 *VersionInfo16_FindChild( const VS_VERSION_INFO_STRUCT16 *info,

@@ -39,6 +39,9 @@ extern void init_locale( HMODULE module );
 extern void init_console(void);
 extern BOOL is_console_handle( HANDLE );
 
+/* APIs not declared in the Windows SDK. */
+extern BOOL WINAPI GetFileVersionInfoByHandle( DWORD flags, HANDLE file, void **data, DWORD *size );
+
 extern const WCHAR windows_dir[];
 extern const WCHAR system_dir[];
 
