@@ -1097,6 +1097,7 @@ W32KAPI void window_surface_release( struct window_surface *surface )
         if (surface->app_painted_region) NtGdiDeleteObjectApp( surface->app_painted_region );
         if (surface->gdi_over_producer_region) NtGdiDeleteObjectApp( surface->gdi_over_producer_region );
         if (surface->gdi_over_paint_region) NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
+        if (surface->client_paint_region) NtGdiDeleteObjectApp( surface->client_paint_region );
         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
         if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
         surface->funcs->destroy( surface );
@@ -1189,6 +1190,11 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
                 NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
                 surface->gdi_over_paint_region = 0;
             }
+            if (surface->client_paint_region)
+            {
+                NtGdiDeleteObjectApp( surface->client_paint_region );
+                surface->client_paint_region = 0;
+            }
         }
     }
 
@@ -1233,9 +1239,10 @@ W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface, 
     NtGdiDeleteObjectApp( rect_region );
 }
 
-W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect )
+W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect, BOOL client )
 {
     HRGN rect_region, clipped_region, producer_region = 0, synthetic_region = 0, combined_region = 0;
+    HRGN *paint_region = client ? &surface->client_paint_region : &surface->gdi_over_paint_region;
     int type;
 
     if (IsRectEmpty( rect )) return;
@@ -1296,11 +1303,8 @@ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surf
     type = NtGdiCombineRgn( clipped_region, rect_region, producer_region, RGN_AND );
     if (type != ERROR && type != NULLREGION)
     {
-        if (!surface->gdi_over_paint_region)
-            surface->gdi_over_paint_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
-        if (surface->gdi_over_paint_region)
-            NtGdiCombineRgn( surface->gdi_over_paint_region, surface->gdi_over_paint_region,
-                             clipped_region, RGN_OR );
+        if (!*paint_region) *paint_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+        if (*paint_region) NtGdiCombineRgn( *paint_region, *paint_region, clipped_region, RGN_OR );
     }
 
     if (combined_region) NtGdiDeleteObjectApp( combined_region );
@@ -1665,13 +1669,16 @@ static void update_visible_region( struct dce *dce )
 
     if (surface)
     {
-        BOOL gdi_over_source = !foreign &&
+        UINT gdi_paint_flags = !foreign &&
             (dce->hwnd != top_win) &&
             (get_window_long( dce->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) &&
-            !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT));
+            !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT)) ? GDI_PAINT_OVER_CHILD : 0;
+
+        if (!foreign && dce->hwnd == top_win && (paint_flags & SET_WINPOS_PIXEL_FORMAT))
+            gdi_paint_flags |= GDI_PAINT_CLIENT;
 
         user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
-        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, gdi_over_source, 0, 0 );
+        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, gdi_paint_flags, 0, 0 );
         window_surface_release( surface );
     }
     else

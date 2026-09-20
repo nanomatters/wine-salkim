@@ -983,7 +983,8 @@ err:
  * Gets a free buffer from the buffer queue. If no free buffers
  * are available this function blocks until it can provide one.
  */
-static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wayland_buffer_queue *queue)
+static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wayland_buffer_queue *queue,
+                                                                       struct wayland_shm_buffer *preserve)
 {
     struct wayland_shm_buffer *shm_buffer;
 
@@ -1000,7 +1001,7 @@ static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wa
         /* Search through our buffers to find an available one. */
         wl_list_for_each(shm_buffer, &queue->buffer_list, link)
         {
-            if (!shm_buffer->busy) goto out;
+            if (!shm_buffer->busy && shm_buffer != preserve) goto out;
             nbuffers++;
         }
 
@@ -1198,13 +1199,13 @@ static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
     free(rgndata);
 }
 
-static void clear_pixel_region(struct wayland_shm_buffer *buffer, HRGN region)
+BOOL wayland_shm_buffer_clear_region(struct wayland_shm_buffer *buffer, HRGN region)
 {
     RGNDATA *rgndata = get_region_data(region);
     RECT buffer_rect = {0, 0, buffer->width, buffer->height};
     RECT *rgn_rect, *rgn_rect_end;
 
-    if (!rgndata) return;
+    if (!rgndata) return FALSE;
 
     rgn_rect = (RECT *)rgndata->Buffer;
     rgn_rect_end = rgn_rect + rgndata->rdh.nCount;
@@ -1223,6 +1224,7 @@ static void clear_pixel_region(struct wayland_shm_buffer *buffer, HRGN region)
     }
 
     free(rgndata);
+    return TRUE;
 }
 
 static void wayland_shm_buffer_clear_outside_clip(struct wayland_shm_buffer *buffer,
@@ -1241,7 +1243,7 @@ static void wayland_shm_buffer_clear_outside_clip(struct wayland_shm_buffer *buf
     }
 
     if (NtGdiCombineRgn(clear_region, dirty_region, clip_region, RGN_DIFF) != ERROR)
-        clear_pixel_region(buffer, clear_region);
+        wayland_shm_buffer_clear_region(buffer, clear_region);
 
     NtGdiDeleteObjectApp(clear_region);
     NtGdiDeleteObjectApp(dirty_region);
@@ -1357,9 +1359,11 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     HRGN merged_gdi_over_region = NULL;
     HRGN gdi_over_region, gdi_over_paint_region;
     HRGN copy_from_window_region = NULL;
+    HRGN client_clip = NULL;
     BOOL content_over_producer = FALSE;
     HWND external_host = ReadPointerAcquire((void *const volatile *)&wws->external_host);
     BOOL externally_hosted = external_host != NULL;
+    BOOL own_client = !externally_hosted && window_surface->clip_producer == window_surface->hwnd;
     BOOL host_dirty = InterlockedExchange(&wws->host_dirty, FALSE) != 0;
     BYTE host_alpha = 0xff;
     BOOL host_layered_composite = externally_hosted && window_surface->alpha_mask;
@@ -1381,7 +1385,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     {
         wayland_gdi_overlay_reset(window_surface->hwnd, &wws->gdi_overlay);
         InterlockedExchange(&wws->host_dirty, TRUE);
-        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE, NULL);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE, NULL, NULL);
         wl_display_flush(process_wayland.wl_display);
         goto done;
     }
@@ -1389,7 +1393,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     if (!window_surface->app_painted_full && !window_surface->app_painted_region && !refresh_host)
     {
         if (shape_changed) wayland_window_surface_sync_regions(window_surface);
-        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE, NULL);
+        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE, NULL, NULL);
         wl_display_flush(process_wayland.wl_display);
         goto done;
     }
@@ -1404,13 +1408,16 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         ERR("failed to create surface damage region\n");
         goto done;
     }
-    if (window_surface->app_painted_full || refresh_host)
+    if ((window_surface->app_painted_full || refresh_host) && !own_client)
         copy_from_window_region = surface_damage_region;
     else if (!(copy_from_window_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
     {
         ERR("failed to create copy_from_window region\n");
         goto done;
     }
+    if ((window_surface->app_painted_full || refresh_host) && own_client &&
+        NtGdiCombineRgn(copy_from_window_region, surface_damage_region, 0, RGN_COPY) == ERROR)
+        goto done;
     if (!window_surface->app_painted_full && !refresh_host &&
         NtGdiCombineRgn(copy_from_window_region, surface_damage_region,
                         window_surface->app_painted_region, RGN_AND) == ERROR)
@@ -1430,14 +1437,57 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     wayland_buffer_queue_add_damage(wws->wayland_buffer_queue, surface_damage_region);
 
-    shm_buffer = wayland_buffer_queue_get_free_buffer(wws->wayland_buffer_queue);
+    latest_buffer = get_window_surface_contents(window_surface->hwnd);
+    /* A client present may clone the published GDI buffer concurrently. Keep
+     * it immutable even after the compositor has released its wl_buffer. */
+    shm_buffer = wayland_buffer_queue_get_free_buffer(wws->wayland_buffer_queue,
+            own_client || (latest_buffer && latest_buffer->client_paint_region) ? latest_buffer : NULL);
     if (!shm_buffer)
     {
         ERR("failed to acquire Wayland SHM buffer, returning\n");
         goto done;
     }
 
-    if ((latest_buffer = get_window_surface_contents(window_surface->hwnd)))
+    if (own_client)
+    {
+        HRGN paint = window_surface->client_paint_region;
+        HRGN previous = latest_buffer ? latest_buffer->client_paint_region : 0;
+        HRGN region;
+        int type;
+
+        /* Keep explicit same-window GDI pixels until the next client present.
+         * Geometry-only flushes must not resurrect old pixels from the DIB. */
+        if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0))) goto done;
+        type = previous ? NtGdiCombineRgn(region, previous, 0, RGN_COPY) : NULLREGION;
+        if (type != ERROR && paint) type = NtGdiCombineRgn(region, region, paint, RGN_OR);
+        if (type == ERROR || type == NULLREGION)
+        {
+            NtGdiDeleteObjectApp(region);
+            region = 0;
+        }
+        if (type == ERROR) goto done;
+        if (shm_buffer->client_paint_region) NtGdiDeleteObjectApp(shm_buffer->client_paint_region);
+        shm_buffer->client_paint_region = region;
+        if (!(client_clip = NtGdiCreateRectRgn(0, 0, 0, 0))) goto done;
+        if (NtGdiCombineRgn(client_clip, window_surface->clip_region, 0, RGN_COPY) == ERROR ||
+            (paint && NtGdiCombineRgn(client_clip, client_clip, paint, RGN_OR) == ERROR) ||
+            (window_surface->gdi_over_paint_region &&
+             NtGdiCombineRgn(client_clip, client_clip, window_surface->gdi_over_paint_region, RGN_OR) == ERROR) ||
+            NtGdiCombineRgn(copy_from_window_region, copy_from_window_region, client_clip, RGN_AND) == ERROR ||
+            NtGdiCombineRgn(client_clip, window_surface->clip_region, 0, RGN_COPY) == ERROR ||
+            (region && NtGdiCombineRgn(client_clip, client_clip, region, RGN_OR) == ERROR))
+            goto done;
+        /* A client present may have replaced the last published buffer with
+         * a masked copy, outside this queue's accumulated GDI damage. */
+        NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, shm_buffer->width, shm_buffer->height);
+    }
+    else if (shm_buffer->client_paint_region)
+    {
+        NtGdiDeleteObjectApp(shm_buffer->client_paint_region);
+        shm_buffer->client_paint_region = 0;
+    }
+
+    if (latest_buffer)
     {
         TRACE("latest_window_buffer=%p\n", latest_buffer);
         /* If we have a latest buffer, use it as the source of all pixel
@@ -1456,7 +1506,6 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
                                     shm_buffer, copy_from_latest_region);
             NtGdiDeleteObjectApp(copy_from_latest_region);
         }
-        wayland_shm_buffer_unref(latest_buffer);
     }
     else
     {
@@ -1467,7 +1516,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         if ((clear_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
         {
             NtGdiCombineRgn(clear_region, surface_damage_region, copy_from_window_region, RGN_DIFF);
-            clear_pixel_region(shm_buffer, clear_region);
+            wayland_shm_buffer_clear_region(shm_buffer, clear_region);
             NtGdiDeleteObjectApp(clear_region);
         }
     }
@@ -1499,8 +1548,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     /* Slots are allocated only when GDI pixels require overlay transport. */
     content_over_producer = wws->gdi_overlay.slots_created;
     if (wws->occlusion_clipped && !externally_hosted)
-        wayland_shm_buffer_clear_outside_clip(shm_buffer, effective_dirty,
-                                              window_surface->clip_region);
+        wayland_shm_buffer_clear_outside_clip(shm_buffer, own_client ? &full_dirty : effective_dirty,
+                                              client_clip ? client_clip : window_surface->clip_region);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
 
@@ -1512,10 +1561,12 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     if (overlay_flushed)
         flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer,
                                               surface_damage_region, content_over_producer,
-                                              window_surface->clip_region);
+                                              window_surface->clip_region, latest_buffer);
     wl_display_flush(process_wayland.wl_display);
 
 done:
+    if (latest_buffer) wayland_shm_buffer_unref(latest_buffer);
+    if (client_clip) NtGdiDeleteObjectApp(client_clip);
     if (refresh_host && !flushed) InterlockedExchange(&wws->host_dirty, TRUE);
     if (merged_gdi_over_region && merged_gdi_over_region != window_surface->gdi_over_producer_region &&
         merged_gdi_over_region != occluded_region)

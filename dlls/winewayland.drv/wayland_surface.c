@@ -3450,9 +3450,36 @@ static struct wayland_shm_buffer *wayland_shm_buffer_clone(struct wayland_shm_bu
 
     if (!(clone = wayland_shm_buffer_create(source->width, source->height, source->format))) return NULL;
     memcpy(clone->map_data, source->map_data, source->map_size);
+    clone->content_over_producer = source->content_over_producer;
+    if (source->client_paint_region)
+    {
+        if (!(clone->client_paint_region = NtGdiCreateRectRgn(0, 0, 0, 0)) ||
+            NtGdiCombineRgn(clone->client_paint_region, source->client_paint_region, 0, RGN_COPY) == ERROR)
+        {
+            wayland_shm_buffer_unref(clone);
+            return NULL;
+        }
+    }
     NtGdiSetRectRgn(clone->damage_region, 0, 0, clone->width, clone->height);
     wl_buffer_add_listener(clone->wl_buffer, &wayland_shm_buffer_clone_listener, clone);
     return clone;
+}
+
+struct wayland_shm_buffer *wayland_shm_buffer_without_client_paint(struct wayland_shm_buffer *source)
+{
+    struct wayland_shm_buffer *buffer;
+
+    /* Never alter an in-flight wl_buffer. Only a GDI-to-client handoff
+     * needs this copy. Child-window overlays retain their own lifetime. */
+    if (!(buffer = wayland_shm_buffer_clone(source))) return NULL;
+    if (!wayland_shm_buffer_clear_region(buffer, buffer->client_paint_region))
+    {
+        wayland_shm_buffer_unref(buffer);
+        return NULL;
+    }
+    NtGdiDeleteObjectApp(buffer->client_paint_region);
+    buffer->client_paint_region = 0;
+    return buffer;
 }
 
 
@@ -6520,6 +6547,8 @@ void wayland_shm_buffer_unref(struct wayland_shm_buffer *shm_buffer)
         NtUnmapViewOfSection(GetCurrentProcess(), shm_buffer->map_data);
     if (shm_buffer->damage_region)
         NtGdiDeleteObjectApp(shm_buffer->damage_region);
+    if (shm_buffer->client_paint_region)
+        NtGdiDeleteObjectApp(shm_buffer->client_paint_region);
 
     free(shm_buffer);
 }
@@ -7465,7 +7494,7 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
         surface->updated_attachment_generation =
             ReadAcquire(&surface->attachment_generation);
     }
-    ensure_window_surface_contents(toplevel);
+    ensure_window_surface_contents(toplevel, surface);
 }
 
 static BOOL wayland_client_surface_get_presentation_rects(struct client_surface *client,

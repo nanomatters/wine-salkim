@@ -101,6 +101,7 @@ typedef struct dibdrv_physdev
     RECT *bounds;
     struct window_surface *window_surface;
     struct window_surface *gdi_over_surface;
+    BOOL gdi_client_paint;
     struct cached_font *font;
 
     /* pen */

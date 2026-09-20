@@ -626,6 +626,8 @@ struct wayland_shm_buffer
     BOOL busy;
     LONG ref;
     HRGN damage_region;
+    HRGN client_paint_region;
+    BOOL content_over_producer;
 };
 
 struct wayland_hwnd_dmabuf_surface;
@@ -935,6 +937,8 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
                                                                  HBITMAP mask, BOOL allow_padding);
 void wayland_shm_buffer_ref(struct wayland_shm_buffer *shm_buffer);
 void wayland_shm_buffer_unref(struct wayland_shm_buffer *shm_buffer);
+BOOL wayland_shm_buffer_clear_region(struct wayland_shm_buffer *buffer, HRGN region);
+struct wayland_shm_buffer *wayland_shm_buffer_without_client_paint(struct wayland_shm_buffer *source);
 
 /**********************************************************************
  *          Wayland Window
@@ -1017,9 +1021,9 @@ BOOL wayland_toplevel_has_other_client_surface(HWND toplevel,
 BOOL wayland_toplevel_has_visible_child_surface(HWND toplevel);
 void wayland_surface_invalidate_attached_clients(HWND hwnd, struct wl_surface *parent);
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
-                                 BOOL overlay_content, HRGN clip_region);
+                                 BOOL overlay_content, HRGN clip_region, struct wayland_shm_buffer *previous);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
-void ensure_window_surface_contents(HWND hwnd);
+void ensure_window_surface_contents(HWND hwnd, struct wayland_client_surface *presented);
 BOOL wayland_surface_monitor_fd(struct wayland_surface *surface, int fd);
 void wayland_surface_unmonitor_fd(int fd);
 void wayland_surface_dispatch_dmabuf(HWND hwnd, UINT32 serial);

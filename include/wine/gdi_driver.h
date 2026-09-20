@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 114
+#define WINE_GDI_DRIVER_VERSION 115
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -397,6 +397,7 @@ struct window_surface
     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
     HRGN                               gdi_over_producer_region; /* GDI pixels that must appear over child producers */
     HRGN                               gdi_over_paint_region; /* actual GDI paints to carry over child producers */
+    HRGN                               client_paint_region; /* GDI paints replacing this window's client content */
     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
     /* driver-specific fields here */
@@ -411,7 +412,7 @@ W32KAPI void window_surface_unlock( struct window_surface *surface );
 W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
 W32KAPI void window_surface_flush( struct window_surface *surface );
 W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface, const RECT *rect );
-W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect );
+W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect, BOOL client );
 W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region, HWND clip_producer );
 W32KAPI void window_surface_clear_clip_producer( struct window_surface *surface );
 W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );

@@ -1788,7 +1788,8 @@ static struct region *get_surface_region( struct window *win, user_handle_t *sur
 {
     struct region *region, *clip = NULL, *client_clip = NULL, *holes = NULL, *covered = NULL;
     user_handle_t hole_owner = (user_handle_t)-1;
-    int track_producer = hwnd_dmabuf_has_single_local_frame( win );
+    int track_producer = hwnd_dmabuf_has_single_local_frame( win ) ||
+                         (win->paint_flags & PAINT_HAS_PIXEL_FORMAT);
 
     *surface_producer = 0;
 

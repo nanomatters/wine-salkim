@@ -2040,7 +2040,7 @@ static void wayland_configure_window(HWND hwnd)
     /* rawpos may already have acknowledged the configure while flushing GDI.
      * Still update retained producer geometry; a replacement frame need not
      * arrive while the application recreates its swapchain. No locks are held. */
-    ensure_window_surface_contents(hwnd);
+    ensure_window_surface_contents(hwnd, NULL);
 }
 
 /**********************************************************************
@@ -2127,7 +2127,7 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * Import it without entering application resize callbacks. Configures
          * have their own message and must not starve frame delivery. */
         had_dmabuf_content = window_surface_has_hwnd_dmabuf_content(hwnd);
-        ensure_window_surface_contents(hwnd);
+        ensure_window_surface_contents(hwnd, NULL);
         if (had_dmabuf_content != window_surface_has_hwnd_dmabuf_content(hwnd))
             NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
         return 0;
@@ -2159,7 +2159,7 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             wayland_win_data_release(data);
         }
-        if (ensure_contents) ensure_window_surface_contents(hwnd);
+        if (ensure_contents) ensure_window_surface_contents(hwnd, NULL);
         return 0;
     }
     case WM_WINE_MAP_NOTIFY_ICON_POINT:
@@ -2690,7 +2690,7 @@ static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)
 
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer,
                                  HRGN damage_region, BOOL overlay_content,
-                                 HRGN clip_region)
+                                 HRGN clip_region, struct wayland_shm_buffer *previous)
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
@@ -2700,6 +2700,13 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
     uint32_t current_serial;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    /* A client present can remove same-window GDI while the flush prepares
+     * its buffer. Retry against the new contents instead of resurrecting it. */
+    if (shm_buffer && shm_buffer->client_paint_region && data->window_contents != previous)
+    {
+        wayland_win_data_release(data);
+        return FALSE;
+    }
     if (shm_buffer)
     {
         RECT fullscreen_rect, source;
@@ -2716,7 +2723,8 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             source.bottom = shm_buffer->height;
         }
         clip_content = clip_region && NtGdiRectInRegion(clip_region, &source);
-        has_content_over_producer = overlay_content || clip_content;
+        shm_buffer->content_over_producer = overlay_content || clip_content;
+        has_content_over_producer = shm_buffer->content_over_producer || shm_buffer->client_paint_region;
     }
     content_over_changed = data->content_over_producer != has_content_over_producer;
     data->content_over_producer = has_content_over_producer;
@@ -2842,9 +2850,10 @@ void wayland_window_init(void)
     pthread_mutexattr_destroy(&attr);
 }
 
-void ensure_window_surface_contents(HWND hwnd)
+void ensure_window_surface_contents(HWND hwnd, struct wayland_client_surface *presented)
 {
     BOOL has_dmabuf_content = FALSE, expose = FALSE;
+    struct wayland_shm_buffer *buffer;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
     uint32_t current_serial;
@@ -2856,6 +2865,15 @@ void ensure_window_surface_contents(HWND hwnd)
     }
 
     TRACE("hwnd=%p wayland_surface=%p\n", hwnd, data->wayland_surface);
+
+    if (presented && data->client_surface == presented && data->window_contents &&
+        data->window_contents->client_paint_region &&
+        (buffer = wayland_shm_buffer_without_client_paint(data->window_contents)))
+    {
+        set_window_surface_contents(hwnd, buffer, buffer->damage_region,
+                                    buffer->content_over_producer, 0, data->window_contents);
+        wayland_shm_buffer_unref(buffer);
+    }
 
     if ((wayland_surface = data->wayland_surface))
     {
