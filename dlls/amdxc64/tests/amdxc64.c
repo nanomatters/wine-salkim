@@ -94,6 +94,42 @@ static const ID3D12DeviceExt3Vtbl ext_vtbl =
 
 static struct test_device device = {{&device_vtbl}, {&ext_vtbl}, 1};
 
+static void test_creation_errors(void)
+{
+    static const IID *iids[] = {&IID_IAmdExtD3DShaderIntrinsics, &IID_IAmdExtD3DDevice8};
+    IAmdExtD3DFactory *factory;
+    void *out;
+    unsigned int i;
+    HRESULT hr;
+
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtD3DFactory, NULL);
+    ok(hr == E_INVALIDARG, "Null output returned %#lx.\n", hr);
+    out = (void *)0xdeadbeef;
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_ID3D12Device, &out);
+    ok(hr == E_NOINTERFACE && !out, "Unknown interface returned %#lx, %p.\n", hr, out);
+    out = (void *)0xdeadbeef;
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtFfxApi, &out);
+    ok(hr == E_INVALIDARG && !out, "Null FFX device returned %#lx, %p.\n", hr, out);
+    out = (void *)0xdeadbeef;
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtAntiLagApi, &out);
+    ok(hr == E_INVALIDARG && !out, "Null AntiLag device returned %#lx, %p.\n", hr, out);
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtD3DFactory, (void **)&factory);
+    ok(hr == S_OK, "Factory with no device returned %#lx.\n", hr);
+    if (FAILED(hr)) return;
+    for (i = 0; i < ARRAY_SIZE(iids); ++i)
+    {
+        hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface, iids[i], NULL);
+        ok(hr == E_INVALIDARG, "Null output returned %#lx.\n", hr);
+        out = (void *)0xdeadbeef;
+        hr = IAmdExtD3DFactory_CreateInterface(factory, NULL, iids[i], &out);
+        ok(hr == E_INVALIDARG && !out, "Null device returned %#lx, %p.\n", hr, out);
+    }
+    out = (void *)0xdeadbeef;
+    hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface, &IID_ID3D12Device, &out);
+    ok(hr == E_NOINTERFACE && !out, "Unknown interface returned %#lx, %p.\n", hr, out);
+    IAmdExtD3DFactory_Release(factory);
+}
+
 static void test_interfaces(void)
 {
     static const IID *iids[] = {&IID_IAmdExtD3DFactory, &IID_IAmdExtFfxApi,
@@ -229,6 +265,7 @@ START_TEST(amdxc64)
         return;
     }
     test_disabled_provider();
+    test_creation_errors();
     test_interfaces();
     test_intrinsics();
     FreeLibrary(module);

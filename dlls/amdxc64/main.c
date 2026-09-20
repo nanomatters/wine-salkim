@@ -101,7 +101,8 @@ static BOOL is_rdna2(ID3D12Device *device)
     if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
         goto fail;
 
-    extensions = malloc(sizeof(*extensions) * extension_count);
+    if (!extension_count) goto fail;
+    if (!(extensions = calloc(extension_count, sizeof(*extensions)))) goto fail;
 
     if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
         goto fail;
@@ -644,7 +645,10 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *if
 
     if (IsEqualGUID(iid, &IID_IAmdExtD3DShaderIntrinsics))
     {
-        struct AmdExtD3DShaderIntrinsics *this = calloc(1, sizeof(struct AmdExtD3DShaderIntrinsics));
+        struct AmdExtD3DShaderIntrinsics *this;
+
+        if (!outer) return E_INVALIDARG;
+        if (!(this = calloc(1, sizeof(*this)))) return E_OUTOFMEMORY;
         this->IAmdExtD3DShaderIntrinsics_iface.lpVtbl = &AmdExtD3DShaderIntrinsics_vtable;
         this->ref = 1;
         check_intrinsic_support((ID3D12Device *)outer, &this->supports_fp8, &this->supports_wmma, &this->intrinsics);
@@ -653,7 +657,10 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *if
     }
     else if (IsEqualGUID(iid, &IID_IAmdExtD3DDevice8))
     {
-        struct AmdExtD3DDevice8 *this = calloc(1, sizeof(struct AmdExtD3DDevice8));
+        struct AmdExtD3DDevice8 *this;
+
+        if (!outer) return E_INVALIDARG;
+        if (!(this = calloc(1, sizeof(*this)))) return E_OUTOFMEMORY;
         this->IAmdExtD3DDevice8_iface.lpVtbl = &AmdExtD3DDevice8_vtable;
         this->ref = 1;
         check_intrinsic_support((ID3D12Device *)outer, &this->fp8_supported, NULL, NULL);
@@ -702,9 +709,15 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
 {
     TRACE("outer %p, iid %s, obj %p\n", outer, debugstr_guid(iid), obj);
 
+    if (!obj) return E_INVALIDARG;
+    *obj = NULL;
+
     if (IsEqualGUID(iid, &IID_IAmdExtFfxApi))
     {
-        struct AMDFSR4FFX* ffx = calloc(1, sizeof(struct AMDFSR4FFX));
+        struct AMDFSR4FFX *ffx;
+
+        if (!outer) return E_INVALIDARG;
+        if (!(ffx = calloc(1, sizeof(*ffx)))) return E_OUTOFMEMORY;
         ffx->IAmdExtFfxApi_iface.lpVtbl = &AMDFSR4FFX_vtable;
         ffx->ref = 1;
         ffx->rdna2 = is_rdna2((ID3D12Device *)outer);
@@ -712,6 +725,7 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
         *obj = &ffx->IAmdExtFfxApi_iface;
         return S_OK;
     } else if (IsEqualGUID(iid, &IID_IAmdExtAntiLagApi)) {
+        if (!outer) return E_INVALIDARG;
         return ID3D12Device_QueryInterface((ID3D12Device *)outer, &IID_IAmdExtAntiLagApi, obj);
     } else if (IsEqualGUID(iid, &IID_IAmdExtD3DFactory)) {
         *obj = (void *)&amd_d3d_factory.IAmdExtD3DFactory_iface;
