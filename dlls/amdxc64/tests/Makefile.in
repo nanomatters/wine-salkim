@@ -1,0 +1,5 @@
+TESTDLL = amdxc64.dll
+PARENTSRC = ..
+
+SOURCES = \
+	amdxc64.c

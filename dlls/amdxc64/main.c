@@ -149,6 +149,43 @@ typedef HRESULT (__stdcall *updateffxapi_pfn)(void*, unsigned int);
 /* SDK 2.1.0 requires this */
 typedef HRESULT (__stdcall *updateffxapi_pfn_ex)(void*, unsigned int, void*);
 
+enum upgrade_mode
+{
+    UPGRADE_AUTO,
+    UPGRADE_DISABLED,
+    UPGRADE_ENABLED,
+};
+
+static INIT_ONCE config_once = INIT_ONCE_STATIC_INIT;
+static INIT_ONCE provider_once = INIT_ONCE_STATIC_INIT;
+static enum upgrade_mode fsr4_upgrade, mlfg_upgrade;
+static updateffxapi_pfn_ex update_provider_ex;
+static updateffxapi_pfn update_provider;
+
+static BOOL WINAPI init_upgrade_config(INIT_ONCE *once, void *param, void **context)
+{
+    const char *env;
+
+    env = getenv("FSR4_UPGRADE");
+    fsr4_upgrade = !env ? UPGRADE_AUTO : !strcmp(env, "1") ? UPGRADE_ENABLED : UPGRADE_DISABLED;
+    env = getenv("MLFG_UPGRADE");
+    mlfg_upgrade = env && !strcmp(env, "1") ? UPGRADE_ENABLED :
+                   env && !strcmp(env, "0") ? UPGRADE_DISABLED : UPGRADE_AUTO;
+    return TRUE;
+}
+
+static BOOL WINAPI init_ffx_provider(INIT_ONCE *once, void *param, void **context)
+{
+    HMODULE module;
+
+    if (!(module = LoadLibraryA("amdxcffx64"))) return FALSE;
+
+    /* Returned providers contain callbacks into this module. Keep its reference. */
+    update_provider_ex = (updateffxapi_pfn_ex)GetProcAddress(module, "UpdateFfxApiProviderEx");
+    update_provider = (updateffxapi_pfn)GetProcAddress(module, "UpdateFfxApiProvider");
+    return TRUE;
+}
+
 typedef ULONG (*pfnCanProvide)(ULONG64 typeId);
 typedef ULONG (*pfnCreateContext)(void* context, void* desc, const void* allocator);
 typedef ULONG (*pfnDestroyContext)(void* context, const void* allocator);
@@ -190,37 +227,27 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
     struct ffxExternalProvider *data = _data;
     /* required to expose MLFG support */
     struct unk_data unk_data[1] = {{{0, 1, 0, 0}, NULL}};
-    const char *env;
-    updateffxapi_pfn_ex pfn_ex;
-    updateffxapi_pfn pfn;
-    HMODULE amdffx;
-    BOOL fsr4;
 
     TRACE("%p %p %u\n", iface, data, size);
 
     if (!data) return E_INVALIDARG;
 
-    env = getenv("MLFG_UPGRADE");
-    if (this->fp8_supported || (env && !strcmp(env, "1")))
-        unk_data->unk[2] = !env || strcmp(env, "0");
+    InitOnceExecuteOnce(&config_once, init_upgrade_config, NULL, NULL);
+    if (this->fp8_supported || mlfg_upgrade == UPGRADE_ENABLED)
+        unk_data->unk[2] = mlfg_upgrade != UPGRADE_DISABLED;
 
-    fsr4 = (env = getenv("FSR4_UPGRADE")) && !strcmp(env, "1");
-    if (!fsr4 && !this->rdna2) return E_NOTIMPL;
-    /* explicitly disabled */
-    if (env && !fsr4) return E_NOTIMPL;
+    if (fsr4_upgrade == UPGRADE_DISABLED ||
+        (fsr4_upgrade == UPGRADE_AUTO && !this->rdna2)) return E_NOTIMPL;
 
-    if (!(amdffx = LoadLibraryA("amdxcffx64")))
+    if (!InitOnceExecuteOnce(&provider_once, init_ffx_provider, NULL, NULL))
     {
         ERR("Failed to load FSR4 dll (amdxcffx64)!\n");
         return E_NOINTERFACE;
     }
 
-    pfn_ex = (updateffxapi_pfn_ex)GetProcAddress(amdffx, "UpdateFfxApiProviderEx");
-    pfn = (updateffxapi_pfn)GetProcAddress(amdffx, "UpdateFfxApiProvider");
-
-    if (pfn_ex)
+    if (update_provider_ex)
     {
-        HRESULT ret = pfn_ex(data, size, unk_data);
+        HRESULT ret = update_provider_ex(data, size, unk_data);
 
         TRACE("status: %lx\n", ret);
         dump_provider(data);
@@ -228,7 +255,7 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
         return ret;
     }
 
-    if (pfn)
+    if (update_provider)
     {
         HRESULT ret;
 
@@ -239,9 +266,9 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
             return E_NOINTERFACE;
         }
 
-        if (!fsr4) return E_NOINTERFACE;
+        if (fsr4_upgrade != UPGRADE_ENABLED) return E_NOINTERFACE;
 
-        ret = pfn(data, size);
+        ret = update_provider(data, size);
 
         TRACE("status: %lx\n", ret);
         dump_provider(data);
