@@ -94,6 +94,53 @@ static const ID3D12DeviceExt3Vtbl ext_vtbl =
 
 static struct test_device device = {{&device_vtbl}, {&ext_vtbl}, 1};
 
+static void test_intrinsics(void)
+{
+    static const int groups[] =
+    {
+        -1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, -1, -1, -1, 5, 5,
+        7, 6, 9, 8, 10, 11, 12, 12, -1, -1, -1, -1, -1, -1, -1,
+    };
+    IAmdExtD3DShaderIntrinsics *intrinsics;
+    IAmdExtD3DFactory *factory;
+    HRESULT hr, expected;
+    unsigned int opcode, caps;
+    int group;
+
+    hr = pAmdExtD3DCreateInterface(NULL, &IID_IAmdExtD3DFactory, (void **)&factory);
+    ok(hr == S_OK, "Factory returned %#lx.\n", hr);
+    if (FAILED(hr)) return;
+    for (group = -1; group <= 12; ++group)
+    for (caps = 0; caps < 4; ++caps)
+    {
+        device.intrinsics = group < 0 ? 0 : 1u << group;
+        device.wmma = !!(caps & 1);
+        device.fp8 = !!(caps & 2);
+        hr = IAmdExtD3DFactory_CreateInterface(factory, &device.IUnknown_iface,
+                &IID_IAmdExtD3DShaderIntrinsics, (void **)&intrinsics);
+        ok(hr == S_OK, "Create returned %#lx.\n", hr);
+        if (FAILED(hr)) continue;
+        device.intrinsics = 0;
+        device.wmma = device.fp8 = FALSE;
+        for (opcode = 0; opcode <= 0x23; ++opcode)
+        {
+            expected = E_NOTIMPL;
+            if (opcode < ARRAY_SIZE(groups) && group >= 0 && groups[opcode] == group)
+                expected = S_OK;
+            if (opcode == AmdExtD3DShaderIntrinsicsSupport_WaveMatrix && (caps & 1)) expected = S_OK;
+            if (opcode == AmdExtD3DShaderIntrinsicsSupport_Float8Conversion && (caps & 2)) expected = S_OK;
+            hr = IAmdExtD3DShaderIntrinsics_CheckSupport(intrinsics, opcode);
+            ok(hr == expected, "Group %d, caps %u, opcode %#x returned %#lx, expected %#lx.\n",
+                    group, caps, opcode, hr, expected);
+        }
+        hr = IAmdExtD3DShaderIntrinsics_CheckSupport(intrinsics, 0xdead);
+        ok(hr == E_NOTIMPL, "Unknown opcode returned %#lx.\n", hr);
+        IAmdExtD3DShaderIntrinsics_Release(intrinsics);
+    }
+    IAmdExtD3DFactory_Release(factory);
+    ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
+}
+
 static void test_disabled_provider(void)
 {
     IAmdExtFfxApi *ffx;
@@ -138,5 +185,6 @@ START_TEST(amdxc64)
         return;
     }
     test_disabled_provider();
+    test_intrinsics();
     FreeLibrary(module);
 }
