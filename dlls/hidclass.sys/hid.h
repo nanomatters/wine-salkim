@@ -45,7 +45,6 @@ struct device
 
     WCHAR device_id[MAX_DEVICE_ID_LEN];
     WCHAR instance_id[MAX_DEVICE_ID_LEN];
-    WCHAR container_id[MAX_GUID_STRING_LEN];
     const GUID *class_guid;
 
     HANDLE steam_overlay_event;
