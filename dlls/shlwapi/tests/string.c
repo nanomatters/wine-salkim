@@ -18,6 +18,7 @@
  */
 
 #include <stdio.h>
+#include <limits.h>
 
 #include "wine/test.h"
 #include "winbase.h"
@@ -816,8 +817,8 @@ static void test_StrCmpA(void)
 
   SetLastError(0xdeadbeef);
   res = StrCmpNA(NULL, NULL, 0);
-  todo_wine ok(res == 0, "StrCmpNA(NULL,NULL,0) returned %i\n", res);
-  todo_wine ok(GetLastError() == 0xdeadbeef, "last error was %lu\n", GetLastError());
+  ok(res == 0, "StrCmpNA(NULL,NULL,0) returned %i\n", res);
+  ok(GetLastError() == 0xdeadbeef, "last error was %lu\n", GetLastError());
 
   SetLastError(0xdeadbeef);
   res = StrCmpNIA(NULL, NULL, 0);
@@ -841,18 +842,18 @@ static void test_StrCmpA(void)
   ok(res == 0, "StrCmpNIA returned %i\n", res);
 
   res = StrCmpNA(str3, str4, 3);
-  todo_wine ok(res == 0, "StrCmpNA returned %i\n", res);
+  ok(res == 0, "StrCmpNA returned %i\n", res);
 
   res = StrCmpNIA(str3, str4, 3);
-  todo_wine ok(res == 0, "StrCmpNIA returned %i\n", res);
+  ok(res == 0, "StrCmpNIA returned %i\n", res);
 
   if (is_locale_english())
   {
     res = StrCmpNA(str4, str5, 3);
-    todo_wine ok(res == 0, "StrCmpNA returned %i\n", res);
+    ok(res == 0, "StrCmpNA returned %i\n", res);
 
     res = StrCmpNA(str5, str4, 3);
-    todo_wine ok(res == 0, "StrCmpNA returned %i\n", res);
+    ok(res == 0, "StrCmpNA returned %i\n", res);
 
     res = StrCmpNIA(str4, str5, 3);
     ok(res == -1, "StrCmpNIA returned %i\n", res);
@@ -888,8 +889,8 @@ static void test_StrCmpA(void)
 
   ok(StrIsIntlEqualA(FALSE, str1, str2, 5), "StrIsIntlEqualA(FALSE,...) is case-sensitive\n");
   ok(!StrIsIntlEqualA(TRUE, str1, str2, 5), "StrIsIntlEqualA(TRUE,...) isn't case-sensitive\n");
-  todo_wine ok(StrIsIntlEqualA(FALSE, str3, str4, 3), "StrIsIntlEqualA(FALSE,...) read past null terminator\n");
-  todo_wine ok(StrIsIntlEqualA(TRUE, str3, str4, 3), "StrIsIntlEqualA(TRUE,...) read past null terminator\n");
+  ok(StrIsIntlEqualA(FALSE, str3, str4, 3), "StrIsIntlEqualA(FALSE,...) read past null terminator\n");
+  ok(StrIsIntlEqualA(TRUE, str3, str4, 3), "StrIsIntlEqualA(TRUE,...) read past null terminator\n");
 
   if (is_locale_english())
   {
@@ -915,8 +916,8 @@ static void test_StrCmpA(void)
 
   ok(IntlStrEqWorkerA(FALSE, str1, str2, 5), "IntlStrEqWorkerA(FALSE,...) is case-sensitive\n");
   ok(!IntlStrEqWorkerA(TRUE, str1, str2, 5), "IntlStrEqWorkerA(TRUE,...) isn't case-sensitive\n");
-  todo_wine ok(IntlStrEqWorkerA(FALSE, str3, str4, 3), "IntlStrEqWorkerA(FALSE,...) read past null terminator\n");
-  todo_wine ok(IntlStrEqWorkerA(TRUE, str3, str4, 3), "IntlStrEqWorkerA(TRUE,...) read past null terminator\n");
+  ok(IntlStrEqWorkerA(FALSE, str3, str4, 3), "IntlStrEqWorkerA(FALSE,...) read past null terminator\n");
+  ok(IntlStrEqWorkerA(TRUE, str3, str4, 3), "IntlStrEqWorkerA(TRUE,...) read past null terminator\n");
 
   if (is_locale_english())
   {
@@ -961,10 +962,10 @@ static void test_StrCmpW(void)
   ok(res == 0, "StrCmpNIW returned %i\n", res);
 
   res = StrCmpNW(str3, str4, 3);
-  todo_wine ok(res == 0, "StrCmpNW returned %i\n", res);
+  ok(res == 0, "StrCmpNW returned %i\n", res);
 
   res = StrCmpNIW(str3, str4, 3);
-  todo_wine ok(res == 0, "StrCmpNIW returned %i\n", res);
+  ok(res == 0, "StrCmpNIW returned %i\n", res);
 
   res = StrCmpNW(str4, str5, 3);
   ok(res == -1, "StrCmpNW returned %i\n", res);
@@ -1005,8 +1006,8 @@ static void test_StrCmpW(void)
 
   ok(StrIsIntlEqualW(FALSE, str1, str2, 5), "StrIsIntlEqualW(FALSE,...) is case-sensitive\n");
   ok(!StrIsIntlEqualW(TRUE, str1, str2, 5), "StrIsIntlEqualW(TRUE,...) isn't case-sensitive\n");
-  todo_wine ok(StrIsIntlEqualW(FALSE, str3, str4, 3), "StrIsIntlEqualW(FALSE,...) read past null terminator\n");
-  todo_wine ok(StrIsIntlEqualW(TRUE, str3, str4, 3), "StrIsIntlEqualW(TRUE,...) read past null terminator\n");
+  ok(StrIsIntlEqualW(FALSE, str3, str4, 3), "StrIsIntlEqualW(FALSE,...) read past null terminator\n");
+  ok(StrIsIntlEqualW(TRUE, str3, str4, 3), "StrIsIntlEqualW(TRUE,...) read past null terminator\n");
 
   ok(!StrIsIntlEqualW(FALSE, str4, str5, 3), "StrIsIntlEqualW(FALSE,...) was true\n");
   ok(!StrIsIntlEqualW(TRUE, str4, str5, 3), "StrIsIntlEqualW(TRUE,...) was true\n");
@@ -1029,11 +1030,33 @@ static void test_StrCmpW(void)
 
   ok(IntlStrEqWorkerW(FALSE, str1, str2, 5), "IntlStrEqWorkerW(FALSE,...) is case-sensitive\n");
   ok(!IntlStrEqWorkerW(TRUE, str1, str2, 5), "IntlStrEqWorkerW(TRUE,...) isn't case-sensitive\n");
-  todo_wine ok(IntlStrEqWorkerW(FALSE, str3, str4, 3), "IntlStrEqWorkerW(FALSE,...) read past null terminator\n");
-  todo_wine ok(IntlStrEqWorkerW(TRUE, str3, str4, 3), "IntlStrEqWorkerW(TRUE,...) read past null terminator\n");
+  ok(IntlStrEqWorkerW(FALSE, str3, str4, 3), "IntlStrEqWorkerW(FALSE,...) read past null terminator\n");
+  ok(IntlStrEqWorkerW(TRUE, str3, str4, 3), "IntlStrEqWorkerW(TRUE,...) read past null terminator\n");
 
   ok(!IntlStrEqWorkerW(FALSE, str4, str5, 3), "IntlStrEqWorkerW(FALSE,...) was true\n");
   ok(!IntlStrEqWorkerW(TRUE, str4, str5, 3), "IntlStrEqWorkerW(TRUE,...) was true\n");
+}
+
+static void test_StrCmpN_negative_lengths(void)
+{
+  static const int lengths[] = {-1, -2, INT_MIN};
+  unsigned int i;
+
+  for (i = 0; i < ARRAY_SIZE(lengths); ++i)
+  {
+    int len = lengths[i];
+
+    winetest_push_context("len %d", len);
+    ok(!StrCmpNA("abc", "abc", len), "StrCmpNA failed\n");
+    ok(!StrCmpNIA("abc", "ABC", len), "StrCmpNIA failed\n");
+    ok(!StrCmpNW(L"abc", L"abc", len), "StrCmpNW failed\n");
+    ok(!StrCmpNIW(L"abc", L"ABC", len), "StrCmpNIW failed\n");
+    ok(StrIsIntlEqualA(FALSE, "abc", "ABC", len), "StrIsIntlEqualA(FALSE) failed\n");
+    ok(StrIsIntlEqualA(TRUE, "abc", "abc", len), "StrIsIntlEqualA(TRUE) failed\n");
+    ok(StrIsIntlEqualW(FALSE, L"abc", L"ABC", len), "StrIsIntlEqualW(FALSE) failed\n");
+    ok(StrIsIntlEqualW(TRUE, L"abc", L"abc", len), "StrIsIntlEqualW(TRUE) failed\n");
+    winetest_pop_context();
+  }
 }
 
 static WCHAR *CoDupStrW(const char* src)
@@ -2140,6 +2163,7 @@ START_TEST(string)
 
   test_StrCmpA();
   test_StrCmpW();
+  test_StrCmpN_negative_lengths();
   test_StrRetToBSTR();
   test_StrCpyNXA();
   test_StrCpyNXW();
