@@ -2725,11 +2725,20 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
 static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    struct thread_data *data = init_handler( sigcontext );
+    struct thread_data *data;
     struct xcontext context;
     void *steamclient_addr = NULL;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
+    /* CPUID faults can also occur in native threads without a Wine signal stack. */
+    if (signal == SIGSEGV && TRAP_sig(sigcontext) == TRAP_x86_PROTFLT && siginfo->si_code == 0x80 /* SI_KERNEL */
+        && !ERROR_sig(sigcontext)
+        && handle_cpuid_fault( (ULONG_PTR *)&RIP_sig(sigcontext), (ULONG_PTR *)&RAX_sig(sigcontext),
+                               (ULONG_PTR *)&RBX_sig(sigcontext), (ULONG_PTR *)&RCX_sig(sigcontext),
+                               (ULONG_PTR *)&RDX_sig(sigcontext) ))
+        return;
+
+    data = init_handler( sigcontext );
     save_context( data, &context, sigcontext );
 
     switch(TRAP_sig(sigcontext))
@@ -3405,6 +3414,7 @@ void signal_init_process( TEB *teb )
     }
 #endif
 
+    emulate_cpuid();
     return;
 
  error:
