@@ -2074,12 +2074,22 @@ static BOOL handle_syscall_trap( struct thread_data *data, ucontext_t *sigcontex
 static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
-    struct thread_data *data = init_handler( sigcontext );
-    void *stack = get_exception_stack( data, sigcontext );
+    struct thread_data *data;
+    void *stack;
     struct xcontext xcontext;
     void *steamclient_addr = NULL;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)EIP_sig( sigcontext ) };
 
+    /* CPUID faults can also occur in native threads without a Wine signal stack. */
+    if (signal == SIGSEGV && TRAP_sig(sigcontext) == TRAP_x86_PROTFLT && siginfo->si_code == 0x80 /* SI_KERNEL */
+        && !ERROR_sig(sigcontext)
+        && handle_cpuid_fault( (ULONG_PTR *)&EIP_sig(sigcontext), (ULONG_PTR *)&EAX_sig(sigcontext),
+                               (ULONG_PTR *)&EBX_sig(sigcontext), (ULONG_PTR *)&ECX_sig(sigcontext),
+                               (ULONG_PTR *)&EDX_sig(sigcontext) ))
+        return;
+
+    data = init_handler( sigcontext );
+    stack = get_exception_stack( data, sigcontext );
     save_context( data, &xcontext.c, sigcontext );
 
     switch (TRAP_sig(sigcontext))
@@ -2652,6 +2662,7 @@ void signal_init_process( TEB *teb )
     if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
+    emulate_cpuid();
     return;
 
  error:
