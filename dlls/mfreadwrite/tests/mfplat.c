@@ -2408,6 +2408,16 @@ static void test_sink_writer_create(void)
     hr = MFCreateMediaType(&input_type);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     init_media_type(input_type, float_audio_type_desc, -1);
+
+    /* A rejected input type must not consume the initial type change. */
+    hr = MFCreateMediaType(&media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaType_SetGUID(media_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFSinkWriter_SetInputMediaType(writer, 0, media_type, NULL);
+    ok(FAILED(hr), "Unexpected hr %#lx.\n", hr);
+    IMFMediaType_Release(media_type);
+
     hr = IMFSinkWriter_SetInputMediaType(writer, 0, input_type, NULL);
     /* Not all Windows machines succeed here. */
     flaky
