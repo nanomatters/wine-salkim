@@ -855,7 +855,7 @@ static HRESULT WINAPI DdsFrameDecode_CopyPixels(IWICBitmapFrameDecode *iface,
     bpp = This->info.pixel_format_bpp;
     if (!bpp) return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
 
-    frame_stride = This->info.width * bpp / 8;
+    frame_stride = This->info.width * (bpp / 8);
     frame_size = frame_stride * This->info.height;
     if (!prc) {
         if (cbStride < frame_stride) return E_INVALIDARG;
@@ -870,7 +870,7 @@ static HRESULT WINAPI DdsFrameDecode_CopyPixels(IWICBitmapFrameDecode *iface,
             y + height > This->info.height) {
             return E_INVALIDARG;
         }
-        if (cbStride < width * bpp / 8) return E_INVALIDARG;
+        if (cbStride < width * (bpp / 8)) return E_INVALIDARG;
         if (cbBufferSize < cbStride * height) return WINCODEC_ERR_INSUFFICIENTBUFFER;
     }
 
@@ -1429,6 +1429,13 @@ static HRESULT WINAPI DdsDecoder_Dds_GetFrame(IWICDdsDecoder *iface,
         if (width > 1) width /= 2;
         if (height > 1) height /= 2;
         if (depth > 1) depth /= 2;
+    }
+
+    if (This->info.pixel_format_bpp && (frame_height == 0 || frame_width >= (UINT_MAX / (This->info.pixel_format_bpp / 8) / frame_height)))
+    {
+        /* Size calculation in CopyPixels may overflow */
+        hr = E_FAIL;
+        goto end;
     }
 
     hr = DdsFrameDecode_CreateInstance(&frame_decode);
