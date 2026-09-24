@@ -3562,6 +3562,19 @@ static void test_presentation_clock(void)
     hr = IMFRateControl_SetRate(rate_control, FALSE, 0.0f);
     ok(hr == MF_E_CLOCK_NO_TIME_SOURCE, "Unexpected hr %#lx.\n", hr);
 
+    /* SetTimer() with no time source. MFTIMER_RELATIVE is not tested because native crashes. */
+    callback = create_test_callback(FALSE);
+    timer_callback = impl_from_IMFAsyncCallback(callback);
+
+    hr = IMFPresentationClock_QueryInterface(clock, &IID_IMFTimer, (void **)&timer);
+    ok(hr == S_OK, "got hr %#lx.\n", hr);
+
+    hr = IMFTimer_SetTimer(timer, 0, 1000000, callback, NULL, &timer_cancel_key);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTimer_CancelTimer(timer, timer_cancel_key);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IUnknown_Release(timer_cancel_key);
+
     /* Set default time source. */
     hr = MFCreateSystemTimeSource(&time_source);
     ok(hr == S_OK, "Failed to create time source, hr %#lx.\n", hr);
@@ -3694,18 +3707,12 @@ static void test_presentation_clock(void)
 
     IMFRateControl_Release(rate_control);
 
-
-    hr = IMFPresentationClock_QueryInterface(clock, &IID_IMFTimer, (void **)&timer);
-    ok(hr == S_OK, "got hr %#lx.\n", hr);
-
     hr = IMFPresentationClock_Start(clock, 200000);
     ok(hr == S_OK, "got hr %#lx.\n", hr);
 
     hr = IMFPresentationClock_GetCorrelatedTime(clock, 0, &time, &systime);
     ok(hr == S_OK, "got hr %#lx.\n", hr);
 
-    callback = create_test_callback(FALSE);
-    timer_callback = impl_from_IMFAsyncCallback(callback);
     hr = IMFTimer_SetTimer(timer, 0, 100000, callback, NULL, &timer_cancel_key);
     ok(hr == S_OK, "got hr %#lx.\n", hr);
 
