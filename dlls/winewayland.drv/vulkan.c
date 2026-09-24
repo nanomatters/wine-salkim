@@ -548,7 +548,7 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
 
     if (!client || color_space == WAYLAND_IMAGE_DESCRIPTION_DEFAULT) return colorspace;
 
-    /* Select the fallback without claiming the wl_surface. The old host
+    /* Select the color description without claiming the wl_surface. The old host
      * swapchain may still own its color-management object until replacement. */
     status = wayland_color_manager_get_image_description(color_space, NULL);
     if (status != WAYLAND_IMAGE_DESCRIPTION_READY)

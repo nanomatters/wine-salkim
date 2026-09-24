@@ -5347,7 +5347,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     LONG generation_before_update;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
-    VkColorSpaceKHR mapped_color_space;
     uint32_t format_count = 0;
     VkSurfaceFormatKHR *formats = NULL;
     RECT client_rect, fullscreen_rect;
@@ -5623,11 +5622,13 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         }
     }
 
-    /* Preserve native HDR signaling for host layers. Only use Wine's Wayland
-     * color description when the host cannot present the requested pair. */
+    /* Prefer Wine's Windows color description through pass-through. Keep the
+     * native HDR colorspace as a fallback when the mapped pair is unavailable. */
     if (create_info_host.imageColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ||
         create_info_host.imageColorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
     {
+        create_info_host.imageColorSpace = driver_funcs->p_vulkan_map_colorspace(
+                create_info->imageColorSpace, surface->client );
         color_space_supported = FALSE;
 
         res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device, surface_host_handle( surface ), &format_count, NULL );
@@ -5651,15 +5652,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                 color_space_supported = TRUE;
         }
 
-        if (!color_space_supported && create_info_host.imageColorSpace == create_info->imageColorSpace)
+        if (!color_space_supported && create_info_host.imageColorSpace != create_info->imageColorSpace)
         {
-            mapped_color_space = driver_funcs->p_vulkan_map_colorspace(
-                    create_info->imageColorSpace, surface->client );
-            if (mapped_color_space != create_info_host.imageColorSpace)
-            {
-                create_info_host.imageColorSpace = mapped_color_space;
-                goto again;
-            }
+            create_info_host.imageColorSpace = create_info->imageColorSpace;
+            goto again;
         }
 
         if (color_space_supported && create_info_host.imageColorSpace == create_info->imageColorSpace)
