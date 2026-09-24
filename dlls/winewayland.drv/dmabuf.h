@@ -23,10 +23,28 @@
 
 #include <errno.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "wine/hwnd_dmabuf.h"
+
+/* Each dispatch drains all channels for one host. Coalesce only this batch,
+ * retaining the surface serial so a recycled HWND is a different identity. */
+static inline unsigned int wayland_dmabuf_coalesce_events(struct epoll_event *events,
+                                                         unsigned int count)
+{
+    unsigned int i, j, unique = 0;
+
+    for (i = 0; i < count; i++)
+    {
+        for (j = 0; j < unique; j++)
+            if (events[j].data.u64 == events[i].data.u64) break;
+        if (j == unique) events[unique++] = events[i];
+        else events[j].events |= events[i].events;
+    }
+    return unique;
+}
 
 /* Return 1 for a packet (invalid packets have version 0), 0 only for an empty
  * channel, and -1 for a closed/broken channel. EPOLLET requires draining past

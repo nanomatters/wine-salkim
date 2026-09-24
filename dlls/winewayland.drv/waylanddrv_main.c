@@ -34,6 +34,7 @@
 #define WIN32_NO_STATUS
 
 #include "waylanddrv.h"
+#include "dmabuf.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -216,6 +217,7 @@ static int dispatch_events(void)
 
     count = epoll_wait(dmabuf_epoll_fd, events, ARRAY_SIZE(events), 0);
     if (count < 0) return errno == EINTR ? 0 : -1;
+    count = wayland_dmabuf_coalesce_events(events, count);
     for (i = 0; i < count; i++)
         wayland_surface_dispatch_dmabuf(ULongToHandle((UINT32)events[i].data.u64),
                                         events[i].data.u64 >> 32);

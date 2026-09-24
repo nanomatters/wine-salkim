@@ -124,6 +124,38 @@ static void expect_quiet(int epfd)
     assert(!epoll_wait(epfd, &event, 1, 0));
 }
 
+static void test_coalesce(void)
+{
+    const uint64_t a = (uint64_t)1 << 32 | 0x10020;
+    const uint64_t b = (uint64_t)2 << 32 | 0x10020; /* Same HWND, new surface. */
+    const uint64_t c = (uint64_t)1 << 32 | 0x10022;
+    struct epoll_event events[] = {
+        {.events = EPOLLIN, .data.u64 = a}, {.events = EPOLLIN, .data.u64 = b},
+        {.events = EPOLLHUP, .data.u64 = a}, {.events = EPOLLIN, .data.u64 = c},
+        {.events = EPOLLERR, .data.u64 = b}, {.events = EPOLLIN, .data.u64 = a}};
+
+    assert(!wayland_dmabuf_coalesce_events(events, 0));
+    assert(wayland_dmabuf_coalesce_events(events, ARRAY_SIZE(events)) == 3);
+    assert(events[0].data.u64 == a && events[0].events == (EPOLLIN | EPOLLHUP));
+    assert(events[1].data.u64 == b && events[1].events == (EPOLLIN | EPOLLERR));
+    assert(events[2].data.u64 == c);
+    /* Coalescing must not suppress a later batch for the same host. */
+    assert(wayland_dmabuf_coalesce_events(events, 3) == 3);
+}
+
+static void test_full_batch(void)
+{
+    struct epoll_event events[32];
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(events); i++)
+        events[i] = (struct epoll_event){.events = EPOLLIN, .data.u64 = i};
+    assert(wayland_dmabuf_coalesce_events(events, ARRAY_SIZE(events)) == ARRAY_SIZE(events));
+    for (i = 0; i < ARRAY_SIZE(events); i++) events[i].data.u64 = 7;
+    assert(wayland_dmabuf_coalesce_events(events, ARRAY_SIZE(events)) == 1);
+    assert(events[0].data.u64 == 7);
+}
+
 static void test_empty_closed(void)
 {
     hwnd_dmabuf_frame_desc_t desc;
@@ -302,6 +334,39 @@ static void test_receive_errors(void)
     close(pair[1]);
 }
 
+static void test_multiple_channels(void)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(4), received;
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.u64 = 42}, events[4];
+    int channels[4][2], epfd = epoll_create1(EPOLL_CLOEXEC), count, fd, sync_fd;
+    unsigned int i;
+
+    assert(epfd >= 0);
+    for (i = 0; i < ARRAY_SIZE(channels); i++)
+    {
+        create_channel(channels[i]);
+        assert(!epoll_ctl(epfd, EPOLL_CTL_ADD, channels[i][1], &event));
+        send_packet(channels[i][0], &desc, sizeof(desc), NULL, 0);
+    }
+    count = epoll_wait(epfd, events, ARRAY_SIZE(events), 0);
+    assert(count == 4 && wayland_dmabuf_coalesce_events(events, count) == 1);
+    /* One host dispatch drains all four channels. */
+    for (i = 0; i < ARRAY_SIZE(channels); i++)
+    {
+        assert(wayland_dmabuf_channel_recv(channels[i][1], &received, &fd, &sync_fd) == 1);
+        assert(!wayland_dmabuf_channel_recv(channels[i][1], &received, &fd, &sync_fd));
+    }
+    expect_quiet(epfd);
+    send_packet(channels[2][0], &desc, sizeof(desc), NULL, 0);
+    expect_ready(epfd, 42);
+    for (i = 0; i < ARRAY_SIZE(channels); i++)
+    {
+        close(channels[i][0]);
+        close(channels[i][1]);
+    }
+    close(epfd);
+}
+
 static void test_unregister_and_replace(void)
 {
     hwnd_dmabuf_frame_desc_t desc = frame(5);
@@ -345,13 +410,14 @@ static void test_deferred_fence(void)
 int main(void)
 {
     static const struct { const char *name; void (*run)(void); } tests[] = {
+        {"coalesce identities", test_coalesce}, {"full event batch", test_full_batch},
         {"empty and closed channel", test_empty_closed},
         {"late registration", test_late_registration}, {"empty packet rights", test_empty_packet_rights},
         {"short packet drain", test_short_packet_drain},
         {"oversized packet", test_oversized}, {"truncated rights", test_truncated_rights},
         {"extra rights", test_extra_rights}, {"missing fence", test_missing_fence},
         {"descriptor transfer", test_rights}, {"receive errors", test_receive_errors},
-        {"unregister and replace", test_unregister_and_replace},
+        {"multiple channels", test_multiple_channels}, {"unregister and replace", test_unregister_and_replace},
         {"deferred fence", test_deferred_fence}};
     unsigned int i, before;
 
