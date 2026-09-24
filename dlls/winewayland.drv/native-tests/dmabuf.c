@@ -552,6 +552,72 @@ static void test_suspend_socket_full(void)
     check_failed_suspend(TRUE);
 }
 
+static void test_update_mode(void)
+{
+    BOOL reconfigured, configured, direct;
+
+    for (reconfigured = FALSE; reconfigured <= TRUE; reconfigured++)
+        for (configured = FALSE; configured <= TRUE; configured++)
+            for (direct = FALSE; direct <= TRUE; direct++)
+            {
+                enum wayland_dmabuf_update_mode mode =
+                    wayland_dmabuf_get_update_mode(reconfigured, configured, direct);
+
+                if (reconfigured)
+                    assert(mode == WAYLAND_DMABUF_UPDATE_ALL);
+                else if (!configured || direct)
+                    assert(mode == WAYLAND_DMABUF_UPDATE_BLOCKED);
+                else
+                    assert(mode == WAYLAND_DMABUF_UPDATE_CHILDREN);
+            }
+
+    /* Initial mapping and role recreation still require configuration. */
+    assert(wayland_dmabuf_get_update_mode(FALSE, FALSE, FALSE) == WAYLAND_DMABUF_UPDATE_BLOCKED);
+    /* An established parent need not be reconfigured to present child buffers.
+     * This does not authorize replacing a direct parent buffer or carrier. */
+    assert(wayland_dmabuf_get_update_mode(FALSE, TRUE, FALSE) == WAYLAND_DMABUF_UPDATE_CHILDREN);
+    assert(wayland_dmabuf_get_update_mode(FALSE, TRUE, TRUE) == WAYLAND_DMABUF_UPDATE_BLOCKED);
+    /* No sticky fallback after the window thread accepts the configuration. */
+    assert(wayland_dmabuf_get_update_mode(TRUE, TRUE, FALSE) == WAYLAND_DMABUF_UPDATE_ALL);
+}
+
+static void test_child_readiness_during_reconfigure(void)
+{
+    hwnd_dmabuf_frame_desc_t desc, received;
+    hwnd_dmabuf_release_t release, reply;
+    int pair[2], epfd, fd, sync_fd;
+    unsigned int i;
+
+    create_channel(pair);
+    epfd = watch(pair[1], 123);
+    for (i = 0; i < 3; i++)
+    {
+        /* Two frames while geometry is incompatible, then normal delivery.
+         * The transport must drain and reply without waiting for a configure
+         * message on the blocked window thread. */
+        enum wayland_dmabuf_update_mode mode = wayland_dmabuf_get_update_mode(i == 2, TRUE, FALSE);
+
+        assert(mode == (i == 2 ? WAYLAND_DMABUF_UPDATE_ALL : WAYLAND_DMABUF_UPDATE_CHILDREN));
+        desc = frame(i + 1);
+        send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+        expect_ready(epfd, 123);
+        assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+        assert(received.frame_seq == desc.frame_seq && fd == -1 && sync_fd == -1);
+        assert(!wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd));
+        expect_quiet(epfd);
+
+        /* Model a discarded completion, not a fake compositor presentation. */
+        release = (hwnd_dmabuf_release_t){.release_token = desc.release_token,
+                                        .flags = HWND_DMABUF_RELEASE_DROPPED};
+        send_packet(pair[1], &release, sizeof(release), NULL, 0);
+        assert(recv(pair[0], &reply, sizeof(reply), MSG_DONTWAIT) == sizeof(reply));
+        assert(reply.release_token == desc.release_token && reply.flags == release.flags);
+    }
+    close(epfd);
+    close(pair[0]);
+    close(pair[1]);
+}
+
 int main(void)
 {
     static const struct { const char *name; void (*run)(void); } tests[] = {
@@ -565,7 +631,8 @@ int main(void)
         {"extra rights", test_extra_rights}, {"missing fence", test_missing_fence},
         {"descriptor transfer", test_rights}, {"receive errors", test_receive_errors},
         {"multiple channels", test_multiple_channels}, {"unregister and replace", test_unregister_and_replace},
-        {"deferred fence", test_deferred_fence}};
+        {"deferred fence", test_deferred_fence}, {"parent update modes", test_update_mode},
+        {"child readiness during reconfigure", test_child_readiness_during_reconfigure}};
     unsigned int i, before;
 
     setbuf(stdout, NULL);

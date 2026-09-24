@@ -51,6 +51,24 @@ static inline int wayland_dmabuf_channel_suspend(int channel_fd)
     return ret;
 }
 
+enum wayland_dmabuf_update_mode
+{
+    WAYLAND_DMABUF_UPDATE_BLOCKED,
+    WAYLAND_DMABUF_UPDATE_CHILDREN,
+    WAYLAND_DMABUF_UPDATE_ALL,
+};
+
+/* A configured parent can keep presenting child buffers while its window
+ * thread handles a resize. Buffers attached to the parent itself still need
+ * a compatible configuration; never promote a child in this interval. */
+static inline enum wayland_dmabuf_update_mode wayland_dmabuf_get_update_mode(
+        BOOL reconfigured, BOOL configured_toplevel, BOOL direct_buffer)
+{
+    if (reconfigured) return WAYLAND_DMABUF_UPDATE_ALL;
+    if (configured_toplevel && !direct_buffer) return WAYLAND_DMABUF_UPDATE_CHILDREN;
+    return WAYLAND_DMABUF_UPDATE_BLOCKED;
+}
+
 /* Each dispatch drains all channels for one host. Coalesce only this batch,
  * retaining the surface serial so a recycled HWND is a different identity. */
 static inline unsigned int wayland_dmabuf_coalesce_events(struct epoll_event *events,

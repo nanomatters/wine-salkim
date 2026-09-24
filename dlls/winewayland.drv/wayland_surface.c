@@ -5902,10 +5902,11 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
     struct wayland_hwnd_dmabuf_buffer *buffer, *buffer_next;
     struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *next;
     enum hwnd_dmabuf_status status;
+    enum wayland_dmabuf_update_mode update_mode;
     struct wayland_win_data *data;
     struct wl_surface *sibling, *bottom = NULL;
     unsigned long long now = wayland_time_ms();
-    BOOL any_new = FALSE;
+    BOOL reconfigured, any_new = FALSE;
 
     /* Producer children are composited by every live presentation surface. */
     if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface) &&
@@ -5965,18 +5966,25 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         }
     }
 
-    /* A queued configure is not a presentation barrier. Reuse the accepted
-     * configuration until the window thread processes its replacement, while
-     * still enforcing the initial configure and strict fullscreen sizes. */
-    if (!wayland_surface_has_external_commit_owner(surface) &&
-        !wayland_surface_reconfigure(surface))
+    /* Top-level geometry and child-buffer delivery have separate lifetimes.
+     * A resize callback can wait for a child present before the window thread
+     * handles our configure. In that interval, commit the child buffers under
+     * the existing parent geometry without acknowledging the pending serial
+     * or replacing the parent's buffer/viewport. */
+    reconfigured = wayland_surface_has_external_commit_owner(surface) || wayland_surface_reconfigure(surface);
+    update_mode = wayland_dmabuf_get_update_mode(reconfigured,
+            wayland_surface_is_toplevel(surface) && surface->xdg_surface &&
+                surface->current.serial && !IsRectEmpty(&surface->geometry),
+            !!surface->direct_dmabuf_surface);
+    if (update_mode == WAYLAND_DMABUF_UPDATE_BLOCKED)
     {
         if (frames != stack_frames) free(frames);
         return;
     }
 
     data = wayland_win_data_get_nolock(surface->hwnd);
-    if (wayland_surface_update_direct_dmabuf(surface, data, frames, count, now))
+    if (update_mode == WAYLAND_DMABUF_UPDATE_ALL &&
+        wayland_surface_update_direct_dmabuf(surface, data, frames, count, now))
     {
         if (frames != stack_frames) free(frames);
         return;
@@ -6206,7 +6214,8 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         }
     }
 
-    if (data && !data->window_contents && wayland_surface_has_hwnd_dmabuf_content(surface))
+    if (update_mode == WAYLAND_DMABUF_UPDATE_ALL &&
+        data && !data->window_contents && wayland_surface_has_hwnd_dmabuf_content(surface))
         wayland_surface_attach_transparent_carrier(surface);
 
     if (any_new && data && data->client_surface && data->client_surface->wl_subsurface &&
