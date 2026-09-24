@@ -38,6 +38,7 @@
 #define WIN32_NO_STATUS
 
 #include "waylanddrv.h"
+#include "dmabuf.h"
 #include "dxgi1_2.h"
 #include "wine/debug.h"
 #include "wine/hwnd_dmabuf.h"
@@ -4803,83 +4804,6 @@ static void wayland_hwnd_dmabuf_surface_claim_channel(struct wayland_hwnd_dmabuf
                        surface->gdi_overlay ? "gdi overlay" : "dmabuf", fd);
 }
 
-/* Receive one frame. Returns 1 on success, 0 if empty, -1 on EOF. */
-static int wayland_hwnd_dmabuf_channel_recv_one(int channel_fd, hwnd_dmabuf_frame_desc_t *desc,
-                                                int *out_fd, int *out_sync_fd)
-{
-    char control[CMSG_SPACE(2 * sizeof(int))];
-    struct msghdr msg = {0};
-    struct cmsghdr *cmsg;
-    struct iovec iov;
-    int fds[2] = {-1, -1};
-    unsigned int expected, fd_count = 0;
-    ssize_t n;
-
-    *out_fd = -1;
-    *out_sync_fd = -1;
-    iov.iov_base = desc;
-    iov.iov_len = sizeof(*desc);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    n = recvmsg(channel_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
-    if (n == 0) return -1;                       /* peer closed the channel */
-    if (n != (ssize_t)sizeof(*desc))
-    {
-        if (n > 0)
-            for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
-                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-                    cmsg->cmsg_len >= CMSG_LEN(0))
-                {
-                    size_t size = cmsg->cmsg_len - CMSG_LEN(0);
-                    int *fd = (int *)CMSG_DATA(cmsg);
-
-                    while (size >= sizeof(*fd))
-                    {
-                        close(*fd++);
-                        size -= sizeof(*fd);
-                    }
-                }
-        return 0;   /* EAGAIN or short packet: nothing usable now */
-    }
-
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-            cmsg->cmsg_len >= CMSG_LEN(0))
-        {
-            size_t size = cmsg->cmsg_len - CMSG_LEN(0);
-            unsigned int count = min(size / sizeof(int), ARRAY_SIZE(fds) - fd_count);
-
-            memcpy(fds + fd_count, CMSG_DATA(cmsg), count * sizeof(int));
-            fd_count += count;
-        }
-
-    if (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE)
-    {
-        expected = fd_count == 2 ? 2 : 1;
-        if (fd_count == 2) *out_fd = fds[0];
-        if (fd_count) *out_sync_fd = fds[fd_count - 1];
-    }
-    else
-    {
-        expected = fd_count ? 1 : 0;
-        if (fd_count) *out_fd = fds[0];
-    }
-
-    if ((msg.msg_flags & MSG_CTRUNC) || fd_count != expected ||
-        (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE && *out_sync_fd < 0))
-    {
-        unsigned int i;
-
-        for (i = 0; i < fd_count; i++) if (fds[i] >= 0) close(fds[i]);
-        *out_fd = *out_sync_fd = -1;
-        desc->version = 0;
-    }
-    return 1;
-}
-
 static BOOL wayland_hwnd_dmabuf_desc_is_shm(const hwnd_dmabuf_frame_desc_t *desc)
 {
     return (desc->flags & HWND_DMABUF_FLAG_SHM) != 0;
@@ -5415,8 +5339,7 @@ retry:
                 HWND_DMABUF_RELEASE_CONSUMER_ACTIVE))
         surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE;
 
-    while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc,
-                                                      &fd, &sync_fd)) > 0)
+    while ((r = wayland_dmabuf_channel_recv(surface->channel_fd, &desc, &fd, &sync_fd)) > 0)
     {
         BOOL desc_valid = wayland_hwnd_dmabuf_desc_is_valid(&desc);
         BOOL format_supported = desc_valid &&

@@ -1,0 +1,368 @@
+/*
+ * Native tests for DMA-BUF channel readiness
+ *
+ * Copyright 2026 Erhan Bilgili
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#include <assert.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int recv_error, recv_errors_remaining;
+
+static ssize_t interrupted_recvmsg(int fd, struct msghdr *msg, int flags)
+{
+    if (recv_errors_remaining)
+    {
+        recv_errors_remaining--;
+        errno = recv_error;
+        return -1;
+    }
+    return recvmsg(fd, msg, flags);
+}
+
+/* Test the production receiver, including its EINTR/error handling. */
+#define recvmsg interrupted_recvmsg
+#include "../dmabuf.h"
+#undef recvmsg
+
+static unsigned int open_fd_count(void)
+{
+    struct dirent *entry;
+    unsigned int count = 0;
+    DIR *dir = opendir("/proc/self/fd");
+
+    assert(dir);
+    while ((entry = readdir(dir)))
+        if (entry->d_name[0] != '.') count++;
+    closedir(dir);
+    return count;
+}
+
+static void create_channel(int pair[2])
+{
+    assert(!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair));
+}
+
+static hwnd_dmabuf_frame_desc_t frame(unsigned int seq)
+{
+    return (hwnd_dmabuf_frame_desc_t){.version = HWND_DMABUF_DESC_VERSION_V1,
+            .flags = HWND_DMABUF_FLAG_STABLE_SLOT, .width = 16, .height = 16,
+            .stride = 64, .fourcc = HWND_DMABUF_SHM_FORMAT_XRGB8888,
+            .frame_seq = seq, .producer_unique_id = 123, .release_token = seq + 1};
+}
+
+static void send_packet(int sock, const void *data, size_t size, const int *fds, unsigned int count)
+{
+    union { struct cmsghdr align; char data[CMSG_SPACE(4 * sizeof(int))]; } control;
+    struct iovec iov = {.iov_base = (void *)data, .iov_len = size};
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+    ssize_t ret;
+
+    assert(count <= 4);
+    if (count)
+    {
+        struct cmsghdr *cmsg;
+
+        msg.msg_control = control.data;
+        msg.msg_controllen = CMSG_SPACE(count * sizeof(int));
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(count * sizeof(int));
+        memcpy(CMSG_DATA(cmsg), fds, count * sizeof(int));
+    }
+    do ret = sendmsg(sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    while (ret < 0 && errno == EINTR);
+    assert(ret == (ssize_t)size);
+}
+
+static int watch(int fd, uint64_t identity)
+{
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.u64 = identity};
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+
+    assert(epfd >= 0);
+    assert(!epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event));
+    return epfd;
+}
+
+static void expect_ready(int epfd, uint64_t identity)
+{
+    struct epoll_event event;
+
+    assert(epoll_wait(epfd, &event, 1, 0) == 1);
+    assert(event.data.u64 == identity);
+}
+
+static void expect_quiet(int epfd)
+{
+    struct epoll_event event;
+
+    assert(!epoll_wait(epfd, &event, 1, 0));
+}
+
+static void test_empty_closed(void)
+{
+    hwnd_dmabuf_frame_desc_t desc;
+    int pair[2], fd = 0, sync_fd = 0;
+
+    create_channel(pair);
+    assert(!wayland_dmabuf_channel_recv(pair[1], &desc, &fd, &sync_fd));
+    assert(fd == -1 && sync_fd == -1);
+    close(pair[0]);
+    assert(wayland_dmabuf_channel_recv(pair[1], &desc, &fd, &sync_fd) == -1);
+    close(pair[1]);
+}
+
+static void test_late_registration(void)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(7), received;
+    int pair[2], epfd, fd, sync_fd;
+
+    create_channel(pair);
+    send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    epfd = watch(pair[1], 17); /* Data arrived before discovery/registration. */
+    expect_ready(epfd, 17);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(received.frame_seq == 7 && fd == -1 && sync_fd == -1);
+    assert(!wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd));
+    expect_quiet(epfd);
+    close(epfd);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void test_empty_packet_rights(void)
+{
+    hwnd_dmabuf_frame_desc_t desc;
+    int pair[2], fd, sync_fd, backing = eventfd(0, EFD_CLOEXEC);
+    unsigned int before;
+
+    assert(backing >= 0);
+    create_channel(pair);
+    before = open_fd_count();
+    send_packet(pair[0], NULL, 0, &backing, 1);
+    assert(wayland_dmabuf_channel_recv(pair[1], &desc, &fd, &sync_fd) == -1);
+    assert(fd == -1 && sync_fd == -1);
+    assert(open_fd_count() == before);
+    close(backing);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void test_short_packet_drain(void)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(9), received;
+    int pair[2], epfd, fd, sync_fd, backing = eventfd(0, EFD_CLOEXEC);
+    unsigned int before;
+
+    assert(backing >= 0);
+    create_channel(pair);
+    epfd = watch(pair[1], 21);
+    before = open_fd_count();
+    send_packet(pair[0], &desc, 1, &backing, 1);
+    send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    expect_ready(epfd, 21);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(!received.version && !received.release_token && fd == -1 && sync_fd == -1);
+    assert(open_fd_count() == before);
+    /* There is no second edge for the already queued valid packet. */
+    expect_quiet(epfd);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(received.frame_seq == 9);
+    assert(!wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd));
+    desc = frame(10);
+    send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    expect_ready(epfd, 21);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(received.frame_seq == 10);
+    close(backing);
+    close(epfd);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void test_bad_packet(unsigned int kind)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(1), received;
+    char oversized[sizeof(desc) + 1];
+    int pair[2], fds[4], fd, sync_fd;
+    unsigned int before, i;
+
+    create_channel(pair);
+    for (i = 0; i < ARRAY_SIZE(fds); i++) assert((fds[i] = eventfd(0, EFD_CLOEXEC)) >= 0);
+    before = open_fd_count();
+    if (kind == 0)
+    {
+        memcpy(oversized, &desc, sizeof(desc));
+        oversized[sizeof(desc)] = 0;
+        send_packet(pair[0], oversized, sizeof(oversized), fds, 1);
+    }
+    else if (kind == 1) send_packet(pair[0], &desc, sizeof(desc), fds, 4);
+    else if (kind == 2) send_packet(pair[0], &desc, sizeof(desc), fds, 2);
+    else
+    {
+        desc.sync_fd_kind = HWND_DMABUF_SYNC_FILE;
+        send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    }
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(!received.version && fd == -1 && sync_fd == -1);
+    assert(received.release_token == (kind == 0 ? 0 : desc.release_token));
+    assert(open_fd_count() == before);
+    for (i = 0; i < ARRAY_SIZE(fds); i++) close(fds[i]);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void test_oversized(void) { test_bad_packet(0); }
+static void test_truncated_rights(void) { test_bad_packet(1); }
+static void test_extra_rights(void) { test_bad_packet(2); }
+static void test_missing_fence(void) { test_bad_packet(3); }
+
+static void test_rights(void)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(2), received;
+    int pair[2], pipes[2], fds[2], fd, sync_fd;
+    struct stat original, imported;
+    unsigned int before;
+
+    create_channel(pair);
+    assert(!pipe2(pipes, O_CLOEXEC));
+    fds[0] = pipes[0];
+    assert((fds[1] = eventfd(0, EFD_CLOEXEC)) >= 0);
+    before = open_fd_count();
+    desc.sync_fd_kind = HWND_DMABUF_SYNC_FILE;
+    send_packet(pair[0], &desc, sizeof(desc), fds, 2);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(received.version == desc.version && fd >= 0 && sync_fd >= 0);
+    assert(fcntl(fd, F_GETFD) & FD_CLOEXEC);
+    assert(fcntl(sync_fd, F_GETFD) & FD_CLOEXEC);
+    assert(!fstat(pipes[0], &original) && !fstat(fd, &imported));
+    assert(original.st_dev == imported.st_dev && original.st_ino == imported.st_ino);
+    close(fd);
+    close(sync_fd);
+    assert(open_fd_count() == before);
+    /* A cached slot can supply just a new acquire fence. */
+    send_packet(pair[0], &desc, sizeof(desc), &fds[1], 1);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(fd == -1 && sync_fd >= 0 && received.version == desc.version);
+    close(sync_fd);
+    desc.sync_fd_kind = HWND_DMABUF_SYNC_NONE;
+    send_packet(pair[0], &desc, sizeof(desc), fds, 1);
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(fd >= 0 && sync_fd == -1);
+    close(fd);
+    assert(open_fd_count() == before);
+    close(fds[1]);
+    close(pipes[0]);
+    close(pipes[1]);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void test_receive_errors(void)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(3), received;
+    int pair[2], fd, sync_fd;
+
+    create_channel(pair);
+    send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    recv_error = EINTR;
+    recv_errors_remaining = 2;
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == 1);
+    assert(received.frame_seq == 3 && !recv_errors_remaining);
+    recv_error = ECONNRESET;
+    recv_errors_remaining = 1;
+    assert(wayland_dmabuf_channel_recv(pair[1], &received, &fd, &sync_fd) == -1);
+    assert(fd == -1 && sync_fd == -1);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void test_unregister_and_replace(void)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(5);
+    int pair[2], duplicate, epfd;
+
+    create_channel(pair);
+    epfd = watch(pair[1], 100);
+    assert((duplicate = dup(pair[1])) >= 0);
+    /* Buffer/release objects may keep the endpoint alive after the surface dies. */
+    assert(!epoll_ctl(epfd, EPOLL_CTL_DEL, pair[1], NULL));
+    close(pair[1]);
+    send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    expect_quiet(epfd);
+    {
+        struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.u64 = 101};
+        assert(!epoll_ctl(epfd, EPOLL_CTL_ADD, duplicate, &event));
+    }
+    expect_ready(epfd, 101);
+    close(duplicate);
+    close(pair[0]);
+    close(epfd);
+}
+
+static void test_deferred_fence(void)
+{
+    uint64_t signal = 1;
+    int fence = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK), epfd;
+
+    assert(fence >= 0);
+    epfd = watch(fence, 123);
+    expect_quiet(epfd);
+    /* Models the pollable completion FD without requiring a GPU. */
+    assert(write(fence, &signal, sizeof(signal)) == sizeof(signal));
+    expect_ready(epfd, 123);
+    assert(!epoll_ctl(epfd, EPOLL_CTL_DEL, fence, NULL));
+    expect_quiet(epfd);
+    close(fence);
+    close(epfd);
+}
+
+int main(void)
+{
+    static const struct { const char *name; void (*run)(void); } tests[] = {
+        {"empty and closed channel", test_empty_closed},
+        {"late registration", test_late_registration}, {"empty packet rights", test_empty_packet_rights},
+        {"short packet drain", test_short_packet_drain},
+        {"oversized packet", test_oversized}, {"truncated rights", test_truncated_rights},
+        {"extra rights", test_extra_rights}, {"missing fence", test_missing_fence},
+        {"descriptor transfer", test_rights}, {"receive errors", test_receive_errors},
+        {"unregister and replace", test_unregister_and_replace},
+        {"deferred fence", test_deferred_fence}};
+    unsigned int i, before;
+
+    setbuf(stdout, NULL);
+    printf("TAP version 13\n1..%u\n", (unsigned int)ARRAY_SIZE(tests));
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        before = open_fd_count();
+        tests[i].run();
+        assert(open_fd_count() == before);
+        printf("ok %u - %s\n", i + 1, tests[i].name);
+    }
+    return 0;
+}

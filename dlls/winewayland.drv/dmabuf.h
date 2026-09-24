@@ -1,0 +1,114 @@
+/*
+ * DMA-BUF channel event helpers
+ *
+ * Copyright 2026 Erhan Bilgili
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#ifndef __WINE_WAYLAND_DMABUF_H
+#define __WINE_WAYLAND_DMABUF_H
+
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "wine/hwnd_dmabuf.h"
+
+/* Return 1 for a packet (invalid packets have version 0), 0 only for an empty
+ * channel, and -1 for a closed/broken channel. EPOLLET requires draining past
+ * malformed packets and interrupted reads, all the way to EAGAIN. */
+static inline int wayland_dmabuf_channel_recv(int channel_fd, hwnd_dmabuf_frame_desc_t *desc,
+                                             int *out_fd, int *out_sync_fd)
+{
+    union
+    {
+        struct cmsghdr align;
+        char data[CMSG_SPACE(2 * sizeof(int))];
+    } control;
+    struct iovec iov = {.iov_base = desc, .iov_len = sizeof(*desc)};
+    struct msghdr msg;
+    struct cmsghdr *cmsg;
+    int fds[2];
+    unsigned int fd_count = 0, expected, i;
+    ssize_t n;
+
+    *out_fd = *out_sync_fd = -1;
+    do
+    {
+        msg = (struct msghdr){.msg_iov = &iov, .msg_iovlen = 1,
+                             .msg_control = control.data, .msg_controllen = sizeof(control.data)};
+        n = recvmsg(channel_fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+    } while (n < 0 && errno == EINTR);
+#if EAGAIN == EWOULDBLOCK
+    if (n < 0) return errno == EAGAIN ? 0 : -1;
+#else
+    if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+#endif
+    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(0))
+        {
+            unsigned int count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            int *received = (int *)CMSG_DATA(cmsg);
+
+            for (i = 0; i < count; i++)
+            {
+                if (fd_count < ARRAY_SIZE(fds)) fds[fd_count++] = received[i];
+                else close(received[i]);
+            }
+        }
+
+    if (!n)
+    {
+        /* Even a zero-length seqpacket can carry descriptors. */
+        for (i = 0; i < fd_count; i++) close(fds[i]);
+        return -1;
+    }
+
+    if (n != sizeof(*desc) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
+    {
+        for (i = 0; i < fd_count; i++) close(fds[i]);
+        /* Preserve a complete descriptor's token so the caller can return a
+         * failed release, but never interpret a partial/oversized payload. */
+        if (n != sizeof(*desc) || (msg.msg_flags & MSG_TRUNC)) memset(desc, 0, sizeof(*desc));
+        else desc->version = 0;
+        return 1;
+    }
+
+    if (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE)
+    {
+        expected = fd_count == 2 ? 2 : 1;
+        if (fd_count == 2) *out_fd = fds[0];
+        if (fd_count) *out_sync_fd = fds[fd_count - 1];
+    }
+    else
+    {
+        expected = fd_count ? 1 : 0;
+        if (fd_count) *out_fd = fds[0];
+    }
+
+    if (fd_count != expected ||
+        (desc->sync_fd_kind == HWND_DMABUF_SYNC_FILE && *out_sync_fd < 0))
+    {
+        for (i = 0; i < fd_count; i++) close(fds[i]);
+        *out_fd = *out_sync_fd = -1;
+        desc->version = 0;
+    }
+    return 1;
+}
+
+#endif /* __WINE_WAYLAND_DMABUF_H */
