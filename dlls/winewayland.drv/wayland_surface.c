@@ -692,16 +692,6 @@ static UINT64 wayland_hwnd_dmabuf_buffer_exchange_release_token(struct wayland_h
     return old;
 }
 
-/* Send a release record, retrying EINTR. */
-static int wayland_hwnd_dmabuf_channel_send_release(int channel_fd, const hwnd_dmabuf_release_t *rel)
-{
-    ssize_t n;
-
-    do n = send(channel_fd, rel, sizeof(*rel), MSG_DONTWAIT | MSG_NOSIGNAL);
-    while (n < 0 && errno == EINTR);
-    return n == sizeof(*rel) ? 0 : n < 0 ? errno : EMSGSIZE;
-}
-
 static int wayland_hwnd_dmabuf_surface_send_consumer_state(
         struct wayland_hwnd_dmabuf_surface *surface, unsigned int flag)
 {
@@ -709,6 +699,9 @@ static int wayland_hwnd_dmabuf_surface_send_consumer_state(
 
     if (process_wayland.wp_alpha_modifier_v1)
         flag |= HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER;
+    /* channel_fd is published only after successful epoll registration. */
+    if (flag & HWND_DMABUF_RELEASE_CONSUMER_ACTIVE)
+        flag |= HWND_DMABUF_RELEASE_CAP_FD_READINESS;
     rel = (hwnd_dmabuf_release_t){ .flags = flag };
 
     if (surface->channel_fd < 0) return ENOTCONN;
@@ -1737,12 +1730,10 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
         wp_alpha_modifier_surface_v1_destroy(surface->wp_alpha_modifier_surface_v1);
     if (!surface->direct && surface->wp_viewport) wp_viewport_destroy(surface->wp_viewport);
     if (!surface->direct && surface->wl_surface) wl_surface_destroy(surface->wl_surface);
-    if (surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
-        !wayland_hwnd_dmabuf_surface_send_consumer_state(surface,
-                HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
-        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
     if (surface->channel_fd >= 0)
     {
+        if (surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED)
+            wayland_dmabuf_channel_suspend(surface->channel_fd);
         wayland_surface_unmonitor_fd(surface->channel_fd);
         close(surface->channel_fd);
     }

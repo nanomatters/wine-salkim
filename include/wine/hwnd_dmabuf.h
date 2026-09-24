@@ -24,6 +24,27 @@
 #define HWND_DMABUF_HOST_CAP_CONSUMER_STATE    0x00000002
 #define HWND_DMABUF_HOST_CAP_PRESENTATION_FEEDBACK 0x00000004
 
+enum hwnd_dmabuf_consumer_state
+{
+    HWND_DMABUF_CONSUMER_UNKNOWN,
+    HWND_DMABUF_CONSUMER_ACTIVE,
+    HWND_DMABUF_CONSUMER_SUSPENDED,
+    HWND_DMABUF_CONSUMER_ACTIVE_FD,
+};
+
+static inline enum hwnd_dmabuf_consumer_state hwnd_dmabuf_consumer_state_from_flags(unsigned int flags)
+{
+    if (flags & HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED) return HWND_DMABUF_CONSUMER_SUSPENDED;
+    if (!(flags & HWND_DMABUF_RELEASE_CONSUMER_ACTIVE)) return HWND_DMABUF_CONSUMER_UNKNOWN;
+    return flags & HWND_DMABUF_RELEASE_CAP_FD_READINESS ?
+           HWND_DMABUF_CONSUMER_ACTIVE_FD : HWND_DMABUF_CONSUMER_ACTIVE;
+}
+
+static inline BOOL hwnd_dmabuf_consumer_active(enum hwnd_dmabuf_consumer_state state)
+{
+    return state == HWND_DMABUF_CONSUMER_ACTIVE || state == HWND_DMABUF_CONSUMER_ACTIVE_FD;
+}
+
 enum hwnd_dmabuf_wake_flags
 {
     HWND_DMABUF_WAKE_REANNOUNCE = 0x00000001,

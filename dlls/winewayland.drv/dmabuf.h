@@ -29,6 +29,28 @@
 
 #include "wine/hwnd_dmabuf.h"
 
+static inline int wayland_hwnd_dmabuf_channel_send_release(int channel_fd,
+                                                          const hwnd_dmabuf_release_t *rel)
+{
+    ssize_t n;
+
+    do n = send(channel_fd, rel, sizeof(*rel), MSG_DONTWAIT | MSG_NOSIGNAL);
+    while (n < 0 && errno == EINTR);
+    return n == sizeof(*rel) ? 0 : n < 0 ? errno : EMSGSIZE;
+}
+
+/* Teardown cannot retry a lost state message. Shut down all duplicates of the
+ * endpoint on failure, including wineserver's retained copy, so blocked
+ * producers see EOF and recreate instead of waiting for image releases. */
+static inline int wayland_dmabuf_channel_suspend(int channel_fd)
+{
+    hwnd_dmabuf_release_t rel = {.flags = HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED};
+    int ret = wayland_hwnd_dmabuf_channel_send_release(channel_fd, &rel);
+
+    if (ret) shutdown(channel_fd, SHUT_RDWR);
+    return ret;
+}
+
 /* Each dispatch drains all channels for one host. Coalesce only this batch,
  * retaining the surface serial so a recycled HWND is a different identity. */
 static inline unsigned int wayland_dmabuf_coalesce_events(struct epoll_event *events,

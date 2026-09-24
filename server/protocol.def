@@ -301,6 +301,8 @@ enum hwnd_dmabuf_status
 /* A frame-correlated wp_presentation result. This is independent of buffer release. */
 #define HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK  0x00000100
 #define HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED 0x00000200
+/* Sent with CONSUMER_ACTIVE only after successful readiness registration. */
+#define HWND_DMABUF_RELEASE_CAP_FD_READINESS       0x00000400
 
 /* hwnd_dmabuf_release_t.presentation_flags bits */
 #define HWND_DMABUF_PRESENTATION_VSYNC          0x00000001

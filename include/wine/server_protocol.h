@@ -286,6 +286,8 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK  0x00000100
 #define HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED 0x00000200
 
+#define HWND_DMABUF_RELEASE_CAP_FD_READINESS       0x00000400
+
 
 #define HWND_DMABUF_PRESENTATION_VSYNC          0x00000001
 #define HWND_DMABUF_PRESENTATION_HW_CLOCK       0x00000002
@@ -7493,6 +7495,6 @@ union generic_reply
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 940
+#define SERVER_PROTOCOL_VERSION 941
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

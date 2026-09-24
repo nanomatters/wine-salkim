@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -3517,7 +3518,14 @@ static int hwnd_dmabuf_create_server_channel( struct window *win )
 {
     int fds[2];
 
-    if (win->dmabuf_channel_producer) return 1;
+    if (win->dmabuf_channel_producer)
+    {
+        struct fd *fd = get_obj_fd( win->dmabuf_channel_producer );
+        int events = check_fd_events( fd, 0 );
+
+        release_object( fd );
+        if (!(events & (POLLHUP | POLLERR))) return 1;
+    }
 
     if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
         return 0;
@@ -3533,6 +3541,11 @@ static int hwnd_dmabuf_create_server_channel( struct window *win )
             if (consumer_end) release_object( consumer_end );
             return 0;
         }
+        /* A consumer unable to announce teardown shuts down the old socket.
+         * Replace the retained endpoints without resetting producer counts:
+         * old swapchains may still be retiring their own channel handles. */
+        if (win->dmabuf_channel_producer) release_object( win->dmabuf_channel_producer );
+        if (win->dmabuf_channel_consumer) release_object( win->dmabuf_channel_consumer );
         win->dmabuf_channel_producer = producer_end;
         win->dmabuf_channel_consumer = consumer_end;
     }
@@ -3732,6 +3745,11 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
         return;
     }
 
+    if (!hwnd_dmabuf_create_server_channel( win ))
+    {
+        reply->status = HWND_DMABUF_NOT_FOUND;
+        return;
+    }
     reply->channel_handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_consumer,
                                                           GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
     if (!reply->channel_handle)

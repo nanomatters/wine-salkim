@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/epoll.h>
@@ -154,6 +155,37 @@ static void test_full_batch(void)
     for (i = 0; i < ARRAY_SIZE(events); i++) events[i].data.u64 = 7;
     assert(wayland_dmabuf_coalesce_events(events, ARRAY_SIZE(events)) == 1);
     assert(events[0].data.u64 == 7);
+}
+
+static void test_consumer_state(void)
+{
+    const unsigned int active = HWND_DMABUF_RELEASE_CONSUMER_ACTIVE;
+    const unsigned int suspended = HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED;
+    const unsigned int readiness = HWND_DMABUF_RELEASE_CAP_FD_READINESS;
+    static const unsigned int irrelevant[] = {0, HWND_DMABUF_RELEASE_CACHED,
+        HWND_DMABUF_RELEASE_PRESENTED, HWND_DMABUF_RELEASE_CAP_ALPHA_MODIFIER};
+    enum hwnd_dmabuf_consumer_state state;
+    unsigned int i;
+
+    assert(!hwnd_dmabuf_consumer_active(HWND_DMABUF_CONSUMER_UNKNOWN));
+    assert(!hwnd_dmabuf_consumer_active(HWND_DMABUF_CONSUMER_SUSPENDED));
+    for (i = 0; i < ARRAY_SIZE(irrelevant); i++)
+    {
+        /* Cached buffers or a capability alone do not establish an active watch. */
+        assert(hwnd_dmabuf_consumer_state_from_flags(irrelevant[i]) == HWND_DMABUF_CONSUMER_UNKNOWN);
+        assert(hwnd_dmabuf_consumer_state_from_flags(readiness | irrelevant[i]) == HWND_DMABUF_CONSUMER_UNKNOWN);
+        state = hwnd_dmabuf_consumer_state_from_flags(active | irrelevant[i]);
+        assert(state == HWND_DMABUF_CONSUMER_ACTIVE && hwnd_dmabuf_consumer_active(state));
+        state = hwnd_dmabuf_consumer_state_from_flags(active | readiness | irrelevant[i]);
+        assert(state == HWND_DMABUF_CONSUMER_ACTIVE_FD && hwnd_dmabuf_consumer_active(state));
+    }
+    /* Suspend wins, including over a conflicting/stale active indication. */
+    assert(hwnd_dmabuf_consumer_state_from_flags(suspended | active | readiness) == HWND_DMABUF_CONSUMER_SUSPENDED);
+    state = hwnd_dmabuf_consumer_state_from_flags(suspended);
+    assert(!hwnd_dmabuf_consumer_active(state));
+    /* A replacement legacy consumer restores posted notifications, not sticky FD mode. */
+    state = hwnd_dmabuf_consumer_state_from_flags(active);
+    assert(state == HWND_DMABUF_CONSUMER_ACTIVE);
 }
 
 static void test_empty_closed(void)
@@ -407,11 +439,126 @@ static void test_deferred_fence(void)
     close(epfd);
 }
 
+static unsigned int fill_reply_queue(int fd)
+{
+    hwnd_dmabuf_release_t rel = {.flags = HWND_DMABUF_RELEASE_CONSUMER_ACTIVE |
+                                        HWND_DMABUF_RELEASE_CAP_FD_READINESS};
+    unsigned int count = 0;
+    int ret;
+
+    while (!(ret = wayland_hwnd_dmabuf_channel_send_release(fd, &rel))) count++;
+    assert(count && (ret == EAGAIN || ret == EWOULDBLOCK));
+    return count;
+}
+
+static void test_suspend_reuse(void)
+{
+    hwnd_dmabuf_release_t rel;
+    hwnd_dmabuf_frame_desc_t desc = frame(1), received;
+    struct pollfd pfd;
+    int pair[2], retained, consumer, fd, sync_fd;
+
+    create_channel(pair);
+    assert((retained = dup(pair[1])) >= 0);
+    assert(!wayland_dmabuf_channel_suspend(pair[1]));
+    close(pair[1]);
+    assert(recv(pair[0], &rel, sizeof(rel), MSG_DONTWAIT) == sizeof(rel));
+    assert(hwnd_dmabuf_consumer_state_from_flags(rel.flags) == HWND_DMABUF_CONSUMER_SUSPENDED);
+    pfd = (struct pollfd){.fd = pair[0], .events = POLLIN};
+    assert(!poll(&pfd, 1, 0));
+
+    /* Normal hide/show keeps the retained channel usable. */
+    assert((consumer = dup(retained)) >= 0);
+    send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    assert(wayland_dmabuf_channel_recv(consumer, &received, &fd, &sync_fd) == 1);
+    assert(received.release_token == desc.release_token && fd == -1 && sync_fd == -1);
+    close(consumer);
+    close(retained);
+    close(pair[0]);
+}
+
+static void check_failed_suspend(BOOL fill_frames)
+{
+    hwnd_dmabuf_frame_desc_t desc = frame(1);
+    hwnd_dmabuf_release_t rel;
+    struct stat old_stat, duplicate_stat, new_stat;
+    struct pollfd pfd;
+    int pair[2], replacement[2], retained[2], ret;
+    unsigned int i, replies;
+
+    create_channel(pair);
+    /* The server retains both endpoints; closing the consumer alone cannot
+     * wake a producer waiting for buffer release or presentation feedback. */
+    assert((retained[0] = dup(pair[0])) >= 0);
+    assert((retained[1] = dup(pair[1])) >= 0);
+    replies = fill_reply_queue(pair[1]);
+    for (i = 0; i < 8; i++)
+    {
+        desc = frame(i + 1);
+        send_packet(pair[0], &desc, sizeof(desc), NULL, 0);
+    }
+    if (fill_frames)
+    {
+        while (send(pair[0], &desc, sizeof(desc), MSG_DONTWAIT | MSG_NOSIGNAL) == sizeof(desc)) {}
+        assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+    else
+    {
+        pfd = (struct pollfd){.fd = pair[0], .events = POLLOUT};
+        assert(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT));
+    }
+    /* Otherwise the image ring is exhausted before the frame socket: no
+     * failed frame send is needed for teardown to become observable. */
+    pfd = (struct pollfd){.fd = pair[0]};
+    assert(!poll(&pfd, 1, 0));
+    ret = wayland_dmabuf_channel_suspend(pair[1]);
+    assert(ret == EAGAIN || ret == EWOULDBLOCK);
+    close(pair[1]);
+    assert(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLHUP));
+    /* Queued ACTIVE_FD records cannot hide EOF from the release drain. */
+    for (i = 0; i < replies; i++)
+    {
+        assert(recv(pair[0], &rel, sizeof(rel), MSG_DONTWAIT) == sizeof(rel));
+        assert(hwnd_dmabuf_consumer_state_from_flags(rel.flags) == HWND_DMABUF_CONSUMER_ACTIVE_FD);
+    }
+    assert(!recv(pair[0], &rel, sizeof(rel), MSG_DONTWAIT));
+    assert(send(pair[0], &desc, sizeof(desc), MSG_DONTWAIT | MSG_NOSIGNAL) == -1 && errno == EPIPE);
+
+    /* Reopen while old producers still exist: duplicate descriptors share
+     * consumer state, but a replacement socket must start discovery afresh. */
+    create_channel(replacement);
+    assert(!fstat(pair[0], &old_stat) && !fstat(retained[0], &duplicate_stat));
+    assert(old_stat.st_dev == duplicate_stat.st_dev && old_stat.st_ino == duplicate_stat.st_ino);
+    assert(!fstat(replacement[0], &new_stat));
+    assert(old_stat.st_dev != new_stat.st_dev || old_stat.st_ino != new_stat.st_ino);
+    close(retained[0]);
+    close(retained[1]);
+    close(pair[0]);
+    pfd = (struct pollfd){.fd = replacement[0], .events = POLLIN};
+    assert(!poll(&pfd, 1, 0));
+    assert(!wayland_dmabuf_channel_suspend(replacement[1]));
+    assert(recv(replacement[0], &rel, sizeof(rel), MSG_DONTWAIT) == sizeof(rel));
+    close(replacement[0]);
+    close(replacement[1]);
+}
+
+static void test_suspend_ring_full(void)
+{
+    check_failed_suspend(FALSE);
+}
+
+static void test_suspend_socket_full(void)
+{
+    check_failed_suspend(TRUE);
+}
+
 int main(void)
 {
     static const struct { const char *name; void (*run)(void); } tests[] = {
         {"coalesce identities", test_coalesce}, {"full event batch", test_full_batch},
-        {"empty and closed channel", test_empty_closed},
+        {"consumer notification states", test_consumer_state}, {"empty and closed channel", test_empty_closed},
+        {"suspend and reuse", test_suspend_reuse}, {"suspend with full image ring", test_suspend_ring_full},
+        {"suspend with full frame socket", test_suspend_socket_full},
         {"late registration", test_late_registration}, {"empty packet rights", test_empty_packet_rights},
         {"short packet drain", test_short_packet_drain},
         {"oversized packet", test_oversized}, {"truncated rights", test_truncated_rights},
