@@ -879,7 +879,7 @@ static VOID test_thread_processor(void)
    HANDLE curthread,curproc;
    DWORD_PTR processMask,systemMask,retMask;
    SYSTEM_INFO sysInfo;
-   BOOL is_wow64, old_wow64 = FALSE;
+   BOOL is_wow64, old_wow64 = FALSE, bret;
    DWORD ret;
 
    if (!pIsWow64Process || !pIsWow64Process( GetCurrentProcess(), &is_wow64 )) is_wow64 = FALSE;
@@ -911,9 +911,19 @@ static VOID test_thread_processor(void)
    ok(SetThreadAffinityMask(curthread,processMask+1)==0,
       "SetThreadAffinityMask passed for an illegal processor\n");
 /* NOTE: Pre-Vista does not recognize the "all processors" flag (all bits set) */
-   retMask = SetThreadAffinityMask(curthread,~0);
-   ok(broken(retMask==0) || retMask==processMask,
-      "SetThreadAffinityMask(thread,-1) failed to request all processors.\n");
+   retMask = 0;
+   if (processMask == systemMask)
+   {
+       retMask = SetThreadAffinityMask(curthread,~0);
+       ok(broken(retMask==0) || retMask==processMask,
+          "SetThreadAffinityMask(thread,-1) failed to request all processors.\n");
+   }
+   else
+       skip("Process affinity does not allow all processors.\n");
+
+    SetLastError(0xdeadbeef);
+    bret = SetThreadAffinityMask(curthread, 0);
+    ok(!bret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, err %ld.\n", bret, GetLastError());
 
     if (retMask == processMask)
     {
@@ -962,10 +972,16 @@ static VOID test_thread_processor(void)
     if (pGetThreadGroupAffinity && pSetThreadGroupAffinity)
     {
         GROUP_AFFINITY affinity, affinity_new;
+        DWORD_PTR mask, orig_mask, group_mask;
         NTSTATUS status;
 
         memset(&affinity, 0, sizeof(affinity));
-        ok(pGetThreadGroupAffinity(curthread, &affinity), "GetThreadGroupAffinity failed\n");
+        bret = pGetThreadGroupAffinity(curthread, &affinity);
+        ok(bret, "GetThreadGroupAffinity failed\n");
+        if (!bret) return;
+        orig_mask = affinity.Mask;
+        ok(affinity.Mask, "zero mask.\n");
+        if (!affinity.Mask) return;
 
         SetLastError(0xdeadbeef);
         ok(!pGetThreadGroupAffinity(curthread, NULL), "GetThreadGroupAffinity succeeded\n");
@@ -979,6 +995,39 @@ static VOID test_thread_processor(void)
         ok(pSetThreadGroupAffinity(curthread, &affinity_new, &affinity), "SetThreadGroupAffinity failed\n");
         ok(affinity_new.Mask == affinity.Mask, "Expected old affinity mask %Ix, got %Ix\n",
            affinity_new.Mask, affinity.Mask);
+
+        /* These tests use group zero, whose full mask is returned by GetProcessAffinityMask(). */
+        group_mask = systemMask;
+        if (processMask == group_mask)
+        {
+            /* Narrow the mask only if at least two processors are available. */
+            mask = orig_mask & (orig_mask - 1);
+            if (!mask) mask = orig_mask;
+            affinity_new.Mask = mask;
+            bret = pSetThreadGroupAffinity(curthread, &affinity_new, &affinity);
+            ok(bret, "got error %ld.\n", GetLastError());
+            if (bret)
+            {
+                ok(affinity.Mask == orig_mask, "got %#Ix, expected %#Ix\n", affinity.Mask, orig_mask);
+
+                affinity_new.Mask = 0;
+                bret = pSetThreadGroupAffinity(curthread, &affinity_new, &affinity);
+                todo_wine ok(bret, "got error %ld.\n", GetLastError());
+                if (bret)
+                {
+                    ok(affinity.Mask == mask, "got %#Ix, expected %#Ix\n", affinity.Mask, mask);
+                    mask = group_mask;
+                }
+
+                affinity_new.Mask = orig_mask;
+                bret = pSetThreadGroupAffinity(curthread, &affinity_new, &affinity);
+                ok(bret, "got error %ld.\n", GetLastError());
+                if (bret) ok(affinity.Mask == mask, "got %#Ix, expected %#Ix\n", affinity.Mask, mask);
+            }
+        }
+        else
+            skip("Process affinity does not allow the full processor group.\n");
+        affinity.Mask = orig_mask;
 
         /* show that the "all processors" flag is not supported for SetThreadGroupAffinity */
         if (sysInfo.dwNumberOfProcessors < 8 * sizeof(DWORD_PTR))
@@ -2672,65 +2721,112 @@ static void test_CreateRemoteThreadEx_affinity(void)
 {
     struct _PROC_THREAD_ATTRIBUTE_LIST *attr_list;
     GROUP_AFFINITY gaff, thread_gaff;
+    DWORD_PTR prev_mask, process_mask, system_mask, mask;
     HANDLE handle;
     SIZE_T size;
     BOOL ret;
 
-    if (RtlGetCurrentPeb()->NumberOfProcessors < 2)
-    {
-        skip("Not enough cores to test\n");
-        return;
-    }
+    ret = GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+    ok(ret, "GetProcessAffinityMask failed, error %lu.\n", GetLastError());
+    if (!ret || !process_mask) return;
 
     ret = pInitializeProcThreadAttributeList(NULL, 1, 0, &size);
     ok(!ret && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
                 "Got unexpected ret %#x, GetLastError() %lu.\n", ret, GetLastError());
 
     attr_list = HeapAlloc(GetProcessHeap(), 0, size);
+    ok(attr_list != NULL, "Failed to allocate attribute list.\n");
+    if (!attr_list) return;
     ret = pInitializeProcThreadAttributeList(attr_list, 1, 0, &size);
     ok(ret, "Got unexpected ret %#x, GetLastError() %lu.\n", ret, GetLastError());
+    if (!ret) goto free;
     memset(&gaff, 0, sizeof(gaff));
-    gaff.Mask = (ULONG_PTR)1u << ((GetCurrentProcessorNumber() + 1) % RtlGetCurrentPeb()->NumberOfProcessors);
+    /* Select an allowed processor even when the process affinity is restricted. */
+    mask = process_mask & (process_mask - 1);
+    if (!mask) mask = process_mask;
+    gaff.Mask = mask & ~(mask - 1);
     ret = pUpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_GROUP_AFFINITY,
                                      &gaff, sizeof(gaff), NULL, NULL);
     ok(ret, "Couldn't update attr_list\n");
+    if (!ret) goto done;
 
     handle = pCreateRemoteThreadEx(GetCurrentProcess(), NULL, 0, &thread_ex_proc, &thread_gaff, 0, attr_list, NULL);
     ok(handle != NULL, "Couldn't create thread %lu %lu\n", GetLastError(), RtlGetCurrentPeb()->NumberOfProcessors);
 
-    ret = WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0;
-    ok(ret, "Couldn't wait for thread termination\n");
-    ok(thread_gaff.Group == gaff.Group, "Unexpected group %x (expecting %x)\n", thread_gaff.Group, gaff.Group);
-    ok(thread_gaff.Mask == gaff.Mask, "Unexpected affinity %Ix (expecting %Ix)\n", thread_gaff.Mask, gaff.Mask);
-    CloseHandle(handle);
+    if (handle)
+    {
+        ret = WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0;
+        ok(ret, "Couldn't wait for thread termination\n");
+        if (ret)
+        {
+            ok(thread_gaff.Group == gaff.Group, "Unexpected group %x (expecting %x)\n", thread_gaff.Group, gaff.Group);
+            ok(thread_gaff.Mask == gaff.Mask, "Unexpected affinity %Ix (expecting %Ix)\n", thread_gaff.Mask, gaff.Mask);
+        }
+        CloseHandle(handle);
+    }
 
     pDeleteProcThreadAttributeList(attr_list);
-    HeapFree(GetProcessHeap(), 0, attr_list);
-
-    ret = pInitializeProcThreadAttributeList(NULL, 1, 0, &size);
-    ok(!ret && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
-                "Got unexpected ret %#x, GetLastError() %lu.\n", ret, GetLastError());
-
-    /* check invalid core number */
-    if ((RtlGetCurrentPeb()->NumberOfProcessors + 1) < MAXIMUM_PROCESSORS)
+    ret = pInitializeProcThreadAttributeList(attr_list, 1, 0, &size);
+    ok(ret, "Got unexpected ret %#x, GetLastError() %lu.\n", ret, GetLastError());
+    if (!ret) goto free;
+    SetLastError(0xdeadbeef);
+    prev_mask = SetThreadAffinityMask(GetCurrentThread(), 0);
+    ok(!prev_mask && GetLastError() == ERROR_INVALID_PARAMETER, "got %#Ix, error %lu.\n", prev_mask, GetLastError());
+    if (process_mask == system_mask)
     {
-        attr_list = HeapAlloc(GetProcessHeap(), 0, size);
-        ret = pInitializeProcThreadAttributeList(attr_list, 1, 0, &size);
-        ok(ret, "Got unexpected ret %#x, GetLastError() %lu.\n", ret, GetLastError());
         memset(&gaff, 0, sizeof(gaff));
-        gaff.Mask = (ULONG_PTR)1u << (RtlGetCurrentPeb()->NumberOfProcessors + 1);
         ret = pUpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_GROUP_AFFINITY,
                                          &gaff, sizeof(gaff), NULL, NULL);
         ok(ret, "Couldn't update attr_list\n");
+        if (!ret) goto done;
+
+        handle = pCreateRemoteThreadEx(GetCurrentProcess(), NULL, 0, &thread_ex_proc, &thread_gaff, 0, attr_list, NULL);
+        todo_wine ok(handle != NULL, "Couldn't create thread %lu %lu\n", GetLastError(), RtlGetCurrentPeb()->NumberOfProcessors);
+        if (handle)
+        {
+            ret = WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0;
+            ok(ret, "Couldn't wait for thread termination\n");
+            if (ret)
+            {
+                ok(thread_gaff.Group == gaff.Group, "Unexpected group %x (expecting %x)\n", thread_gaff.Group, gaff.Group);
+                ok(thread_gaff.Mask == system_mask, "Unexpected affinity %Ix (expecting %Ix)\n", thread_gaff.Mask, system_mask);
+            }
+            CloseHandle(handle);
+        }
+    }
+    else
+        skip("Process affinity does not allow the full processor group.\n");
+
+    pDeleteProcThreadAttributeList(attr_list);
+    ret = pInitializeProcThreadAttributeList(attr_list, 1, 0, &size);
+    ok(ret, "Got unexpected ret %#x, GetLastError() %lu.\n", ret, GetLastError());
+    if (!ret) goto free;
+
+    /* check invalid core number */
+    if ((mask = ~system_mask))
+    {
+        memset(&gaff, 0, sizeof(gaff));
+        gaff.Mask = mask & ~(mask - 1);
+        ret = pUpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_GROUP_AFFINITY,
+                                         &gaff, sizeof(gaff), NULL, NULL);
+        ok(ret, "Couldn't update attr_list\n");
+        if (!ret) goto done;
 
         SetLastError(0xdeadbeef);
         handle = pCreateRemoteThreadEx(GetCurrentProcess(), NULL, 0, &thread_ex_proc, &thread_gaff, 0, attr_list, NULL);
         ok(handle == NULL, "Expecting failure\n");
         ok(GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected gle %lu\n", GetLastError());
-        if (handle) CloseHandle(handle);
-        pDeleteProcThreadAttributeList(attr_list);
-        HeapFree(GetProcessHeap(), 0, attr_list);
+        if (handle)
+        {
+            ret = WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0;
+            ok(ret, "Couldn't wait for thread termination\n");
+            CloseHandle(handle);
+        }
     }
+done:
+    pDeleteProcThreadAttributeList(attr_list);
+free:
+    HeapFree(GetProcessHeap(), 0, attr_list);
 }
 
 START_TEST(thread)
