@@ -1012,7 +1012,7 @@ static VOID test_thread_processor(void)
 
                 affinity_new.Mask = 0;
                 bret = pSetThreadGroupAffinity(curthread, &affinity_new, &affinity);
-                todo_wine ok(bret, "got error %ld.\n", GetLastError());
+                ok(bret, "got error %ld.\n", GetLastError());
                 if (bret)
                 {
                     ok(affinity.Mask == mask, "got %#Ix, expected %#Ix\n", affinity.Mask, mask);
@@ -2781,7 +2781,7 @@ static void test_CreateRemoteThreadEx_affinity(void)
         if (!ret) goto done;
 
         handle = pCreateRemoteThreadEx(GetCurrentProcess(), NULL, 0, &thread_ex_proc, &thread_gaff, 0, attr_list, NULL);
-        todo_wine ok(handle != NULL, "Couldn't create thread %lu %lu\n", GetLastError(), RtlGetCurrentPeb()->NumberOfProcessors);
+        ok(handle != NULL, "Couldn't create thread %lu %lu\n", GetLastError(), RtlGetCurrentPeb()->NumberOfProcessors);
         if (handle)
         {
             ret = WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0;
