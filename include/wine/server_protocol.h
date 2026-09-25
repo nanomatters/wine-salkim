@@ -4053,10 +4053,14 @@ struct update_window_zorder_request
     struct request_header __header;
     user_handle_t  window;
     struct rectangle rect;
+    int raw;
+    char __pad_36[4];
 };
 struct update_window_zorder_reply
 {
     struct reply_header __header;
+    int changed;
+    char __pad_12[4];
 };
 
 
@@ -7516,6 +7520,6 @@ union generic_reply
     struct set_window_cloaked_reply set_window_cloaked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 943
+#define SERVER_PROTOCOL_VERSION 945
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

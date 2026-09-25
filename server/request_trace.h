@@ -2016,6 +2016,12 @@ static void dump_update_window_zorder_request( const struct update_window_zorder
 {
     fprintf( stderr, " window=%08x", req->window );
     dump_rectangle( ", rect=", &req->rect );
+    fprintf( stderr, ", raw=%d", req->raw );
+}
+
+static void dump_update_window_zorder_reply( const struct update_window_zorder_reply *req )
+{
+    fprintf( stderr, " changed=%d", req->changed );
 }
 
 static void dump_redraw_window_request( const struct redraw_window_request *req )
@@ -4179,7 +4185,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_window_region_reply,
     NULL,
     (dump_func)dump_get_update_region_reply,
-    NULL,
+    (dump_func)dump_update_window_zorder_reply,
     NULL,
     NULL,
     (dump_func)dump_remove_window_property_reply,

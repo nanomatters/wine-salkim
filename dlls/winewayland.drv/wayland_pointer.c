@@ -35,6 +35,7 @@
 
 #include "waylanddrv.h"
 #include "wine/debug.h"
+#include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(cursor);
 
@@ -143,6 +144,44 @@ static void wayland_pointer_reset_frame(void)
     frame->flags = 0;
 }
 
+static void wayland_pointer_update_window_zorder(HWND hwnd, POINT point)
+{
+    struct wayland_win_data *data;
+    GUITHREADINFO info = {.cbSize = sizeof(info)};
+    BOOL changed = FALSE, toplevel;
+
+    if (NtUserGetGUIThreadInfo(0, &info) && info.hwndCapture) return;
+    /* Child content, including a foreign dmabuf producer, exposes its root
+     * window. Do not reorder popup or layer-shell surface trees. */
+    if (!(hwnd = NtUserGetAncestor(hwnd, GA_ROOT))) return;
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    toplevel = data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL;
+    wayland_win_data_release(data);
+    if (!toplevel) return;
+
+    /* As in winex11 and winemac, an ungrabbed host pointer event establishes
+     * which window is exposed at this point, without assuming that keyboard
+     * focus implies that the whole window is above every other window. */
+    SERVER_START_REQ(update_window_zorder)
+    {
+        req->window = wine_server_user_handle(hwnd);
+        req->rect.left = point.x;
+        req->rect.top = point.y;
+        req->rect.right = point.x + 1;
+        req->rect.bottom = point.y + 1;
+        req->raw = TRUE;
+        if (!wine_server_call(req)) changed = reply->changed;
+    }
+    SERVER_END_REQ;
+
+    if (!changed) return;
+    NtUserNotifyWinEvent(EVENT_OBJECT_REORDER, NtUserGetDesktopWindow(), OBJID_CLIENT, 0);
+    /* Keyboard focus may have arrived before the pointer enter. Refresh the
+     * foreground notification only after observers can see the corrected order. */
+    if (hwnd == NtUserGetForegroundWindow())
+        NtUserNotifyWinEvent(EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0);
+}
+
 static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
@@ -150,7 +189,7 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
     double screen_x, screen_y;
     LONG external_x = 0, external_y = 0, external_width = 0, external_height = 0;
     RECT input_rect;
-    BOOL external_input_active;
+    BOOL external_input_active, sync_zorder;
     HWND hwnd;
     POINT screen;
     struct wl_surface *focused_wl_surface;
@@ -214,8 +253,12 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
         frame->external_height = external_height;
     }
     frame->flags |= WAYLAND_POINTER_FRAME_ABSOLUTE;
+    sync_zorder = !external_input_active && !pointer->button_count &&
+                  pointer->constraint_state != WAYLAND_POINTER_CONSTRAINT_ACTIVE;
 
     pthread_mutex_unlock(&pointer->mutex);
+
+    if (sync_zorder) wayland_pointer_update_window_zorder(hwnd, screen);
 
     if (external_input_active)
         TRACE("hwnd=%p wayland_xy=%.2f,%.2f screen_xy=%d,%d external_xy=%d,%d size=%dx%d\n",
@@ -294,6 +337,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
         pointer->focused_wl_surface = NULL;
         pointer->focused_hwnd = NULL;
         pointer->enter_serial = 0;
+        pointer->button_count = 0;
     }
     pthread_mutex_unlock(&pointer->mutex);
 }
@@ -342,6 +386,8 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     else wayland_cancel_layer_menu_if_needed(hwnd);
 
     pthread_mutex_lock(&pointer->mutex);
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) ++pointer->button_count;
+    else if (pointer->button_count) --pointer->button_count;
     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
                              serial : 0;
     external_input_active = pointer->external_input_active;
@@ -814,6 +860,7 @@ void wayland_pointer_init(struct wl_pointer *wl_pointer)
     pointer->constraint_state = WAYLAND_POINTER_CONSTRAINT_NONE;
     pointer->confine_rect_valid = FALSE;
     pointer->enter_serial = 0;
+    pointer->button_count = 0;
     if (process_wayland.zwp_relative_pointer_manager_v1)
     {
         pointer->zwp_relative_pointer_v1 =

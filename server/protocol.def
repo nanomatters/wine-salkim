@@ -3037,7 +3037,10 @@ enum coords_relative
 /* Update the z order of a window so that a given rectangle is fully visible */
 @REQ(update_window_zorder)
     user_handle_t  window;        /* handle to the window */
-    struct rectangle rect;        /* rectangle that must be visible (in client coords) */
+    struct rectangle rect;        /* rectangle that must be visible (in parent coords) */
+    int raw;                      /* use raw screen coordinates for a top-level window */
+@REPLY
+    int changed;                  /* whether the window moved in the Z order */
 @END
 
 

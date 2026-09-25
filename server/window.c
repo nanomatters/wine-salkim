@@ -3952,7 +3952,19 @@ DECL_HANDLER(update_window_zorder)
     struct rectangle tmp, rect = req->rect;
     struct window *ptr, *win = get_window( req->window );
 
+    reply->changed = 0;
     if (!win || !win->parent || !is_visible( win )) return;  /* nothing to do */
+
+    if (req->raw)
+    {
+        if (!is_desktop_window( win->parent ) || is_rect_empty( &rect )) return;
+        /* Map inclusive corners so a single exposed pixel remains nonempty
+         * when the emulated display mode is smaller than the host output. */
+        --rect.right;
+        --rect.bottom;
+        map_point_raw_to_virt( win->desktop, &rect.left, &rect.top );
+        map_point_raw_to_virt( win->desktop, &rect.right, &rect.bottom );
+    }
 
     LIST_FOR_EACH_ENTRY( ptr, &win->parent->children, struct window, entry )
     {
@@ -3961,7 +3973,13 @@ DECL_HANDLER(update_window_zorder)
         if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
         if (ptr->is_layered && (ptr->layered_flags & LWA_COLORKEY)) continue;
         tmp = rect;
-        map_dpi_rect( win, &tmp, get_window_dpi( win->parent ), get_window_dpi( win ) );
+        if (req->raw)
+        {
+            map_dpi_rect( ptr, &tmp, 0, get_window_dpi( ptr ) );
+            ++tmp.right;
+            ++tmp.bottom;
+        }
+        else map_dpi_rect( win, &tmp, get_window_dpi( win->parent ), get_window_dpi( win ) );
         if (!intersect_rect( &tmp, &tmp, &ptr->visible_rect )) continue;
         if (ptr->win_region)
         {
@@ -3974,6 +3992,7 @@ DECL_HANDLER(update_window_zorder)
         {
             list_remove( &win->entry );
             list_add_before( &ptr->entry, &win->entry );
+            reply->changed = 1;
         }
         break;
     }

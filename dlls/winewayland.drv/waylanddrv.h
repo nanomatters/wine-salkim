@@ -223,6 +223,7 @@ struct wayland_pointer
     BOOL external_input_active;
     uint32_t enter_serial;
     uint32_t button_serial;
+    unsigned int button_count;
     uint32_t popup_serial;
     HWND popup_serial_hwnd;
     UINT64 popup_serial_time;
