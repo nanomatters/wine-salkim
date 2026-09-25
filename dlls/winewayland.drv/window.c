@@ -927,7 +927,10 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         wayland_surface_make_layer(surface, &data->rects.window);
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
-        wayland_surface_make_subsurface(surface, toplevel_surface);
+        if (wayland_surface_make_subsurface(surface, toplevel_surface))
+            /* A new role has no attached buffer. Restore retained GDI content
+             * on the window thread without asking the application to repaint. */
+            NtUserPostMessage(data->hwnd, WM_WAYLAND_EXPOSE, 0, 0);
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (wayland_surface_make_toplevel(surface, server_decor, data->owner,
@@ -2750,8 +2753,10 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         data->window_contents = shm_buffer;
     }
 
-    if (data->external_host)
+    if (data->external_host || (wayland_surface && !wayland_surface->window.visible))
     {
+        /* Keep the latest bitmap while cloaked, but do not attach it to the
+         * roleless surface. The next mapping exposes this retained content. */
         committed = TRUE;
     }
     else if (wayland_surface)

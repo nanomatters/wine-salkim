@@ -3893,6 +3893,7 @@ struct set_window_pos_reply
 #define SET_WINPOS_PIXEL_FORMAT     0x02
 #define SET_WINPOS_LAYERED_WINDOW   0x04
 #define SET_WINPOS_CLIP_CLIENT      0x08
+#define SET_WINPOS_REDIRECTED       0x200
 
 
 struct get_window_rectangles_request
@@ -7515,6 +7516,6 @@ union generic_reply
     struct set_window_cloaked_reply set_window_cloaked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 942
+#define SERVER_PROTOCOL_VERSION 943
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

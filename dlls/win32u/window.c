@@ -2685,7 +2685,9 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child) needs_surface = FALSE;
+    /* Layered children need their own bitmap even before being shown. Never
+     * fall back to drawing a cloaked window into its parent's visible bitmap. */
+    else if (is_child) needs_surface = (ex_style & WS_EX_LAYERED) || NtUserGetWindowCloaked( hwnd );
     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
     else needs_surface = !!(style & WS_VISIBLE);
@@ -2721,7 +2723,9 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (new_surface && new_surface != &dummy_surface)
     {
         window_surface_release( new_surface );
-        window_surface_add_ref( (new_surface = &dummy_surface) );
+        /* A child leaving redirection must draw into its parent again. */
+        new_surface = is_child ? NULL : &dummy_surface;
+        if (new_surface) window_surface_add_ref( new_surface );
     }
 
     if (new_surface && new_surface != &dummy_surface && !is_layered)
@@ -2824,6 +2828,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             wine_server_add_data( req, extra_rects, sizeof(extra_rects) );
         }
         if (new_surface) req->paint_flags |= SET_WINPOS_PAINT_SURFACE;
+        if (new_surface && new_surface != &dummy_surface) req->paint_flags |= SET_WINPOS_REDIRECTED;
         if (is_layered) req->paint_flags |= SET_WINPOS_LAYERED_WINDOW;
         else if (win->clip_clients) req->paint_flags |= SET_WINPOS_PIXEL_FORMAT;
         if (win->clip_from_parent) req->paint_flags |= SET_WINPOS_CLIP_CLIENT;

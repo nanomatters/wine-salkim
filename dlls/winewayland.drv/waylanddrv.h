@@ -778,8 +778,8 @@ struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flag
 void wayland_surface_destroy(struct wayland_surface *surface);
 BOOL wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
                                    HWND owner, LPCWSTR title);
-void wayland_surface_make_subsurface(struct wayland_surface *surface,
-                                     struct wayland_surface *parent);
+BOOL wayland_surface_make_subsurface(struct wayland_surface *surface,
+                                    struct wayland_surface *parent);
 void wayland_surface_make_popup(struct wayland_surface *surface,
                                 struct wayland_surface *owner);
 void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect);

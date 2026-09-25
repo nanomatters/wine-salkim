@@ -2532,21 +2532,22 @@ err:
 /**********************************************************************
  *          wayland_surface_make_subsurface
  *
- * Gives the subsurface role to a plain Wayland surface.
+ * Gives the subsurface role to a plain Wayland surface. Returns TRUE when a
+ * new role was created and retained content needs to be attached again.
  */
-void wayland_surface_make_subsurface(struct wayland_surface *surface,
-                                     struct wayland_surface *parent)
+BOOL wayland_surface_make_subsurface(struct wayland_surface *surface,
+                                    struct wayland_surface *parent)
 {
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE);
     if (surface->wl_subsurface && surface->toplevel_hwnd == parent->hwnd)
     {
-        if (surface->parent_serial == parent->serial) return;
+        if (surface->parent_serial == parent->serial) return FALSE;
 
         TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
               surface->hwnd, parent->hwnd, surface->parent_serial, parent->serial);
     }
 
-    if (!wayland_surface_clear_role(surface)) return;
+    if (!wayland_surface_clear_role(surface)) return FALSE;
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
 
     TRACE("surface=%p parent=%p\n", surface, parent);
@@ -2564,11 +2565,12 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
     /* Present contents independently of the parent surface. */
     wl_subsurface_set_desync(surface->wl_subsurface);
     wl_display_flush(process_wayland.wl_display);
-    return;
+    return TRUE;
 
 err:
     wayland_surface_clear_role(surface);
     ERR("Failed to assign subsurface role to Wayland surface\n");
+    return FALSE;
 }
 
 static struct xdg_positioner *create_xdg_positioner(RECT rect)

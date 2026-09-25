@@ -147,8 +147,9 @@ static const struct object_ops window_ops =
 #define PAINT_HAS_PIXEL_FORMAT     SET_WINPOS_PIXEL_FORMAT
 #define PAINT_HAS_LAYERED_SURFACE  SET_WINPOS_LAYERED_WINDOW
 #define PAINT_CLIP_CLIENT          SET_WINPOS_CLIP_CLIENT
+#define PAINT_REDIRECTED           SET_WINPOS_REDIRECTED
 #define PAINT_CLIENT_FLAGS         (PAINT_HAS_SURFACE | PAINT_HAS_PIXEL_FORMAT | \
-                                    PAINT_HAS_LAYERED_SURFACE | PAINT_CLIP_CLIENT)
+                                    PAINT_HAS_LAYERED_SURFACE | PAINT_CLIP_CLIENT | PAINT_REDIRECTED)
 /* flags only manipulated by the server */
 #define PAINT_INTERNAL           0x0010  /* internal WM_PAINT pending */
 #define PAINT_ERASE              0x0020  /* needs WM_ERASEBKGND */
@@ -2910,14 +2911,15 @@ DECL_HANDLER(set_window_cloaked)
         set_error( STATUS_ACCESS_DENIED );
         return;
     }
-    /* Child windows can paint into their parent's backing store. Cloaking
-     * these needs redirected child composition, not a visibility change. */
-    if (!is_desktop_window( win->parent ))
+    if (win->app_cloaked == !!req->cloaked) return;
+    /* Only accept child cloaking once drawing is redirected into a retained
+     * bitmap. Ordinary children still share their parent's backing store. */
+    if (req->cloaked && !is_desktop_window( win->parent ) &&
+        (!(win->ex_style & WS_EX_LAYERED) || !(win->paint_flags & PAINT_REDIRECTED)))
     {
         set_error( STATUS_NOT_SUPPORTED );
         return;
     }
-    if (win->app_cloaked == !!req->cloaked) return;
     win->app_cloaked = !!req->cloaked;
     update_window_cloaked( win->desktop->top_window );
 }

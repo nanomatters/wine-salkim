@@ -349,6 +349,125 @@ done:
     DestroyWindow(replacement);
 }
 
+static void test_child_cloaking(void)
+{
+    HWND parent, other, child, hidden;
+    RECT before, after;
+    DWORD style, exstyle;
+    BOOL cloak = TRUE;
+    HDC dc = NULL;
+    HRESULT hr;
+    COLORREF color;
+
+    parent = CreateWindowExA(0, "static", "parent", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            30, 30, 300, 240, NULL, NULL, NULL, NULL);
+    other = CreateWindowExA(0, "static", "other parent", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           360, 30, 300, 240, NULL, NULL, NULL, NULL);
+    child = CreateWindowExA(WS_EX_LAYERED, "static", "layered child", WS_CHILD | WS_VISIBLE,
+                           20, 20, 100, 80, parent, NULL, NULL, NULL);
+    ok(parent && other && child, "CreateWindow failed, error %lu.\n", GetLastError());
+    if (!parent || !other || !child) goto done;
+    ok(SetLayeredWindowAttributes(child, 0, 255, LWA_ALPHA), "Setting child attributes failed.\n");
+    flush_messages();
+    style = GetWindowLongW(child, GWL_STYLE);
+    exstyle = GetWindowLongW(child, GWL_EXSTYLE);
+    GetWindowRect(child, &before);
+    check_cloaked(child, 0);
+
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
+    {
+        skip("The driver does not provide a redirected child bitmap.\n");
+        goto done;
+    }
+    if (FAILED(hr))
+    {
+        win_skip("Layered child cloaking is unavailable, hr %#lx.\n", hr);
+        goto done;
+    }
+    check_cloaked(child, DWM_CLOAKED_APP);
+    check_cloaked(parent, 0);
+    check_cloaked_other_process(child, DWM_CLOAKED_APP);
+    ok(GetWindowLongW(child, GWL_STYLE) == style, "Cloaking changed child style.\n");
+    ok(GetWindowLongW(child, GWL_EXSTYLE) == exstyle, "Cloaking changed child exstyle.\n");
+    ok(IsWindowVisible(child), "Cloaking cleared child visibility.\n");
+    GetWindowRect(child, &after);
+    ok(EqualRect(&before, &after), "Cloaking changed child geometry.\n");
+    InvalidateRect(child, NULL, FALSE);
+    ok(GetUpdateRect(child, NULL, FALSE), "Cloaking suppressed child invalidation.\n");
+    UpdateWindow(child);
+    ok(!GetUpdateRect(child, NULL, FALSE), "Cloaking suppressed child WM_PAINT.\n");
+
+    /* Keep a DC across the transition to check that drawing remains usable. */
+    dc = GetDC(child);
+    ok(!!dc, "GetDC failed.\n");
+    SetPixelV(dc, 5, 5, RGB(255, 0, 0));
+    color = GetPixel(dc, 5, 5);
+    ok(color == RGB(255, 0, 0), "Cloaked child pixel is %#lx.\n", color);
+    cloak = FALSE;
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Uncloak child returned %#lx.\n", hr);
+    check_cloaked(child, 0);
+    color = GetPixel(dc, 5, 5);
+    ok(color == RGB(255, 0, 0), "Uncloaking lost child contents, pixel %#lx.\n", color);
+    ReleaseDC(child, dc);
+    dc = NULL;
+
+    cloak = TRUE;
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Cloak child returned %#lx.\n", hr);
+    check_cloaked(child, DWM_CLOAKED_APP);
+    ok(SetParent(child, other) == parent, "SetParent failed, error %lu.\n", GetLastError());
+    check_cloaked(child, DWM_CLOAKED_APP);
+    check_cloaked(other, 0);
+    cloak = FALSE;
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Uncloak reparented child returned %#lx.\n", hr);
+    check_cloaked(child, 0);
+
+    cloak = TRUE;
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Cloak child returned %#lx.\n", hr);
+    SetWindowLongW(child, GWL_EXSTYLE, exstyle & ~WS_EX_LAYERED);
+    check_cloaked(child, DWM_CLOAKED_APP);
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Repeated cloak after style change returned %#lx.\n", hr);
+    cloak = FALSE;
+    hr = DwmSetWindowAttribute(child, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Uncloak after style change returned %#lx.\n", hr);
+    check_cloaked(child, 0);
+    dc = GetDC(child);
+    SetPixelV(dc, 5, 5, RGB(0, 255, 0));
+    color = GetPixel(dc, 5, 5);
+    ok(color == RGB(0, 255, 0), "Child drawing after leaving redirection returned %#lx.\n", color);
+
+    hidden = CreateWindowExA(WS_EX_LAYERED, "static", "initially hidden child", WS_CHILD,
+                            140, 20, 100, 80, parent, NULL, NULL, NULL);
+    ok(!!hidden, "CreateWindow failed, error %lu.\n", GetLastError());
+    if (hidden)
+    {
+        ok(SetLayeredWindowAttributes(hidden, 0, 255, LWA_ALPHA), "Setting hidden child attributes failed.\n");
+        cloak = TRUE;
+        hr = DwmSetWindowAttribute(hidden, DWMWA_CLOAK, &cloak, sizeof(cloak));
+        ok(hr == S_OK, "Cloak before showing child returned %#lx.\n", hr);
+        check_cloaked(hidden, DWM_CLOAKED_APP);
+        ok(!IsWindowVisible(hidden), "Cloaking made hidden child visible.\n");
+        ShowWindow(hidden, SW_SHOWNOACTIVATE);
+        check_cloaked(hidden, DWM_CLOAKED_APP);
+        ok(IsWindowVisible(hidden), "Cloaking blocked ShowWindow.\n");
+        cloak = FALSE;
+        hr = DwmSetWindowAttribute(hidden, DWMWA_CLOAK, &cloak, sizeof(cloak));
+        ok(hr == S_OK, "Uncloak newly shown child returned %#lx.\n", hr);
+        check_cloaked(hidden, 0);
+        DestroyWindow(hidden);
+    }
+done:
+    if (dc) ReleaseDC(child, dc);
+    DestroyWindow(child);
+    DestroyWindow(other);
+    DestroyWindow(parent);
+}
+
 START_TEST(dwmapi)
 {
     char **argv;
@@ -362,6 +481,7 @@ START_TEST(dwmapi)
     if (argc == 3 && !strcmp(argv[2], "cloak_only"))
     {
         test_cloaking();
+        test_child_cloaking();
         return;
     }
 
@@ -371,4 +491,5 @@ START_TEST(dwmapi)
     test_DWMWA_EXTENDED_FRAME_BOUNDS();
     test_DwmFlush();
     test_cloaking();
+    test_child_cloaking();
 }
