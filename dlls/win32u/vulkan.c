@@ -553,6 +553,8 @@ static BOOL surface_is_occluded( const struct surface *surface )
 {
     struct client_surface *client = surface->client;
 
+    /* Application cloaking is independent of compositor suspension. */
+    if (NtUserIsWindowPresentationCloaked( client->hwnd )) return TRUE;
     return client->funcs->is_occluded && client->funcs->is_occluded( client );
 }
 

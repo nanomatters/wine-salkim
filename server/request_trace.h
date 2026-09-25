@@ -3677,6 +3677,12 @@ static void dump_hwnd_dmabuf_release_channel_reply( const struct hwnd_dmabuf_rel
     fprintf( stderr, " status=%08x", req->status );
 }
 
+static void dump_set_window_cloaked_request( const struct set_window_cloaked_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", cloaked=%d", req->cloaked );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4001,6 +4007,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_request,
     (dump_func)dump_hwnd_dmabuf_claim_channel_request,
     (dump_func)dump_hwnd_dmabuf_release_channel_request,
+    (dump_func)dump_set_window_cloaked_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4325,6 +4332,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_reply,
     (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
     (dump_func)dump_hwnd_dmabuf_release_channel_reply,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4649,6 +4657,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "hwnd_dmabuf_get_channel_exclusive",
     "hwnd_dmabuf_claim_channel",
     "hwnd_dmabuf_release_channel",
+    "set_window_cloaked",
 };
 
 static const struct

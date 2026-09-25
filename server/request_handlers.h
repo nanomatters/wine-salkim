@@ -327,6 +327,7 @@ DECL_HANDLER(hwnd_dmabuf_get_channel);
 DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
 DECL_HANDLER(hwnd_dmabuf_claim_channel);
 DECL_HANDLER(hwnd_dmabuf_release_channel);
+DECL_HANDLER(set_window_cloaked);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -651,6 +652,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_hwnd_dmabuf_get_channel_exclusive,
     (req_handler)req_hwnd_dmabuf_claim_channel,
     (req_handler)req_hwnd_dmabuf_release_channel,
+    (req_handler)req_set_window_cloaked,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2486,3 +2488,6 @@ C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_request, flags) == 16 );
 C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_request) == 24 );
 C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_reply, status) == 8 );
 C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_reply) == 16 );
+C_ASSERT( offsetof(struct set_window_cloaked_request, handle) == 12 );
+C_ASSERT( offsetof(struct set_window_cloaked_request, cloaked) == 16 );
+C_ASSERT( sizeof(struct set_window_cloaked_request) == 24 );

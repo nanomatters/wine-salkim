@@ -191,11 +191,184 @@ static void test_DwmFlush(void)
     ok(apc_count == 1, "got apc_count %d.\n", apc_count);
 }
 
+static void flush_messages(void)
+{
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+static void check_cloaked(HWND hwnd, DWORD expected)
+{
+    DWORD flags = 0xdeadbeef, start = GetTickCount();
+    HRESULT hr;
+
+    do
+    {
+        flush_messages();
+        hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, sizeof(flags));
+        if (FAILED(hr) || flags == expected) break;
+        Sleep(10);
+    } while (GetTickCount() - start < 2000);
+    ok(hr == S_OK, "Get cloak returned %#lx.\n", hr);
+    ok(flags == expected, "Expected cloak %#lx, got %#lx.\n", expected, flags);
+}
+
+static void check_cloaked_other_process(HWND hwnd, DWORD flags)
+{
+    STARTUPINFOA si = {sizeof(si)};
+    PROCESS_INFORMATION pi;
+    char **argv, command[1024];
+    DWORD wait, start;
+    BOOL ret;
+
+    winetest_get_mainargs(&argv);
+    snprintf(command, sizeof(command), "\"%s\" dwmapi cloak_query %p %lx",
+             argv[0], hwnd, flags);
+    ret = CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+    ok(ret, "CreateProcess failed, error %lu.\n", GetLastError());
+    if (!ret) return;
+    start = GetTickCount();
+    do
+    {
+        flush_messages();
+        wait = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, 100, QS_ALLINPUT);
+    } while (wait != WAIT_OBJECT_0 && GetTickCount() - start < 15000);
+    ok(wait == WAIT_OBJECT_0, "Child query timed out.\n");
+    if (wait == WAIT_OBJECT_0) winetest_wait_child_process(&pi);
+    else
+    {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+static HWND cloak_event_window;
+static unsigned int cloak_events, uncloak_events;
+
+static void CALLBACK cloak_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                     LONG object, LONG child, DWORD thread, DWORD time)
+{
+    if (hwnd != cloak_event_window || object != OBJID_WINDOW || child != CHILDID_SELF) return;
+    if (event == EVENT_OBJECT_CLOAKED) cloak_events++;
+    if (event == EVENT_OBJECT_UNCLOAKED) uncloak_events++;
+}
+
+static void test_cloaking(void)
+{
+    HWND hwnd, owned, nested, replacement, late;
+    HWINEVENTHOOK hook;
+    RECT before, after;
+    DWORD style, flags;
+    BOOL cloak = TRUE;
+    HRESULT hr;
+
+    hwnd = CreateWindowExA(0, "static", "cloak owner", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                          30, 30, 240, 180, NULL, NULL, NULL, NULL);
+    ok(!!hwnd, "CreateWindow failed.\n");
+    if (!hwnd) return;
+    cloak_event_window = hwnd;
+    cloak_events = uncloak_events = 0;
+    hook = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, NULL,
+                          cloak_event_proc, GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+    ok(!!hook, "SetWinEventHook failed.\n");
+    owned = CreateWindowExA(0, "static", "owned", WS_POPUP | WS_VISIBLE,
+                           40, 40, 100, 80, hwnd, NULL, NULL, NULL);
+    nested = CreateWindowExA(0, "static", "nested", WS_POPUP | WS_VISIBLE,
+                            50, 50, 80, 60, owned, NULL, NULL, NULL);
+    ok(!!owned && !!nested, "CreateWindow failed.\n");
+    flush_messages();
+    style = GetWindowLongW(hwnd, GWL_STYLE);
+    GetWindowRect(hwnd, &before);
+    check_cloaked(hwnd, 0);
+    check_cloaked_other_process(hwnd, 0);
+
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    if (FAILED(hr))
+    {
+        win_skip("Cloaking is unavailable, hr %#lx.\n", hr);
+        goto done;
+    }
+    check_cloaked(hwnd, DWM_CLOAKED_APP);
+    check_cloaked(owned, DWM_CLOAKED_INHERITED);
+    check_cloaked(nested, DWM_CLOAKED_INHERITED);
+    late = CreateWindowExA(0, "static", "late owned", WS_POPUP | WS_VISIBLE,
+                          60, 60, 80, 60, nested, NULL, NULL, NULL);
+    check_cloaked(late, DWM_CLOAKED_INHERITED);
+    DestroyWindow(late);
+    check_cloaked_other_process(hwnd, DWM_CLOAKED_APP);
+    check_cloaked_other_process(nested, DWM_CLOAKED_INHERITED);
+    ok(GetWindowLongW(hwnd, GWL_STYLE) == style, "Cloaking changed the style.\n");
+    ok(IsWindowVisible(hwnd), "Cloaking cleared visibility.\n");
+    GetWindowRect(hwnd, &after);
+    ok(EqualRect(&before, &after), "Cloaking moved or resized the window.\n");
+    InvalidateRect(hwnd, NULL, FALSE);
+    ok(GetUpdateRect(hwnd, NULL, FALSE), "Cloaking suppressed invalidation.\n");
+    UpdateWindow(hwnd);
+    ok(!GetUpdateRect(hwnd, NULL, FALSE), "Cloaking suppressed WM_PAINT.\n");
+
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Repeated cloak returned %#lx.\n", hr);
+    flush_messages();
+    ok(cloak_events == 1, "Expected one cloak event, got %u.\n", cloak_events);
+    SetWindowLongPtrW(owned, GWLP_HWNDPARENT, 0);
+    check_cloaked(owned, 0);
+    check_cloaked(nested, 0);
+    SetWindowLongPtrW(owned, GWLP_HWNDPARENT, (LONG_PTR)hwnd);
+    check_cloaked(nested, DWM_CLOAKED_INHERITED);
+    cloak = FALSE;
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    ok(hr == S_OK, "Uncloak returned %#lx.\n", hr);
+    check_cloaked(hwnd, 0);
+    check_cloaked(owned, 0);
+    check_cloaked(nested, 0);
+    check_cloaked_other_process(hwnd, 0);
+    flush_messages();
+    ok(uncloak_events == 1, "Expected one uncloak event, got %u.\n", uncloak_events);
+
+    hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, sizeof(flags) - 1);
+    ok(hr == E_INVALIDARG, "Short query returned %#lx.\n", hr);
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, NULL, sizeof(cloak));
+    ok(FAILED(hr), "NULL value returned %#lx.\n", hr);
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak) - 1);
+    ok(FAILED(hr), "Short setter returned %#lx.\n", hr);
+done:
+    if (hook) UnhookWinEvent(hook);
+    DestroyWindow(nested);
+    DestroyWindow(owned);
+    DestroyWindow(hwnd);
+    hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, sizeof(flags));
+    ok(FAILED(hr), "Destroyed window query returned %#lx.\n", hr);
+    replacement = CreateWindowExA(0, "static", "replacement", WS_OVERLAPPEDWINDOW,
+                                  30, 30, 240, 180, NULL, NULL, NULL, NULL);
+    check_cloaked(replacement, 0);
+    DestroyWindow(replacement);
+}
+
 START_TEST(dwmapi)
 {
+    char **argv;
+    int argc = winetest_get_mainargs(&argv);
+
+    if (argc == 5 && !strcmp(argv[2], "cloak_query"))
+    {
+        check_cloaked((HWND)(UINT_PTR)strtoull(argv[3], NULL, 16), strtoul(argv[4], NULL, 16));
+        return;
+    }
+    if (argc == 3 && !strcmp(argv[2], "cloak_only"))
+    {
+        test_cloaking();
+        return;
+    }
+
     test_DwmIsCompositionEnabled();
     test_DwmGetCompositionTimingInfo();
     test_DWMWA_NCRENDERING_ENABLED();
     test_DWMWA_EXTENDED_FRAME_BOUNDS();
     test_DwmFlush();
+    test_cloaking();
 }

@@ -5452,7 +5452,8 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
     if (count != 1) return FALSE;
     if (!wayland_surface_is_toplevel(surface)) return FALSE;
     if (frames[0].opened & (HWND_DMABUF_FRAME_GDI_OVERLAY |
-                            HWND_DMABUF_FRAME_HOST_SURFACE)) return FALSE;
+                            HWND_DMABUF_FRAME_HOST_SURFACE |
+                            HWND_DMABUF_FRAME_CLOAKED)) return FALSE;
     if (!data || data->client_surface) return FALSE;
     if (data->window_contents) return FALSE;
     if (data->content_over_producer) return FALSE;
@@ -6040,6 +6041,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
                 dmabuf_surface->last_seen_ms = now;
                 if (wayland_hwnd_dmabuf_surface_set_suppressed(
                         dmabuf_surface,
+                        (frames[i].opened & HWND_DMABUF_FRAME_CLOAKED) ||
                         wayland_hwnd_dmabuf_container_composites_children(container)))
                     any_new = TRUE;
                 if (dmabuf_surface->suppressed) continue;
@@ -6088,6 +6090,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
         if (attached_frame) any_new = TRUE;
         if (wayland_hwnd_dmabuf_surface_set_suppressed(
                 dmabuf_surface,
+                (frames[i].opened & HWND_DMABUF_FRAME_CLOAKED) ||
                 wayland_hwnd_dmabuf_container_composites_children(container)))
             any_new = TRUE;
         if (dmabuf_surface->suppressed) continue;
@@ -7209,7 +7212,8 @@ static enum client_surface_attachment client_surface_attachment_for_window(
     struct wayland_win_data *toplevel_data;
     struct wayland_surface *surface;
 
-    if (!toplevel || data->explicitly_hidden) return CLIENT_SURFACE_DETACH;
+    if (!toplevel || data->explicitly_hidden || NtUserIsWindowPresentationCloaked(data->hwnd))
+        return CLIENT_SURFACE_DETACH;
     /* A kept toplevel remains mapped while WS_VISIBLE is transiently clear. */
     if (data->hwnd != toplevel && !data->visible && !data->has_present_rect)
         return CLIENT_SURFACE_DETACH;
@@ -8270,6 +8274,10 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
     RECT client_rect, dst;
     struct wayland_child_visibility_info visibility;
     BOOL opaque, presentation_scaled, stack_above_parent;
+
+    if (NtUserIsWindowPresentationCloaked(hwnd) ||
+        (toplevel && NtUserIsWindowPresentationCloaked(toplevel)))
+        toplevel = NULL;
 
     if (ReadAcquire(&client->direct_toplevel))
     {

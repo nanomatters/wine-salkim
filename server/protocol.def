@@ -334,6 +334,7 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
 #define HWND_DMABUF_FRAME_HOST_SURFACE    0x00000004
 #define HWND_DMABUF_FRAME_FULLY_VISIBLE   0x00000008
+#define HWND_DMABUF_FRAME_CLOAKED         0x00000010
 
 #define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
 
@@ -1165,6 +1166,8 @@ typedef volatile struct
 {
     struct obj_locator   class;            /* object locator for the window class shared object */
     unsigned int         dpi_context;      /* DPI awareness context */
+    unsigned int         cloaked;          /* DWM_CLOAKED flags */
+    int                  presentation_cloaked; /* also hidden by a cloaked parent */
 } window_shm_t;
 
 typedef volatile union
@@ -4548,4 +4551,11 @@ enum fsync_type
     unsigned int   flags;               /* HWND_DMABUF_CHANNEL_* */
 @REPLY
     unsigned int   status;              /* enum hwnd_dmabuf_status */
+@END
+
+
+/* Set application cloaking without changing Win32 visibility. */
+@REQ(set_window_cloaked)
+    user_handle_t  handle;
+    int            cloaked;
 @END

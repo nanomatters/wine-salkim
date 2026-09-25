@@ -1496,6 +1496,31 @@ UINT get_window_dpi_awareness_context( HWND hwnd )
     return ctx;
 }
 
+static UINT get_window_cloaked( HWND hwnd, BOOL presentation )
+{
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const window_shm_t *window_shm = NULL;
+    UINT status, cloaked = 0;
+
+    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
+        cloaked = presentation ? window_shm->presentation_cloaked : window_shm->cloaked;
+    return status ? 0 : cloaked;
+}
+
+static BOOL set_window_cloaked( HWND hwnd, BOOL cloaked )
+{
+    BOOL ret;
+
+    SERVER_START_REQ( set_window_cloaked )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->cloaked = !!cloaked;
+        ret = !wine_server_call_err( req );
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
 /* see GetDpiForWindow */
 UINT get_dpi_for_window( HWND hwnd )
 {
@@ -6803,6 +6828,12 @@ ULONG_PTR WINAPI NtUserCallHwnd( HWND hwnd, DWORD code )
     case NtUserCallHwnd_GetWindowDpiAwarenessContext:
         return get_window_dpi_awareness_context( hwnd );
 
+    case NtUserCallHwnd_GetWindowCloaked:
+        return get_window_cloaked( hwnd, FALSE );
+
+    case NtUserCallHwnd_IsWindowPresentationCloaked:
+        return get_window_cloaked( hwnd, TRUE );
+
     case NtUserCallHwnd_GetWindowInputContext:
         return HandleToUlong( get_window_input_context( hwnd ));
 
@@ -6847,6 +6878,9 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
 {
     switch (code)
     {
+    case NtUserCallHwndParam_SetWindowCloaked:
+        return set_window_cloaked( hwnd, param );
+
     case NtUserCallHwndParam_ClientToScreen:
         return client_to_screen( hwnd, (POINT *)param );
 

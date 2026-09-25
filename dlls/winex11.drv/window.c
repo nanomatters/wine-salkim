@@ -3715,6 +3715,9 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     XFlush( gdi_display );  /* make sure painting is done before we move the window */
 
+    /* Only the host mapping changes. WS_VISIBLE and the backing store remain intact. */
+    if (NtUserIsWindowPresentationCloaked(hwnd)) new_style &= ~WS_VISIBLE;
+
     if (use_force_below_hack())
     {
         if (insert_after != HWND_BOTTOM && insert_after != HWND_NOTOPMOST && insert_after != HWND_TOP && insert_after != HWND_TOPMOST)

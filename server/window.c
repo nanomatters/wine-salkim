@@ -31,6 +31,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "ntuser.h"
+#include "dwmapi.h"
 
 #include "object.h"
 #include "file.h"
@@ -86,6 +87,7 @@ struct window
     unsigned int     is_layered : 1;  /* has layered info been set? */
     unsigned int     is_orphan : 1;   /* is window orphaned */
     unsigned int     set_foreground : 1;/* has window been foreground once */
+    unsigned int     app_cloaked : 1; /* application requested DWM cloaking */
     int              is_update_region_full_frame : 1; /* the whole window rect is invalidated */
     int              is_update_region_full_client : 1; /* the whole client rect is invalidated */
     unsigned int     color_key;       /* color key for a layered window */
@@ -250,6 +252,49 @@ static inline struct window *get_first_child( struct window *win )
 {
     struct list *ptr = list_head( &win->children );
     return ptr ? LIST_ENTRY( ptr, struct window, entry ) : NULL;
+}
+
+/* Owner chains are acyclic. Compute from application bits, not cached inherited
+ * bits, so recomputing the desktop does not depend on its Z order. */
+static unsigned int window_cloaked_flags( struct window *win )
+{
+    unsigned int flags = win->app_cloaked ? DWM_CLOAKED_APP : 0;
+    struct window *owner;
+
+    for (owner = win; owner->owner; )
+    {
+        if (!(owner = get_user_object( owner->owner, NTUSER_OBJ_WINDOW ))) break;
+        if (owner->app_cloaked) return flags | DWM_CLOAKED_INHERITED;
+    }
+    return flags;
+}
+
+static void update_window_cloaked( struct window *win )
+{
+    struct window *child;
+    unsigned int flags, previous;
+    int presentation_cloaked;
+
+    if (win->handle)
+    {
+        previous = win->shared->cloaked;
+        flags = window_cloaked_flags( win );
+        presentation_cloaked = flags || (win->parent && win->parent->shared->presentation_cloaked);
+        if (flags != previous || presentation_cloaked != win->shared->presentation_cloaked)
+        {
+            SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+            {
+                shared->cloaked = flags;
+                shared->presentation_cloaked = presentation_cloaked;
+            }
+            SHARED_WRITE_END;
+            post_message( win->handle, WM_WINE_CLOAKED_CHANGED, !!flags, !flags != !previous );
+        }
+    }
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        update_window_cloaked( child );
+    LIST_FOR_EACH_ENTRY( child, &win->unlinked, struct window, entry )
+        update_window_cloaked( child );
 }
 
 /* get last child in Z-order list */
@@ -713,6 +758,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->is_layered     = 0;
     win->is_orphan      = 0;
     win->set_foreground = 0;
+    win->app_cloaked    = 0;
     win->monitor_dpi    = USER_DEFAULT_SCREEN_DPI;
     win->user_data      = 0;
     win->text           = NULL;
@@ -741,6 +787,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     {
         shared->class       = class_locator;
         shared->dpi_context = NTUSER_DPI_PER_MONITOR_AWARE;
+        shared->cloaked     = owner && owner->shared->cloaked ? DWM_CLOAKED_INHERITED : 0;
+        shared->presentation_cloaked = shared->cloaked || (parent && parent->shared->presentation_cloaked);
     }
     SHARED_WRITE_END;
 
@@ -977,6 +1025,7 @@ static int is_parent_composited( struct window *win )
 static int is_point_in_window( struct window *win, int *x, int *y, unsigned int dpi )
 {
     if (!(win->style & WS_VISIBLE)) return 0; /* not visible */
+    if (win->shared->presentation_cloaked) return 0;
     if ((win->style & (WS_POPUP|WS_CHILD|WS_DISABLED)) == (WS_CHILD|WS_DISABLED))
         return 0;  /* disabled child */
     if ((win->ex_style & (WS_EX_LAYERED|WS_EX_TRANSPARENT)) == (WS_EX_LAYERED|WS_EX_TRANSPARENT))
@@ -1403,6 +1452,7 @@ static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct wind
     if (win->dmabuf_producer_count) info->opened |= HWND_DMABUF_FRAME_OPENED;
     if (win->gdi_overlay_producer_count) info->opened |= HWND_DMABUF_FRAME_GDI_OVERLAY;
     if (host_surface) info->opened |= HWND_DMABUF_FRAME_HOST_SURFACE;
+    if (win->shared->presentation_cloaked) info->opened |= HWND_DMABUF_FRAME_CLOAKED;
 }
 
 static void hwnd_dmabuf_release_server_channel( struct window *win )
@@ -2661,6 +2711,8 @@ void free_window_handle( struct window *win )
     if (win->parent) set_parent_window( win, NULL );
     free_user_handle( win->handle );
     win->handle = 0;
+    if (win->shared->cloaked && win->desktop->top_window)
+        update_window_cloaked( win->desktop->top_window );
     release_object( win );
 }
 
@@ -2760,6 +2812,8 @@ DECL_HANDLER(set_parent)
     reply->old_parent  = win->parent->handle;
     reply->full_parent = parent ? parent->handle : 0;
     set_parent_window( win, parent );
+    if (win->shared->presentation_cloaked || (win->parent && win->parent->shared->presentation_cloaked))
+        update_window_cloaked( win );
 }
 
 
@@ -2842,6 +2896,30 @@ DECL_HANDLER(set_window_owner)
 
     reply->prev_owner = win->owner;
     reply->full_owner = win->owner = owner ? owner->handle : 0;
+    if (win->shared->cloaked || (owner && owner->shared->cloaked))
+        update_window_cloaked( win->desktop->top_window );
+}
+
+DECL_HANDLER(set_window_cloaked)
+{
+    struct window *win = get_window( req->handle );
+
+    if (!win) return;
+    if (is_desktop_window( win ))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    /* Child windows can paint into their parent's backing store. Cloaking
+     * these needs redirected child composition, not a visibility change. */
+    if (!is_desktop_window( win->parent ))
+    {
+        set_error( STATUS_NOT_SUPPORTED );
+        return;
+    }
+    if (win->app_cloaked == !!req->cloaked) return;
+    win->app_cloaked = !!req->cloaked;
+    update_window_cloaked( win->desktop->top_window );
 }
 
 

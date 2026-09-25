@@ -682,6 +682,7 @@ enum wine_internal_message
     WM_WINE_REQUESTACTIVATION,
     WM_WINE_ACTIVATION_TOKEN,
     WM_WINE_MAP_NOTIFY_ICON_POINT,
+    WM_WINE_CLOAKED_CHANGED,
     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
     WM_WINE_SETCURSOR,
@@ -1359,7 +1360,19 @@ enum
     NtUserGetFullWindowHandle,
     NtUserIsCurrentProcessWindow,
     NtUserIsCurrentThreadWindow,
+    NtUserCallHwnd_GetWindowCloaked,
+    NtUserCallHwnd_IsWindowPresentationCloaked,
 };
+
+static inline UINT NtUserGetWindowCloaked( HWND hwnd )
+{
+    return NtUserCallHwnd( hwnd, NtUserCallHwnd_GetWindowCloaked );
+}
+
+static inline BOOL NtUserIsWindowPresentationCloaked( HWND hwnd )
+{
+    return NtUserCallHwnd( hwnd, NtUserCallHwnd_IsWindowPresentationCloaked );
+}
 
 static inline void NtUserActivateOtherWindow( HWND hwnd )
 {
@@ -1469,6 +1482,7 @@ enum
     NtUserCallHwndParam_ExposeWindowSurface,
     NtUserCallHwndParam_GetWinMonitorDpi,
     NtUserCallHwndParam_SetRawWindowPos,
+    NtUserCallHwndParam_SetWindowCloaked,
 };
 
 struct get_window_rects_params

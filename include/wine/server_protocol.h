@@ -318,6 +318,7 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
 #define HWND_DMABUF_FRAME_HOST_SURFACE    0x00000004
 #define HWND_DMABUF_FRAME_FULLY_VISIBLE   0x00000008
+#define HWND_DMABUF_FRAME_CLOAKED         0x00000010
 
 #define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
 
@@ -1149,6 +1150,8 @@ typedef volatile struct
 {
     struct obj_locator   class;
     unsigned int         dpi_context;
+    unsigned int         cloaked;
+    int                  presentation_cloaked;
 } window_shm_t;
 
 typedef volatile union
@@ -6519,6 +6522,20 @@ struct hwnd_dmabuf_release_channel_reply
 };
 
 
+
+struct set_window_cloaked_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    int            cloaked;
+    char __pad_20[4];
+};
+struct set_window_cloaked_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6841,6 +6858,7 @@ enum request
     REQ_hwnd_dmabuf_get_channel_exclusive,
     REQ_hwnd_dmabuf_claim_channel,
     REQ_hwnd_dmabuf_release_channel,
+    REQ_set_window_cloaked,
     REQ_NB_REQUESTS
 };
 
@@ -7168,6 +7186,7 @@ union generic_request
     struct hwnd_dmabuf_get_channel_exclusive_request hwnd_dmabuf_get_channel_exclusive_request;
     struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
     struct hwnd_dmabuf_release_channel_request hwnd_dmabuf_release_channel_request;
+    struct set_window_cloaked_request set_window_cloaked_request;
 };
 union generic_reply
 {
@@ -7493,8 +7512,9 @@ union generic_reply
     struct hwnd_dmabuf_get_channel_exclusive_reply hwnd_dmabuf_get_channel_exclusive_reply;
     struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
+    struct set_window_cloaked_reply set_window_cloaked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 941
+#define SERVER_PROTOCOL_VERSION 942
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

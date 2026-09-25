@@ -837,6 +837,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     if (keep_toplevel_mapped)
         visible = TRUE;
 
+    /* Cloaking suppresses presentation, not Win32 visibility or painting. */
+    if (NtUserIsWindowPresentationCloaked(data->hwnd)) visible = FALSE;
+
     if (visible && !subsurface_window && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !wayland_output_layout_intersects_rect(&data->rects.window) &&
         !keep_toplevel_mapped && !fullscreen_target_active && !first_show_minimized)
