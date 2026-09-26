@@ -4202,6 +4202,20 @@ struct handle_info
 @END
 
 
+/* Share the image of a cursor selected by another process */
+@REQ(set_cursor_data)
+    user_handle_t handle;        /* cursor owned by the calling process */
+    VARARG(data,bytes);           /* immutable cursor image and resource information */
+@END
+
+@REQ(get_cursor_data)
+    user_handle_t handle;
+@REPLY
+    data_size_t total;
+    VARARG(data,bytes);
+@END
+
+
 /* Set/get the current cursor */
 @REQ(set_cursor)
     unsigned int   flags;         /* flags for fields to set (see below) */

@@ -5959,6 +5959,32 @@ struct free_user_handle_reply
 
 
 
+struct set_cursor_data_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    /* VARARG(data,bytes); */
+};
+struct set_cursor_data_reply
+{
+    struct reply_header __header;
+};
+
+struct get_cursor_data_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+};
+struct get_cursor_data_reply
+{
+    struct reply_header __header;
+    data_size_t total;
+    /* VARARG(data,bytes); */
+    char __pad_12[4];
+};
+
+
+
 struct set_cursor_request
 {
     struct request_header __header;
@@ -6829,6 +6855,8 @@ enum request
     REQ_set_window_layered_info,
     REQ_alloc_user_handle,
     REQ_free_user_handle,
+    REQ_set_cursor_data,
+    REQ_get_cursor_data,
     REQ_set_cursor,
     REQ_get_cursor_history,
     REQ_get_rawinput_buffer,
@@ -7157,6 +7185,8 @@ union generic_request
     struct set_window_layered_info_request set_window_layered_info_request;
     struct alloc_user_handle_request alloc_user_handle_request;
     struct free_user_handle_request free_user_handle_request;
+    struct set_cursor_data_request set_cursor_data_request;
+    struct get_cursor_data_request get_cursor_data_request;
     struct set_cursor_request set_cursor_request;
     struct get_cursor_history_request get_cursor_history_request;
     struct get_rawinput_buffer_request get_rawinput_buffer_request;
@@ -7483,6 +7513,8 @@ union generic_reply
     struct set_window_layered_info_reply set_window_layered_info_reply;
     struct alloc_user_handle_reply alloc_user_handle_reply;
     struct free_user_handle_reply free_user_handle_reply;
+    struct set_cursor_data_reply set_cursor_data_reply;
+    struct get_cursor_data_reply get_cursor_data_reply;
     struct set_cursor_reply set_cursor_reply;
     struct get_cursor_history_reply get_cursor_history_reply;
     struct get_rawinput_buffer_reply get_rawinput_buffer_reply;
@@ -7520,6 +7552,6 @@ union generic_reply
     struct set_window_cloaked_reply set_window_cloaked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 945
+#define SERVER_PROTOCOL_VERSION 946
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

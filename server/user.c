@@ -36,6 +36,12 @@ static void *server_objects[MAX_USER_HANDLES];
 static mem_size_t freelist = -1;
 static int nb_handles;
 
+struct cursor_data
+{
+    data_size_t size;
+    char data[];
+};
+
 static void *get_server_object( const user_entry_t *entry )
 {
     const user_entry_t *handles = shared_session->user_entries;
@@ -106,6 +112,10 @@ static void free_user_entry( user_entry_t *entry )
     user_entry_t *handles = shared_session->user_entries;
     size_t index = entry - handles;
 
+    if (entry->type == NTUSER_OBJ_ICON && server_objects[index] != (void *)-1)
+        free( server_objects[index] );
+    server_objects[index] = NULL;
+
     WriteRelease64( &entry->uniq, MAKELONG(0, entry->generation) );
     entry->offset = freelist;
     freelist = index;
@@ -164,7 +174,7 @@ void *free_user_handle( user_handle_t handle )
         return NULL;
     }
 
-    ret = set_server_object( entry, NULL );
+    ret = get_server_object( entry );
     free_user_entry( entry );
     return ret;
 }
@@ -235,4 +245,46 @@ DECL_HANDLER(free_user_handle)
         free_user_entry( entry );
     else
         set_error( STATUS_INVALID_HANDLE );
+}
+
+/* Publish a cursor once, before another process can be asked to display it. */
+DECL_HANDLER(set_cursor_data)
+{
+    const user_entry_t *entry = handle_to_entry( req->handle );
+    struct cursor_data *data;
+    data_size_t size = get_req_data_size();
+
+    if (!entry || entry->type != NTUSER_OBJ_ICON)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
+    if (entry->pid != get_process_id( current->process ))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (get_server_object( entry ) != (void *)-1) return;
+    if (!size || size > ~(data_size_t)0 - sizeof(*data))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (!(data = mem_alloc( sizeof(*data) + size ))) return;
+    data->size = size;
+    memcpy( data->data, get_req_data(), size );
+    set_server_object( entry, data );
+}
+
+DECL_HANDLER(get_cursor_data)
+{
+    struct cursor_data *data = get_user_object( req->handle, NTUSER_OBJ_ICON );
+
+    if (!data || data == (void *)-1)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
+    reply->total = data->size;
+    set_reply_data( data->data, min( data->size, get_reply_max_size() ));
 }

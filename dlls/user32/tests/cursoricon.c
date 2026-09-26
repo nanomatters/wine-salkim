@@ -306,6 +306,53 @@ static BOOL (WINAPI *pGetIconInfoExW)(HICON,ICONINFOEXW *);
 
 static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
 
+static void check_shared_cursor( HCURSOR cursor, unsigned int type )
+{
+    ICONINFOEXW info = { .cbSize = sizeof(info) };
+    unsigned char mask[4 * 26];
+    DWORD pixels[19 * 13];
+    BITMAP bm;
+    unsigned int i, size;
+    BOOL ret;
+
+    ret = pGetIconInfoExW( cursor, &info );
+    ok( ret, "GetIconInfoExW(%p) failed: %lu\n", cursor, GetLastError() );
+    if (!ret) return;
+    ok( !info.fIcon, "Expected a cursor\n" );
+    if (type == 2)
+    {
+        ok( info.wResID == (ULONG_PTR)IDC_ARROW, "Resource ID %u\n", info.wResID );
+        ok( GetModuleHandleW( info.szModName ) == GetModuleHandleW( L"user32.dll" ),
+            "Module %s\n", wine_dbgstr_w(info.szModName) );
+    }
+    else
+    {
+        ok( info.xHotspot == 3 && info.yHotspot == 5, "Hotspot %lu,%lu\n", info.xHotspot, info.yHotspot );
+        ok( !info.szModName[0] && !info.szResName[0] && !info.wResID, "Unexpected resource info\n" );
+        size = sizeof(mask) / (type ? 1 : 2);
+        ret = GetObjectW( info.hbmMask, sizeof(bm), &bm );
+        ok( ret && bm.bmWidth == 19 && bm.bmHeight == (type ? 26 : 13) && bm.bmBitsPixel == 1,
+            "Unexpected mask bitmap\n" );
+        memset( mask, 0xcc, sizeof(mask) );
+        ok( GetBitmapBits( info.hbmMask, size, mask ) == size, "Failed to read mask\n" );
+        for (i = 0; i < size; i += 4)
+            ok( mask[i] == 0x55 && mask[i + 1] == 0xaa && (mask[i + 2] & 0xe0) == 0x60,
+                "Mask row %u: %02x %02x %02x\n", i / 4, mask[i], mask[i + 1], mask[i + 2] );
+        if (!type)
+        {
+            ret = GetObjectW( info.hbmColor, sizeof(bm), &bm );
+            ok( ret && bm.bmWidth == 19 && bm.bmHeight == 13 && bm.bmBitsPixel == 32,
+                "Unexpected colour bitmap\n" );
+            ok( GetBitmapBits( info.hbmColor, sizeof(pixels), pixels ) == sizeof(pixels), "Failed to read colour\n" );
+            for (i = 0; i < ARRAY_SIZE(pixels); ++i)
+                ok( pixels[i] == (0x80000000u | i * 0x010101), "Pixel %u: %08lx\n", i, pixels[i] );
+        }
+        else ok( !info.hbmColor, "Monochrome cursor has a colour bitmap\n" );
+    }
+    DeleteObject( info.hbmColor );
+    DeleteObject( info.hbmMask );
+}
+
 static LRESULT CALLBACK callback_child(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -320,9 +367,9 @@ static LRESULT CALLBACK callback_child(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
             memset(&info, 0, sizeof(info));
             ret = GetIconInfo(cursor, &info);
-            todo_wine ok(ret, "GetIconInfoEx failed with error %lu\n", GetLastError());
-            todo_wine ok(info.hbmColor != NULL, "info.hmbColor was not set\n");
-            todo_wine ok(info.hbmMask != NULL, "info.hmbColor was not set\n");
+            ok(ret, "GetIconInfo failed with error %lu\n", GetLastError());
+            ok(info.hbmColor != NULL, "info.hbmColor was not set\n");
+            ok(info.hbmMask != NULL, "info.hbmMask was not set\n");
             DeleteObject(info.hbmColor);
             DeleteObject(info.hbmMask);
 
@@ -334,6 +381,37 @@ static LRESULT CALLBACK callback_child(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                error == 0xdeadbeef,  /* vista */
                 "Last error: %lu\n", error);
             return TRUE;
+        }
+        case WM_USER+2:
+            check_shared_cursor( (HCURSOR)lParam, wParam );
+            return TRUE;
+        case WM_USER+3:
+        {
+            ICONINFO info;
+            BOOL ret = GetIconInfo( (HCURSOR)lParam, &info );
+            ok( !ret, "Destroyed foreign cursor is still readable\n" );
+            if (ret)
+            {
+                DeleteObject( info.hbmColor );
+                DeleteObject( info.hbmMask );
+            }
+            return TRUE;
+        }
+        case WM_USER+4:
+        {
+            BYTE bits[4 * 13];
+            HCURSOR cursor;
+            unsigned int i;
+            for (i = 0; i < sizeof(bits); i += 4)
+            {
+                bits[i] = 0x55;
+                bits[i + 1] = 0xaa;
+                bits[i + 2] = 0x60;
+                bits[i + 3] = 0;
+            }
+            cursor = CreateCursor( NULL, 3, 5, 19, 13, bits, bits );
+            SetCursor( cursor );
+            return (LRESULT)cursor;
         }
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -402,7 +480,10 @@ static void test_child_process(void)
     ICONINFO cursorInfo;
     UINT display_bpp;
     WNDCLASSA class;
-    HCURSOR cursor;
+    HCURSOR cursor, previous, child_cursor;
+    unsigned char mask_bits[4 * 26];
+    DWORD color_bits[19 * 13];
+    unsigned int i, type;
     BOOL ret;
     HDC hdc;
     MSG msg;
@@ -459,13 +540,70 @@ static void test_child_process(void)
     cursor = CreateIconIndirect(&cursorInfo);
     ok(cursor != NULL, "CreateIconIndirect returned %p.\n", cursor);
 
-    SetCursor(cursor);
+    previous = SetCursor(cursor);
 
-    /* Destroy the cursor. */
+    /* A foreign process cannot destroy the cursor. */
     SendMessageA(child, WM_USER+1, 0, (LPARAM) cursor);
 
+    SetCursor( previous );
+    DestroyCursor( cursor );
+    DeleteObject( cursorInfo.hbmColor );
+    DeleteObject( cursorInfo.hbmMask );
+
+    for (i = 0; i < sizeof(mask_bits); i += 4)
+    {
+        mask_bits[i] = 0x55;
+        mask_bits[i + 1] = 0xaa;
+        mask_bits[i + 2] = 0x60;
+        mask_bits[i + 3] = 0;
+    }
+    for (i = 0; i < ARRAY_SIZE(color_bits); ++i) color_bits[i] = 0x80000000u | i * 0x010101;
+    if (pGetIconInfoExW && display_bpp == 32)
+    {
+        for (type = 0; type < 3; ++type)
+        {
+            if (type == 2) cursor = LoadCursorA( NULL, IDC_ARROW );
+            else
+            {
+                cursorInfo.xHotspot = 3;
+                cursorInfo.yHotspot = 5;
+                cursorInfo.hbmMask = CreateBitmap( 19, type ? 26 : 13, 1, 1, mask_bits );
+                cursorInfo.hbmColor = type ? NULL : CreateBitmap( 19, 13, 1, 32, color_bits );
+                cursor = CreateIconIndirect( &cursorInfo );
+                DeleteObject( cursorInfo.hbmColor );
+                DeleteObject( cursorInfo.hbmMask );
+            }
+            ok( !!cursor, "Failed to create cursor type %u\n", type );
+            if (!cursor) continue;
+            check_shared_cursor( cursor, type );
+            previous = SetCursor( cursor );
+            SendMessageA( child, WM_USER+2, type, (LPARAM)cursor );
+            /* Hiding must not discard the selected cursor's shared image. */
+            SetCursor( NULL );
+            SendMessageA( child, WM_USER+2, type, (LPARAM)cursor );
+            SetCursor( cursor );
+            SendMessageA( child, WM_USER+2, type, (LPARAM)cursor );
+            SetCursor( previous );
+            if (type != 2)
+            {
+                DestroyCursor( cursor );
+                SendMessageA( child, WM_USER+3, 0, (LPARAM)cursor );
+            }
+        }
+    }
+
+    child_cursor = (HCURSOR)SendMessageA( child, WM_USER+4, 0, 0 );
+    if (pGetIconInfoExW) check_shared_cursor( child_cursor, 1 );
     SendMessageA(child, WM_CLOSE, 0, 0);
     wait_child_process( &info );
+    ret = GetIconInfo( child_cursor, &cursorInfo );
+    ok( !ret, "Cursor from exited process is still readable\n" );
+    if (ret)
+    {
+        DeleteObject( cursorInfo.hbmColor );
+        DeleteObject( cursorInfo.hbmMask );
+    }
+    DestroyWindow( parent );
 }
 
 static BOOL color_match(COLORREF a, COLORREF b)
