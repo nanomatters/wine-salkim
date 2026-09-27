@@ -886,11 +886,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
     if (surface && role && surface->role && surface->role != role)
     {
-        /* Make sure any attached client surface is detached before we destroy the surface.
-         * They will be reattached when win32u updates them again after WindowPosChanged.
+        /* Destruction detaches the surface's clients without entering win32u's
+         * surface list under win_data_mutex. They are reattached by the normal
+         * client update after WindowPosChanged.
          */
         data->wayland_surface = NULL;
-        update_client_surfaces(data->hwnd);
         wayland_surface_destroy(surface);
     }
 

@@ -576,6 +576,8 @@ struct wayland_fullscreen_request
 struct wayland_client_surface
 {
     struct client_surface client;
+    /* Normal subsurface attachment, protected by win_data_mutex. */
+    struct list parent_entry;
     HWND toplevel;
     HANDLE throttle;
     struct wl_callback *wl_callback;
@@ -689,6 +691,8 @@ struct wayland_surface
     BOOL resizing;
     enum wayland_surface_ensure_type ensured_contents;
     struct wl_list hwnd_dmabuf_surfaces;
+    /* Includes replacement clients not selected by any wayland_win_data. */
+    struct list client_surfaces;
     struct wayland_hwnd_dmabuf_surface *direct_dmabuf_surface;
     struct wp_linux_drm_syncobj_surface_v1 *direct_dmabuf_syncobj_surface;
     /* The direct-toplevel client surface currently borrowing wl_surface for

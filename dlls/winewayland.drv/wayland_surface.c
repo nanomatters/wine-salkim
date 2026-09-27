@@ -2270,6 +2270,7 @@ struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flag
     surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
     surface->alpha_multiplier = UINT32_MAX;
     wl_list_init(&surface->hwnd_dmabuf_surfaces);
+    list_init(&surface->client_surfaces);
     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
     if (!surface->wl_surface)
     {
@@ -2306,6 +2307,16 @@ err:
  */
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
+    struct wayland_client_surface *client, *next;
+
+    /* Attachment and client destruction are serialized by win_data_mutex.
+     * Do not call update_client_surfaces here: its callbacks acquire that
+     * mutex while holding win32u's surface-list lock in the opposite order.
+     */
+    LIST_FOR_EACH_ENTRY_SAFE(client, next, &surface->client_surfaces,
+                             struct wayland_client_surface, parent_entry)
+        wayland_client_surface_attach(client, NULL);
+
     wayland_surface_clear_input_state(surface);
     if (!wayland_surface_clear_role(surface))
     {
@@ -7164,7 +7175,10 @@ static void wayland_client_surface_destroy(struct client_surface *client)
     if (surface->wp_viewport)
         wp_viewport_destroy(surface->wp_viewport);
     if (surface->wl_subsurface)
+    {
+        list_remove(&surface->parent_entry);
         wl_subsurface_destroy(surface->wl_subsurface);
+    }
     if (surface->owns_wl_surface && surface->wl_surface)
         wl_surface_destroy(surface->wl_surface);
     if (surface->owns_direct_wl_surface && surface->direct_wl_surface &&
@@ -7744,6 +7758,7 @@ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
     client_surface_suspend_presentation(&client->client, FALSE);
 
     list_init(&client->fullscreen_requests);
+    list_init(&client->parent_entry);
 
     client->wl_surface =
         wl_compositor_create_surface(process_wayland.wl_compositor);
@@ -7982,6 +7997,8 @@ BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *clien
         surface->retired_wl_surfaces[surface->retired_wl_surface_count - 1].handoff_subsurface =
                 surface->wl_subsurface;
         surface->wl_subsurface = NULL;
+        list_remove(&surface->parent_entry);
+        list_init(&surface->parent_entry);
     }
     /* Per-surface objects targeting the retired wl_surface; the direct path
      * recreates what it needs against the toplevel on demand. */
@@ -8298,6 +8315,8 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
             client_surface_invalidate_presentation(&client->client);
             wl_subsurface_destroy(client->wl_subsurface);
             client->wl_subsurface = NULL;
+            list_remove(&client->parent_entry);
+            list_init(&client->parent_entry);
             client->toplevel_wl_surface = NULL;
         }
 
@@ -8368,6 +8387,7 @@ static void wayland_client_surface_attach_internal(struct wayland_client_surface
                                             client->wl_surface,
                                             surface->wl_surface);
         if (!client->wl_subsurface) goto done;
+        list_add_tail(&surface->client_surfaces, &client->parent_entry);
 
         /* Present contents independently of the parent surface. */
         wl_subsurface_set_desync(client->wl_subsurface);
