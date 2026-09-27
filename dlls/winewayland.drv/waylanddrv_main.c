@@ -163,22 +163,21 @@ BOOL wayland_process_activation_token_pending(void)
 
 static NTSTATUS waylanddrv_unix_init(void *arg)
 {
-    /* Set the user driver functions now so that they are available during
-     * our initialization. We clear them on error. */
-    __wine_set_user_driver(&waylanddrv_funcs, WINE_GDI_DRIVER_VERSION);
-
     wayland_init_process_name();
     wayland_init_activation_token();
 
     if ((dmabuf_epoll_fd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto err;
     if (!wayland_process_init()) goto err;
 
+    /* Other threads can call the driver as soon as it is published. Finish
+     * initializing the window mutex and Wayland objects before exposing it. */
+    __wine_set_user_driver(&waylanddrv_funcs, WINE_GDI_DRIVER_VERSION);
+
     return 0;
 
 err:
     if (dmabuf_epoll_fd >= 0) close(dmabuf_epoll_fd);
     dmabuf_epoll_fd = -1;
-    __wine_set_user_driver(NULL, WINE_GDI_DRIVER_VERSION);
     return STATUS_UNSUCCESSFUL;
 }
 
