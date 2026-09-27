@@ -1752,14 +1752,12 @@ static void wayland_surface_destroy_dmabuf_surfaces(struct wayland_surface *surf
     }
 }
 
-/* Roundtrip through WindowPosChanged to refresh the host window state. */
-static void update_window_state(HWND hwnd)
+/* Refresh and expose on the window thread, without making the event dispatcher
+ * wait for it. The expose must follow the refresh of the host window state. */
+static void request_window_state_update(HWND hwnd)
 {
-    static const UINT swp_flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE |
-                                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
-    static const RECT rect;
-
-    NtUserSetRawWindowPos(hwnd, rect, swp_flags, FALSE);
+    NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+    NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
 }
 
 static BOOL wayland_surface_config_has_bounds(const struct wayland_surface_config *config)
@@ -2060,8 +2058,7 @@ static void xdg_popup_handle_done(void *private, struct xdg_popup *xdg_popup)
     }
 
     /* Ungrabbed popups may still be wanted by the application. */
-    update_window_state(hwnd);
-    NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+    request_window_state_update(hwnd);
 }
 
 static void xdg_popup_handle_reposition(void *private, struct xdg_popup *xdg_popup, uint32_t token)
@@ -2153,8 +2150,7 @@ void wp_fractional_scale_handle_scale(void* user_data,
 
     wayland_win_data_release(data);
 
-    request_window_surface_expose(hwnd, FALSE);
-    update_window_state(hwnd);
+    request_window_state_update(hwnd);
 }
 
 static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener =
