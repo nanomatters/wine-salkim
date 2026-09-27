@@ -1045,7 +1045,8 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
              !wayland_window_has_popup_grab(wayland_keyboard_get_focus_owner(hwnd)))
     {
         if (!(NtUserGetWindowLongW(input_hwnd, GWL_STYLE) & WS_MINIMIZE))
-            send_message(input_hwnd, WM_CANCELMODE, 0, 0);
+            /* Do not wait for the application from the Wayland event thread. */
+            NtUserMessageCall(input_hwnd, WM_CANCELMODE, 0, 0, NULL, NtUserSendNotifyMessage, FALSE);
     }
 
     if (input_hwnd == foreground)
