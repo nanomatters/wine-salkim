@@ -2545,22 +2545,47 @@ static BOOL has_collapsed_caption( UINT style, UINT ex_style,
     return top <= border_top;
 }
 
-static BOOL is_frameless_window( HWND hwnd, UINT style, UINT ex_style,
+static BOOL is_frameless_window( BOOL custom_frame, UINT style, UINT ex_style,
     const struct window_rects *rects )
 {
     if (!window_has_frame_style( style )) return FALSE;
     if ((style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME) &&
         (style & WS_CAPTION) != WS_CAPTION)
         return TRUE;
-    return has_collapsed_frame( &rects->window, &rects->client, get_custom_frame( hwnd ) ) ||
+    return has_collapsed_frame( &rects->window, &rects->client, custom_frame ) ||
            has_collapsed_caption( style, ex_style, &rects->window, &rects->client );
 }
 
-static void update_frameless_window( HWND hwnd, WND *win )
+static void update_frameless_window( HWND hwnd )
 {
-    if (is_frameless_window( hwnd, win->dwStyle, win->dwExStyle, &win->rects ))
-        NtUserSetProp( hwnd, frameless_window_prop, (HANDLE)1 );
-    else NtUserRemoveProp( hwnd, frameless_window_prop );
+    struct window_rects rects;
+    DWORD style, ex_style;
+    BOOL custom_frame, frameless;
+    WND *win;
+
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    style = win->dwStyle;
+    ex_style = win->dwExStyle;
+    rects = win->rects;
+    custom_frame = get_custom_frame( hwnd );
+    release_win_ptr( win );
+
+    /* Non-client metrics use the display DC and can initialize the driver.
+     * Do not keep the USER lock or a WND pointer across that work. */
+    user_check_not_lock();
+    frameless = is_frameless_window( custom_frame, style, ex_style, &rects );
+
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    /* Do not overwrite a newer window state if the query re-entered USER. */
+    if (win->dwStyle == style && win->dwExStyle == ex_style &&
+        EqualRect( &win->rects.window, &rects.window ) &&
+        EqualRect( &win->rects.client, &rects.client ) &&
+        custom_frame == get_custom_frame( hwnd ))
+    {
+        if (frameless) NtUserSetProp( hwnd, frameless_window_prop, (HANDLE)1 );
+        else NtUserRemoveProp( hwnd, frameless_window_prop );
+    }
+    release_win_ptr( win );
 }
 
 static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style, const struct window_rects *rects )
@@ -2570,7 +2595,7 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
 
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
     /* Kept borders are non-client space; present only the client area. */
-    if (is_frameless_window( hwnd, style, ex_style, rects )) return rects->client;
+    if (is_frameless_window( get_custom_frame( hwnd ), style, ex_style, rects )) return rects->client;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
     if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
 
@@ -2838,7 +2863,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             win->dwStyle      = reply->new_style;
             win->dwExStyle    = reply->new_ex_style;
             win->rects        = *new_rects;
-            update_frameless_window( hwnd, win );
             if ((win->surface = new_surface)) window_surface_add_ref( win->surface );
             surface_win       = wine_server_ptr_handle( reply->surface_win );
             if (get_window_long( win->parent, GWL_EXSTYLE ) & WS_EX_LAYOUTRTL)
@@ -2901,6 +2925,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (ret)
     {
+        update_frameless_window( hwnd );
         update_surface_region( surface_win );
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
         register_window_surface( old_surface, new_surface );
