@@ -2657,7 +2657,7 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
 {
     struct release_render_buffer_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
-    UINT32 written_bytes;
+    UINT32 written_bytes, locked_bytes;
     BYTE *buffer;
 
     pw_thread_loop_lock(pw_loop_global);
@@ -2669,8 +2669,8 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
         return STATUS_SUCCESS;
     }
 
-    if (params->written_frames * stream->frame_size >
-        (stream->locked >= 0 ? stream->locked : -stream->locked))
+    locked_bytes = stream->locked >= 0 ? stream->locked : -(INT64)stream->locked;
+    if (params->written_frames > locked_bytes / stream->frame_size)
     {
         pw_thread_loop_unlock(pw_loop_global);
         params->result = AUDCLNT_E_INVALID_SIZE;
