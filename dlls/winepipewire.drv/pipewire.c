@@ -1699,7 +1699,7 @@ static void on_stream_process(void *data)
         return;
     buf = b->buffer;
     if (!buf || !buf->n_datas || !buf->datas ||
-        !(d = &buf->datas[0])->data || !d->chunk)
+        !(d = &buf->datas[0])->data || !d->chunk || !d->maxsize)
     {
         stream->bad_buffer_count++;
         pw_stream_queue_buffer(stream->pw, b);
@@ -1743,14 +1743,13 @@ static void on_stream_process(void *data)
     {
         if (stream->started && stream->capture_ring)
         {
-            UINT32 offs = min(d->chunk->offset, d->maxsize);
-            UINT32 avail = min(d->chunk->size, d->maxsize - offs);
-            const BYTE *src = (const BYTE *)d->data + offs;
+            UINT32 offs = d->chunk->offset % d->maxsize;
+            UINT32 avail = min(d->chunk->size, d->maxsize);
             SIZE_T n = avail, cap_held;
 
             if (n > stream->capture_ring_size)
             {
-                src += n - stream->capture_ring_size;
+                offs = ((UINT64)offs + n - stream->capture_ring_size) % d->maxsize;
                 n = stream->capture_ring_size;
             }
             cap_held = __atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE);
@@ -1765,9 +1764,10 @@ static void on_stream_process(void *data)
             {
                 SIZE_T woff = (stream->cap_read_offs + stream->cap_held_bytes) % stream->capture_ring_size;
                 SIZE_T first = min(n, stream->capture_ring_size - woff);
-                memcpy(stream->capture_ring + woff, src, first);
+                copy_from_ring(stream->capture_ring + woff, d->data, d->maxsize, offs, first);
                 if (n > first)
-                    memcpy(stream->capture_ring, src + first, n - first);
+                    copy_from_ring(stream->capture_ring, d->data, d->maxsize,
+                                   ((UINT64)offs + first) % d->maxsize, n - first);
                 __atomic_add_fetch(&stream->cap_held_bytes, n, __ATOMIC_RELEASE);
             }
         }
