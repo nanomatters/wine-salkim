@@ -128,7 +128,8 @@ struct pipewire_stream
     SIZE_T capture_ring_size, cap_read_offs, cap_held_bytes;
     UINT64 capture_written;
 
-    INT64 clock_lastpos, clock_written;
+    UINT64 clock_lastpos; /* Cached in bytes, independently of the requested clock interface. */
+    INT64 clock_written;
     UINT32 underrun_count, overrun_count, bad_buffer_count;
     BOOL underrun_logged, overrun_logged, bad_buffer_logged;
 
@@ -2894,13 +2895,13 @@ static NTSTATUS pipewire_get_position(void *args)
     else
         *params->pos = stream->clock_written - stream->held_bytes;
 
-    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE || params->device)
-        *params->pos /= stream->frame_size;
-
     if (*params->pos < stream->clock_lastpos)
         *params->pos = stream->clock_lastpos;
     else
         stream->clock_lastpos = *params->pos;
+
+    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE || params->device)
+        *params->pos /= stream->frame_size;
     pw_thread_loop_unlock(pw_loop_global);
 
     if (params->qpctime)
