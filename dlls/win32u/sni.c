@@ -1212,6 +1212,12 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
      * past the unlock: holding sni_mutex across a send would invert lock order
      * against the pump handler (connection lock then sni_mutex) and deadlock. */
     pthread_mutex_lock( &sni_mutex );
+    if (!sni_available)
+    {
+        pthread_mutex_unlock( &sni_mutex );
+        free( image.bits );
+        return -1;
+    }
     switch (msg)
     {
     case NIM_ADD:
