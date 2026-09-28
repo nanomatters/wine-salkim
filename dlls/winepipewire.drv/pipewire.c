@@ -304,7 +304,16 @@ static UINT spa_format_bytes(enum spa_audio_format f)
 
 static void silence_buffer(enum spa_audio_format format, BYTE *buffer, UINT32 bytes)
 {
-    memset(buffer, format == SPA_AUDIO_FORMAT_U8 ? 0x80 : 0, bytes);
+    BYTE silence;
+
+    switch (format)
+    {
+    case SPA_AUDIO_FORMAT_U8:   silence = 0x80; break;
+    case SPA_AUDIO_FORMAT_ULAW: silence = 0xff; break;
+    case SPA_AUDIO_FORMAT_ALAW: silence = 0xd5; break;
+    default:                   silence = 0; break;
+    }
+    memset(buffer, silence, bytes);
 }
 
 /* Keep the unused low byte zero in Windows' little-endian 24-in-32 PCM. */
