@@ -2508,7 +2508,7 @@ static NTSTATUS pipewire_reset(void *args)
     else
     {
         ACPacket *p;
-        stream->clock_written = stream->capture_written;
+        stream->capture_written = stream->clock_written = stream->clock_lastpos = 0;
         stream->held_bytes = 0;
         stream->cap_read_offs = 0;
         __atomic_store_n(&stream->cap_held_bytes, 0, __ATOMIC_RELEASE);
@@ -2889,7 +2889,10 @@ static NTSTATUS pipewire_get_position(void *args)
         return STATUS_SUCCESS;
     }
 
-    *params->pos = stream->clock_written - stream->held_bytes;
+    if (stream->dataflow == eCapture)
+        *params->pos = stream->capture_written;
+    else
+        *params->pos = stream->clock_written - stream->held_bytes;
 
     if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE || params->device)
         *params->pos /= stream->frame_size;
