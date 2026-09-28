@@ -2804,6 +2804,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     WND *win;
     HWND owner_hint, surface_win = 0, toplevel;
     UINT raw_dpi, monitor_dpi, dpi = get_thread_dpi();
+    DWORD style = 0, ex_style = 0;
     BOOL ret, is_layered, is_child, need_icons = FALSE;
     struct window_rects old_rects;
     RECT extra_rects[3];
@@ -2916,15 +2917,18 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             if (is_fullscreen( &monitor_info, &new_rects->window )) swp_flags &= ~WINE_SWP_RESIZABLE;
             monitor_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
         }
-        if (!is_child && sni_should_layer_context_menu( hwnd, win->dwStyle, win->dwExStyle,
-                                                       &new_rects->window ))
-            swp_flags |= WINE_SWP_TRAY_MENU;
+        style = win->dwStyle;
+        ex_style = win->dwExStyle;
     }
 
     release_win_ptr( win );
 
     if (ret)
     {
+        /* Tray classification takes SNI and may query display/window state.
+         * Use this positioning request's snapshot without keeping USER held. */
+        if (!is_child && sni_should_layer_context_menu( hwnd, style, ex_style, &new_rects->window ))
+            swp_flags |= WINE_SWP_TRAY_MENU;
         update_frameless_window( hwnd );
         update_surface_region( surface_win );
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );

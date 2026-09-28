@@ -159,6 +159,12 @@ struct sni_icon
     unsigned char *icon_bits;
 };
 
+struct sni_icon_image
+{
+    unsigned char *bits;
+    int width, height;
+};
+
 static struct list icon_list = LIST_INIT( icon_list );
 static struct list dead_list = LIST_INIT( dead_list );   /* icons handed to the pump to close+free */
 static pthread_mutex_t sni_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -674,10 +680,24 @@ static DBusHandlerResult sni_object_handler( DBusConnection *conn, DBusMessage *
     const char *path = p_dbus_message_get_path( msg );
     DBusMessage *reply = NULL;
     struct sni_icon *icon = data;   /* one item per connection: the icon is the object user_data */
+    int x = 0, y = 0;
 
     if (!iface || !member || !path) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 
     TRACE( "incoming %s.%s on %s\n", iface, member, path );
+
+    if (!strcmp( iface, SNI_ITEM_IFACE ) && icon)
+    {
+        POINT point;
+
+        p_dbus_message_get_args( msg, NULL, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INVALID );
+        point.x = x;
+        point.y = y;
+        /* Driver coordinate mapping can acquire display locks. */
+        user_driver->pWindowMessage( 0, WM_WINE_MAP_NOTIFY_ICON_POINT, 0, (LPARAM)&point );
+        x = point.x;
+        y = point.y;
+    }
 
     pthread_mutex_lock( &sni_mutex );
 
@@ -734,15 +754,6 @@ static DBusHandlerResult sni_object_handler( DBusConnection *conn, DBusMessage *
     }
     else if (!strcmp( iface, SNI_ITEM_IFACE ) && icon)
     {
-        POINT point;
-        int x = 0, y = 0;
-
-        p_dbus_message_get_args( msg, NULL, DBUS_TYPE_INT32, &x, DBUS_TYPE_INT32, &y, DBUS_TYPE_INVALID );
-        point.x = x;
-        point.y = y;
-        user_driver->pWindowMessage( 0, WM_WINE_MAP_NOTIFY_ICON_POINT, 0, (LPARAM)&point );
-        x = point.x;
-        y = point.y;
         if (!strcmp( member, "Activate" ))
         {
             /* SNI sends one Activate per left-click with no double-click notion.
@@ -811,7 +822,13 @@ static DBusHandlerResult sni_object_handler( DBusConnection *conn, DBusMessage *
             pthread_mutex_lock( &sni_mutex );
         }
         else if (!strcmp( member, "SecondaryActivate" ))
+        {
+            icon_grab( icon );
+            pthread_mutex_unlock( &sni_mutex );
             notify_owner( icon, WM_MBUTTONUP, x, y );
+            icon_release( icon );
+            pthread_mutex_lock( &sni_mutex );
+        }
         /* Scroll: no Win32 tray equivalent. Ignored. */
         reply = p_dbus_message_new_method_return( msg );
     }
@@ -1123,23 +1140,19 @@ static void icon_release( struct sni_icon *icon )
 }
 
 /* apply a NOTIFYICONDATA update onto an icon record. Flags out which signals to emit */
-static void update_icon( struct sni_icon *icon, NOTIFYICONDATAW *nid, BOOL *image_changed,
-                         BOOL *tip_changed, BOOL *status_changed )
+static void update_icon( struct sni_icon *icon, NOTIFYICONDATAW *nid, struct sni_icon_image *image,
+                         BOOL *image_changed, BOOL *tip_changed, BOOL *status_changed )
 {
     if (nid->uFlags & NIF_MESSAGE) icon->callback_message = nid->uCallbackMessage;
 
-    if (nid->uFlags & NIF_ICON)
+    if (image->bits)
     {
-        unsigned char *bits;
-        int w = 0, h = 0;
-        if ((bits = icon_to_argb( nid->hIcon, &w, &h )))
-        {
-            free( icon->icon_bits );
-            icon->icon_bits = bits;
-            icon->icon_w = w;
-            icon->icon_h = h;
-            *image_changed = TRUE;
-        }
+        free( icon->icon_bits );
+        icon->icon_bits = image->bits;
+        icon->icon_w = image->width;
+        icon->icon_h = image->height;
+        image->bits = NULL;
+        *image_changed = TRUE;
     }
 
     if (nid->uFlags & NIF_TIP)
@@ -1178,6 +1191,7 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
     enum { ACT_NONE, ACT_REGISTER } action = ACT_NONE;
     BOOL sig_icon = FALSE, sig_tip = FALSE, sig_status = FALSE, queued_dead = FALSE;
     struct sni_icon *icon, *target = NULL;
+    struct sni_icon_image image = {0};
     LRESULT ret = -1;
 
     pthread_mutex_lock( &sni_mutex );
@@ -1187,10 +1201,17 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
     if (!sni_available && sni_connection && msg == NIM_ADD)
         sni_available = sni_watcher_present();
     if (!sni_available) { pthread_mutex_unlock( &sni_mutex ); return -1; }
+    pthread_mutex_unlock( &sni_mutex );
+
+    /* Reading an HICON acquires USER and can initialize GDI. Prepare the image
+     * without SNI held, then look up the destination again under the lock. */
+    if ((msg == NIM_ADD || msg == NIM_MODIFY) && (nid->uFlags & NIF_ICON))
+        image.bits = icon_to_argb( nid->hIcon, &image.width, &image.height );
 
     /* Touch the icon list and icon data only under the mutex. Defer all D-Bus I/O
      * past the unlock: holding sni_mutex across a send would invert lock order
      * against the pump handler (connection lock then sni_mutex) and deadlock. */
+    pthread_mutex_lock( &sni_mutex );
     switch (msg)
     {
     case NIM_ADD:
@@ -1202,7 +1223,7 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
         snprintf( icon->path, sizeof(icon->path), "%s", SNI_ITEM_OBJECT );
         snprintf( icon->id_str, sizeof(icon->id_str), "wine-%p-%u", icon->owner, icon->id );
         list_add_tail( &icon_list, &icon->entry );
-        update_icon( icon, nid, &sig_icon, &sig_tip, &sig_status );
+        update_icon( icon, nid, &image, &sig_icon, &sig_tip, &sig_status );
         icon_grab( icon );   /* keep alive across the post-unlock register */
         target = icon;
         action = ACT_REGISTER;
@@ -1210,7 +1231,7 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
         break;
     case NIM_MODIFY:
         if (!(icon = find_icon( nid->hWnd, nid->uID ))) { ret = -1; break; }  /* unknown here -> let the explorer tray try */
-        update_icon( icon, nid, &sig_icon, &sig_tip, &sig_status );
+        update_icon( icon, nid, &image, &sig_icon, &sig_tip, &sig_status );
         icon_grab( icon );   /* keep alive across the post-unlock signals */
         target = icon;
         ret = TRUE;
@@ -1233,6 +1254,7 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
         break;
     }
     pthread_mutex_unlock( &sni_mutex );
+    free( image.bits );
 
     /* D-Bus I/O, mutex released. target holds a ref taken under the mutex. It
      * stays alive here even if another thread deletes the icon concurrently. */
@@ -1292,10 +1314,14 @@ void sni_cleanup_icons( HWND owner )
 void sni_adjust_menu_position( HWND hwnd, INT *x, INT *y )
 {
     BOOL remove_context = FALSE;
+    HWND root_owner;
+
+    /* Window ancestry takes USER. Do not query it while holding SNI. */
+    root_owner = NtUserGetAncestor( hwnd, GA_ROOTOWNER );
 
     pthread_mutex_lock( &sni_mutex );
     if (native_menu_owner && native_menu_context_is_current() &&
-        (hwnd == native_menu_owner || NtUserGetAncestor( hwnd, GA_ROOTOWNER ) == native_menu_owner))
+        (hwnd == native_menu_owner || root_owner == native_menu_owner))
     {
         *x = native_menu_pos.x;
         *y = native_menu_pos.y;
