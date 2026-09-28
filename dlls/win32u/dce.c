@@ -2526,7 +2526,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
     HRGN rgn = get_update_region( hwnd, &flags, NULL );
     HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
-    void *bits;
+    void *bits, *copy = NULL;
 
     RECT dst = valid_rects[0];
     RECT src = valid_rects[1];
@@ -2536,15 +2536,28 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
     OffsetRect( &dst, -window_rect->left, -window_rect->top );
 
+    /* GDI can lock a different destination surface. Snapshot the source so
+     * it is never held across that lock acquisition. */
     window_surface_lock( old_surface );
-    bits = window_surface_get_color( old_surface, info );
+    if ((bits = window_surface_get_color( old_surface, info )) &&
+        (copy = malloc( info->bmiHeader.biSizeImage )))
+        memcpy( copy, bits, info->bmiHeader.biSizeImage );
+    window_surface_unlock( old_surface );
+
+    if (!copy)
+    {
+        NtUserReleaseDC( hwnd, hdc );
+        NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+        return;
+    }
+
     set_copy_bits_depth( copy_bits_depth + 1 );
     NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                                    src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
-                                    0, old_surface->rect.bottom - old_surface->rect.top,
-                                    bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+                                  src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                  0, old_surface->rect.bottom - old_surface->rect.top,
+                                  copy, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
     set_copy_bits_depth( copy_bits_depth );
-    window_surface_unlock( old_surface );
+    free( copy );
     NtUserReleaseDC( hwnd, hdc );
 }
 
