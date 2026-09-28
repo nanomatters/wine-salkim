@@ -545,9 +545,18 @@ static inline void unlock_surface( struct windrv_physdev *dev )
 
 static inline void lock_surfaces( struct windrv_physdev *dst_dev, struct windrv_physdev *src_dev )
 {
-    lock_surface( dst_dev );
-    if (src_dev && !src_dev->lock_count++ && dst_dev->surface != src_dev->surface)
-        window_surface_lock( src_dev->surface );
+    /* Order by backing surface, since different DCs may use the same surface. */
+    if (src_dev && (UINT_PTR)src_dev->surface < (UINT_PTR)dst_dev->surface)
+    {
+        if (!src_dev->lock_count++) window_surface_lock( src_dev->surface );
+        lock_surface( dst_dev );
+    }
+    else
+    {
+        lock_surface( dst_dev );
+        if (src_dev && !src_dev->lock_count++ && dst_dev->surface != src_dev->surface)
+            window_surface_lock( src_dev->surface );
+    }
 }
 
 static inline void unlock_surfaces( struct windrv_physdev *dst_dev, struct windrv_physdev *src_dev )
