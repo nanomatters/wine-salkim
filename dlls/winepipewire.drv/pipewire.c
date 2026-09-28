@@ -89,6 +89,7 @@ struct pipewire_stream
     struct spa_hook stream_listener;
     struct spa_audio_info_raw info;
     UINT32 frame_size;
+    BOOL pcm_24_in_32; /* Windows stores the valid bits at the high end of S32. */
     UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
     char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
     BOOL pending_error;
@@ -304,6 +305,16 @@ static UINT spa_format_bytes(enum spa_audio_format f)
 static void silence_buffer(enum spa_audio_format format, BYTE *buffer, UINT32 bytes)
 {
     memset(buffer, format == SPA_AUDIO_FORMAT_U8 ? 0x80 : 0, bytes);
+}
+
+/* Keep the unused low byte zero in Windows' little-endian 24-in-32 PCM. */
+static void clear_unused_sample_bits(const struct pipewire_stream *stream, BYTE *buffer, SIZE_T bytes)
+{
+    SIZE_T i;
+
+    if (stream->pcm_24_in_32)
+        for (i = 0; i < bytes; i += sizeof(INT32))
+            buffer[i] = 0;
 }
 
 /* copy n bytes out of a byte ring starting at offs, wrapping at ring_size */
@@ -1418,6 +1429,7 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
     UINT mask = 0, i = 0, j;
 
     memset(info, 0, sizeof(*info));
+    stream->pcm_24_in_32 = FALSE;
     info->rate = fmt->nSamplesPerSec;
 
     switch (fmt->wFormatTag)
@@ -1468,8 +1480,13 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
             case 16: if (valid == 16) spafmt = SPA_AUDIO_FORMAT_S16_LE; break;
             case 24: if (valid == 24) spafmt = SPA_AUDIO_FORMAT_S24_LE; break;
             case 32:
-                if (valid == 32) spafmt = SPA_AUDIO_FORMAT_S32_LE;
-                else if (valid == 24) spafmt = SPA_AUDIO_FORMAT_S24_32_LE;
+                if (valid == 32 || valid == 24)
+                {
+                    /* SPA's S24_32 stores the sample in the low 24 bits,
+                     * unlike WAVEFORMATEXTENSIBLE's left-aligned sample. */
+                    spafmt = SPA_AUDIO_FORMAT_S32_LE;
+                    stream->pcm_24_in_32 = valid == 24;
+                }
                 break;
             default:
                 WARN("Unsupported PCM container %u valid %lu.\n",
@@ -1550,6 +1567,8 @@ static void apply_volume(const struct pipewire_stream *stream, BYTE *buffer, UIN
 
     if (!bytes)
         return;
+
+    clear_unused_sample_bits(stream, buffer, bytes);
 
     for (i = 0; i < channels; i++)
     {
@@ -1673,6 +1692,7 @@ static void apply_volume(const struct pipewire_stream *stream, BYTE *buffer, UIN
     default:
         break;
     }
+    clear_unused_sample_bits(stream, buffer, bytes);
 }
 
 static void on_stream_state_changed(void *data, enum pw_stream_state old,
@@ -2195,6 +2215,7 @@ static void pipewire_read(struct pipewire_stream *stream)
 
         copy_from_ring(p->data, stream->capture_ring, stream->capture_ring_size,
                        stream->cap_read_offs, stream->period_bytes);
+        clear_unused_sample_bits(stream, p->data, stream->period_bytes);
         stream->cap_read_offs = (stream->cap_read_offs + stream->period_bytes) % stream->capture_ring_size;
         __atomic_sub_fetch(&stream->cap_held_bytes, stream->period_bytes, __ATOMIC_RELEASE);
     }
