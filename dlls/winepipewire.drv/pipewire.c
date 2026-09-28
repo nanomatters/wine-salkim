@@ -2200,27 +2200,48 @@ static void pipewire_read(struct pipewire_stream *stream)
     }
 }
 
+static BOOL pipewire_stream_get_time(struct pipewire_stream *stream, UINT64 mono_ns, UINT64 *now)
+{
+    struct pw_time pwt;
+
+    if (!stream->started || !stream_valid(stream) ||
+        pw_stream_get_time_n(stream->pw, &pwt, sizeof(pwt)) < 0 ||
+        !pwt.now || !pwt.rate.denom || mono_ns < (UINT64)pwt.now ||
+        mono_ns - pwt.now >= 1000000000)
+        return FALSE;
+
+    /* Extrapolate the graph clock between its once-per-cycle updates so the
+     * period grid does not chase quantum-sized steps when periods differ. */
+    *now = pwt.ticks * (UINT64)pwt.rate.num * 1000000 / pwt.rate.denom
+           + (mono_ns - pwt.now) / 1000;
+    return TRUE;
+}
+
 static void pipewire_period_timer_loop(void *args)
 {
     struct pipewire_period *period = args;
     struct pipewire_stream *stream;
     LARGE_INTEGER delay;
-    struct pw_time pwt;
     UINT64 now = 0;
 
     delay.QuadPart = -(INT64)period->period_usec * 10;
 
     while (!__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
     {
-        int have_now = 0;
+        struct timespec ts;
+        UINT64 mono_ns;
+        BOOL advance = TRUE;
 
         NtDelayExecution(FALSE, &delay);
 
         pw_thread_loop_lock(pw_loop_global);
         delay.QuadPart = -(INT64)period->period_usec * 10;
 
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        mono_ns = (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
+
         if (period->timer_stream &&
-            (!period->timer_stream->started || !period->timer_stream->pw))
+            !pipewire_stream_get_time(period->timer_stream, mono_ns, &now))
         {
             period->timer_stream = NULL;
             period->grid_valid = FALSE;
@@ -2229,7 +2250,7 @@ static void pipewire_period_timer_loop(void *args)
         {
             LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
             {
-                if (stream->started && stream->pw)
+                if (pipewire_stream_get_time(stream, mono_ns, &now))
                 {
                     period->timer_stream = stream;
                     period->grid_valid = FALSE;
@@ -2238,35 +2259,8 @@ static void pipewire_period_timer_loop(void *args)
             }
         }
 
-        if (period->timer_stream && period->timer_stream->pw &&
-            pw_stream_get_time_n(period->timer_stream->pw, &pwt, sizeof(pwt)) == 0 &&
-            pwt.now && pwt.rate.denom)
-        {
-            struct timespec ts;
-            UINT64 mono_ns;
-
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            mono_ns = (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
-
-            /* pwt.now and pwt.ticks only advance once per graph cycle, so
-             * comparing the continuous period grid against them directly
-             * makes the grid chase quantum-sized steps with clamp-sized
-             * corrections every tick (the wakeup cadence smears across
-             * period +/- period/2 whenever the quantum does not divide the
-             * period).  Extrapolate the graph clock to the sampling instant
-             * instead, like winepulse's PA_STREAM_INTERPOLATE_TIMING, and
-             * treat a graph that stopped updating as having no clock so the
-             * grid free-runs at the nominal period and re-acquires on
-             * resume. */
-            if (mono_ns >= (UINT64)pwt.now && mono_ns - pwt.now < 1000000000)
-            {
-                now = pwt.ticks * (UINT64)pwt.rate.num * 1000000 / pwt.rate.denom
-                      + (mono_ns - pwt.now) / 1000;
-                have_now = 1;
-            }
-        }
-
-        if (!have_now)
+        /* Without a usable graph clock, advance at the nominal period. */
+        if (!period->timer_stream)
             period->grid_valid = FALSE;
         else if (!period->grid_valid)
         {
@@ -2274,6 +2268,7 @@ static void pipewire_period_timer_loop(void *args)
              * one-period start absorb of the old per-stream loop */
             period->last_time = now;
             period->grid_valid = TRUE;
+            advance = FALSE;
         }
         else
         {
@@ -2283,6 +2278,7 @@ static void pipewire_period_timer_loop(void *args)
             {
                 /* graph clock stalled or jumped: re-acquire the grid next tick */
                 period->grid_valid = FALSE;
+                advance = FALSE;
             }
             else
             {
@@ -2293,21 +2289,24 @@ static void pipewire_period_timer_loop(void *args)
 
                 delay.QuadPart = -((INT64)period->period_usec + adjust) * 10;
                 period->last_time += period->period_usec;
+            }
+        }
 
-                LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
+        if (advance)
+        {
+            LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
+            {
+                if (!stream->started || !stream_valid(stream))
+                    continue;
+                if (stream->dataflow == eRender)
                 {
-                    if (!stream->started)
-                        continue;
-                    if (stream->dataflow == eRender)
-                    {
-                        UINT32 adv = min(stream->period_bytes, stream->held_bytes);
-                        stream->lcl_offs_bytes += adv;
-                        stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
-                        stream->held_bytes -= adv;
-                    }
-                    else
-                        pipewire_read(stream);
+                    UINT32 adv = min(stream->period_bytes, stream->held_bytes);
+                    stream->lcl_offs_bytes += adv;
+                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                    stream->held_bytes -= adv;
                 }
+                else
+                    pipewire_read(stream);
             }
         }
 
