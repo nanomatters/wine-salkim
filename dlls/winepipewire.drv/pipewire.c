@@ -126,6 +126,7 @@ struct pipewire_stream
      * cap_read_offs stays plain. */
     BYTE *capture_ring;
     SIZE_T capture_ring_size, cap_read_offs, cap_held_bytes;
+    UINT64 capture_written;
 
     INT64 clock_lastpos, clock_written;
     UINT32 underrun_count, overrun_count, bad_buffer_count;
@@ -145,7 +146,7 @@ typedef struct _ACPacket
     struct list entry;
     UINT64 qpcpos;
     BYTE *data;
-    UINT32 discont;
+    UINT64 devpos;
 } ACPacket;
 
 struct pw_phys_device
@@ -1745,12 +1746,16 @@ static void on_stream_process(void *data)
         {
             UINT32 offs = d->chunk->offset % d->maxsize;
             UINT32 avail = min(d->chunk->size, d->maxsize);
-            SIZE_T n = avail, cap_held;
+            SIZE_T n = avail - avail % stream->frame_size, cap_held;
+
+            /* Count all captured frames, including any lost before packetization. */
+            stream->capture_written += n;
 
             if (n > stream->capture_ring_size)
             {
                 offs = ((UINT64)offs + n - stream->capture_ring_size) % d->maxsize;
                 n = stream->capture_ring_size;
+                stream->overrun_count++;
             }
             cap_held = __atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE);
             if (cap_held + n > stream->capture_ring_size)
@@ -2169,20 +2174,13 @@ static void pipewire_read(struct pipewire_stream *stream)
 {
     while (__atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE) >= stream->period_bytes)
     {
-        ACPacket *p, *next;
+        ACPacket *p;
         LARGE_INTEGER stamp, freq;
 
         if (!(p = (ACPacket *)list_head(&stream->packet_free_head)))
         {
             p = (ACPacket *)list_head(&stream->packet_filled_head);
             if (!p) return;
-            if (!p->discont)
-            {
-                next = (ACPacket *)p->entry.next;
-                next->discont = 1;
-            }
-            else
-                p = (ACPacket *)list_tail(&stream->packet_filled_head);
         }
         else
         {
@@ -2190,7 +2188,7 @@ static void pipewire_read(struct pipewire_stream *stream)
         }
         NtQueryPerformanceCounter(&stamp, &freq);
         p->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
-        p->discont = 0;
+        p->devpos = stream->capture_written - stream->cap_held_bytes;
         list_remove(&p->entry);
         list_add_tail(&stream->packet_filled_head, &p->entry);
 
@@ -2510,7 +2508,7 @@ static NTSTATUS pipewire_reset(void *args)
     else
     {
         ACPacket *p;
-        stream->clock_written += stream->held_bytes;
+        stream->clock_written = stream->capture_written;
         stream->held_bytes = 0;
         stream->cap_read_offs = 0;
         __atomic_store_n(&stream->cap_held_bytes, 0, __ATOMIC_RELEASE);
@@ -2729,15 +2727,11 @@ static NTSTATUS pipewire_get_capture_buffer(void *args)
     {
         *params->frames = stream->period_bytes / stream->frame_size;
         *params->flags = 0;
-        if (packet->discont)
+        /* Absolute packet positions preserve gaps without altering older queued packets. */
+        if (packet->devpos != stream->clock_written)
             *params->flags |= AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
         if (params->devpos)
-        {
-            if (packet->discont)
-                *params->devpos = (stream->clock_written + stream->period_bytes) / stream->frame_size;
-            else
-                *params->devpos = stream->clock_written / stream->frame_size;
-        }
+            *params->devpos = packet->devpos / stream->frame_size;
         if (params->qpcpos)
             *params->qpcpos = packet->qpcpos;
         *params->data = packet->data;
@@ -2773,10 +2767,7 @@ static NTSTATUS pipewire_release_capture_buffer(void *args)
         ACPacket *packet = stream->locked_ptr;
         stream->locked_ptr = NULL;
         stream->held_bytes -= stream->period_bytes;
-        if (packet->discont)
-            stream->clock_written += 2 * stream->period_bytes;
-        else
-            stream->clock_written += stream->period_bytes;
+        stream->clock_written = packet->devpos + stream->period_bytes;
         list_add_tail(&stream->packet_free_head, &packet->entry);
     }
     stream->locked = 0;
