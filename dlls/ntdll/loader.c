@@ -2589,7 +2589,7 @@ static void build_ntdll_module(void)
     if (TRACE_ON(relay)) RELAY_SetupDLL( module );
     TRACE_(loaddll)( "Loaded %s at %p: builtin\n", debugstr_w(wm->ldr.FullDllName.Buffer), module);
 
-    hidden_exports_init( wm->ldr.FullDllName.Buffer );
+    hidden_exports_init( NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer );
 }
 
 
