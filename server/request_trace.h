@@ -3317,23 +3317,6 @@ static void dump_free_user_handle_request( const struct free_user_handle_request
     fprintf( stderr, ", handle=%08x", req->handle );
 }
 
-static void dump_set_cursor_data_request( const struct set_cursor_data_request *req )
-{
-    fprintf( stderr, " handle=%08x", req->handle );
-    dump_varargs_bytes( ", data=", cur_size );
-}
-
-static void dump_get_cursor_data_request( const struct get_cursor_data_request *req )
-{
-    fprintf( stderr, " handle=%08x", req->handle );
-}
-
-static void dump_get_cursor_data_reply( const struct get_cursor_data_reply *req )
-{
-    fprintf( stderr, " total=%u", req->total );
-    dump_varargs_bytes( ", data=", cur_size );
-}
-
 static void dump_set_cursor_request( const struct set_cursor_request *req )
 {
     fprintf( stderr, " flags=%08x", req->flags );
@@ -3706,6 +3689,23 @@ static void dump_set_window_cloaked_request( const struct set_window_cloaked_req
     fprintf( stderr, ", cloaked=%d", req->cloaked );
 }
 
+static void dump_set_cursor_data_request( const struct set_cursor_data_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_varargs_bytes( ", data=", cur_size );
+}
+
+static void dump_get_cursor_data_request( const struct get_cursor_data_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+}
+
+static void dump_get_cursor_data_reply( const struct get_cursor_data_reply *req )
+{
+    fprintf( stderr, " total=%u", req->total );
+    dump_varargs_bytes( ", data=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3996,8 +3996,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_window_layered_info_request,
     (dump_func)dump_alloc_user_handle_request,
     (dump_func)dump_free_user_handle_request,
-    (dump_func)dump_set_cursor_data_request,
-    (dump_func)dump_get_cursor_data_request,
     (dump_func)dump_set_cursor_request,
     (dump_func)dump_get_cursor_history_request,
     (dump_func)dump_get_rawinput_buffer_request,
@@ -4033,6 +4031,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_hwnd_dmabuf_claim_channel_request,
     (dump_func)dump_hwnd_dmabuf_release_channel_request,
     (dump_func)dump_set_window_cloaked_request,
+    (dump_func)dump_set_cursor_data_request,
+    (dump_func)dump_get_cursor_data_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4323,8 +4323,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_alloc_user_handle_reply,
     NULL,
-    NULL,
-    (dump_func)dump_get_cursor_data_reply,
     (dump_func)dump_set_cursor_reply,
     (dump_func)dump_get_cursor_history_reply,
     (dump_func)dump_get_rawinput_buffer_reply,
@@ -4360,6 +4358,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
     (dump_func)dump_hwnd_dmabuf_release_channel_reply,
     NULL,
+    NULL,
+    (dump_func)dump_get_cursor_data_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4650,8 +4650,6 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "set_window_layered_info",
     "alloc_user_handle",
     "free_user_handle",
-    "set_cursor_data",
-    "get_cursor_data",
     "set_cursor",
     "get_cursor_history",
     "get_rawinput_buffer",
@@ -4687,6 +4685,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "hwnd_dmabuf_claim_channel",
     "hwnd_dmabuf_release_channel",
     "set_window_cloaked",
+    "set_cursor_data",
+    "get_cursor_data",
 };
 
 static const struct

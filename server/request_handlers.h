@@ -293,8 +293,6 @@ DECL_HANDLER(get_window_layered_info);
 DECL_HANDLER(set_window_layered_info);
 DECL_HANDLER(alloc_user_handle);
 DECL_HANDLER(free_user_handle);
-DECL_HANDLER(set_cursor_data);
-DECL_HANDLER(get_cursor_data);
 DECL_HANDLER(set_cursor);
 DECL_HANDLER(get_cursor_history);
 DECL_HANDLER(get_rawinput_buffer);
@@ -330,6 +328,8 @@ DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
 DECL_HANDLER(hwnd_dmabuf_claim_channel);
 DECL_HANDLER(hwnd_dmabuf_release_channel);
 DECL_HANDLER(set_window_cloaked);
+DECL_HANDLER(set_cursor_data);
+DECL_HANDLER(get_cursor_data);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -620,8 +620,6 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_window_layered_info,
     (req_handler)req_alloc_user_handle,
     (req_handler)req_free_user_handle,
-    (req_handler)req_set_cursor_data,
-    (req_handler)req_get_cursor_data,
     (req_handler)req_set_cursor,
     (req_handler)req_get_cursor_history,
     (req_handler)req_get_rawinput_buffer,
@@ -657,6 +655,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_hwnd_dmabuf_claim_channel,
     (req_handler)req_hwnd_dmabuf_release_channel,
     (req_handler)req_set_window_cloaked,
+    (req_handler)req_set_cursor_data,
+    (req_handler)req_get_cursor_data,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2313,12 +2313,6 @@ C_ASSERT( sizeof(struct alloc_user_handle_reply) == 16 );
 C_ASSERT( offsetof(struct free_user_handle_request, type) == 12 );
 C_ASSERT( offsetof(struct free_user_handle_request, handle) == 16 );
 C_ASSERT( sizeof(struct free_user_handle_request) == 24 );
-C_ASSERT( offsetof(struct set_cursor_data_request, handle) == 12 );
-C_ASSERT( sizeof(struct set_cursor_data_request) == 16 );
-C_ASSERT( offsetof(struct get_cursor_data_request, handle) == 12 );
-C_ASSERT( sizeof(struct get_cursor_data_request) == 16 );
-C_ASSERT( offsetof(struct get_cursor_data_reply, total) == 8 );
-C_ASSERT( sizeof(struct get_cursor_data_reply) == 16 );
 C_ASSERT( offsetof(struct set_cursor_request, flags) == 12 );
 C_ASSERT( offsetof(struct set_cursor_request, handle) == 16 );
 C_ASSERT( offsetof(struct set_cursor_request, show_count) == 20 );
@@ -2504,3 +2498,9 @@ C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_reply) == 16 );
 C_ASSERT( offsetof(struct set_window_cloaked_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_window_cloaked_request, cloaked) == 16 );
 C_ASSERT( sizeof(struct set_window_cloaked_request) == 24 );
+C_ASSERT( offsetof(struct set_cursor_data_request, handle) == 12 );
+C_ASSERT( sizeof(struct set_cursor_data_request) == 16 );
+C_ASSERT( offsetof(struct get_cursor_data_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_cursor_data_request) == 16 );
+C_ASSERT( offsetof(struct get_cursor_data_reply, total) == 8 );
+C_ASSERT( sizeof(struct get_cursor_data_reply) == 16 );
