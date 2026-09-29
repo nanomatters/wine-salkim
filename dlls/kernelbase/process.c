@@ -554,6 +554,31 @@ char *get_product_name( const WCHAR *app_name )
     return ret;
 }
 
+static BOOL is_eac_eos_launcher( const WCHAR *image_path, const char *product_name )
+{
+    static const WCHAR settings[] = L"EasyAntiCheat\\Settings.json";
+    const WCHAR *filename = image_path + wcslen( image_path );
+    WCHAR *path;
+    DWORD attributes;
+    SIZE_T len;
+
+    if (product_name && !strcmp( product_name, "Easy Anti-Cheat Bootstrapper (EOS)" )) return TRUE;
+    if (product_name && !strcmp( product_name, "EasyAntiCheat Launcher" )) return FALSE;
+
+    /* Some games replace the bootstrapper's version information. Also recognize
+     * the EOS deployment layout, relative to the resolved executable, not the cwd. */
+    while (filename > image_path && filename[-1] != '\\' && filename[-1] != '/') --filename;
+    if (wcsicmp( filename, L"start_protected_game.exe" )) return FALSE;
+
+    len = filename - image_path;
+    if (!(path = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) + sizeof(settings) ))) return FALSE;
+    memcpy( path, image_path, len * sizeof(WCHAR) );
+    memcpy( path + len, settings, sizeof(settings) );
+    attributes = GetFileAttributesW( path );
+    HeapFree( GetProcessHeap(), 0, path );
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 static int battleye_launcher_redirect_hack( const WCHAR *app_name, WCHAR *new_name, DWORD new_name_len,
                                             WCHAR **orig_app_name, const char *product_name )
 {
@@ -781,6 +806,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     {
         UNICODE_STRING name, value;
         WCHAR exe_path[MAX_PATH], *p;
+        BOOL eos_launcher = is_eac_eos_launcher( params->ImagePathName.Buffer, product_name );
 
         WCHAR *new_env = RtlAllocateHeap( GetProcessHeap(), 0, params->EnvironmentSize );
         if (!new_env)
@@ -794,7 +820,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
         RtlDestroyProcessParameters( params );
         params = NULL;
 
-        if (product_name && !strcmp( product_name, "Easy Anti-Cheat Bootstrapper (EOS)" ))
+        if (eos_launcher)
         {
             /* Keep the compatibility state local to the child process tree. */
             RtlInitUnicodeString( &name, L"PROTON_EAC_EOS_PROCESS" );
@@ -805,7 +831,10 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                 HeapFree( GetProcessHeap(), 0, orig_app_name );
                 goto done;
             }
+        }
 
+        if (product_name && !strcmp( product_name, "Easy Anti-Cheat Bootstrapper (EOS)" ))
+        {
             /* EOS EAC bootstrapper will start the game process directly without using WINAPI, so env vars set on the
              * PE side will be lost. Preserve some critical ones. */
             sync_env_var_to_unix( new_env, "UPLAY_ARGUMENTS" );
