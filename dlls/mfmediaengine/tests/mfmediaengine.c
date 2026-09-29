@@ -2201,7 +2201,7 @@ static void test_GetDuration(BOOL add_extension)
     double duration;
     HRESULT hr;
     DWORD res;
-    BSTR url;
+    BSTR url, current_source;
 
     notify = create_transfer_notify();
     hr = create_media_engine(&notify->IMFMediaEngineNotify_iface, NULL, add_extension, DXGI_FORMAT_B8G8R8X8_UNORM,
@@ -2219,9 +2219,20 @@ static void test_GetDuration(BOOL add_extension)
     duration = IMFMediaEngineEx_GetDuration(media_engine);
     ok(compare_double(duration, 0.133467, allowed_error), "Got unexpected duration %lf.\n", duration);
 
+    hr = IMFMediaEngineEx_GetCurrentSource(media_engine, &current_source);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(current_source && !wcscmp(current_source, url), "Unexpected source %s.\n", wine_dbgstr_w(current_source));
+    SysFreeString(current_source);
+
     SysFreeString(url);
     IMFByteStream_Release(stream);
-    IMFMediaEngineEx_Shutdown(media_engine);
+    hr = IMFMediaEngineEx_Shutdown(media_engine);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    current_source = (BSTR)0xdeadbeef;
+    hr = IMFMediaEngineEx_GetCurrentSource(media_engine, &current_source);
+    ok(hr == MF_E_SHUTDOWN, "Unexpected hr %#lx.\n", hr);
+    ok(!current_source, "Unexpected source %p.\n", current_source);
+    if (current_source && current_source != (BSTR)0xdeadbeef) SysFreeString(current_source);
     IMFMediaEngineEx_Release(media_engine);
     IMFMediaEngineNotify_Release(&notify->IMFMediaEngineNotify_iface);
 }
