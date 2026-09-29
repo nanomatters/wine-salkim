@@ -636,12 +636,20 @@ struct wayland_shm_buffer
 struct wayland_hwnd_dmabuf_surface;
 struct wayland_win_data;
 
+struct wayland_surface_output
+{
+    struct wl_list link;
+    struct wayland_output *output;
+};
+
 struct wayland_surface
 {
     HWND hwnd;
     unsigned int serial;
 
     struct wl_surface *wl_surface;
+    /* Output membership belongs to this proxy, independently of its role. */
+    struct wl_list output_list;
     LONG pending_commit;
     struct wp_viewport *wp_viewport;
     struct wp_viewport *configured_wp_viewport;
@@ -748,6 +756,7 @@ void wayland_pointer_set_external_input_active(BOOL active);
  */
 
 void wayland_output_add_ref(struct wayland_output *output);
+struct wayland_output *wayland_output_get(struct wl_output *wl_output);
 BOOL wayland_output_create(uint32_t id, uint32_t version);
 void wayland_output_release(struct wayland_output *output);
 void wayland_output_remove(struct wayland_output *output);
@@ -781,6 +790,9 @@ enum wayland_image_description_status wayland_color_manager_get_image_descriptio
 unsigned long long wayland_time_ms(void);
 struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flags);
 void wayland_surface_destroy(struct wayland_surface *surface);
+struct wl_output *wayland_surface_get_output(struct wayland_surface *surface);
+BOOL wayland_surface_update_output(struct wayland_surface *surface,
+                                    struct wl_output *wl_output, BOOL entered);
 BOOL wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
                                    HWND owner, LPCWSTR title);
 BOOL wayland_surface_make_subsurface(struct wayland_surface *surface,
@@ -1033,6 +1045,7 @@ BOOL wayland_surface_monitor_fd(struct wayland_surface *surface, int fd);
 void wayland_surface_unmonitor_fd(int fd);
 void wayland_surface_dispatch_dmabuf(HWND hwnd, UINT32 serial);
 void wayland_window_init(void);
+void wayland_window_remove_output(struct wl_output *output);
 
 /**********************************************************************
  *          Wayland Keyboard

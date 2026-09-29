@@ -1852,6 +1852,19 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (hwnd == NtUserGetForegroundWindow()) reapply_cursor_clipping();
 }
 
+void wayland_window_remove_output(struct wl_output *output)
+{
+    struct wayland_win_data *data;
+
+    wayland_win_data_lock();
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->wayland_surface)
+            wayland_surface_update_output(data->wayland_surface, output, FALSE);
+    }
+    wayland_win_data_unlock();
+}
+
 static void wayland_configure_window(HWND hwnd)
 {
     struct wayland_surface *surface;

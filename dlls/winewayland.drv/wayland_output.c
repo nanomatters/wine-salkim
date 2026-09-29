@@ -737,6 +737,8 @@ void wayland_output_remove(struct wayland_output *output)
     output_info_array_update();
     pthread_mutex_unlock(&process_wayland.output_mutex);
 
+    /* Surface membership takes win_data_mutex before output_mutex. */
+    wayland_window_remove_output(output->wl_output);
     wayland_output_release(output);
 
     maybe_init_display_devices();
@@ -745,6 +747,22 @@ void wayland_output_remove(struct wayland_output *output)
 void wayland_output_add_ref(struct wayland_output *output)
 {
     InterlockedIncrement(&output->ref);
+}
+
+struct wayland_output *wayland_output_get(struct wl_output *wl_output)
+{
+    struct wayland_output *output, *found = NULL;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    wl_list_for_each(output, &process_wayland.output_list, link)
+    {
+        if (output->wl_output != wl_output) continue;
+        wayland_output_add_ref(output);
+        found = output;
+        break;
+    }
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+    return found;
 }
 
 /**********************************************************************

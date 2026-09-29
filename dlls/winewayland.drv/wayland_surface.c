@@ -1760,6 +1760,92 @@ static void request_window_state_update(HWND hwnd)
     NtUserPostMessage(hwnd, WM_WAYLAND_EXPOSE, 0, 0);
 }
 
+/* The result is borrowed while win_data_mutex is held. Multiple memberships
+ * do not identify a preferred output, so leave that case unresolved. */
+struct wl_output *wayland_surface_get_output(struct wayland_surface *surface)
+{
+    struct wayland_surface_output *entry;
+
+    if (wl_list_empty(&surface->output_list) ||
+        surface->output_list.next != surface->output_list.prev) return NULL;
+    entry = wl_container_of(surface->output_list.next, entry, link);
+    return entry->output->wl_output;
+}
+
+static void wayland_surface_clear_outputs(struct wayland_surface *surface)
+{
+    struct wayland_surface_output *entry, *next;
+
+    wl_list_for_each_safe(entry, next, &surface->output_list, link)
+    {
+        wl_list_remove(&entry->link);
+        wayland_output_release(entry->output);
+        free(entry);
+    }
+}
+
+/* Caller holds win_data_mutex. Each membership owns an output reference. */
+BOOL wayland_surface_update_output(struct wayland_surface *surface,
+                                    struct wl_output *wl_output, BOOL entered)
+{
+    struct wayland_surface_output *entry;
+    struct wayland_output *output;
+
+    if (!wl_output) return FALSE;
+    wl_list_for_each(entry, &surface->output_list, link)
+    {
+        if (entry->output->wl_output != wl_output) continue;
+        if (entered) return FALSE;
+        wl_list_remove(&entry->link);
+        wayland_output_release(entry->output);
+        free(entry);
+        return TRUE;
+    }
+    if (!entered || !(output = wayland_output_get(wl_output))) return FALSE;
+    if (!(entry = malloc(sizeof(*entry))))
+    {
+        wayland_output_release(output);
+        return FALSE;
+    }
+    entry->output = output;
+    wl_list_insert(surface->output_list.prev, &entry->link);
+    return TRUE;
+}
+
+static void wayland_surface_handle_output(void *private, struct wl_surface *wl_surface,
+                                          struct wl_output *wl_output, BOOL entered)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+
+    if (!(data = wayland_win_data_get(private))) return;
+    /* A retired direct-WSI proxy can outlive its HWND's current surface. */
+    if ((surface = data->wayland_surface) && surface->wl_surface == wl_surface &&
+        wayland_surface_update_output(surface, wl_output, entered))
+        TRACE("hwnd=%p wl_surface=%p output=%p entered=%u single_output=%p\n",
+              surface->hwnd, wl_surface, wl_output, entered, wayland_surface_get_output(surface));
+    wayland_win_data_release(data);
+}
+
+static void wl_surface_handle_enter(void *private, struct wl_surface *wl_surface,
+                                     struct wl_output *wl_output)
+{
+    wayland_surface_handle_output(private, wl_surface, wl_output, TRUE);
+}
+
+static void wl_surface_handle_leave(void *private, struct wl_surface *wl_surface,
+                                     struct wl_output *wl_output)
+{
+    wayland_surface_handle_output(private, wl_surface, wl_output, FALSE);
+}
+
+/* wl_compositor is bound at version 4, before preferred buffer scale events. */
+static const struct wl_surface_listener wl_surface_listener =
+{
+    .enter = wl_surface_handle_enter,
+    .leave = wl_surface_handle_leave,
+};
+
 static BOOL wayland_surface_config_has_bounds(const struct wayland_surface_config *config)
 {
     return config->bounds_set && config->bounds_width > 0 && config->bounds_height > 0;
@@ -2265,6 +2351,7 @@ struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flag
     surface->hwnd = hwnd;
     surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
     surface->alpha_multiplier = UINT32_MAX;
+    wl_list_init(&surface->output_list);
     wl_list_init(&surface->hwnd_dmabuf_surfaces);
     list_init(&surface->client_surfaces);
     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
@@ -2273,7 +2360,7 @@ struct wayland_surface *wayland_surface_create(HWND hwnd, BYTE alpha, DWORD flag
         ERR("Failed to create wl_surface Wayland surface\n");
         goto err;
     }
-    wl_surface_set_user_data(surface->wl_surface, hwnd);
+    wl_surface_add_listener(surface->wl_surface, &wl_surface_listener, hwnd);
 
     surface->wp_viewport =
         wp_viewporter_get_viewport(process_wayland.wp_viewporter,
@@ -2304,6 +2391,8 @@ err:
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
     struct wayland_client_surface *client, *next;
+
+    wayland_surface_clear_outputs(surface);
 
     /* Attachment and client destruction are serialized by win_data_mutex.
      * Do not call update_client_surfaces here: its callbacks acquire that
@@ -3132,7 +3221,7 @@ static BOOL wayland_surface_evict_direct_client(struct wayland_surface *surface)
         ERR("Failed to create replacement wl_surface for hwnd=%p\n", surface->hwnd);
         return FALSE;
     }
-    wl_surface_set_user_data(fresh, surface->hwnd);
+    wl_surface_add_listener(fresh, &wl_surface_listener, surface->hwnd);
     if (!(viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter, fresh)))
     {
         ERR("Failed to create replacement wp_viewport for hwnd=%p\n", surface->hwnd);
@@ -3161,6 +3250,7 @@ static BOOL wayland_surface_evict_direct_client(struct wayland_surface *surface)
     surface->configured_wp_viewport = NULL;
     surface->viewport_dest_width = surface->viewport_dest_height = 0;
 
+    wayland_surface_clear_outputs(surface);
     surface->wl_surface = fresh;
     surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
     surface->wp_viewport = viewport;
