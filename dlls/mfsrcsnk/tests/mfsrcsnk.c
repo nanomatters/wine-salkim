@@ -75,6 +75,7 @@ static void test_wave_sink(void)
     IMFMediaSink *sink, *sink2;
     IMFByteStream *bytestream;
     DWORD id, count, flags;
+    ULONG refcount;
     HRESULT hr;
     GUID guid;
 
@@ -105,6 +106,18 @@ static void test_wave_sink(void)
 
     hr = MFCreateWAVEMediaSink(bytestream, NULL, &sink);
     ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
+
+    hr = MFCreateMediaType(&media_type2);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaType_SetGUID(media_type2, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    refcount = IMFByteStream_AddRef(bytestream);
+    IMFByteStream_Release(bytestream);
+    hr = MFCreateWAVEMediaSink(bytestream, media_type2, &sink);
+    ok(hr == MF_E_ATTRIBUTENOTFOUND, "Unexpected hr %#lx.\n", hr);
+    ok(IMFByteStream_AddRef(bytestream) == refcount, "Byte stream reference leaked on failure.\n");
+    IMFByteStream_Release(bytestream);
+    IMFMediaType_Release(media_type2);
 
     hr = MFCreateWAVEMediaSink(bytestream, media_type, &sink);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
