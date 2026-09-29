@@ -126,8 +126,12 @@ NTSTATUS WINAPI vDbgPrintExWithPrefix( LPCSTR prefix, ULONG id, ULONG level, LPC
 
 static struct ntuser_client_procs_table user_procs;
 
+/*
+ * The Finals expects these functions to have the same ordering as in GCC builds,
+ * which use .text$name sections. Specify the sections so Clang uses that ordering too.
+ */
 #define DEFINE_USER_FUNC(name,ptr) \
-    LRESULT WINAPI name( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp ) { return (ptr)( hwnd, msg, wp, lp ); }
+    __attribute__((section(".text$" #name))) LRESULT WINAPI name( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp ) { return (ptr)( hwnd, msg, wp, lp ); }
 
 #define USER_FUNC(name,proc) \
     DEFINE_USER_FUNC( Ntdll##name##_A, user_procs.A[proc][0] ) \
