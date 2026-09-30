@@ -1861,6 +1861,41 @@ static const struct test_image_load_info
             }
         }
     },
+    /* Explicit dimensions must be rounded up for block-compressed textures. */
+    {
+        test_dds_dxt1, sizeof(test_dds_dxt1),
+        {
+            7, 5, D3DX10_DEFAULT, D3DX10_DEFAULT, 1, (D3D10_USAGE)D3DX10_DEFAULT,
+            D3DX10_DEFAULT, D3DX10_DEFAULT, D3DX10_DEFAULT, DXGI_FORMAT_BC1_UNORM,
+            D3DX10_DEFAULT, D3DX10_DEFAULT
+        },
+        S_OK, D3D10_SRV_DIMENSION_TEXTURE2D, D3D10_RESOURCE_DIMENSION_TEXTURE2D,
+        {.desc_2d = {8, 8, 1, 1, DXGI_FORMAT_BC1_UNORM, {1, 0}, D3D10_USAGE_DEFAULT,
+                D3D10_BIND_SHADER_RESOURCE, 0, 0}}
+    },
+    /* Resolve dimension sentinels before block alignment. */
+    {
+        test_dds_bc5, sizeof(test_dds_bc5),
+        {
+            D3DX10_FROM_FILE, D3DX10_DEFAULT, D3DX10_DEFAULT, D3DX10_DEFAULT, 1, (D3D10_USAGE)D3DX10_DEFAULT,
+            D3DX10_DEFAULT, D3DX10_DEFAULT, D3DX10_DEFAULT, D3DX10_DEFAULT,
+            D3DX10_DEFAULT, D3DX10_DEFAULT
+        },
+        S_OK, D3D10_SRV_DIMENSION_TEXTURE2D, D3D10_RESOURCE_DIMENSION_TEXTURE2D,
+        {.desc_2d = {8, 4, 1, 1, DXGI_FORMAT_BC5_UNORM, {1, 0}, D3D10_USAGE_DEFAULT,
+                D3D10_BIND_SHADER_RESOURCE, 0, 0}}
+    },
+    {
+        test_dds_bc5, sizeof(test_dds_bc5),
+        {
+            0, 0, D3DX10_DEFAULT, D3DX10_DEFAULT, 1, (D3D10_USAGE)D3DX10_DEFAULT,
+            D3DX10_DEFAULT, D3DX10_DEFAULT, D3DX10_DEFAULT, D3DX10_DEFAULT,
+            D3DX10_DEFAULT, D3DX10_DEFAULT
+        },
+        S_OK, D3D10_SRV_DIMENSION_TEXTURE2D, D3D10_RESOURCE_DIMENSION_TEXTURE2D,
+        {.desc_2d = {8, 4, 1, 1, DXGI_FORMAT_BC5_UNORM, {1, 0}, D3D10_USAGE_DEFAULT,
+                D3D10_BIND_SHADER_RESOURCE, 0, 0}}
+    },
 };
 
 static const struct test_invalid_image_load_info
