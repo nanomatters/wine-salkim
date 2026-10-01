@@ -163,6 +163,15 @@ typedef struct _ACPacket
     UINT64 devpos;
 } ACPacket;
 
+static BOOL capture_packet_offset(SIZE_T buffer_bytes, SIZE_T *offset)
+{
+    const SIZE_T alignment = TYPE_ALIGNMENT(ACPacket);
+
+    if (buffer_bytes > SIZE_MAX - (alignment - 1)) return FALSE;
+    *offset = (buffer_bytes + alignment - 1) & ~(alignment - 1);
+    return TRUE;
+}
+
 struct pw_phys_device
 {
     struct list entry;
@@ -2333,6 +2342,7 @@ static NTSTATUS pipewire_create_stream(void *args)
     else
     {
         UINT32 capture_packets, unalign;
+        SIZE_T packet_offset;
 
         if ((unalign = bufsize_bytes % stream->period_bytes))
             bufsize_bytes += stream->period_bytes - unalign;
@@ -2340,7 +2350,12 @@ static NTSTATUS pipewire_create_stream(void *args)
         stream->real_bufsize_bytes = bufsize_bytes;
         capture_packets = stream->real_bufsize_bytes / stream->period_bytes;
 
-        size = stream->real_bufsize_bytes + capture_packets * sizeof(ACPacket);
+        if (!capture_packet_offset(stream->real_bufsize_bytes, &packet_offset))
+        {
+            hr = E_INVALIDARG;
+            goto exit;
+        }
+        size = packet_offset + capture_packets * sizeof(ACPacket);
         if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
         {
@@ -2349,7 +2364,7 @@ static NTSTATUS pipewire_create_stream(void *args)
         }
         else
         {
-            ACPacket *cur_packet = (ACPacket *)((char *)stream->local_buffer + stream->real_bufsize_bytes);
+            ACPacket *cur_packet = (ACPacket *)((char *)stream->local_buffer + packet_offset);
             BYTE *data = stream->local_buffer;
             silence_buffer(stream->info.format, stream->local_buffer, stream->real_bufsize_bytes);
             for (i = 0; i < capture_packets; ++i, ++cur_packet)

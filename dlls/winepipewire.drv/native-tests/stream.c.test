@@ -306,6 +306,23 @@ static void test_next_packet(void)
     assert(params.result == S_OK && !frames && !loop_depth);
 }
 
+static void test_packet_alignment(void)
+{
+    const SIZE_T bytes[] = {0, 1, 3, 396, 1188, 2049};
+    SIZE_T offset;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(bytes); ++i)
+    {
+        assert(capture_packet_offset(bytes[i], &offset));
+        assert(offset >= bytes[i] && offset - bytes[i] < TYPE_ALIGNMENT(ACPacket));
+        assert(!(offset % TYPE_ALIGNMENT(ACPacket)));
+    }
+    assert(capture_packet_offset(SIZE_MAX - TYPE_ALIGNMENT(ACPacket) + 1, &offset));
+    assert(!capture_packet_offset(SIZE_MAX - TYPE_ALIGNMENT(ACPacket) + 2, &offset));
+    assert(!capture_packet_offset(SIZE_MAX, &offset));
+}
+
 int main(int argc, char **argv)
 {
     assert(argc <= 2);
@@ -313,6 +330,7 @@ int main(int argc, char **argv)
     if (argc == 1 || !strcmp(argv[1], "rate")) test_sample_rate();
     if (argc == 1 || !strcmp(argv[1], "clock")) test_clock_frequency();
     if (argc == 1 || !strcmp(argv[1], "packet")) test_next_packet();
+    if (argc == 1 || !strcmp(argv[1], "alignment")) test_packet_alignment();
     puts("PipeWire stream tests passed");
     return 0;
 }
