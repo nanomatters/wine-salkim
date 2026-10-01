@@ -1,0 +1,209 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#define udev_new test_udev_new
+#define udev_unref test_udev_unref
+#define udev_device_new_from_syspath test_device_new
+#define udev_device_get_parent_with_subsystem_devtype test_device_parent
+#define udev_device_get_property_value test_device_property
+#define udev_device_unref test_device_unref
+#define pw_proxy_destroy test_proxy_destroy
+#include "test.h"
+#include <sys/mman.h>
+
+static const char *usb_product = "054c/0ce6/100";
+static char requested_path[PATH_MAX];
+static unsigned int destroyed;
+
+void test_proxy_destroy(struct pw_proxy *proxy)
+{
+    assert(proxy);
+    ++destroyed;
+}
+
+struct udev *test_udev_new(void) { return (void *)1; }
+struct udev *test_udev_unref(struct udev *context) { return NULL; }
+struct udev_device *test_device_new(struct udev *context, const char *path)
+{
+    copy_cstr(requested_path, sizeof(requested_path), path);
+    return !strcmp(path, "/sys/devices/controller/sound/card0") ? (void *)2 : NULL;
+}
+struct udev_device *test_device_parent(struct udev_device *device, const char *subsystem, const char *type)
+{
+    assert(!strcmp(subsystem, "usb") && !strcmp(type, "usb_device"));
+    return (void *)3;
+}
+const char *test_device_property(struct udev_device *device, const char *key)
+{
+    if (!strcmp(key, "PRODUCT")) return usb_product;
+    if (!strcmp(key, "USEC_INITIALIZED")) return "72623859790382856";
+    if (!strcmp(key, "BUSNUM")) return "3";
+    if (!strcmp(key, "DEVNUM")) return "17";
+    return NULL;
+}
+struct udev_device *test_device_unref(struct udev_device *device) { return NULL; }
+
+static void test_container(void)
+{
+    GUID a = {0}, b = {0};
+    UINT64 initialized = 0x0102030405060708;
+
+    get_usb_container("/devices/controller/sound/card0", &a);
+    get_usb_container("/sys/devices/controller/sound/card0", &b);
+    assert(!memcmp(&a, &b, sizeof(a)));
+    assert(a.Data1 == 0x0ce6054c && a.Data2 == 3 && a.Data3 == 17);
+    assert(!memcmp(a.Data4, &initialized, sizeof(a.Data4)));
+    memset(&b, 0, sizeof(b));
+    usb_product = "10000/0ce6/100";
+    get_usb_container("/devices/controller/sound/card0", &b);
+    assert(!b.Data1);
+    get_usb_container("/etc/controller", &b);
+    assert(!strcmp(requested_path, "/sys/devices/controller/sound/card0"));
+    usb_product = "054c/0ce6/100";
+}
+
+static void test_properties(void)
+{
+    static const PROPERTYKEY path_key = {
+        {0xb3f8fa53,0x0004,0x438e,{0x90,0x03,0x51,0xa4,0x6e,0x13,0x9b,0xfc}}, 2
+    };
+    struct pw_phys_device *device = calloc(1, sizeof(*device) + 4);
+    GUID guid = {0,0,0,{0,0,0,0,0x12,0x34,0x56,0x78}};
+    WCHAR buffer[128];
+    PROPVARIANT value = {0};
+    unsigned int size = 0;
+    struct get_prop_value_params params = {
+        .device = "usb", .flow = eRender, .guid = &guid, .prop = &path_key,
+        .value = &value, .buffer_size = &size
+    };
+    const char expected[] = "{1}.USB\\VID_054C&PID_0CE6\\7&12345678";
+    unsigned int i;
+
+    strcpy(device->pw_name, "usb");
+    device->bus = DEVICE_BUS_USB;
+    device->vendor = 0x054c;
+    device->product = 0x0ce6;
+    device->index = 7;
+    get_usb_container("/devices/controller/sound/card0", &device->container);
+    list_add_tail(&g_render_devices, &device->entry);
+    pipewire_get_prop_value(&params);
+    assert(params.result == E_NOT_SUFFICIENT_BUFFER && size == sizeof(expected) * sizeof(WCHAR));
+    params.buffer = buffer;
+    size--;
+    pipewire_get_prop_value(&params);
+    assert(params.result == E_NOT_SUFFICIENT_BUFFER);
+    pipewire_get_prop_value(&params);
+    assert(params.result == S_OK && value.vt == VT_LPWSTR && value.pwszVal == buffer);
+    for (i = 0; i < sizeof(expected); i++) assert(buffer[i] == expected[i]);
+
+    params.prop = (const PROPERTYKEY *)&DEVPKEY_Device_ContainerId;
+    size = sizeof(GUID) - 1;
+    pipewire_get_prop_value(&params);
+    assert(params.result == E_NOT_SUFFICIENT_BUFFER && size == sizeof(GUID));
+    pipewire_get_prop_value(&params);
+    assert(params.result == S_OK && value.vt == VT_CLSID);
+    assert(value.puuid == (GUID *)buffer && !memcmp(buffer, &device->container, sizeof(GUID)));
+
+#ifdef _WIN64
+    {
+        struct prop32 { USHORT vt, reserved[3]; union { ULONG ptr; UINT64 padding; }; };
+        struct params32 { ULONG device; EDataFlow flow; ULONG guid, prop; HRESULT result;
+                          ULONG value, buffer, buffer_size; };
+        BYTE *memory = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+        struct params32 *args;
+        struct prop32 *out;
+
+        assert(memory != MAP_FAILED && (UINT_PTR)memory <= UINT32_MAX);
+        args = (void *)memory;
+        out = (void *)(memory + 64);
+        args->device = (UINT_PTR)(memory + 128);
+        strcpy((void *)(memory + 128), "usb");
+        args->flow = eRender;
+        args->guid = (UINT_PTR)(memory + 160);
+        args->prop = (UINT_PTR)(memory + 192);
+        memcpy(memory + 192, &DEVPKEY_Device_ContainerId, sizeof(PROPERTYKEY));
+        args->value = (UINT_PTR)out;
+        args->buffer = (UINT_PTR)(memory + 256);
+        args->buffer_size = (UINT_PTR)(memory + 320);
+        *(unsigned int *)(memory + 320) = sizeof(GUID);
+        pipewire_wow64_get_prop_value(args);
+        assert(args->result == S_OK && out->vt == VT_CLSID && out->ptr == args->buffer);
+        assert(!memcmp(memory + 256, &device->container, sizeof(GUID)));
+        munmap(memory, 4096);
+    }
+#endif
+    list_remove(&device->entry);
+    free(device);
+}
+
+static void test_device_info(void)
+{
+    struct spa_dict_item properties[] = {
+        {PW_KEY_DEVICE_BUS, "usb"}, {PW_KEY_DEVICE_VENDOR_ID, "0x054c"},
+        {PW_KEY_DEVICE_PRODUCT_ID, "0x0ce6"},
+        {PW_KEY_DEVICE_SYSFS_PATH, "/devices/controller/sound/card0"}
+    };
+    struct spa_dict dict = SPA_DICT_INIT_ARRAY(properties);
+    struct pw_device_info info = {.change_mask = PW_DEVICE_CHANGE_MASK_PROPS, .props = &dict};
+    struct probe p = {0};
+    struct probe_device *source = calloc(1, sizeof(*source));
+    struct pw_phys_device device = {0};
+
+    list_init(&p.devices);
+    source->id = 42;
+    list_add_tail(&p.devices, &source->entry);
+    on_probe_device_info(source, &info);
+    set_device_identity(&device, &p, 42);
+    assert(device.bus == DEVICE_BUS_USB && device.vendor == 0x054c && device.product == 0x0ce6);
+    assert(device.container.Data1 == 0x0ce6054c);
+    on_probe_registry_global_remove(&p, 42);
+    assert(list_empty(&p.devices));
+}
+
+static void test_missing_device_info(void)
+{
+    struct probe p = {0};
+    struct pw_phys_device device = {0};
+    struct probe_device *source;
+    unsigned int i;
+
+    list_init(&p.nodes);
+    list_init(&p.devices);
+    for (i = 0; i < 3; ++i)
+    {
+        source = calloc(1, sizeof(*source));
+        assert(source);
+        source->id = 42;
+        list_add_tail(&p.devices, &source->entry);
+        /* Failed bind, removal before info, and teardown before info. */
+        if (i)
+        {
+            source->proxy = (void *)1;
+            spa_list_init(&source->listener.link);
+        }
+        set_device_identity(&device, &p, 42);
+        assert(!device.bus && !device.vendor && !device.product && !device.container.Data1);
+        if (i == 2)
+        {
+            probe_teardown(&p);
+            assert(!source->proxy && !source->info);
+            release_probe_device(source);
+        }
+        else
+            on_probe_registry_global_remove(&p, 42);
+        assert(list_empty(&p.devices));
+    }
+    assert(destroyed == 2);
+}
+
+int main(void)
+{
+    test_container();
+    test_properties();
+    test_device_info();
+    test_missing_device_info();
+    puts("PipeWire identity tests passed");
+    return 0;
+}
