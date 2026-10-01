@@ -2258,15 +2258,16 @@ static void SETUPDI_EnumerateInterfaces(HDEVINFO DeviceInfoSet,
 static BOOL is_device_instance_linked(HKEY subKey, HKEY interfacesKey, const WCHAR *deviceInstance)
 {
     LONG l;
-    DWORD class_idx = 0, device_idx, len, type;
+    DWORD class_idx = 0, device_idx, len;
     HKEY class_key, device_key, link_key;
     WCHAR class_keyname[40], device_keyname[MAX_DEVICE_ID_LEN];
     WCHAR interface_devinstance[MAX_DEVICE_ID_LEN];
     WCHAR alt_devinstance[MAX_DEVICE_ID_LEN];
     WCHAR service[40];
 
-    l = RegQueryValueExW(subKey, L"Service", NULL, &type, (BYTE *)service, &len);
-    if (!l && type == REG_SZ && !wcsicmp(service, L"winehid") && !wcsstr(deviceInstance, L"HID\\"))
+    len = sizeof(service);
+    l = RegGetValueW(subKey, NULL, L"Service", RRF_RT_REG_SZ, NULL, service, &len);
+    if (!l && !wcsicmp(service, L"winehid") && !wcsstr(deviceInstance, L"HID\\"))
     {
         const WCHAR *tmp = wcschr(deviceInstance, L'\\');
 
@@ -2300,9 +2301,9 @@ static BOOL is_device_instance_linked(HKEY subKey, HKEY interfacesKey, const WCH
             if (l)
                 continue;
 
-            len = ARRAY_SIZE(interface_devinstance);
-            l = RegQueryValueExW(device_key, L"DeviceInstance", NULL, &type, (BYTE *)interface_devinstance, &len);
-            if (l || type != REG_SZ)
+            len = sizeof(interface_devinstance);
+            l = RegGetValueW(device_key, NULL, L"DeviceInstance", RRF_RT_REG_SZ, NULL, interface_devinstance, &len);
+            if (l)
             {
                 RegCloseKey(device_key);
                 continue;

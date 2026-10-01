@@ -5249,6 +5249,94 @@ static void test_driver_store(struct testsign_context *ctx)
     ok(ret, "Failed to destroy device list.\n");
 }
 
+static void test_winehid_device_presence(void)
+{
+    static const struct
+    {
+        DWORD type, size;
+        const WCHAR *service;
+        BOOL present;
+    }
+    tests[] =
+    {
+        {REG_SZ, sizeof(L"winehidx"), L"winehidx", FALSE},
+        {REG_SZ, sizeof(L"winehid") - sizeof(WCHAR), L"winehid", TRUE},
+        {REG_SZ, sizeof(L"winehid"), L"winehid", TRUE},
+        {REG_BINARY, sizeof(L"winehid"), L"winehid", FALSE},
+        {REG_SZ, sizeof(L""), L"", FALSE},
+    };
+    static const WCHAR usb_id[] = L"USB\\WINE_TEST_SERVICE\\0000";
+    static const WCHAR hid_id[] = L"HID\\WINE_TEST_SERVICE\\0000";
+    static const WCHAR link_key[] = L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+            L"{6a55b5a4-3f65-11db-b704-0011955c2bdb}\\"
+            L"##?#HID#WINE_TEST_SERVICE#0000#{6a55b5a4-3f65-11db-b704-0011955c2bdb}\\#\\Control";
+    SP_DEVINFO_DATA usb = {sizeof(usb)}, hid = {sizeof(hid)}, found = {sizeof(found)};
+    HDEVINFO set, present_set;
+    HKEY key, service_key;
+    DWORD linked = 1;
+    unsigned int i;
+    BOOL ret;
+    LONG status;
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        skip("Wine HID aliases are not used on Windows.\n");
+        return;
+    }
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "CreateDeviceInfoList failed: %lu.\n", GetLastError());
+    if (set == INVALID_HANDLE_VALUE) return;
+
+    ret = SetupDiCreateDeviceInfoW(set, usb_id, &guid, NULL, NULL, 0, &usb);
+    ok(ret, "CreateDeviceInfo failed: %lu.\n", GetLastError());
+    if (!ret) goto done;
+    ret = SetupDiCreateDeviceInfoW(set, hid_id, &guid, NULL, NULL, 0, &hid);
+    ok(ret, "CreateDeviceInfo failed: %lu.\n", GetLastError());
+    if (!ret) goto remove_usb;
+    ret = SetupDiRegisterDeviceInfo(set, &usb, 0, NULL, NULL, NULL);
+    ok(ret, "RegisterDeviceInfo failed: %lu.\n", GetLastError());
+    ret = SetupDiRegisterDeviceInfo(set, &hid, 0, NULL, NULL, NULL);
+    ok(ret, "RegisterDeviceInfo failed: %lu.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &hid, &guid, NULL, 0, NULL);
+    ok(ret, "CreateDeviceInterface failed: %lu.\n", GetLastError());
+
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, link_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+    ok(!status, "Create link key failed: %lu.\n", status);
+    if (status) goto remove_hid;
+    status = RegSetValueExW(key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+    ok(!status, "Set Linked failed: %lu.\n", status);
+    RegCloseKey(key);
+
+    service_key = SetupDiOpenDevRegKey(set, &usb, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_ALL_ACCESS);
+    ok(service_key != INVALID_HANDLE_VALUE, "OpenDevRegKey failed: %lu.\n", GetLastError());
+    if (service_key == INVALID_HANDLE_VALUE) goto remove_hid;
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("case %u", i);
+        status = RegSetValueExW(service_key, L"Service", 0, tests[i].type,
+                (const BYTE *)tests[i].service, tests[i].size);
+        ok(!status, "Set Service failed: %lu.\n", status);
+        present_set = SetupDiGetClassDevsW(&guid, L"USB\\WINE_TEST_SERVICE", NULL, DIGCF_PRESENT);
+        ok(present_set != INVALID_HANDLE_VALUE, "GetClassDevs failed: %lu.\n", GetLastError());
+        if (present_set != INVALID_HANDLE_VALUE)
+        {
+            ret = SetupDiEnumDeviceInfo(present_set, 0, &found);
+            ok(ret == tests[i].present, "Device presence is %u, expected %u.\n", ret, tests[i].present);
+            SetupDiDestroyDeviceInfoList(present_set);
+        }
+        winetest_pop_context();
+    }
+    RegCloseKey(service_key);
+
+remove_hid:
+    SetupDiRemoveDevice(set, &hid);
+remove_usb:
+    SetupDiRemoveDevice(set, &usb);
+done:
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 static void test_device_enum(void)
 {
     SP_DEVINFO_DATA devinfodata;
@@ -5369,6 +5457,7 @@ START_TEST(devinst)
     test_get_class_devs();
     test_SetupDiOpenDeviceInterface();
     test_device_enum();
+    test_winehid_device_presence();
 
     if (!testsign_create_cert(&ctx))
         return;
