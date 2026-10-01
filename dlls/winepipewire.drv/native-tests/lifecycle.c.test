@@ -1,0 +1,52 @@
+/* PipeWire initialization and teardown regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static unsigned int init_count, loop_attempts;
+
+static void check_init_locked(void)
+{
+    int ret = pthread_mutex_trylock(&pw_init_mutex);
+
+    if (!ret) pthread_mutex_unlock(&pw_init_mutex);
+    assert(ret == EBUSY);
+}
+
+void pw_init(int *argc, char **argv[])
+{
+    check_init_locked();
+    assert(!init_count);
+    ++init_count;
+}
+
+void pw_deinit(void)
+{
+    check_init_locked();
+    assert(init_count == 1);
+    --init_count;
+}
+
+struct pw_thread_loop *pw_thread_loop_new(const char *name, const struct spa_dict *props)
+{
+    check_init_locked();
+    assert(init_count == 1);
+    ++loop_attempts;
+    return NULL;
+}
+
+int main(void)
+{
+    assert(!pipewire_process_attach(NULL));
+    assert(!pipewire_main_loop_start(NULL));
+    assert(loop_attempts == 1);
+    assert(!pw_loop_global);
+    assert(!pipewire_main_loop_stop(NULL));
+    assert(!init_count);
+    assert(!pthread_mutex_trylock(&pw_init_mutex));
+    assert(!pthread_mutex_unlock(&pw_init_mutex));
+    puts("PipeWire lifecycle checks passed.");
+    return 0;
+}

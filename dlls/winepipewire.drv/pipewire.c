@@ -697,8 +697,10 @@ static void pipewire_set_plugin_dirs(void)
 
 static NTSTATUS pipewire_process_attach(void *args)
 {
+    pthread_mutex_lock(&pw_init_mutex);
     pipewire_set_plugin_dirs();
     pw_init(NULL, NULL);
+    pthread_mutex_unlock(&pw_init_mutex);
     TRACE("PipeWire %s, header %s\n", pw_get_library_version(), pw_get_headers_version());
     return STATUS_SUCCESS;
 }
@@ -874,8 +876,8 @@ static NTSTATUS pipewire_main_loop_stop(void *args)
         pw_thread_loop_destroy(pw_loop_global);
         pw_loop_global = NULL;
     }
-    pthread_mutex_unlock(&pw_init_mutex);
     pw_deinit();
+    pthread_mutex_unlock(&pw_init_mutex);
     return STATUS_SUCCESS;
 }
 
