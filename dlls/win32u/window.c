@@ -2548,12 +2548,18 @@ static BOOL has_collapsed_caption( UINT style, UINT ex_style,
 static BOOL is_frameless_window( BOOL custom_frame, UINT style, UINT ex_style,
     const struct window_rects *rects )
 {
+    RECT client;
+
     if (!window_has_frame_style( style )) return FALSE;
     if ((style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME) &&
         (style & WS_CAPTION) != WS_CAPTION)
         return TRUE;
-    return has_collapsed_frame( &rects->window, &rects->client, custom_frame ) ||
-           has_collapsed_caption( style, ex_style, &rects->window, &rects->client );
+
+    /* Only borders inside the window contribute to its non-client frame.
+     * Preserve the existing handling of empty or disjoint rectangles. */
+    if (!intersect_rect( &client, &rects->window, &rects->client )) client = rects->client;
+    return has_collapsed_frame( &rects->window, &client, custom_frame ) ||
+           has_collapsed_caption( style, ex_style, &rects->window, &client );
 }
 
 static void update_frameless_window( HWND hwnd )
@@ -2595,7 +2601,12 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
 
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
     /* Kept borders are non-client space; present only the client area. */
-    if (is_frameless_window( get_custom_frame( hwnd ), style, ex_style, rects )) return rects->client;
+    if (is_frameless_window( get_custom_frame( hwnd ), style, ex_style, rects ))
+    {
+        /* An expanded client area must not enlarge the host window. */
+        if (intersect_rect( &visible_rect, &rects->window, &rects->client )) return visible_rect;
+        return rects->client;
+    }
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
     if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
 
