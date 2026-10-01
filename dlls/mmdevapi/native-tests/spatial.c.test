@@ -1,0 +1,574 @@
+/* Native tests of the static spatial-audio implementation.
+ *
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include <assert.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define COBJMACROS
+#include "initguid.h"
+#include "windef.h"
+#include "winbase.h"
+#include "ole2.h"
+#include "mmdeviceapi.h"
+#include "audioclient.h"
+#include "spatialaudioclient.h"
+#include "wine/debug.h"
+#include "wine/list.h"
+#include "wine/unixlib.h"
+
+extern NTSTATUS __wine_unix_call(unixlib_handle_t, unsigned int, void *);
+
+static unsigned int allocation_count, fail_allocation;
+static int live_allocations, live_locks;
+static unsigned int close_count, duplicate_count, endpoint_count, render_release_count;
+static BOOL duplicate_result = TRUE;
+static HRESULT endpoint_result = S_OK, render_release_result = S_OK;
+static LONG notify_refs = 1;
+static pthread_barrier_t admission_barrier;
+static _Thread_local BOOL wait_before_lock;
+static float render_buffer[2048];
+
+static void *test_malloc(size_t size);
+static void *test_calloc(size_t count, size_t size);
+static void test_free(void *ptr);
+static void test_initialize_cs(CRITICAL_SECTION *cs);
+static void test_delete_cs(CRITICAL_SECTION *cs);
+static void test_enter_cs(CRITICAL_SECTION *cs);
+static void test_leave_cs(CRITICAL_SECTION *cs);
+static BOOL test_duplicate(HANDLE source_process, HANDLE source, HANDLE dest_process,
+                           HANDLE *dest, DWORD access, BOOL inherit, DWORD flags);
+static BOOL test_close(HANDLE handle);
+static INT test_muldiv(INT value, INT numerator, INT denominator);
+
+/* Only operating-system services are replaced. The API bodies, object types,
+ * lists, reference counts, and COM vtables below are the production source. */
+#define malloc test_malloc
+#define calloc test_calloc
+#define free test_free
+#define InitializeCriticalSection test_initialize_cs
+#define DeleteCriticalSection test_delete_cs
+#define EnterCriticalSection test_enter_cs
+#define LeaveCriticalSection test_leave_cs
+#define DuplicateHandle test_duplicate
+#define CloseHandle test_close
+#define MulDiv test_muldiv
+#define CoTaskMemFree test_free
+#undef GetLastError
+#define GetLastError() ERROR_ACCESS_DENIED
+#undef GetCurrentProcess
+#define GetCurrentProcess() ((HANDLE)(LONG_PTR)-1)
+#ifndef SPATIAL_TEST_SOURCE
+#define SPATIAL_TEST_SOURCE "../spatialaudio.c"
+#endif
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#include SPATIAL_TEST_SOURCE
+#pragma GCC diagnostic pop
+#undef malloc
+#undef calloc
+#undef free
+#undef InitializeCriticalSection
+#undef DeleteCriticalSection
+#undef EnterCriticalSection
+#undef LeaveCriticalSection
+#undef DuplicateHandle
+#undef CloseHandle
+#undef MulDiv
+#undef CoTaskMemFree
+
+unsigned char __wine_dbg_get_channel_flags(struct __wine_debug_channel *channel)
+{
+    return 0;
+}
+
+int __wine_dbg_header(enum __wine_debug_class cls, struct __wine_debug_channel *channel,
+                      const char *function)
+{
+    return -1;
+}
+
+int __wine_dbg_output(const char *str)
+{
+    return 0;
+}
+
+const char *__wine_dbg_strdup(const char *str)
+{
+    return "";
+}
+
+static void *test_malloc(size_t size)
+{
+    void *ptr;
+    unsigned int n = __atomic_add_fetch(&allocation_count, 1, __ATOMIC_RELAXED);
+    if (fail_allocation && n == fail_allocation) return NULL;
+    ptr = malloc(size);
+    assert(ptr);
+    __atomic_add_fetch(&live_allocations, 1, __ATOMIC_RELAXED);
+    return ptr;
+}
+
+static void *test_calloc(size_t count, size_t size)
+{
+    void *ptr = test_malloc(count * size);
+    if (ptr) memset(ptr, 0, count * size);
+    return ptr;
+}
+
+static void test_free(void *ptr)
+{
+    if (!ptr) return;
+    __atomic_sub_fetch(&live_allocations, 1, __ATOMIC_RELAXED);
+    free(ptr);
+}
+
+static void test_initialize_cs(CRITICAL_SECTION *cs)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutex_t *mutex = malloc(sizeof(*mutex));
+    assert(mutex);
+    assert(!pthread_mutexattr_init(&attr));
+    assert(!pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE));
+    assert(!pthread_mutex_init(mutex, &attr));
+    assert(!pthread_mutexattr_destroy(&attr));
+    cs->LockSemaphore = mutex;
+    __atomic_add_fetch(&live_locks, 1, __ATOMIC_RELAXED);
+}
+
+static void test_delete_cs(CRITICAL_SECTION *cs)
+{
+    assert(!pthread_mutex_destroy(cs->LockSemaphore));
+    free(cs->LockSemaphore);
+    __atomic_sub_fetch(&live_locks, 1, __ATOMIC_RELAXED);
+}
+
+static void test_enter_cs(CRITICAL_SECTION *cs)
+{
+    if (wait_before_lock)
+    {
+        int ret;
+        wait_before_lock = FALSE;
+        ret = pthread_barrier_wait(&admission_barrier);
+        assert(!ret || ret == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
+    assert(!pthread_mutex_lock(cs->LockSemaphore));
+}
+
+static void test_leave_cs(CRITICAL_SECTION *cs)
+{
+    assert(!pthread_mutex_unlock(cs->LockSemaphore));
+}
+
+static BOOL test_duplicate(HANDLE source_process, HANDLE source, HANDLE dest_process,
+                           HANDLE *dest, DWORD access, BOOL inherit, DWORD flags)
+{
+    duplicate_count++;
+    assert(source == (HANDLE)0x1234);
+    if (!duplicate_result) return FALSE;
+    *dest = (HANDLE)0x5678;
+    return TRUE;
+}
+
+static BOOL test_close(HANDLE handle)
+{
+    /* Cleanup must never close the caller's event after DuplicateHandle fails. */
+    assert(handle == (HANDLE)0x5678);
+    close_count++;
+    return TRUE;
+}
+
+static INT test_muldiv(INT value, INT numerator, INT denominator)
+{
+    return ((INT64)value * numerator + denominator / 2) / denominator;
+}
+
+static ULONG WINAPI client_release(IAudioClient *iface) { return 1; }
+static HRESULT WINAPI client_stop(IAudioClient *iface) { return S_OK; }
+static HRESULT WINAPI client_reset(IAudioClient *iface) { return S_OK; }
+static HRESULT WINAPI client_start(IAudioClient *iface) { return S_OK; }
+static HRESULT WINAPI client_period(IAudioClient *iface, REFERENCE_TIME *period, REFERENCE_TIME *min)
+{
+    *period = 100000;
+    return S_OK;
+}
+static HRESULT WINAPI client_initialize(IAudioClient *iface, AUDCLNT_SHAREMODE share, DWORD flags,
+        REFERENCE_TIME duration, REFERENCE_TIME period, const WAVEFORMATEX *format, const GUID *guid)
+{
+    assert(format->nChannels == 1 && format->nSamplesPerSec == 48000);
+    return S_OK;
+}
+static HRESULT WINAPI client_event(IAudioClient *iface, HANDLE event)
+{
+    assert(event == (HANDLE)0x5678);
+    return S_OK;
+}
+static ULONG WINAPI render_release(IAudioRenderClient *iface) { return 1; }
+static HRESULT WINAPI render_get(IAudioRenderClient *iface, UINT32 frames, BYTE **buffer)
+{
+    assert(frames <= ARRAY_SIZE(render_buffer));
+    *buffer = (BYTE *)render_buffer;
+    return S_OK;
+}
+static HRESULT WINAPI render_commit(IAudioRenderClient *iface, UINT32 frames, DWORD flags)
+{
+    render_release_count++;
+    return render_release_result;
+}
+static IAudioRenderClientVtbl render_vtbl = {
+    .Release = render_release, .GetBuffer = render_get, .ReleaseBuffer = render_commit,
+};
+static IAudioRenderClient render_iface = {&render_vtbl};
+static HRESULT WINAPI client_service(IAudioClient *iface, REFIID riid, void **service)
+{
+    assert(IsEqualIID(riid, &IID_IAudioRenderClient));
+    *service = &render_iface;
+    return S_OK;
+}
+static IAudioClientVtbl client_vtbl = {
+    .Release = client_release, .Initialize = client_initialize, .Start = client_start,
+    .Stop = client_stop, .Reset = client_reset, .SetEventHandle = client_event,
+    .GetDevicePeriod = client_period, .GetService = client_service,
+};
+static IAudioClient client_iface = {&client_vtbl};
+static HRESULT WINAPI device_activate(IMMDevice *iface, REFIID riid, DWORD context,
+                                      PROPVARIANT *params, void **out)
+{
+    endpoint_count++;
+    assert(IsEqualIID(riid, &IID_IAudioClient));
+    if (FAILED(endpoint_result)) return endpoint_result;
+    *out = &client_iface;
+    return S_OK;
+}
+static IMMDeviceVtbl device_vtbl = {.Activate = device_activate};
+static IMMDevice device_iface = {&device_vtbl};
+static ULONG WINAPI notify_addref(ISpatialAudioObjectRenderStreamNotify *iface)
+{
+    return InterlockedIncrement(&notify_refs);
+}
+static ULONG WINAPI notify_release(ISpatialAudioObjectRenderStreamNotify *iface)
+{
+    return InterlockedDecrement(&notify_refs);
+}
+static ISpatialAudioObjectRenderStreamNotifyVtbl notify_vtbl = {
+    .AddRef = notify_addref, .Release = notify_release,
+};
+static ISpatialAudioObjectRenderStreamNotify notify_iface = {&notify_vtbl};
+
+static void init_client(SpatialAudioImpl *client)
+{
+    memset(client, 0, sizeof(*client));
+    client->ISpatialAudioClient_iface.lpVtbl = &ISpatialAudioClient_vtbl;
+    client->ref = 1;
+    client->mmdev = &device_iface;
+    client->object_fmtex.Format = (WAVEFORMATEX){
+        WAVE_FORMAT_IEEE_FLOAT, 1, 48000, 48000 * sizeof(float), sizeof(float), 32, 0,
+    };
+}
+
+static void init_stream(SpatialAudioStreamImpl *stream, SpatialAudioImpl *client)
+{
+    memset(stream, 0, sizeof(*stream));
+    stream->ISpatialAudioObjectRenderStream_iface.lpVtbl = &ISpatialAudioObjectRenderStream_vtbl;
+    stream->ref = 1;
+    stream->sa_client = client;
+    stream->params.StaticObjectTypeMask = AudioObjectType_FrontLeft | AudioObjectType_FrontRight;
+    stream->period_frames = 8;
+    stream->update_frames = ~0u;
+    stream->render = &render_iface;
+    stream->buf = render_buffer;
+    test_initialize_cs(&stream->lock);
+    list_init(&stream->objects);
+}
+
+static void object_oom(void)
+{
+    SpatialAudioImpl client;
+    SpatialAudioStreamImpl stream;
+    ISpatialAudioObject *object;
+    unsigned int n;
+    init_client(&client);
+    init_stream(&stream, &client);
+    for (n = 1; n <= 2; ++n)
+    {
+        allocation_count = 0;
+        fail_allocation = n;
+        object = (void *)0xdead;
+        assert(SAORS_ActivateSpatialAudioObject(&stream.ISpatialAudioObjectRenderStream_iface,
+                AudioObjectType_FrontLeft, &object) == E_OUTOFMEMORY);
+        assert(!object && !live_allocations && stream.ref == 1 && list_empty(&stream.objects));
+        fail_allocation = 0;
+        assert(SAORS_ActivateSpatialAudioObject(&stream.ISpatialAudioObjectRenderStream_iface,
+                AudioObjectType_FrontLeft, &object) == S_OK);
+        assert(ISpatialAudioObject_Release(object) == 0);
+        assert(!live_allocations && stream.ref == 1 && list_empty(&stream.objects));
+    }
+    test_delete_cs(&stream.lock);
+}
+
+static void zero_frames(void)
+{
+    SpatialAudioImpl client;
+    SpatialAudioStreamImpl stream;
+    ISpatialAudioObject *object;
+    BYTE *buffer = (void *)0xdead;
+    UINT32 bytes = ~0u, dynamic, frames;
+    init_client(&client);
+    init_stream(&stream, &client);
+    stream.period_frames = 0;
+    assert(SAORS_ActivateSpatialAudioObject(&stream.ISpatialAudioObjectRenderStream_iface,
+            AudioObjectType_FrontLeft, &object) == S_OK);
+    assert(stream.ref == 2);
+    assert(SAORS_BeginUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface,
+                                         &dynamic, &frames) == S_OK);
+    assert(!frames && !dynamic);
+    assert(ISpatialAudioObject_GetBuffer(object, &buffer, &bytes) == S_OK);
+    assert(!bytes);
+    assert(SAORS_EndUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface) == S_OK);
+    assert(stream.update_frames == ~0u && !render_release_count);
+    assert(ISpatialAudioObject_Release(object) == 0);
+    assert(!live_allocations && stream.ref == 1 && list_empty(&stream.objects));
+    test_delete_cs(&stream.lock);
+}
+
+struct activation_thread {
+    SpatialAudioStreamImpl *stream;
+    AudioObjectType type;
+    ISpatialAudioObject *object;
+    HRESULT result;
+};
+
+static void *activate_thread(void *arg)
+{
+    struct activation_thread *t = arg;
+    wait_before_lock = TRUE;
+    t->result = SAORS_ActivateSpatialAudioObject(&t->stream->ISpatialAudioObjectRenderStream_iface,
+                                                t->type, &t->object);
+    return NULL;
+}
+
+static void admission_race(void)
+{
+    SpatialAudioImpl client;
+    SpatialAudioStreamImpl stream;
+    struct activation_thread args[2];
+    pthread_t threads[2];
+    unsigned int i, success = 0;
+    init_client(&client);
+    init_stream(&stream, &client);
+    assert(!pthread_barrier_init(&admission_barrier, NULL, 2));
+    for (i = 0; i < 2; ++i)
+    {
+        args[i] = (struct activation_thread){.stream = &stream, .type = AudioObjectType_FrontLeft};
+        assert(!pthread_create(&threads[i], NULL, activate_thread, &args[i]));
+    }
+    for (i = 0; i < 2; ++i)
+    {
+        assert(!pthread_join(threads[i], NULL));
+        if (args[i].result == S_OK) success++;
+        else assert(args[i].result == SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE && !args[i].object);
+    }
+    assert(success == 1 && stream.ref == 2);
+    for (i = 0; i < 2; ++i) if (args[i].object) ISpatialAudioObject_Release(args[i].object);
+    assert(stream.ref == 1 && list_empty(&stream.objects) && !live_allocations);
+    assert(!pthread_barrier_destroy(&admission_barrier));
+    test_delete_cs(&stream.lock);
+}
+
+static void *release_thread(void *arg)
+{
+    struct activation_thread *t = arg;
+    unsigned int i;
+    for (i = 0; i < 2000; ++i)
+    {
+        ISpatialAudioObject *object = NULL;
+        assert(SAORS_ActivateSpatialAudioObject(&t->stream->ISpatialAudioObjectRenderStream_iface,
+                                                t->type, &object) == S_OK);
+        assert(ISpatialAudioObject_Release(object) == 0);
+    }
+    return NULL;
+}
+
+static void release_race(void)
+{
+    SpatialAudioImpl client;
+    SpatialAudioStreamImpl stream;
+    struct activation_thread args[2];
+    pthread_t threads[2];
+    unsigned int i;
+    init_client(&client);
+    init_stream(&stream, &client);
+    for (i = 0; i < 2; ++i)
+    {
+        args[i] = (struct activation_thread){.stream = &stream,
+                .type = i ? AudioObjectType_FrontRight : AudioObjectType_FrontLeft};
+        assert(!pthread_create(&threads[i], NULL, release_thread, &args[i]));
+    }
+    for (i = 0; i < 2; ++i) assert(!pthread_join(threads[i], NULL));
+    assert(stream.ref == 1 && list_empty(&stream.objects) && !live_allocations);
+    test_delete_cs(&stream.lock);
+}
+
+static void stream_failure(unsigned int fail, BOOL duplicate, HRESULT endpoint, HRESULT expected)
+{
+    SpatialAudioImpl client;
+    ISpatialAudioObjectRenderStream *stream = (void *)0xdead;
+    SpatialAudioObjectRenderStreamActivationParams params = {0};
+    PROPVARIANT prop = {.vt = VT_BLOB};
+    HRESULT hr;
+    init_client(&client);
+    params.ObjectFormat = &client.object_fmtex.Format;
+    params.StaticObjectTypeMask = AudioObjectType_FrontLeft;
+    params.EventHandle = (HANDLE)0x1234;
+    params.NotifyObject = &notify_iface;
+    prop.blob.cbSize = sizeof(params);
+    prop.blob.pBlobData = (BYTE *)&params;
+    fail_allocation = fail;
+    duplicate_result = duplicate;
+    endpoint_result = endpoint;
+    hr = SAC_ActivateSpatialAudioStream(&client.ISpatialAudioClient_iface, &prop,
+                                        &IID_ISpatialAudioObjectRenderStream, (void **)&stream);
+    assert(hr == expected && !stream);
+    assert(client.ref == 1 && notify_refs == 1 && !live_allocations && !live_locks);
+    if (duplicate_count && duplicate) assert(close_count == 1);
+    else assert(!close_count);
+    if (!duplicate) assert(!endpoint_count);
+
+    /* A failure must leave the client reusable, not merely avoid a crash. */
+    fail_allocation = 0;
+    duplicate_result = TRUE;
+    endpoint_result = S_OK;
+    assert(SAC_ActivateSpatialAudioStream(&client.ISpatialAudioClient_iface, &prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&stream) == S_OK);
+    assert(client.ref == 2 && notify_refs == 2 && live_allocations == 2 && live_locks == 1);
+    assert(ISpatialAudioObjectRenderStream_Release(stream) == 0);
+    assert(client.ref == 1 && notify_refs == 1 && !live_allocations && !live_locks);
+}
+
+static void stream_oom(void) { stream_failure(1, TRUE, S_OK, E_OUTOFMEMORY); }
+static void format_oom(void) { stream_failure(2, TRUE, S_OK, E_OUTOFMEMORY); }
+static void duplicate_failure(void)
+{
+    stream_failure(0, FALSE, S_OK, HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED));
+}
+static void endpoint_failure(void) { stream_failure(0, TRUE, E_FAIL, E_FAIL); }
+
+static void constructor_oom(void)
+{
+    ISpatialAudioClient *client = (void *)0xdead;
+    fail_allocation = 1;
+    assert(SpatialAudioClient_Create(&device_iface, &client) == E_OUTOFMEMORY);
+    assert(!client && !live_allocations && !live_locks && !endpoint_count);
+}
+
+static void null_pointers(void)
+{
+    SpatialAudioImpl client;
+    SpatialAudioStreamImpl stream;
+    ISpatialAudioObjectRenderStream *out = (void *)0xdead;
+    PROPVARIANT prop = {.vt = VT_BLOB};
+    UINT32 frames;
+    BYTE *buffer;
+    init_client(&client);
+    init_stream(&stream, &client);
+    assert(SpatialAudioClient_Create(&device_iface, NULL) == E_POINTER);
+    assert(SAC_ActivateSpatialAudioStream(&client.ISpatialAudioClient_iface, NULL,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&out) == E_INVALIDARG);
+    assert(out == (void *)0xdead);
+    assert(SAC_ActivateSpatialAudioStream(&client.ISpatialAudioClient_iface, &prop,
+            &IID_ISpatialAudioObjectRenderStream, NULL) == E_POINTER);
+    out = (void *)0xdead;
+    assert(SAC_ActivateSpatialAudioStream(&client.ISpatialAudioClient_iface, &prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&out) == E_INVALIDARG);
+    assert(!out);
+    assert(SAORS_ActivateSpatialAudioObject(&stream.ISpatialAudioObjectRenderStream_iface,
+            AudioObjectType_FrontLeft, NULL) == E_POINTER);
+    assert(SAORS_BeginUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface,
+                                         NULL, &frames) == E_POINTER);
+    assert(SAORS_BeginUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface,
+                                         &frames, NULL) == E_POINTER);
+    {
+        SpatialAudioObjectImpl object = {.sa_stream = &stream};
+        assert(SAO_GetBuffer(&object.ISpatialAudioObject_iface, NULL, &frames) == E_POINTER);
+        assert(SAO_GetBuffer(&object.ISpatialAudioObject_iface, &buffer, NULL) == E_POINTER);
+    }
+    assert(stream.update_frames == ~0u && !allocation_count && !endpoint_count);
+    test_delete_cs(&stream.lock);
+}
+
+static void end_failure(void)
+{
+    SpatialAudioImpl client;
+    SpatialAudioStreamImpl stream;
+    UINT32 dynamic, frames;
+    init_client(&client);
+    init_stream(&stream, &client);
+    assert(SAORS_EndUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface) ==
+            SPTLAUDCLNT_E_OUT_OF_ORDER);
+    assert(!render_release_count);
+    stream.update_frames = 0;
+    assert(SAORS_EndUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface) == S_OK);
+    assert(stream.update_frames == ~0u && !render_release_count);
+    render_release_result = AUDCLNT_E_DEVICE_INVALIDATED;
+    stream.update_frames = 8;
+    assert(SAORS_EndUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface) ==
+            AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(stream.update_frames == ~0u && render_release_count == 1);
+    render_release_result = S_OK;
+    assert(SAORS_BeginUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface,
+                                         &dynamic, &frames) == S_OK);
+    assert(frames == 8 && !dynamic);
+    assert(SAORS_EndUpdatingAudioObjects(&stream.ISpatialAudioObjectRenderStream_iface) == S_OK);
+    assert(stream.update_frames == ~0u && render_release_count == 2);
+    test_delete_cs(&stream.lock);
+}
+
+int main(int argc, char **argv)
+{
+    static const struct { const char *name; void (*run)(void); } tests[] = {
+        {"object_oom", object_oom}, {"admission_race", admission_race},
+        {"release_race", release_race}, {"stream_oom", stream_oom},
+        {"format_oom", format_oom}, {"duplicate_failure", duplicate_failure},
+        {"endpoint_failure", endpoint_failure}, {"end_failure", end_failure},
+        {"zero_frames", zero_frames}, {"constructor_oom", constructor_oom},
+        {"null_pointers", null_pointers},
+    };
+    struct rlimit no_core = {0, 0};
+    unsigned int i, failures = 0, run = 0;
+    assert(!setrlimit(RLIMIT_CORE, &no_core));
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        pid_t child;
+        int status;
+        if (argc > 1 && strcmp(argv[1], tests[i].name)) continue;
+        run++;
+        assert((child = fork()) >= 0);
+        if (!child)
+        {
+            tests[i].run();
+            assert(!live_allocations && !live_locks);
+            _exit(0);
+        }
+        assert(waitpid(child, &status, 0) == child);
+        if (WIFEXITED(status) && !WEXITSTATUS(status)) printf("PASS %s\n", tests[i].name);
+        else
+        {
+            failures++;
+            if (WIFSIGNALED(status)) printf("FAIL %s (signal %d)\n", tests[i].name, WTERMSIG(status));
+            else printf("FAIL %s (exit %d)\n", tests[i].name, WEXITSTATUS(status));
+        }
+    }
+    if (!run) fprintf(stderr, "Unknown test: %s\n", argv[1]);
+    if (!run) return 2;
+    return failures ? 1 : 0;
+}

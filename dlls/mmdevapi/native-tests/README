@@ -1,0 +1,21 @@
+Static spatial-audio implementation tests
+=======================================
+
+From the Wine source root, with a configured Wine build available:
+
+  make -C dlls/mmdevapi/native-tests check \
+      WINE_BUILD_DIR=/path/to/configured/wine/build \
+      BUILD_DIR=/tmp/mmdevapi-spatial-tests
+
+The test includes the actual spatialaudio.c implementation and replaces
+allocation, locking, handle operations, and the COM audio endpoint with
+controlled native fixtures. No audio server, Wine runtime, or device is used.
+Each case runs in a child process so an old implementation's allocation-failure
+crash does not prevent the remaining cases from being checked.
+
+These tests exercise error cleanup, concurrent object activation/release, and
+update-cycle state. They do not establish Windows conformance, audio quality,
+or behavior on real devices.
+
+The `.c.test` suffix keeps the standalone fixture out of Wine's generated
+source lists. The native Makefile compiles it explicitly as C.
