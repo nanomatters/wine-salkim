@@ -180,6 +180,40 @@ static void test_stream_activation(void)
 
     /* correct params */
     fill_activation_params(&activation_params);
+
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, NULL);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
+
+    sas = (void *)0xdeadbeef;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, NULL,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Got %#lx.\n", hr);
+
+    activation_params_prop.vt = VT_EMPTY;
+    sas = (void *)0xdeadbeef;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Got %#lx.\n", hr);
+    ok(!sas, "Got stream %p.\n", sas);
+    activation_params_prop.vt = VT_BLOB;
+
+    activation_params_prop.blob.cbSize = sizeof(activation_params) - 1;
+    sas = (void *)0xdeadbeef;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Got %#lx.\n", hr);
+    ok(!sas, "Got stream %p.\n", sas);
+    activation_params_prop.blob.cbSize = sizeof(activation_params);
+
+    activation_params_prop.blob.pBlobData = NULL;
+    sas = (void *)0xdeadbeef;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Got %#lx.\n", hr);
+    ok(!sas, "Got stream %p.\n", sas);
+    activation_params_prop.blob.pBlobData = (BYTE *)&activation_params;
+
     hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
     ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
     ok(ISpatialAudioObjectRenderStream_Release(sas) == 0, "Expected to release the last reference\n");
@@ -255,6 +289,9 @@ static void test_audio_object_activation(void)
     activation_params.StaticObjectTypeMask &= ~AudioObjectType_FrontRight;
     hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
     ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, NULL);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, &sao1);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
@@ -338,6 +375,13 @@ static void test_audio_object_buffers(void)
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_SideLeft, &sao[2]);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
 
+    hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, NULL, &frame_count);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
+    hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &dyn_object_count, NULL);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
+    hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, NULL, NULL);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
+
     hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &dyn_object_count, &frame_count);
     ok(hr == S_OK, "Failed to begin updating audio objects: 0x%08lx\n", hr);
     ok(dyn_object_count == 0, "Unexpected dynamic objects\n");
@@ -345,6 +389,13 @@ static void test_audio_object_buffers(void)
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_SideRight, &sao[3]);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_GetBuffer(sao[0], NULL, &buffer_length);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
+    hr = ISpatialAudioObject_GetBuffer(sao[0], &buffer, NULL);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
+    hr = ISpatialAudioObject_GetBuffer(sao[0], NULL, NULL);
+    ok(hr == E_POINTER, "Got %#lx.\n", hr);
 
     for (i = 0; i < ARRAYSIZE(sao); i++)
     {

@@ -202,6 +202,9 @@ static HRESULT WINAPI SAO_GetBuffer(ISpatialAudioObject *iface,
 
     TRACE("(%p)->(%p, %p)\n", This, buffer, bytes);
 
+    if (!buffer || !bytes)
+        return E_POINTER;
+
     EnterCriticalSection(&This->sa_stream->lock);
 
     if(This->sa_stream->update_frames == ~0){
@@ -399,6 +402,9 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
 
     TRACE("(%p)->(%p, %p)\n", This, dyn_count, frames);
 
+    if (!dyn_count || !frames)
+        return E_POINTER;
+
     EnterCriticalSection(&This->lock);
 
     if(This->update_frames != ~0){
@@ -492,6 +498,10 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
     SpatialAudioObjectImpl *obj;
 
     TRACE("(%p)->(0x%x, %p)\n", This, type, object);
+
+    if (!object)
+        return E_POINTER;
+    *object = NULL;
 
     if(type == AudioObjectType_Dynamic)
         return SPTLAUDCLNT_E_NO_MORE_OBJECTS;
@@ -782,32 +792,33 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
 
     TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), stream);
 
+    if (!prop)
+        return E_INVALIDARG;
+    if (!stream)
+        return E_POINTER;
+    *stream = NULL;
+
     if(IsEqualIID(riid, &IID_ISpatialAudioObjectRenderStream)){
         SpatialAudioStreamImpl *obj;
 
-        if(prop &&
-                (prop->vt != VT_BLOB ||
-                 prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams))){
+        if(prop->vt != VT_BLOB || !prop->blob.pBlobData ||
+                prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams)){
             WARN("Got invalid params\n");
-            *stream = NULL;
             return E_INVALIDARG;
         }
 
         params = (SpatialAudioObjectRenderStreamActivationParams*) prop->blob.pBlobData;
 
         if(params->StaticObjectTypeMask & AudioObjectType_Dynamic){
-            *stream = NULL;
             return E_INVALIDARG;
         }
 
         if(params->EventHandle == INVALID_HANDLE_VALUE ||
                 params->EventHandle == 0){
-            *stream = NULL;
             return E_INVALIDARG;
         }
 
         if(!(params->ObjectFormat && formats_equal(params->ObjectFormat, &This->object_fmtex.Format))) {
-            *stream = NULL;
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
         }
 
@@ -853,14 +864,12 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             CloseHandle(obj->params.EventHandle);
             ISpatialAudioClient_Release(&obj->sa_client->ISpatialAudioClient_iface);
             free(obj);
-            *stream = NULL;
             return hr;
         }
 
         *stream = &obj->ISpatialAudioObjectRenderStream_iface;
     }else{
         FIXME("Unsupported audio stream IID: %s\n", debugstr_guid(riid));
-        *stream = NULL;
         return E_NOTIMPL;
     }
 
@@ -941,6 +950,9 @@ HRESULT SpatialAudioClient_Create(IMMDevice *mmdev, ISpatialAudioClient **out)
     WAVEFORMATEX *closest;
     HRESULT hr;
 
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
     obj = calloc(1, sizeof(*obj));
 
     obj->ref = 1;
