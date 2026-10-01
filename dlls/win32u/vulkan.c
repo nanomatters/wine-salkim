@@ -459,7 +459,7 @@ struct swapchain
     struct surface *surface;
     struct surface_host *host_surface;
     LONG presentation_generation;
-    LONG occluded;                 /* once out of date, a swapchain cannot become usable again */
+    LONG cloak_invalidated;        /* once out of date, a swapchain cannot become usable again */
     VkExtent2D extents;
     struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
     VkSemaphore *present_semaphores; /* mixed-present bridges, indexed by host swapchain image */
@@ -549,13 +549,9 @@ static void surface_update_client_alpha( struct surface *surface )
             surface->client );
 }
 
-static BOOL surface_is_occluded( const struct surface *surface )
+static BOOL surface_is_cloaked( const struct surface *surface )
 {
-    struct client_surface *client = surface->client;
-
-    /* Application cloaking is independent of compositor suspension. */
-    if (NtUserIsWindowPresentationCloaked( client->hwnd )) return TRUE;
-    return client->funcs->is_occluded && client->funcs->is_occluded( client );
+    return NtUserIsWindowPresentationCloaked( surface->client->hwnd );
 }
 
 static BOOL swapchain_is_out_of_date( struct swapchain *swapchain )
@@ -563,14 +559,14 @@ static BOOL swapchain_is_out_of_date( struct swapchain *swapchain )
     LONG generation;
 
     generation = ReadAcquire( &swapchain->surface->client->presentation_generation );
-    if (swapchain->presentation_generation != generation || ReadAcquire( &swapchain->occluded )) return TRUE;
+    if (swapchain->presentation_generation != generation || ReadAcquire( &swapchain->cloak_invalidated )) return TRUE;
 
-    /* Occlusion does not detach the native surface or change Win32 geometry.
-     * Latch it per swapchain so a rejected acquire/present remains out of date
-     * after visibility returns. Managed producers have their own suspend path. */
-    if (!swapchain->managed && surface_is_occluded( swapchain->surface ))
+    /* Keep a swapchain rejected for application cloaking out of date after
+     * uncloaking. Managed producers have their own suspend path. Compositor
+     * suspension alone does not invalidate a native swapchain. */
+    if (!swapchain->managed && surface_is_cloaked( swapchain->surface ))
     {
-        InterlockedExchange( &swapchain->occluded, TRUE );
+        InterlockedExchange( &swapchain->cloak_invalidated, TRUE );
         return TRUE;
     }
     return FALSE;
@@ -2379,10 +2375,9 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
     /* Update the image extents to match what the Win32 WSI would provide. */
     /* FIXME: handle DPI scaling, somehow */
     get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
-    /* Compositor suspension covers hidden windows and display-off states.
-     * DXGI presenters can then return OCCLUDED and poll for visibility without
-     * changing the application's geometry or sending minimize/restore commands. */
-    if (surface_is_occluded( surface )) SetRectEmpty( &client_rect );
+    /* Application cloaking suppresses presentation without changing Win32
+     * geometry. Compositor suspension does not change the available extent. */
+    if (surface_is_cloaked( surface )) SetRectEmpty( &client_rect );
     capabilities->minImageExtent.width = client_rect.right - client_rect.left;
     capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
     capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
@@ -5957,27 +5952,28 @@ static VkResult swapchain_acquire_next_image( struct vulkan_device *device, stru
                                               const VkAcquireNextImageInfoKHR *info, BOOL acquire2,
                                               uint32_t *image_index )
 {
-    BOOL poll_visibility = !!swapchain->surface->client->funcs->is_occluded;
+    BOOL poll_surface = swapchain->surface->client->funcs->needs_acquire_revalidation;
     BOOL infinite = info->timeout == UINT64_MAX;
     uint64_t remaining = info->timeout, start = 0;
     VkAcquireNextImageInfoKHR slice_info = *info;
     VkResult res;
 
-    if (poll_visibility && !infinite && remaining > WINE_VK_PRESENT_WAIT_SLICE_NS)
+    if (poll_surface && !infinite && remaining > WINE_VK_PRESENT_WAIT_SLICE_NS)
         start = managed_monotonic_time_ns();
     for (;;)
     {
-        slice_info.timeout = poll_visibility ? min( remaining, WINE_VK_PRESENT_WAIT_SLICE_NS ) : remaining;
+        slice_info.timeout = poll_surface ? min( remaining, WINE_VK_PRESENT_WAIT_SLICE_NS ) : remaining;
         if (acquire2)
             res = device->p_vkAcquireNextImage2KHR( device->host.device, &slice_info, image_index );
         else
             res = device->p_vkAcquireNextImageKHR( device->host.device, slice_info.swapchain,
                                                    slice_info.timeout, slice_info.semaphore,
                                                    slice_info.fence, image_index );
-        if (res != VK_TIMEOUT || !poll_visibility) return res;
+        if (res != VK_TIMEOUT || !poll_surface) return res;
 
         /* No image or semaphore signal was acquired on timeout. Check for
-         * occlusion before waiting again, without holding any driver locks. */
+         * cloaking or a changed presentation target before waiting again,
+         * without holding any driver locks. */
         if (swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
         if (infinite) continue;
         if (!start) return VK_TIMEOUT;
