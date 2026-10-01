@@ -520,7 +520,18 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
         }
     }
 
-    obj = calloc(1, sizeof(*obj));
+    if (!(obj = calloc(1, sizeof(*obj))))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    if (This->period_frames && !(obj->buf = calloc(This->period_frames,
+            This->sa_client->object_fmtex.Format.nBlockAlign)))
+    {
+        free(obj);
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
 
     obj->ISpatialAudioObject_iface.lpVtbl = &ISpatialAudioObject_vtbl;
     obj->ref = 1;
@@ -534,8 +545,6 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
 
     obj->sa_stream = This;
     SAORS_AddRef(&This->ISpatialAudioObjectRenderStream_iface);
-
-    obj->buf = calloc(This->period_frames, This->sa_client->object_fmtex.Format.nBlockAlign);
 
     list_add_tail(&This->objects, &obj->entry);
     *object = &obj->ISpatialAudioObject_iface;
