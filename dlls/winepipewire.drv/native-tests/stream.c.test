@@ -1,0 +1,90 @@
+/* Native tests of Wine's PipeWire stream helpers.
+ *
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static void test_format_support(void)
+{
+    WAVEFORMATEXTENSIBLE fmt = {0};
+    struct pipewire_stream stream;
+    struct is_format_supported_params params = {0};
+    HRESULT hr;
+    unsigned int i;
+    const unsigned int rates[] = {1, 48000, 768000, INT32_MAX};
+
+    fmt.Format.wFormatTag = WAVE_FORMAT_PCM;
+    fmt.Format.nChannels = 2;
+    fmt.Format.wBitsPerSample = 16;
+    params.fmt_in = &fmt.Format;
+    params.share = AUDCLNT_SHAREMODE_SHARED;
+
+    for (i = 0; i < ARRAY_SIZE(rates); ++i)
+    {
+        fmt.Format.nSamplesPerSec = rates[i];
+        hr = pipewire_info_from_waveformat(&stream, &fmt.Format);
+        assert(hr == S_OK);
+        assert(stream.info.rate == rates[i]);
+        pipewire_is_format_supported(&params);
+        assert(params.result == S_OK);
+    }
+
+    fmt.Format.nSamplesPerSec = 0;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+    fmt.Format.nSamplesPerSec = INT32_MAX + 1u;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+
+    fmt.Format.nSamplesPerSec = 48000;
+    fmt.Format.wBitsPerSample = 20;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+    fmt.Format.wBitsPerSample = 16;
+    fmt.Format.nChannels = 3;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+
+    fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    fmt.Format.cbSize = sizeof(fmt) - sizeof(fmt.Format);
+    fmt.Format.nChannels = 2;
+    fmt.Format.wBitsPerSample = 32;
+    fmt.Samples.wValidBitsPerSample = 24;
+    fmt.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    fmt.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    hr = pipewire_info_from_waveformat(&stream, &fmt.Format);
+    assert(hr == S_OK);
+    assert(stream.info.format == SPA_AUDIO_FORMAT_S32_LE);
+    assert(stream.pcm_24_in_32);
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_OK);
+
+    fmt.Format.nChannels = 0;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+    fmt.Format.nChannels = SPA_AUDIO_MAX_CHANNELS + 1;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+    fmt.Format.nChannels = 2;
+
+    fmt.Format.cbSize--;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+    fmt.Format.cbSize++;
+    fmt.Samples.wValidBitsPerSample = 33;
+    pipewire_is_format_supported(&params);
+    assert(params.result == S_FALSE);
+
+    params.share = AUDCLNT_SHAREMODE_EXCLUSIVE;
+    pipewire_is_format_supported(&params);
+    assert(params.result == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED);
+}
+
+int main(void)
+{
+    test_format_support();
+    puts("PipeWire stream tests passed");
+    return 0;
+}

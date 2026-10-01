@@ -1590,21 +1590,6 @@ static NTSTATUS pipewire_get_device_period(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS pipewire_is_format_supported(void *args)
-{
-    struct is_format_supported_params *params = args;
-
-    /* Shared-mode format conversion/resampling is the adapter's job, so we
-     * accept any format here (mirrors winepulse).  Exclusive mode is not
-     * supported. */
-    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
-        params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
-    else
-        params->result = S_OK;
-
-    return STATUS_SUCCESS;
-}
-
 static void get_device_path(const struct pw_phys_device *device, struct get_prop_value_params *params)
 {
     const GUID *guid = params->guid;
@@ -1714,6 +1699,11 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
 
     memset(info, 0, sizeof(*info));
     stream->pcm_24_in_32 = FALSE;
+
+    /* SPA serializes the rate as a signed integer, not a DWORD. */
+    if (!fmt->nSamplesPerSec || fmt->nSamplesPerSec > INT32_MAX ||
+        !fmt->nChannels || fmt->nChannels > ARRAY_SIZE(info->position))
+        return AUDCLNT_E_UNSUPPORTED_FORMAT;
     info->rate = fmt->nSamplesPerSec;
 
     switch (fmt->wFormatTag)
@@ -1836,6 +1826,21 @@ static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, con
     if (mask == SPEAKER_FRONT_CENTER)
         info->position[0] = SPA_AUDIO_CHANNEL_MONO;
     return S_OK;
+}
+
+static NTSTATUS pipewire_is_format_supported(void *args)
+{
+    struct is_format_supported_params *params = args;
+    struct pipewire_stream stream;
+
+    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
+        params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
+    else if (FAILED(pipewire_info_from_waveformat(&stream, params->fmt_in)))
+        params->result = S_FALSE; /* mmdevapi supplies the device mix format. */
+    else
+        params->result = S_OK;
+
+    return STATUS_SUCCESS;
 }
 
 /* ----------------------------------------------------------------------

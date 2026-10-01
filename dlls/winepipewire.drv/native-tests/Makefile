@@ -10,7 +10,7 @@ CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fshort-wchar -ffunction-sections -fdata-sections -UNDEBUG
 LDFLAGS += -Wl,--gc-sections
 LDLIBS += $(shell $(PKG_CONFIG) --libs libpipewire-0.3)
-TESTS = identity plugins lifecycle
+TESTS = identity plugins lifecycle stream
 
 .PHONY: all check
 all: $(addprefix $(BUILD_DIR)/,$(TESTS))
