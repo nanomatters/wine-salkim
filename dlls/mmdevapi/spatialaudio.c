@@ -696,7 +696,7 @@ static HRESULT WINAPI SAC_IsSpatialAudioStreamAvailable(ISpatialAudioClient *ifa
 static WAVEFORMATEX *clone_fmtex(const WAVEFORMATEX *src)
 {
     WAVEFORMATEX *r = malloc(sizeof(WAVEFORMATEX) + src->cbSize);
-    memcpy(r, src, sizeof(WAVEFORMATEX) + src->cbSize);
+    if (r) memcpy(r, src, sizeof(WAVEFORMATEX) + src->cbSize);
     return r;
 }
 
@@ -835,11 +835,18 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
         }
 
-        obj = calloc(1, sizeof(SpatialAudioStreamImpl));
+        if (!(obj = calloc(1, sizeof(*obj))))
+            return E_OUTOFMEMORY;
+
+        memcpy(&obj->params, params, sizeof(obj->params));
+        if (!(obj->params.ObjectFormat = clone_fmtex(params->ObjectFormat)))
+        {
+            free(obj);
+            return E_OUTOFMEMORY;
+        }
 
         obj->ISpatialAudioObjectRenderStream_iface.lpVtbl = &ISpatialAudioObjectRenderStream_vtbl;
         obj->ref = 1;
-        memcpy(&obj->params, params, sizeof(obj->params));
 
         obj->update_frames = ~0;
 
@@ -848,8 +855,6 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
 
         obj->sa_client = This;
         SAC_AddRef(&This->ISpatialAudioClient_iface);
-
-        obj->params.ObjectFormat = clone_fmtex(obj->params.ObjectFormat);
 
         DuplicateHandle(GetCurrentProcess(), obj->params.EventHandle,
                 GetCurrentProcess(), &obj->params.EventHandle, 0, FALSE,
@@ -966,7 +971,8 @@ HRESULT SpatialAudioClient_Create(IMMDevice *mmdev, ISpatialAudioClient **out)
     if (!out)
         return E_POINTER;
     *out = NULL;
-    obj = calloc(1, sizeof(*obj));
+    if (!(obj = calloc(1, sizeof(*obj))))
+        return E_OUTOFMEMORY;
 
     obj->ref = 1;
     obj->ISpatialAudioClient_iface.lpVtbl = &ISpatialAudioClient_vtbl;
