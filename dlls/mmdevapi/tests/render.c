@@ -759,6 +759,44 @@ static void test_invalid_sample_rate(void)
     IAudioClient_Release(client);
 }
 
+static void test_engine_period_arguments(void)
+{
+    WAVEFORMATEX *format;
+    IAudioClient3 *client;
+    UINT32 periods[4];
+    HRESULT hr;
+    unsigned int i;
+
+    hr = IMMDevice_Activate(dev, &IID_IAudioClient3, CLSCTX_INPROC_SERVER, NULL, (void **)&client);
+    if (hr == E_NOINTERFACE)
+    {
+        win_skip("IAudioClient3 is unavailable.\n");
+        return;
+    }
+    ok(hr == S_OK, "Activate failed: %#lx.\n", hr);
+    if (FAILED(hr)) return;
+
+    hr = IAudioClient3_GetMixFormat(client, &format);
+    ok(hr == S_OK, "GetMixFormat failed: %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        for (i = 0; i < 5; ++i)
+        {
+            hr = IAudioClient3_GetSharedModeEnginePeriod(client, i == 0 ? NULL : format,
+                    i == 1 ? NULL : &periods[0], i == 2 ? NULL : &periods[1],
+                    i == 3 ? NULL : &periods[2], i == 4 ? NULL : &periods[3]);
+            ok(hr == E_POINTER, "Null argument %u returned %#lx.\n", i, hr);
+        }
+
+        format->nSamplesPerSec = 0;
+        hr = IAudioClient3_GetSharedModeEnginePeriod(client, format,
+                &periods[0], &periods[1], &periods[2], &periods[3]);
+        ok(hr == E_INVALIDARG, "Zero sample rate returned %#lx.\n", hr);
+        CoTaskMemFree(format);
+    }
+    IAudioClient3_Release(client);
+}
+
 static void test_references(void)
 {
     IAudioClient *ac, *ac2;
@@ -2923,6 +2961,7 @@ START_TEST(render)
 
     test_audioclient();
     test_invalid_sample_rate();
+    test_engine_period_arguments();
     test_references();
     test_marshal();
     if (GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode))
