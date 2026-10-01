@@ -270,6 +270,84 @@ static void test_stream_activation(void)
     ok(notify_object.ref == 0, "Expected to get lowered NotifyObject's ref count\n");
 }
 
+struct activation_thread_params
+{
+    ISpatialAudioObjectRenderStream *stream;
+    HANDLE ready, start;
+    LONG *ready_count;
+    ISpatialAudioObject *object;
+    HRESULT hr;
+};
+
+static DWORD WINAPI activate_static_object_thread(void *arg)
+{
+    struct activation_thread_params *params = arg;
+    HRESULT hr;
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    ok(SUCCEEDED(hr), "Got %#lx.\n", hr);
+    if (InterlockedIncrement(params->ready_count) == 8) SetEvent(params->ready);
+    WaitForSingleObject(params->start, INFINITE);
+    params->hr = FAILED(hr) ? hr : ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(
+            params->stream, AudioObjectType_FrontLeft, &params->object);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return 0;
+}
+
+static void test_concurrent_object_activation(ISpatialAudioObjectRenderStream *stream)
+{
+    struct activation_thread_params params[8] = {{0}};
+    HANDLE threads[8], ready, start;
+    unsigned int i, count = 0, successes = 0;
+    LONG ready_count = 0;
+    DWORD ret;
+
+    ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    start = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ok(ready && start, "Failed to create events, error %lu.\n", GetLastError());
+    if (!ready || !start) goto done;
+
+    /* All threads, including the caller, belong to the same MTA. Keep the
+     * winning object alive until every activation has finished. */
+    for (i = 0; i < ARRAY_SIZE(params); ++i)
+    {
+        params[i].stream = stream;
+        params[i].ready = ready;
+        params[i].start = start;
+        params[i].ready_count = &ready_count;
+        threads[i] = CreateThread(NULL, 0, activate_static_object_thread, &params[i], 0, NULL);
+        ok(threads[i] != NULL, "Failed to create thread, error %lu.\n", GetLastError());
+        if (!threads[i]) break;
+        ++count;
+    }
+    if (count == ARRAY_SIZE(params))
+    {
+        ret = WaitForSingleObject(ready, 5000);
+        ok(ret == WAIT_OBJECT_0, "Got %#lx.\n", ret);
+    }
+    SetEvent(start);
+    if (count) WaitForMultipleObjects(count, threads, TRUE, INFINITE);
+
+    for (i = 0; i < count; ++i)
+    {
+        ok(params[i].hr == S_OK || params[i].hr == SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE,
+                "Thread %u got %#lx.\n", i, params[i].hr);
+        if (params[i].hr == S_OK)
+        {
+            ++successes;
+            ok(params[i].object != NULL, "Thread %u returned no object.\n", i);
+        }
+        CloseHandle(threads[i]);
+    }
+    if (count) ok(successes == 1, "Got %u successful activations.\n", successes);
+    for (i = 0; i < count; ++i)
+        if (SUCCEEDED(params[i].hr) && params[i].object) ISpatialAudioObject_Release(params[i].object);
+
+done:
+    if (ready) CloseHandle(ready);
+    if (start) CloseHandle(start);
+}
+
 static void test_audio_object_activation(void)
 {
     HRESULT hr;
@@ -310,6 +388,12 @@ static void test_audio_object_activation(void)
     ok(hr == SPTLAUDCLNT_E_NO_MORE_OBJECTS, "Expected to not have no more dynamic objects: 0x%08lx\n", hr);
 
     ISpatialAudioObject_Release(sao1);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, &sao1);
+    ok(hr == S_OK, "Failed to reactivate static object: %#lx.\n", hr);
+    if (SUCCEEDED(hr)) ISpatialAudioObject_Release(sao1);
+
+    test_concurrent_object_activation(sas);
     ISpatialAudioObjectRenderStream_Release(sas);
 }
 

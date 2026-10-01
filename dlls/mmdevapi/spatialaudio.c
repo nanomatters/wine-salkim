@@ -496,6 +496,7 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
     SpatialAudioObjectImpl *obj;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->(0x%x, %p)\n", This, type, object);
 
@@ -509,12 +510,18 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
     if(type & ~This->params.StaticObjectTypeMask)
         return SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE;
 
+    /* Keep the duplicate check and insertion atomic with respect to release. */
+    EnterCriticalSection(&This->lock);
+
     LIST_FOR_EACH_ENTRY(obj, &This->objects, SpatialAudioObjectImpl, entry){
-        if(obj->static_idx == AudioObjectType_to_index(type))
-            return SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE;
+        if(obj->static_idx == AudioObjectType_to_index(type)){
+            hr = SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE;
+            goto done;
+        }
     }
 
     obj = calloc(1, sizeof(*obj));
+
     obj->ISpatialAudioObject_iface.lpVtbl = &ISpatialAudioObject_vtbl;
     obj->ref = 1;
     obj->type = type;
@@ -530,15 +537,12 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
 
     obj->buf = calloc(This->period_frames, This->sa_client->object_fmtex.Format.nBlockAlign);
 
-    EnterCriticalSection(&This->lock);
-
     list_add_tail(&This->objects, &obj->entry);
-
-    LeaveCriticalSection(&This->lock);
-
     *object = &obj->ISpatialAudioObject_iface;
 
-    return S_OK;
+done:
+    LeaveCriticalSection(&This->lock);
+    return hr;
 }
 
 static ISpatialAudioObjectRenderStreamVtbl ISpatialAudioObjectRenderStream_vtbl = {
