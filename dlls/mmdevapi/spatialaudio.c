@@ -813,6 +813,7 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
 
     if(IsEqualIID(riid, &IID_ISpatialAudioObjectRenderStream)){
         SpatialAudioStreamImpl *obj;
+        HANDLE event;
 
         if(prop->vt != VT_BLOB || !prop->blob.pBlobData ||
                 prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams)){
@@ -844,6 +845,15 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             free(obj);
             return E_OUTOFMEMORY;
         }
+        if (!DuplicateHandle(GetCurrentProcess(), params->EventHandle,
+                GetCurrentProcess(), &event, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            free((void *)obj->params.ObjectFormat);
+            free(obj);
+            return hr;
+        }
+        obj->params.EventHandle = event;
 
         obj->ISpatialAudioObjectRenderStream_iface.lpVtbl = &ISpatialAudioObjectRenderStream_vtbl;
         obj->ref = 1;
@@ -855,10 +865,6 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
 
         obj->sa_client = This;
         SAC_AddRef(&This->ISpatialAudioClient_iface);
-
-        DuplicateHandle(GetCurrentProcess(), obj->params.EventHandle,
-                GetCurrentProcess(), &obj->params.EventHandle, 0, FALSE,
-                DUPLICATE_SAME_ACCESS);
 
         if(obj->params.NotifyObject)
             ISpatialAudioObjectRenderStreamNotify_AddRef(obj->params.NotifyObject);
