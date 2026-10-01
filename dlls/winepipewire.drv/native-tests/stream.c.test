@@ -273,11 +273,46 @@ static void test_clock_frequency(void)
     test_stream_state = PW_STREAM_STATE_PAUSED;
 }
 
-int main(void)
+static void test_next_packet(void)
 {
-    test_format_support();
-    test_sample_rate();
-    test_clock_frequency();
+    struct pipewire_stream stream = {0};
+    struct get_next_packet_size_params params = {0};
+    ACPacket packet = {0};
+    UINT32 frames;
+
+    pw_loop_global = (void *)1;
+    stream.pw = (void *)2;
+    stream.frame_size = 4;
+    stream.period_bytes = 1920;
+    list_init(&stream.packet_filled_head);
+    list_add_tail(&stream.packet_filled_head, &packet.entry);
+    params.stream = (UINT_PTR)&stream;
+    params.frames = &frames;
+
+    test_stream_state = PW_STREAM_STATE_ERROR;
+    frames = 0xdeadbeef;
+    pipewire_get_next_packet_size(&params);
+    assert(params.result == AUDCLNT_E_DEVICE_INVALIDATED && !loop_depth);
+    assert(frames == 0xdeadbeef && !stream.locked_ptr);
+    assert(list_head(&stream.packet_filled_head) == &packet.entry);
+
+    test_stream_state = PW_STREAM_STATE_PAUSED;
+    pipewire_get_next_packet_size(&params);
+    assert(params.result == S_OK && frames == 480 && !loop_depth);
+    assert(stream.locked_ptr == &packet && list_empty(&stream.packet_filled_head));
+
+    stream.locked_ptr = NULL;
+    pipewire_get_next_packet_size(&params);
+    assert(params.result == S_OK && !frames && !loop_depth);
+}
+
+int main(int argc, char **argv)
+{
+    assert(argc <= 2);
+    if (argc == 1 || !strcmp(argv[1], "format")) test_format_support();
+    if (argc == 1 || !strcmp(argv[1], "rate")) test_sample_rate();
+    if (argc == 1 || !strcmp(argv[1], "clock")) test_clock_frequency();
+    if (argc == 1 || !strcmp(argv[1], "packet")) test_next_packet();
     puts("PipeWire stream tests passed");
     return 0;
 }
