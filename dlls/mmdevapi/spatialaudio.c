@@ -460,7 +460,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
     SpatialAudioObjectImpl *object;
-    HRESULT hr;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->()\n", This);
 
@@ -488,7 +488,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
 
     LeaveCriticalSection(&This->lock);
 
-    return S_OK;
+    return hr;
 }
 
 static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRenderStream *iface,
