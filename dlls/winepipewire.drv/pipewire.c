@@ -541,7 +541,7 @@ static void convert_channel_map(uint32_t channels, UINT mask, WAVEFORMATEXTENSIB
     fmt->dwChannelMask = mask;
 }
 
-static void build_format(WAVEFORMATEXTENSIBLE *fmt, uint32_t rate, uint32_t channels, UINT mask)
+static BOOL build_format(WAVEFORMATEXTENSIBLE *fmt, uint32_t rate, uint32_t channels, UINT mask)
 {
     WAVEFORMATEX *wfx = &fmt->Format;
 
@@ -551,14 +551,17 @@ static void build_format(WAVEFORMATEXTENSIBLE *fmt, uint32_t rate, uint32_t chan
     wfx->wBitsPerSample = 32;
     wfx->nSamplesPerSec = rate ? rate : 48000;
     wfx->nBlockAlign = wfx->nChannels * wfx->wBitsPerSample / 8;
+    if (!wfx->nBlockAlign || wfx->nSamplesPerSec > UINT32_MAX / wfx->nBlockAlign)
+        return FALSE;
     wfx->nAvgBytesPerSec = wfx->nSamplesPerSec * wfx->nBlockAlign;
     fmt->Samples.wValidBitsPerSample = 32;
     fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    return TRUE;
 }
 
 static struct pw_phys_device *add_device(struct list *list, const char *pw_name, const char *display,
                                          EndpointFormFactor form, uint32_t rate, uint32_t channels, UINT mask,
-                                         REFERENCE_TIME min_period)
+                                         REFERENCE_TIME def_period, REFERENCE_TIME min_period)
 {
     size_t len = strlen(pw_name);
     struct pw_phys_device *dev = calloc(1, sizeof(*dev) + len + 1);
@@ -571,9 +574,14 @@ static struct pw_phys_device *add_device(struct list *list, const char *pw_name,
         return NULL;
     }
     dev->form = form;
-    build_format(&dev->fmt, rate, channels, mask);
+    if (!build_format(&dev->fmt, rate, channels, mask))
+    {
+        free(dev->display);
+        free(dev);
+        return NULL;
+    }
     dev->channel_mask = dev->fmt.dwChannelMask;
-    dev->def_period = 100000;
+    dev->def_period = def_period;
     dev->min_period = min_period;
     memcpy(dev->pw_name, pw_name, len + 1);
     list_add_tail(list, &dev->entry);
@@ -951,7 +959,9 @@ struct probe
     char default_sink[256];
     char default_source[256];
     uint32_t clock_rate;
+    uint32_t force_rate;
     uint32_t min_quantum;
+    uint32_t force_quantum;
     BOOL core_error;
 };
 
@@ -1039,29 +1049,26 @@ static int on_probe_settings_property(void *data, uint32_t subject, const char *
                                       const char *type, const char *value)
 {
     struct probe *p = data;
+    uint32_t *setting;
+    UINT64 value64;
+    UINT64 limit;
 
-    if (!key || !value)
+    if (subject != PW_ID_CORE)
         return 0;
-    if (!strcmp(key, "clock.force-rate"))
+    if (!key)
     {
-        uint32_t r = (uint32_t)strtoul(value, NULL, 10);
-        if (r)
-            p->clock_rate = r;
+        p->clock_rate = p->force_rate = p->min_quantum = p->force_quantum = 0;
+        return 0;
     }
-    else if (!strcmp(key, "clock.rate") && !p->clock_rate)
-    {
-        p->clock_rate = (uint32_t)strtoul(value, NULL, 10);
-    }
-    else if (!strcmp(key, "clock.force-quantum"))
-    {
-        uint32_t q = (uint32_t)strtoul(value, NULL, 10);
-        if (q)
-            p->min_quantum = q;
-    }
-    else if (!strcmp(key, "clock.min-quantum") && !p->min_quantum)
-    {
-        p->min_quantum = (uint32_t)strtoul(value, NULL, 10);
-    }
+    if (!strcmp(key, "clock.force-rate")) setting = &p->force_rate;
+    else if (!strcmp(key, "clock.rate")) setting = &p->clock_rate;
+    else if (!strcmp(key, "clock.force-quantum")) setting = &p->force_quantum;
+    else if (!strcmp(key, "clock.min-quantum")) setting = &p->min_quantum;
+    else return 0;
+
+    /* SPA raw format rates are represented by signed integer pods. */
+    limit = setting == &p->clock_rate || setting == &p->force_rate ? INT32_MAX : UINT32_MAX;
+    *setting = parse_unsigned(value, 10, limit, &value64) ? value64 : 0;
     return 0;
 }
 
@@ -1212,7 +1219,7 @@ static void probe_roundtrip(struct probe *p)
  * default routing).  When the default node is known, mirror its format so
  * the default endpoint advertises the real speaker layout. */
 static void add_default_device(struct list *list, EndpointFormFactor form, const char *match,
-                               uint32_t rate, REFERENCE_TIME min_period)
+                               uint32_t rate, REFERENCE_TIME def_period, REFERENCE_TIME min_period)
 {
     struct pw_phys_device *dev, *def_src = NULL, *def;
 
@@ -1230,7 +1237,7 @@ static void add_default_device(struct list *list, EndpointFormFactor form, const
     }
     def->pw_name[0] = '\0';
     def->form = form;
-    def->def_period = 100000;
+    def->def_period = def_period;
     def->min_period = min_period;
     if (def_src)
     {
@@ -1239,7 +1246,12 @@ static void add_default_device(struct list *list, EndpointFormFactor form, const
     }
     else
     {
-        build_format(&def->fmt, rate, 2, SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+        if (!build_format(&def->fmt, rate, 2, SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT))
+        {
+            free(def->display);
+            free(def);
+            return;
+        }
         def->channel_mask = def->fmt.dwChannelMask;
     }
     list_add_head(list, &def->entry);
@@ -1317,34 +1329,47 @@ static void set_device_identity(struct pw_phys_device *dev, struct probe *p, uin
     }
 }
 
+/* Below one frame per 100ns, floor division round-trips through mmdevapi's
+ * frame-count ceiling. Otherwise round up so the minimum is not understated. */
+static BOOL quantum_to_period(uint32_t quantum, uint32_t rate, REFERENCE_TIME *period)
+{
+    UINT64 scaled = (UINT64)quantum * 10000000;
+
+    if (!quantum || !rate) return FALSE;
+    *period = max((REFERENCE_TIME)1, scaled / rate + (rate > 10000000 && scaled % rate != 0));
+    /* Both products fit in UINT64 because their operands originate as UINT32. */
+    return ((UINT64)*period * rate + 9999999) / 10000000 <= UINT32_MAX;
+}
+
+static BOOL get_probe_periods(const struct probe *p, uint32_t *rate, REFERENCE_TIME *def, REFERENCE_TIME *minimum)
+{
+    uint32_t min_quantum = p->force_quantum ? p->force_quantum : p->min_quantum;
+
+    *rate = p->force_rate ? p->force_rate : (p->clock_rate ? p->clock_rate : 48000);
+    *minimum = 30000;
+    *def = 100000;
+    /* Preserve our shared-engine policy: a 10 ms default and at least 128
+     * frames when graph settings are known. The graph's ordinary quantum
+     * is not a minimum. Clients can request a shorter cycle. */
+    if (min_quantum && !quantum_to_period(max(min_quantum, 128), *rate, minimum))
+        return FALSE;
+    *def = max(*def, *minimum);
+    return TRUE;
+}
+
 static void build_device_cache(struct probe *p)
 {
     struct probe_node *pn;
-    uint32_t rate = p->clock_rate ? p->clock_rate : 48000;
-    REFERENCE_TIME min_period = 30000;
+    uint32_t rate;
+    REFERENCE_TIME def_period, min_period;
     struct pw_phys_device *dev;
     UINT index = 0;
 
-    /* IAudioClient3 shared-mode floor.  The graph cannot deliver cycles
-     * below clock.min-quantum (clock.force-quantum pins it outright), and
-     * 128 frames (~2.7 ms at 48 kHz) matches the typical Windows engine
-     * floor.  Clamp to the 3 ms winepulse-parity value so the advertised
-     * minimum only ever improves; without settings metadata keep 3 ms. */
-    if (p->min_quantum)
-    {
-        /* Floor division: mmdevapi converts back with a ceiling, so this
-         * round-trips to the exact frame count. */
-        REFERENCE_TIME q = (REFERENCE_TIME)p->min_quantum * 10000000 / rate;
-        REFERENCE_TIME floor_rt = (REFERENCE_TIME)128 * 10000000 / rate;
-        min_period = q > floor_rt ? q : floor_rt;
-        if (min_period > 30000)
-            min_period = 30000;
-        TRACE("min_quantum=%u rate=%u -> min_period=%d hns\n",
-              p->min_quantum, rate, (int)min_period);
-    }
+    if (!get_probe_periods(p, &rate, &def_period, &min_period))
+        return;
 
-    lstrcpynA(g_default_sink, p->default_sink, sizeof(g_default_sink));
-    lstrcpynA(g_default_source, p->default_source, sizeof(g_default_source));
+    copy_cstr(g_default_sink, sizeof(g_default_sink), p->default_sink);
+    copy_cstr(g_default_source, sizeof(g_default_source), p->default_source);
 
     LIST_FOR_EACH_ENTRY(pn, &p->nodes, struct probe_node, entry)
     {
@@ -1353,12 +1378,12 @@ static void build_device_cache(struct probe *p)
         uint32_t channels = pn->have_format ? pn->channels : 2;
         UINT mask = pn->have_format ? positions_to_mask(pn->position, pn->channels)
                                     : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
-        dev = add_device(list, pn->node_name, pn->display, form, rate, channels, mask, min_period);
+        dev = add_device(list, pn->node_name, pn->display, form, rate, channels, mask, def_period, min_period);
         set_device_identity(dev, p, pn->device_id);
     }
 
-    add_default_device(&g_render_devices, Speakers, g_default_sink, rate, min_period);
-    add_default_device(&g_capture_devices, Microphone, g_default_source, rate, min_period);
+    add_default_device(&g_render_devices, Speakers, g_default_sink, rate, def_period, min_period);
+    add_default_device(&g_capture_devices, Microphone, g_default_source, rate, def_period, min_period);
     LIST_FOR_EACH_ENTRY(dev, &g_render_devices, struct pw_phys_device, entry) dev->index = index++;
     LIST_FOR_EACH_ENTRY(dev, &g_capture_devices, struct pw_phys_device, entry) dev->index = index++;
 }
@@ -1496,11 +1521,11 @@ static NTSTATUS pipewire_test_connect(void *args)
     LIST_FOR_EACH_ENTRY_SAFE(device, device_next, &p.devices, struct probe_device, entry)
         release_probe_device(device);
 
-    if (p.core_error && list_empty(&g_render_devices)) return STATUS_SUCCESS;
+    if (list_empty(&g_render_devices) && (p.core_error || list_empty(&g_capture_devices))) return STATUS_SUCCESS;
 
     TRACE("probe for %s: %u sinks default=%s, %u sources default=%s, rate=%u\n",
           debugstr_w(params->name), list_count(&g_render_devices), debugstr_a(g_default_sink),
-          list_count(&g_capture_devices), debugstr_a(g_default_source), p.clock_rate);
+          list_count(&g_capture_devices), debugstr_a(g_default_source), p.force_rate ? p.force_rate : p.clock_rate);
 
     params->priority = Priority_Preferred;
     return STATUS_SUCCESS;

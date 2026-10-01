@@ -4,6 +4,18 @@
 
 #include "test.h"
 
+DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
+{
+    DWORD i, count = min(srclen, dstlen);
+
+    for (i = 0; i < count; ++i)
+    {
+        assert((unsigned char)src[i] < 0x80);
+        dst[i] = src[i];
+    }
+    return count;
+}
+
 static void test_defaults(void)
 {
     struct probe probe = {0};
@@ -46,9 +58,119 @@ static void test_defaults(void)
     assert(!probe.default_sink[0]);
 }
 
+static void test_settings(void)
+{
+    static const char *bad_values[] = {"", "-1", "+48000", " 48000", "48000 ", "48000Hz",
+                                       "2147483648", "4294967296", "18446744073709551616", "0x100", NULL};
+    struct probe probe = {0};
+    uint32_t rate;
+    REFERENCE_TIME def, minimum;
+    WAVEFORMATEXTENSIBLE format = {0};
+    unsigned int i;
+
+    get_probe_periods(&probe, &rate, &def, &minimum);
+    assert(rate == 48000 && def == 100000 && minimum == 30000);
+
+    /* Stock graph defaults must not raise Wine's shared default or lower
+     * its 128-frame floor. An explicit graph minimum remains authoritative. */
+    on_probe_settings_property(&probe, 0, "clock.rate", NULL, "48000");
+    on_probe_settings_property(&probe, 0, "clock.quantum", NULL, "1024");
+    on_probe_settings_property(&probe, 0, "clock.min-quantum", NULL, "32");
+    assert(get_probe_periods(&probe, &rate, &def, &minimum));
+    assert(rate == 48000 && def == 100000 && minimum == 26666);
+    assert((minimum * rate + 9999999) / 10000000 == 128);
+    on_probe_settings_property(&probe, 0, "clock.force-quantum", NULL, "256");
+    assert(get_probe_periods(&probe, &rate, &def, &minimum));
+    assert(def == 100000 && minimum == 53333);
+    on_probe_settings_property(&probe, 0, "clock.force-quantum", NULL, "32");
+    assert(get_probe_periods(&probe, &rate, &def, &minimum));
+    assert(def == 100000 && minimum == 26666);
+    on_probe_settings_property(&probe, 0, NULL, NULL, NULL);
+
+    on_probe_settings_property(&probe, 0, "clock.force-rate", NULL, "96000");
+    on_probe_settings_property(&probe, 0, "clock.rate", NULL, "48000");
+    on_probe_settings_property(&probe, 0, "clock.force-quantum", NULL, "1024");
+    on_probe_settings_property(&probe, 0, "clock.min-quantum", NULL, "4096");
+    on_probe_settings_property(&probe, 0, "clock.quantum", NULL, "512");
+    get_probe_periods(&probe, &rate, &def, &minimum);
+    assert(rate == 96000 && def == 106666 && minimum == def);
+    assert((minimum * rate + 9999999) / 10000000 == 1024);
+    {
+        struct probe reverse = {0};
+        uint32_t reverse_rate;
+        REFERENCE_TIME reverse_def, reverse_min;
+
+        on_probe_settings_property(&reverse, 0, "clock.quantum", NULL, "512");
+        on_probe_settings_property(&reverse, 0, "clock.min-quantum", NULL, "4096");
+        on_probe_settings_property(&reverse, 0, "clock.rate", NULL, "48000");
+        on_probe_settings_property(&reverse, 0, "clock.force-quantum", NULL, "1024");
+        on_probe_settings_property(&reverse, 0, "clock.force-rate", NULL, "96000");
+        get_probe_periods(&reverse, &reverse_rate, &reverse_def, &reverse_min);
+        assert(rate == reverse_rate && def == reverse_def && minimum == reverse_min);
+    }
+
+    on_probe_settings_property(&probe, 0, "clock.force-quantum", NULL, "0");
+    on_probe_settings_property(&probe, 0, "clock.force-rate", NULL, NULL);
+    get_probe_periods(&probe, &rate, &def, &minimum);
+    assert(rate == 48000 && minimum == 853333 && def == minimum);
+    on_probe_settings_property(&probe, 0, "clock.min-quantum", NULL, "128");
+    get_probe_periods(&probe, &rate, &def, &minimum);
+    assert(minimum == 26666 && def == 100000);
+
+    for (i = 0; i < ARRAY_SIZE(bad_values); ++i)
+    {
+        on_probe_settings_property(&probe, 0, "clock.force-rate", NULL, "96000");
+        on_probe_settings_property(&probe, 0, "clock.force-rate", NULL, bad_values[i]);
+        assert(!probe.force_rate && probe.clock_rate == 48000);
+    }
+    on_probe_settings_property(&probe, 1, "clock.rate", NULL, "96000");
+    assert(probe.clock_rate == 48000);
+
+    on_probe_settings_property(&probe, 0, "clock.rate", NULL, "1");
+    on_probe_settings_property(&probe, 0, "clock.force-quantum", NULL, "4294967295");
+    get_probe_periods(&probe, &rate, &def, &minimum);
+    assert(rate == 1 && minimum == (REFERENCE_TIME)UINT32_MAX * 10000000 && def == minimum);
+    on_probe_settings_property(&probe, 0, "clock.rate", NULL, "2147483647");
+    on_probe_settings_property(&probe, 0, "clock.force-quantum", NULL, "1");
+    get_probe_periods(&probe, &rate, &def, &minimum);
+    assert(minimum == 1 && def == 100000);
+    assert(quantum_to_period(513, 20000000, &minimum) && minimum == 257);
+    assert((minimum * 20000000 + 9999999) / 10000000 >= 513);
+    assert(!quantum_to_period(UINT32_MAX, 20000000, &minimum));
+    on_probe_settings_property(&probe, 0, NULL, NULL, NULL);
+    assert(!probe.clock_rate && !probe.force_rate && !probe.min_quantum && !probe.force_quantum);
+
+    assert(build_format(&format, 48000, 8, KSAUDIO_SPEAKER_7POINT1_SURROUND));
+    assert(format.Format.nAvgBytesPerSec == 48000 * 32);
+    assert(build_format(&format, UINT32_MAX / 4, 1, SPEAKER_FRONT_CENTER));
+    assert(!build_format(&format, UINT32_MAX, 2, KSAUDIO_SPEAKER_STEREO));
+}
+
+static void test_invalid_cache_format(void)
+{
+    struct probe probe = {.clock_rate = INT32_MAX};
+
+    list_init(&probe.nodes);
+    list_init(&probe.devices);
+    build_device_cache(&probe);
+    assert(list_empty(&g_render_devices) && list_empty(&g_capture_devices));
+
+    probe.clock_rate = 48000;
+    build_device_cache(&probe);
+    assert(list_count(&g_render_devices) == 1 && list_count(&g_capture_devices) == 1);
+    free_device_lists();
+
+    probe.clock_rate = 20000000;
+    probe.force_quantum = UINT32_MAX;
+    build_device_cache(&probe);
+    assert(list_empty(&g_render_devices) && list_empty(&g_capture_devices));
+}
+
 int main(void)
 {
     test_defaults();
+    test_settings();
+    test_invalid_cache_format();
     puts("PipeWire probe tests passed");
     return 0;
 }

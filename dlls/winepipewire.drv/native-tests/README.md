@@ -4,6 +4,9 @@ at link time. The tests replace only the runtime functions they need.
 
 With PipeWire development headers installed and Wine headers generated:
 
+Install the libudev development package as well if Wine was configured with
+udev support.
+
 ```
 make check WINE_BUILD_DIR=/path/to/configured/wine/build
 ```
