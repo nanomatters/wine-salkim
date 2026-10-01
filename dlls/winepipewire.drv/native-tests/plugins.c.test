@@ -16,9 +16,75 @@ static void write_ident(const char *path, unsigned char elf_class)
     assert(!close(fd));
 }
 
+static void test_plugin_dirs(const char *custom_spa)
+{
+    char libdir[PATH_MAX], spa[PATH_MAX + 64], modules[PATH_MAX + 64], custom[PATH_MAX + 64];
+    char paths[PATH_MAX + 128];
+    Dl_info info;
+    char *sep;
+
+    assert(dladdr((void *)pw_init, &info) && info.dli_fname);
+    assert(realpath(info.dli_fname, libdir));
+    assert((sep = strrchr(libdir, '/')));
+    *sep = 0;
+    snprintf(spa, sizeof(spa), "%s/spa-0.2", libdir);
+    snprintf(modules, sizeof(modules), "%s/pipewire-0.3", libdir);
+    if (!spa_plugin_dir_usable(spa) || !plugin_dir_usable(modules, "libpipewire-module-protocol-native.so"))
+    {
+        puts("Plugin-directory tests skipped: no adjacent native plugins.");
+        return;
+    }
+
+    unsetenv("SPA_PLUGIN_DIR");
+    setenv("PIPEWIRE_MODULE_DIR", "/missing/inherited/pipewire-0.3", 1);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), spa));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), modules));
+
+    /* Keep usable explicit module paths even when replacing inherited SPA. */
+    snprintf(custom, sizeof(custom), "%s/libpipewire-module-protocol-native.so", custom_spa);
+    write_ident(custom, sizeof(void *) == 8 ? 2 : 1);
+    setenv("SPA_PLUGIN_DIR", "/missing/inherited/spa-0.2", 1);
+    setenv("PIPEWIRE_MODULE_DIR", custom_spa, 1);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), spa));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), custom_spa));
+
+    setenv("SPA_PLUGIN_DIR", custom_spa, 1);
+    setenv("PIPEWIRE_MODULE_DIR", "/explicit/unused/modules", 1);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), custom_spa));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), modules));
+    setenv("PIPEWIRE_MODULE_DIR", custom_spa, 1);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), custom_spa));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), custom_spa));
+
+    snprintf(paths, sizeof(paths), ":/missing/plugins::%s:/another/missing/path:", custom_spa);
+    setenv("SPA_PLUGIN_DIR", paths, 1);
+    setenv("PIPEWIRE_MODULE_DIR", paths, 1);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), paths));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), paths));
+
+    snprintf(paths, sizeof(paths), "%s:/missing/plugins", custom_spa);
+    setenv("SPA_PLUGIN_DIR", paths, 1);
+    setenv("PIPEWIRE_MODULE_DIR", paths, 1);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), paths));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), paths));
+
+    write_ident(custom, sizeof(void *) == 8 ? 1 : 2);
+    pipewire_set_plugin_dirs();
+    assert(!strcmp(getenv("SPA_PLUGIN_DIR"), paths));
+    assert(!strcmp(getenv("PIPEWIRE_MODULE_DIR"), modules));
+    assert(!unlink(custom));
+}
+
 int main(void)
 {
     char dir[] = "/tmp/winepipewire-plugins-XXXXXX", support[PATH_MAX], path[PATH_MAX], too_long[PATH_MAX + 128];
+    char paths[2 * PATH_MAX + 256];
 
     assert(mkdtemp(dir));
     snprintf(support, sizeof(support), "%s/support", dir);
@@ -28,6 +94,13 @@ int main(void)
 
     write_ident(path, sizeof(void *) == 8 ? 2 : 1);
     assert(spa_plugin_dir_usable(dir));
+    assert(!plugin_paths_usable(NULL, "support/libspa-support.so"));
+    assert(!spa_plugin_dir_usable(":"));
+    snprintf(paths, sizeof(paths), ":/missing::%s:/missing:", dir);
+    assert(spa_plugin_dir_usable(paths));
+    snprintf(paths, sizeof(paths), "%s:/missing", dir);
+    assert(spa_plugin_dir_usable(paths));
+    test_plugin_dirs(dir);
     write_ident(path, sizeof(void *) == 8 ? 1 : 2);
     assert(!spa_plugin_dir_usable(dir));
     write_ident(path, 0);
@@ -47,6 +120,12 @@ int main(void)
     memset(too_long, 'a', sizeof(too_long) - 1);
     too_long[sizeof(too_long) - 1] = 0;
     assert(!spa_plugin_dir_usable(too_long));
+
+    /* An oversized search component must not hide later valid paths. */
+    write_ident(path, sizeof(void *) == 8 ? 2 : 1);
+    snprintf(paths, sizeof(paths), "%s:%s", too_long, dir);
+    assert(spa_plugin_dir_usable(paths));
+    assert(!unlink(path));
 
     assert(!rmdir(support));
     assert(!rmdir(dir));

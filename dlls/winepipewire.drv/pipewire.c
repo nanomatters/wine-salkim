@@ -598,16 +598,41 @@ static BOOL plugin_file_usable(const char *path)
     return ident[4] == (sizeof(void *) == 8 ? 2 : 1); /* ELFCLASS64 : ELFCLASS32 */
 }
 
-/* True when dir holds a SPA support plugin of this process's architecture. */
-static BOOL spa_plugin_dir_usable(const char *dir)
+static BOOL plugin_dir_usable(const char *dir, const char *plugin)
 {
     char path[PATH_MAX + 64];
     int len;
 
-    len = snprintf(path, sizeof(path), "%s/support/libspa-support.so", dir);
+    len = snprintf(path, sizeof(path), "%s/%s", dir, plugin);
     if (len < 0 || len >= (int)sizeof(path))
         return FALSE;
     return plugin_file_usable(path);
+}
+
+static BOOL plugin_paths_usable(const char *paths, const char *plugin)
+{
+    char dir[PATH_MAX];
+    size_t len;
+
+    while (paths && *paths)
+    {
+        len = strcspn(paths, ":");
+        if (len && len < sizeof(dir))
+        {
+            memcpy(dir, paths, len);
+            dir[len] = 0;
+            if (plugin_dir_usable(dir, plugin)) return TRUE;
+        }
+        paths += len;
+        if (*paths) ++paths;
+    }
+    return FALSE;
+}
+
+/* SPA and module overrides both accept colon-separated search paths. */
+static BOOL spa_plugin_dir_usable(const char *paths)
+{
+    return plugin_paths_usable(paths, "support/libspa-support.so");
 }
 
 /* Containers (Steam pressure-vessel) import libpipewire from the host but its
@@ -622,17 +647,20 @@ static void pipewire_set_plugin_dirs(void)
     Dl_info info;
     char libdir[PATH_MAX], path[PATH_MAX + 64], *sep;
     const char *existing = getenv("SPA_PLUGIN_DIR");
+    BOOL keep_spa = FALSE;
 
     if (existing)
     {
         if (spa_plugin_dir_usable(existing))
         {
             TRACE("keeping SPA_PLUGIN_DIR %s\n", existing);
-            return;
+            keep_spa = TRUE;
         }
-        WARN("inherited SPA_PLUGIN_DIR %s is not loadable by this process; re-deriving\n", existing);
-        unsetenv("SPA_PLUGIN_DIR");
-        unsetenv("PIPEWIRE_MODULE_DIR");
+        else
+        {
+            WARN("inherited SPA_PLUGIN_DIR %s is not loadable by this process; re-deriving\n", existing);
+            unsetenv("SPA_PLUGIN_DIR");
+        }
     }
 
     if (!dladdr((void *)pw_init, &info) || !info.dli_fname)
@@ -649,18 +677,21 @@ static void pipewire_set_plugin_dirs(void)
         return;
     *sep = 0;
 
-    snprintf(path, sizeof(path), "%s/spa-0.2/support/libspa-support.so", libdir);
-    if (access(path, F_OK))
+    if (!keep_spa)
     {
-        WARN("no SPA support plugin at %s; leaving SPA_PLUGIN_DIR unset\n", path);
-        return;
+        snprintf(path, sizeof(path), "%s/spa-0.2", libdir);
+        if (!spa_plugin_dir_usable(path))
+        {
+            WARN("no SPA support plugin at %s; leaving SPA_PLUGIN_DIR unset\n", path);
+            return;
+        }
+        setenv("SPA_PLUGIN_DIR", path, 1);
     }
-
-    snprintf(path, sizeof(path), "%s/spa-0.2", libdir);
-    setenv("SPA_PLUGIN_DIR", path, 1);
+    existing = getenv("PIPEWIRE_MODULE_DIR");
     snprintf(path, sizeof(path), "%s/pipewire-0.3", libdir);
-    if (!access(path, F_OK))
-        setenv("PIPEWIRE_MODULE_DIR", path, 0);
+    if ((!existing || !plugin_paths_usable(existing, "libpipewire-module-protocol-native.so")) &&
+        plugin_dir_usable(path, "libpipewire-module-protocol-native.so"))
+        setenv("PIPEWIRE_MODULE_DIR", path, 1);
     TRACE("derived SPA plugin dir from %s\n", libdir);
 }
 
