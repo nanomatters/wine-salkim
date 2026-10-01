@@ -323,6 +323,68 @@ static void test_packet_alignment(void)
     assert(!capture_packet_offset(SIZE_MAX, &offset));
 }
 
+static void test_buffer_sizes(void)
+{
+    struct pipewire_stream stream = {0};
+    SIZE_T size, offset, bytes;
+
+    stream.dataflow = eRender;
+    stream.info.rate = 48000;
+    stream.frame_size = 4;
+    stream.period_bytes = 1920;
+    stream.duration = 300000;
+    assert(calc_buffer_size(&stream, &size, &offset));
+    assert(stream.bufsize_frames == 1440 && stream.real_bufsize_bytes == 11520);
+    assert(size == 11520 && !offset);
+
+    stream.dataflow = eCapture;
+    assert(calc_buffer_size(&stream, &size, &offset));
+    assert(stream.bufsize_frames == 1440 && stream.real_bufsize_bytes == 5760);
+    assert(offset == 5760 && size == 5760 + 3 * sizeof(ACPacket));
+
+    stream.info.rate = 44100;
+    stream.frame_size = 3;
+    stream.period_bytes = 396;
+    assert(calc_buffer_size(&stream, &size, &offset));
+    assert(stream.bufsize_frames == 1452 && stream.real_bufsize_bytes == 4356);
+    assert(offset >= 4356 && !(offset % TYPE_ALIGNMENT(ACPacket)));
+    assert(size == offset + 11 * sizeof(ACPacket));
+
+    stream.duration = 0;
+    assert(!calc_buffer_size(&stream, &size, &offset));
+    stream.duration = -1;
+    assert(!calc_buffer_size(&stream, &size, &offset));
+    stream.duration = INT64_MAX;
+    assert(!calc_buffer_size(&stream, &size, &offset));
+
+    stream.dataflow = eRender;
+    stream.info.rate = 1;
+    stream.frame_size = stream.period_bytes = 1;
+    stream.duration = (UINT64)(UINT32_MAX / 2) * 10000000;
+    assert(calc_buffer_size(&stream, &size, &offset));
+    assert(stream.real_bufsize_bytes == UINT32_MAX - 1u);
+    stream.duration += 10000000;
+    assert(!calc_buffer_size(&stream, &size, &offset));
+
+    stream.dataflow = eCapture;
+    stream.duration = ((UINT64)UINT32_MAX + 1) * 10000000;
+    assert(!calc_buffer_size(&stream, &size, &offset));
+    stream.duration = (UINT64)(UINT32_MAX / sizeof(ACPacket) + 1) * 10000000;
+    if (SIZE_MAX == UINT32_MAX) assert(!calc_buffer_size(&stream, &size, &offset));
+    else assert(calc_buffer_size(&stream, &size, &offset));
+
+    /* Duration fits UINT64 arithmetic, but the frame byte count does not
+     * fit the UINT32-sized callback and ring operations. */
+    stream.duration = (UINT64)UINT32_MAX * 10000000;
+    stream.frame_size = stream.period_bytes = 256;
+    assert(!calc_buffer_size(&stream, &size, &offset));
+
+    assert(calc_period_bytes(30000, 44100, 10000000, 3, &bytes) && bytes == 396);
+    assert(!calc_period_bytes(UINT64_MAX, 48000, 10000000, 4, &bytes));
+    assert(!calc_period_bytes(100000, 0, 10000000, 4, &bytes));
+    assert(!calc_period_bytes(1, 1, 10000000, 4, &bytes));
+}
+
 int main(int argc, char **argv)
 {
     assert(argc <= 2);
@@ -331,6 +393,7 @@ int main(int argc, char **argv)
     if (argc == 1 || !strcmp(argv[1], "clock")) test_clock_frequency();
     if (argc == 1 || !strcmp(argv[1], "packet")) test_next_packet();
     if (argc == 1 || !strcmp(argv[1], "alignment")) test_packet_alignment();
+    if (argc == 1 || !strcmp(argv[1], "sizes")) test_buffer_sizes();
     puts("PipeWire stream tests passed");
     return 0;
 }

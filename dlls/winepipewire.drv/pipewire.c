@@ -114,7 +114,7 @@ struct pipewire_stream
     REFERENCE_TIME def_period;
     REFERENCE_TIME duration;
 
-    INT32 locked;
+    INT64 locked; /* Render bytes (negative for wrapping) or capture frames. */
     BOOL started;
     SIZE_T bufsize_frames, real_bufsize_bytes, period_bytes;
     /* render ring bookkeeping: lcl_offs/held track the application side,
@@ -2237,11 +2237,48 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
     }
 }
 
+static BOOL calc_buffer_size(struct pipewire_stream *stream, SIZE_T *size, SIZE_T *packet_offset)
+{
+    UINT64 frames, bytes, packets;
+
+    if (stream->duration <= 0 || !stream->info.rate || !stream->frame_size ||
+        !stream->period_bytes || stream->period_bytes > UINT32_MAX)
+        return FALSE;
+    if ((UINT64)stream->duration > (UINT64_MAX - 9999999) / stream->info.rate)
+        return FALSE;
+
+    frames = ((UINT64)stream->duration * stream->info.rate + 9999999) / 10000000;
+    if (!frames || frames > UINT32_MAX) return FALSE;
+    bytes = frames * stream->frame_size;
+
+    if (stream->dataflow == eRender)
+    {
+        /* The callback, ring offsets and buffer operations use UINT32 bytes. */
+        if (bytes > UINT32_MAX / 2) return FALSE;
+        *packet_offset = 0;
+        bytes *= 2;
+        *size = bytes;
+    }
+    else
+    {
+        packets = bytes / stream->period_bytes + !!(bytes % stream->period_bytes);
+        bytes = packets * stream->period_bytes;
+        if (bytes > UINT32_MAX || !capture_packet_offset(bytes, packet_offset)) return FALSE;
+        if (packets > (SIZE_MAX - *packet_offset) / sizeof(ACPacket)) return FALSE;
+        frames = bytes / stream->frame_size;
+        *size = *packet_offset + packets * sizeof(ACPacket);
+    }
+
+    stream->bufsize_frames = frames;
+    stream->real_bufsize_bytes = bytes;
+    return TRUE;
+}
+
 static NTSTATUS pipewire_create_stream(void *args)
 {
     struct create_stream_params *params = args;
     struct pipewire_stream *stream;
-    SIZE_T bufsize_bytes, size;
+    SIZE_T size, packet_offset;
     UINT32 i;
     HRESULT hr;
 
@@ -2317,9 +2354,12 @@ static NTSTATUS pipewire_create_stream(void *args)
         goto exit;
     }
 
-    stream->bufsize_frames =
-        (SIZE_T)(((UINT64)params->duration * stream->info.rate + 9999999) / 10000000);
-    bufsize_bytes = stream->bufsize_frames * stream->frame_size;
+    if (!calc_buffer_size(stream, &size, &packet_offset))
+    {
+        WARN("Invalid buffer duration %lld at %u Hz.\n", (long long)params->duration, stream->info.rate);
+        hr = E_INVALIDARG;
+        goto exit;
+    }
 
     hr = pipewire_stream_connect(stream, params->device, params->name);
     if (FAILED(hr))
@@ -2331,7 +2371,6 @@ static NTSTATUS pipewire_create_stream(void *args)
     list_init(&stream->packet_filled_head);
     if (stream->dataflow == eRender)
     {
-        size = stream->real_bufsize_bytes = stream->bufsize_frames * 2 * stream->frame_size;
         if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
         {
@@ -2341,21 +2380,7 @@ static NTSTATUS pipewire_create_stream(void *args)
     }
     else
     {
-        UINT32 capture_packets, unalign;
-        SIZE_T packet_offset;
-
-        if ((unalign = bufsize_bytes % stream->period_bytes))
-            bufsize_bytes += stream->period_bytes - unalign;
-        stream->bufsize_frames = bufsize_bytes / stream->frame_size;
-        stream->real_bufsize_bytes = bufsize_bytes;
-        capture_packets = stream->real_bufsize_bytes / stream->period_bytes;
-
-        if (!capture_packet_offset(stream->real_bufsize_bytes, &packet_offset))
-        {
-            hr = E_INVALIDARG;
-            goto exit;
-        }
-        size = packet_offset + capture_packets * sizeof(ACPacket);
+        UINT32 capture_packets = stream->real_bufsize_bytes / stream->period_bytes;
         if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
         {
