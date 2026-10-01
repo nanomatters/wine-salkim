@@ -2,7 +2,16 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
+#define pw_proxy_destroy test_proxy_destroy
 #include "test.h"
+
+static unsigned int destroyed;
+
+void test_proxy_destroy(struct pw_proxy *proxy)
+{
+    assert(proxy);
+    ++destroyed;
+}
 
 DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
 {
@@ -146,6 +155,67 @@ static void test_settings(void)
     assert(!build_format(&format, UINT32_MAX, 2, KSAUDIO_SPEAKER_STEREO));
 }
 
+static void test_node_removal(void)
+{
+    struct pw_registry_methods methods = {PW_VERSION_REGISTRY_METHODS};
+    struct spa_interface registry = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Registry, PW_VERSION_REGISTRY, &methods, NULL);
+    struct spa_dict_item items[] = {{PW_KEY_MEDIA_CLASS, "Audio/Sink"}, {PW_KEY_NODE_NAME, ""}};
+    struct spa_dict properties = SPA_DICT_INIT_ARRAY(items);
+    struct probe probe = {.registry = (void *)&registry};
+    struct probe_node *node;
+
+    list_init(&probe.nodes);
+    list_init(&probe.devices);
+    on_probe_registry_global(&probe, 1, 0, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &properties);
+    assert(list_empty(&probe.nodes));
+    items[1].value = "sink";
+    on_probe_registry_global(&probe, 1, 0, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &properties);
+    on_probe_registry_global(&probe, 2, 0, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &properties);
+    assert(list_count(&probe.nodes) == 2);
+    node = LIST_ENTRY(list_head(&probe.nodes), struct probe_node, entry);
+    node->proxy = (void *)1;
+    spa_list_init(&node->listener.link);
+    on_probe_registry_global_remove(&probe, 1);
+    assert(destroyed == 1 && list_count(&probe.nodes) == 1);
+    node = LIST_ENTRY(list_head(&probe.nodes), struct probe_node, entry);
+    assert(node->id == 2);
+    on_probe_registry_global_remove(&probe, 99);
+    assert(list_count(&probe.nodes) == 1);
+    on_probe_registry_global_remove(&probe, 2);
+    assert(list_empty(&probe.nodes));
+
+    probe.meta_default = (void *)1;
+    probe.meta_settings = (void *)2;
+    probe.meta_default_id = 10;
+    probe.meta_settings_id = 11;
+    spa_list_init(&probe.meta_default_listener.link);
+    spa_list_init(&probe.meta_settings_listener.link);
+    strcpy(probe.default_sink, "sink");
+    probe.force_rate = 96000;
+    on_probe_registry_global_remove(&probe, 10);
+    assert(!probe.meta_default && !probe.default_sink[0] && probe.meta_settings);
+    on_probe_registry_global_remove(&probe, 11);
+    assert(!probe.meta_settings && !probe.force_rate && destroyed == 3);
+}
+
+static void test_duplicate_names(void)
+{
+    struct pw_phys_device *render, *capture;
+
+    render = add_device(&g_render_devices, "same", "Speakers", Speakers, 48000, 2,
+                        KSAUDIO_SPEAKER_STEREO, 100000, 30000);
+    assert(render);
+    assert(!add_device(&g_render_devices, "same", "Duplicate", Speakers, 48000, 2,
+                       KSAUDIO_SPEAKER_STEREO, 100000, 30000));
+    capture = add_device(&g_capture_devices, "same", "Microphone", Microphone, 48000, 2,
+                         KSAUDIO_SPEAKER_STEREO, 100000, 30000);
+    assert(capture && list_count(&g_render_devices) == 1 && list_count(&g_capture_devices) == 1);
+    assert(render->fmt.Format.nAvgBytesPerSec == 48000 * 8);
+    assert(render->def_period == 100000 && render->min_period == 30000);
+    free_device_lists();
+    assert(list_empty(&g_render_devices) && list_empty(&g_capture_devices));
+}
+
 static void test_invalid_cache_format(void)
 {
     struct probe probe = {.clock_rate = INT32_MAX};
@@ -170,6 +240,8 @@ int main(void)
 {
     test_defaults();
     test_settings();
+    test_node_removal();
+    test_duplicate_names();
     test_invalid_cache_format();
     puts("PipeWire probe tests passed");
     return 0;

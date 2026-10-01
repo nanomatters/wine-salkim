@@ -151,6 +151,7 @@ static void test_device_info(void)
     struct probe_device *source = calloc(1, sizeof(*source));
     struct pw_phys_device device = {0};
 
+    list_init(&p.nodes);
     list_init(&p.devices);
     source->id = 42;
     list_add_tail(&p.devices, &source->entry);

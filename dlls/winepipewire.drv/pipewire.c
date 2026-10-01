@@ -586,8 +586,11 @@ static struct pw_phys_device *add_device(struct list *list, const char *pw_name,
                                          REFERENCE_TIME def_period, REFERENCE_TIME min_period)
 {
     size_t len = strlen(pw_name);
-    struct pw_phys_device *dev = calloc(1, sizeof(*dev) + len + 1);
+    struct pw_phys_device *dev;
 
+    LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
+        if (!strcmp(dev->pw_name, pw_name)) return NULL;
+    dev = calloc(1, sizeof(*dev) + len + 1);
     if (!dev)
         return NULL;
     if (!(dev->display = utf8_to_wstr(display)))
@@ -977,6 +980,7 @@ struct probe
     struct list devices;
     struct pw_metadata *meta_default;
     struct pw_metadata *meta_settings;
+    uint32_t meta_default_id, meta_settings_id;
     struct spa_hook meta_default_listener;
     struct spa_hook meta_settings_listener;
     char default_sink[256];
@@ -1037,6 +1041,20 @@ static void release_probe_device(struct probe_device *device)
     if (device->info) pw_device_info_free(device->info);
     list_remove(&device->entry);
     free(device);
+}
+
+static void release_probe_node(struct probe_node *node)
+{
+    if (node->proxy)
+    {
+        spa_hook_remove(&node->listener);
+        pw_proxy_destroy((struct pw_proxy *)node->proxy);
+    }
+    list_remove(&node->entry);
+    free(node->node_name);
+    free(node->display);
+    free(node->nickname);
+    free(node);
 }
 
 static int on_probe_metadata_property(void *data, uint32_t subject, const char *key,
@@ -1118,7 +1136,7 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
         struct probe_node *pn;
         UINT64 device_id;
 
-        if (!media_class || !node_name)
+        if (!media_class || !node_name || !node_name[0])
             return;
         if (strcmp(media_class, "Audio/Sink") && strcmp(media_class, "Audio/Source"))
             return;
@@ -1174,16 +1192,22 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
             p->meta_default = pw_registry_bind(p->registry, id, PW_TYPE_INTERFACE_Metadata,
                                                PW_VERSION_METADATA, 0);
             if (p->meta_default)
+            {
+                p->meta_default_id = id;
                 pw_metadata_add_listener(p->meta_default, &p->meta_default_listener,
                                          &probe_metadata_events, p);
+            }
         }
         else if (!strcmp(name, "settings") && !p->meta_settings)
         {
             p->meta_settings = pw_registry_bind(p->registry, id, PW_TYPE_INTERFACE_Metadata,
                                                 PW_VERSION_METADATA, 0);
             if (p->meta_settings)
+            {
+                p->meta_settings_id = id;
                 pw_metadata_add_listener(p->meta_settings, &p->meta_settings_listener,
                                          &probe_settings_events, p);
+            }
         }
     }
 }
@@ -1191,14 +1215,35 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
 static void on_probe_registry_global_remove(void *data, uint32_t id)
 {
     struct probe *p = data;
+    struct probe_node *node;
     struct probe_device *device;
 
+    LIST_FOR_EACH_ENTRY(node, &p->nodes, struct probe_node, entry)
+        if (node->id == id)
+        {
+            release_probe_node(node);
+            break;
+        }
     LIST_FOR_EACH_ENTRY(device, &p->devices, struct probe_device, entry)
         if (device->id == id)
         {
             release_probe_device(device);
             break;
         }
+    if (p->meta_default && p->meta_default_id == id)
+    {
+        spa_hook_remove(&p->meta_default_listener);
+        pw_proxy_destroy((struct pw_proxy *)p->meta_default);
+        p->meta_default = NULL;
+        on_probe_metadata_property(p, PW_ID_CORE, NULL, NULL, NULL);
+    }
+    if (p->meta_settings && p->meta_settings_id == id)
+    {
+        spa_hook_remove(&p->meta_settings_listener);
+        pw_proxy_destroy((struct pw_proxy *)p->meta_settings);
+        p->meta_settings = NULL;
+        on_probe_settings_property(p, PW_ID_CORE, NULL, NULL, NULL);
+    }
 }
 
 static const struct pw_registry_events probe_registry_events = {
@@ -1538,13 +1583,7 @@ static NTSTATUS pipewire_test_connect(void *args)
         build_device_cache(&p);
 
     LIST_FOR_EACH_ENTRY_SAFE(pn, next, &p.nodes, struct probe_node, entry)
-    {
-        list_remove(&pn->entry);
-        free(pn->node_name);
-        free(pn->display);
-        free(pn->nickname);
-        free(pn);
-    }
+        release_probe_node(pn);
     LIST_FOR_EACH_ENTRY_SAFE(device, device_next, &p.devices, struct probe_device, entry)
         release_probe_device(device);
 
