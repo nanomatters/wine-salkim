@@ -6,6 +6,53 @@
 
 #include "test.h"
 
+static unsigned int loop_depth, control_calls, flush_calls;
+static int control_result;
+static float last_rate_ratio;
+static enum pw_stream_state test_stream_state = PW_STREAM_STATE_PAUSED;
+
+void pw_thread_loop_lock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global);
+    assert(!loop_depth++);
+}
+
+void pw_thread_loop_unlock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global);
+    assert(loop_depth-- == 1);
+}
+
+enum pw_stream_state pw_stream_get_state(struct pw_stream *stream, const char **error)
+{
+    assert(loop_depth == 1);
+    return test_stream_state;
+}
+
+int pw_stream_set_control(struct pw_stream *stream, uint32_t id, uint32_t n_values, float *values, ...)
+{
+    assert(loop_depth == 1);
+    assert(id == SPA_PROP_rate && n_values == 1);
+    last_rate_ratio = *values;
+    control_calls++;
+    return control_result;
+}
+
+int pw_stream_flush(struct pw_stream *stream, bool drain)
+{
+    assert(loop_depth == 1);
+    flush_calls++;
+    return 0;
+}
+
+NTSTATUS WINAPI NtQueryPerformanceCounter(LARGE_INTEGER *counter, LARGE_INTEGER *frequency)
+{
+    assert(!loop_depth);
+    counter->QuadPart = 12345678;
+    if (frequency) frequency->QuadPart = 10000000;
+    return STATUS_SUCCESS;
+}
+
 static void test_format_support(void)
 {
     WAVEFORMATEXTENSIBLE fmt = {0};
@@ -82,9 +129,155 @@ static void test_format_support(void)
     assert(params.result == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED);
 }
 
+static void test_sample_rate(void)
+{
+    BYTE buffer[64], saved[64];
+    struct pipewire_stream stream = {0};
+    struct set_sample_rate_params params = {0};
+    unsigned int i;
+
+    for (i = 0; i < sizeof(buffer); ++i)
+        buffer[i] = i;
+    memcpy(saved, buffer, sizeof(saved));
+    pw_loop_global = (void *)1;
+    stream.pw = (void *)2;
+    stream.dataflow = eRender;
+    stream.info.rate = stream.rate_connected = 48000;
+    stream.info.format = SPA_AUDIO_FORMAT_S16_LE;
+    stream.frame_size = 4;
+    stream.local_buffer = buffer;
+    stream.real_bufsize_bytes = sizeof(buffer);
+    stream.mmdev_period_usec = 10000;
+    stream.period_bytes = 1920;
+    stream.pa_offs_bytes = 8;
+    stream.lcl_offs_bytes = 4;
+    stream.pa_held_bytes = 12;
+    stream.held_bytes = 16;
+    stream.clock_written = 200;
+    stream.clock_lastpos = 180;
+    stream.locked = 8;
+    params.stream = (UINT_PTR)&stream;
+    params.rate = 24000;
+
+    pipewire_set_sample_rate(&params);
+    assert(params.result == S_OK && !loop_depth);
+    assert(control_calls == 1 && !flush_calls);
+    assert(last_rate_ratio == 0.5f);
+    assert(stream.info.rate == 24000 && stream.period_bytes == 960);
+    assert(stream.locked == 8 && stream.local_buffer == buffer);
+    assert(stream.pa_offs_bytes == 8 && stream.lcl_offs_bytes == 4);
+    assert(stream.pa_held_bytes == 12 && stream.held_bytes == 16);
+    assert(stream.clock_written == 200 && stream.clock_lastpos == 180);
+    assert(!memcmp(buffer, saved, sizeof(buffer)));
+
+    control_result = -ENOTSUP;
+    params.rate = 48000;
+    pipewire_set_sample_rate(&params);
+    assert(params.result == E_NOTIMPL && !loop_depth);
+    assert(control_calls == 2 && !flush_calls);
+    assert(stream.info.rate == 24000 && stream.period_bytes == 960);
+    assert(stream.locked == 8 && stream.local_buffer == buffer);
+    assert(stream.pa_offs_bytes == 8 && stream.lcl_offs_bytes == 4);
+    assert(stream.pa_held_bytes == 12 && stream.held_bytes == 16);
+    assert(stream.clock_written == 200 && stream.clock_lastpos == 180);
+    assert(!memcmp(buffer, saved, sizeof(buffer)));
+
+    control_result = 0;
+    params.rate = 0;
+    pipewire_set_sample_rate(&params);
+    assert(FAILED(params.result) && !loop_depth);
+    assert(control_calls == 2);
+}
+
+static void test_clock_frequency(void)
+{
+    const float rates[] = {24000, 96000, 48000};
+    struct pipewire_stream stream = {0};
+    struct set_sample_rate_params rate = {0};
+    struct get_frequency_params frequency = {0};
+    struct get_position_params position = {0};
+    UINT64 freq, pos, qpc;
+    unsigned int i;
+
+    pw_loop_global = (void *)1;
+    test_stream_state = PW_STREAM_STATE_PAUSED;
+    control_calls = flush_calls = 0;
+    control_result = 0;
+    stream.pw = (void *)2;
+    stream.dataflow = eRender;
+    stream.share = AUDCLNT_SHAREMODE_SHARED;
+    stream.flags = AUDCLNT_STREAMFLAGS_RATEADJUST;
+    stream.info.rate = stream.rate_connected = 48000;
+    stream.frame_size = 4;
+    stream.mmdev_period_usec = 10000;
+    stream.period_bytes = 1920;
+    stream.held_bytes = 16;
+    stream.clock_written = 192016;
+    stream.clock_lastpos = 192000;
+    rate.stream = frequency.stream = position.stream = (UINT_PTR)&stream;
+    frequency.freq = &freq;
+    position.pos = &pos;
+    position.qpctime = &qpc;
+
+    pipewire_get_frequency(&frequency);
+    pipewire_get_position(&position);
+    assert(frequency.result == S_OK && freq == 192000);
+    assert(position.result == S_OK && pos == 192000 && qpc == 12345678);
+    assert(pos / freq == 1 && !loop_depth);
+
+    for (i = 0; i < ARRAY_SIZE(rates); ++i)
+    {
+        rate.rate = rates[i];
+        pipewire_set_sample_rate(&rate);
+        assert(rate.result == S_OK && stream.info.rate == rates[i]);
+        assert(stream.rate_connected == 48000 && !flush_calls);
+        pipewire_get_frequency(&frequency);
+        pipewire_get_position(&position);
+        /* No frames moved: a new playback rate must not rescale elapsed position. */
+        assert(frequency.result == S_OK && freq == 192000);
+        assert(position.result == S_OK && pos == 192000 && pos / freq == 1);
+        assert(stream.clock_written == 192016 && stream.clock_lastpos == 192000);
+        assert(!loop_depth);
+    }
+
+    control_result = -ENOTSUP;
+    rate.rate = 32000;
+    pipewire_set_sample_rate(&rate);
+    assert(rate.result == E_NOTIMPL && stream.info.rate == 48000);
+    pipewire_get_frequency(&frequency);
+    assert(frequency.result == S_OK && freq == 192000 && !loop_depth);
+    control_result = 0;
+
+    stream.dataflow = eCapture;
+    stream.capture_written = 192000;
+    pipewire_get_frequency(&frequency);
+    pipewire_get_position(&position);
+    assert(frequency.result == S_OK && freq == 192000);
+    assert(position.result == S_OK && pos == 192000 && !loop_depth);
+
+    /* Exclusive clocks use frames rather than shared-mode byte positions. */
+    stream.share = AUDCLNT_SHAREMODE_EXCLUSIVE;
+    pipewire_get_frequency(&frequency);
+    pipewire_get_position(&position);
+    assert(frequency.result == S_OK && freq == 48000);
+    assert(position.result == S_OK && pos == 48000 && pos / freq == 1);
+    assert(stream.clock_lastpos == 192000 && !loop_depth);
+
+    test_stream_state = PW_STREAM_STATE_ERROR;
+    freq = pos = 0xdeadbeef;
+    pipewire_get_frequency(&frequency);
+    pipewire_get_position(&position);
+    assert(frequency.result == AUDCLNT_E_DEVICE_INVALIDATED && freq == 0xdeadbeef);
+    assert(position.result == AUDCLNT_E_DEVICE_INVALIDATED && pos == 0xdeadbeef);
+    assert(!loop_depth);
+    test_stream_state = PW_STREAM_STATE_PAUSED;
+}
+
 int main(void)
 {
     test_format_support();
+    test_sample_rate();
+    test_clock_frequency();
     puts("PipeWire stream tests passed");
     return 0;
 }

@@ -3178,7 +3178,8 @@ static NTSTATUS pipewire_get_frequency(void *args)
         return STATUS_SUCCESS;
     }
 
-    *params->freq = stream->info.rate;
+    /* Rate adjustment changes playback speed, not the clock's unit scale. */
+    *params->freq = stream->rate_connected;
     if (stream->share == AUDCLNT_SHAREMODE_SHARED)
         *params->freq *= stream->frame_size;
     pw_thread_loop_unlock(pw_loop_global);
@@ -3269,7 +3270,7 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
     float ratio;
     SIZE_T period_bytes;
 
-    TRACE("stream %p rate %u.\n", stream, (unsigned)params->rate);
+    TRACE("stream %p rate %f.\n", stream, params->rate);
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3288,7 +3289,7 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
      * also catches NaN). */
     if (!(params->rate >= 1.0f && params->rate <= 384000.0f))
     {
-        WARN("Unsupported sample rate %u.\n", (unsigned)params->rate);
+        WARN("Unsupported sample rate %f.\n", params->rate);
         hr = E_OUTOFMEMORY;
         goto exit;
     }
@@ -3311,16 +3312,9 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
         goto exit;
     }
 
-    pw_stream_flush(stream->pw, false);
-
-    stream->clock_lastpos = stream->clock_written = 0;
-    stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
-    stream->held_bytes = 0;
-    __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
+    /* Rate adjustment must not discard queued frames or an acquired buffer. */
     stream->period_bytes = period_bytes;
     stream->info.rate = params->rate;
-
-    silence_buffer(stream->info.format, stream->local_buffer, stream->real_bufsize_bytes);
 
 exit:
     pw_thread_loop_unlock(pw_loop_global);
