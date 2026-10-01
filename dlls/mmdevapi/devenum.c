@@ -673,7 +673,7 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
     }
 
     /* pretend to be pnp */
-    if ((device_set = SetupDiCreateDeviceInfoList(NULL, NULL)))
+    if ((device_set = SetupDiCreateDeviceInfoList(NULL, NULL)) != INVALID_HANDLE_VALUE)
     {
         WCHAR device_name[DEVICE_ID_LEN];
 
