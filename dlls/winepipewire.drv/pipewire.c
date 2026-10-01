@@ -51,6 +51,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 #ifdef HAVE_UDEV
 #include <libudev.h>
@@ -582,21 +583,31 @@ static void free_device_lists(void)
  * Process attach / detach
  * ---------------------------------------------------------------------- */
 
-/* True when dir holds a SPA support plugin of this process's architecture. */
-static BOOL spa_plugin_dir_usable(const char *dir)
+static BOOL plugin_file_usable(const char *path)
 {
-    char path[PATH_MAX + 64];
     unsigned char ident[5];
+    struct stat st;
     int fd, n;
 
-    snprintf(path, sizeof(path), "%s/support/libspa-support.so", dir);
-    if ((fd = open(path, O_RDONLY)) < 0)
+    if ((fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)) < 0)
         return FALSE;
-    n = read(fd, ident, sizeof(ident));
+    n = !fstat(fd, &st) && S_ISREG(st.st_mode) ? read(fd, ident, sizeof(ident)) : -1;
     close(fd);
     if (n != (int)sizeof(ident) || memcmp(ident, "\x7f""ELF", 4))
         return FALSE;
     return ident[4] == (sizeof(void *) == 8 ? 2 : 1); /* ELFCLASS64 : ELFCLASS32 */
+}
+
+/* True when dir holds a SPA support plugin of this process's architecture. */
+static BOOL spa_plugin_dir_usable(const char *dir)
+{
+    char path[PATH_MAX + 64];
+    int len;
+
+    len = snprintf(path, sizeof(path), "%s/support/libspa-support.so", dir);
+    if (len < 0 || len >= (int)sizeof(path))
+        return FALSE;
+    return plugin_file_usable(path);
 }
 
 /* Containers (Steam pressure-vessel) import libpipewire from the host but its

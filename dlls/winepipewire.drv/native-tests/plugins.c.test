@@ -1,0 +1,55 @@
+/* PipeWire plugin discovery regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+#include <signal.h>
+
+static void write_ident(const char *path, unsigned char elf_class)
+{
+    unsigned char ident[] = {0x7f, 'E', 'L', 'F', elf_class};
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    assert(fd >= 0);
+    assert(write(fd, ident, sizeof(ident)) == sizeof(ident));
+    assert(!close(fd));
+}
+
+int main(void)
+{
+    char dir[] = "/tmp/winepipewire-plugins-XXXXXX", support[PATH_MAX], path[PATH_MAX], too_long[PATH_MAX + 128];
+
+    assert(mkdtemp(dir));
+    snprintf(support, sizeof(support), "%s/support", dir);
+    snprintf(path, sizeof(path), "%s/support/libspa-support.so", dir);
+    assert(!mkdir(support, 0700));
+    assert(!spa_plugin_dir_usable(dir));
+
+    write_ident(path, sizeof(void *) == 8 ? 2 : 1);
+    assert(spa_plugin_dir_usable(dir));
+    write_ident(path, sizeof(void *) == 8 ? 1 : 2);
+    assert(!spa_plugin_dir_usable(dir));
+    write_ident(path, 0);
+    assert(!spa_plugin_dir_usable(dir));
+
+    assert(!unlink(path));
+    assert(!mkfifo(path, 0600));
+    /* The old blocking open hangs here, before any ELF validation. */
+    alarm(2);
+    assert(!spa_plugin_dir_usable(dir));
+    alarm(0);
+    assert(!unlink(path));
+
+    assert(!mkdir(path, 0700));
+    assert(!spa_plugin_dir_usable(dir));
+    assert(!rmdir(path));
+    memset(too_long, 'a', sizeof(too_long) - 1);
+    too_long[sizeof(too_long) - 1] = 0;
+    assert(!spa_plugin_dir_usable(too_long));
+
+    assert(!rmdir(support));
+    assert(!rmdir(dir));
+    puts("PipeWire plugin file checks passed.");
+    return 0;
+}
