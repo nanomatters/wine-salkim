@@ -85,7 +85,7 @@ typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufDrainReleaseWINE)( int channel_fd,
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 39
+#define WINE_OPENGL_DRIVER_VERSION 40
 
 struct opengl_drawable;
 struct wgl_context;
@@ -226,6 +226,29 @@ struct egl_platform
     GUID                 device_uuid;
     GUID                 driver_uuid;
 };
+
+static inline EGLConfig egl_config_for_format( const struct egl_platform *egl, int format, UINT *flags )
+{
+    UINT index;
+
+    if (format <= 0 || (UINT)format > 3 * egl->config_count) return NULL;
+    index = format - 1;
+
+    /* Keep single and double buffered variants adjacent, so applications which
+     * only examine the first few formats can find both. Offscreen formats stay last. */
+    if (index < 2 * egl->config_count)
+    {
+        if (flags) *flags = index % 2 ? PFD_DOUBLEBUFFER : PFD_SUPPORT_GDI;
+        index /= 2;
+    }
+    else
+    {
+        if (flags) *flags = 0;
+        index -= 2 * egl->config_count;
+    }
+
+    return egl->configs[index];
+}
 
 struct opengl_drawable_funcs
 {

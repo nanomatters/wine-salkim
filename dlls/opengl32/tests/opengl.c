@@ -978,6 +978,72 @@ static void test_choosepixelformat(void)
     pfd.cDepthBits = 0;
 }
 
+static void test_legacy_pixel_formats(void)
+{
+    const DWORD flags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    HGLRC old_context = wglGetCurrentContext(), context = NULL;
+    HDC old_dc = wglGetCurrentDC(), hdc;
+    PIXELFORMATDESCRIPTOR pfd;
+    GLint depth = 0;
+    GLenum error;
+    int count, format, ret;
+    HWND hwnd;
+
+    hwnd = CreateWindowA( "static", "pixel formats", WS_OVERLAPPEDWINDOW,
+                          10, 10, 200, 200, NULL, NULL, NULL, NULL );
+    ok( !!hwnd, "CreateWindow failed, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+    hdc = GetDC( hwnd );
+    ok( !!hdc, "GetDC failed, error %lu\n", GetLastError() );
+    if (!hdc) goto cleanup;
+
+    count = DescribePixelFormat( hdc, 0, 0, NULL );
+    for (format = 1; format <= count; format++)
+    {
+        ret = DescribePixelFormat( hdc, format, sizeof(pfd), &pfd );
+        ok( ret == count, "Format %d returned %d, expected %d\n", format, ret, count );
+        if (ret && (pfd.dwFlags & flags) == flags && pfd.iPixelType == PFD_TYPE_RGBA &&
+            pfd.cColorBits >= 16 && pfd.cDepthBits >= 16) break;
+    }
+    if (format > count)
+    {
+        skip( "No double-buffered RGBA window format with a depth buffer\n" );
+        goto cleanup;
+    }
+
+    /* Legacy games such as Return to Castle Wolfenstein inspect at most 256 formats. */
+    ok( format <= 256, "First usable double-buffered format is %d of %d\n", format, count );
+    ret = SetPixelFormat( hdc, format, &pfd );
+    ok( ret, "SetPixelFormat(%d) failed, error %lu\n", format, GetLastError() );
+    if (!ret) goto cleanup;
+    ret = GetPixelFormat( hdc );
+    ok( ret == format, "Got pixel format %d, expected %d\n", ret, format );
+    context = wglCreateContext( hdc );
+    ok( !!context, "wglCreateContext failed, error %lu\n", GetLastError() );
+    if (!context) goto cleanup;
+    ret = wglMakeCurrent( hdc, context );
+    ok( ret, "wglMakeCurrent failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        glGetIntegerv( GL_DEPTH_BITS, &depth );
+        error = glGetError();
+        ok( error == GL_NO_ERROR, "Unexpected GL error %#x\n", error );
+        ok( depth == pfd.cDepthBits, "Format %d has %d depth bits, expected %u\n",
+            format, depth, pfd.cDepthBits );
+    }
+
+cleanup:
+    if (context)
+    {
+        ret = wglMakeCurrent( old_dc, old_context );
+        ok( ret, "Failed to restore context, error %lu\n", GetLastError() );
+        ret = wglDeleteContext( context );
+        ok( ret, "wglDeleteContext failed, error %lu\n", GetLastError() );
+    }
+    if (hdc) ReleaseDC( hwnd, hdc );
+    DestroyWindow( hwnd );
+}
+
 static void test_choosepixelformat_flag_is_ignored_when_unset(DWORD flag)
 {
     PIXELFORMATDESCRIPTOR pfd = {
@@ -3857,6 +3923,7 @@ START_TEST(opengl)
          */
         init_functions();
 
+        test_legacy_pixel_formats();
         test_getprocaddress(hdc);
         test_deletecontext(hwnd, hdc);
         test_makecurrent(hdc);

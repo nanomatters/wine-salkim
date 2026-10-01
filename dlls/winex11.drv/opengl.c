@@ -476,11 +476,6 @@ static void x11drv_init_egl_platform( struct egl_platform *platform )
     egl = platform;
 }
 
-static EGLConfig egl_config_for_format( int format )
-{
-    return egl->configs[(format - 1) % egl->config_count];
-}
-
 static struct glx_pixel_format *glx_pixel_format_from_format( int format )
 {
     assert( format > 0 && format <= nb_pixel_formats );
@@ -491,7 +486,7 @@ BOOL visual_from_pixel_format( int format, XVisualInfo *visual )
 {
     if (use_egl)
     {
-        EGLConfig config = egl_config_for_format( format );
+        EGLConfig config = egl_config_for_format( egl, format, NULL );
         XVisualInfo *visuals;
         int count;
 
@@ -543,7 +538,7 @@ static BOOL x11drv_egl_surface_create( HWND hwnd, BOOL raw, int format, struct o
     gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
     gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
 
-    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, egl_config_for_format( format ),
+    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, egl_config_for_format( egl, format, NULL ),
                                                               (void *)window, NULL )))
     {
         opengl_drawable_release( &gl->base );

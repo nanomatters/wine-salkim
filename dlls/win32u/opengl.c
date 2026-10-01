@@ -1006,11 +1006,6 @@ static BOOL needs_framebuffer_surface( HWND hwnd )
 
 static const struct opengl_drawable_funcs egldrv_pbuffer_funcs;
 
-static EGLConfig egl_config_for_format( const struct egl_platform *egl, int format )
-{
-    return egl->configs[(format - 1) % egl->config_count];
-}
-
 static void egldrv_init_egl_platform( struct egl_platform *platform )
 {
     platform->type = EGL_PLATFORM_SURFACELESS_MESA;
@@ -1021,14 +1016,6 @@ static void *egldrv_get_proc_address( const char *name )
 {
     return display_funcs.p_eglGetProcAddress( name );
 }
-
-/* list of flags with which each EGL config will be combined */
-static const UINT pixel_format_flags[] =
-{
-    PFD_SUPPORT_GDI,
-    PFD_DOUBLEBUFFER,
-    0, /* offscreen */
-};
 
 static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
 {
@@ -1075,8 +1062,8 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
     egl->configs = configs;
     egl->config_count = count;
 
-    *onscreen_count = (ARRAY_SIZE(pixel_format_flags) - 1) * count;
-    return ARRAY_SIZE(pixel_format_flags) * count;
+    *onscreen_count = 2 * count;
+    return 3 * count;
 }
 
 static BOOL describe_egl_config( EGLConfig config, struct wgl_pixel_format *fmt, UINT flags )
@@ -1212,11 +1199,11 @@ static BOOL describe_egl_config( EGLConfig config, struct wgl_pixel_format *fmt,
 
 static BOOL egldrv_describe_pixel_format( int format, struct wgl_pixel_format *desc )
 {
-    struct egl_platform *egl = &display_egl;
-    int count = egl->config_count;
+    EGLConfig config;
+    UINT flags;
 
-    if (--format < 0 || format >= ARRAY_SIZE(pixel_format_flags) * count) return FALSE;
-    return describe_egl_config( egl->configs[format % count], desc, pixel_format_flags[format / count] );
+    if (!(config = egl_config_for_format( &display_egl, format, &flags ))) return FALSE;
+    return describe_egl_config( config, desc, flags );
 }
 
 static const char *egldrv_init_wgl_extensions( struct opengl_funcs *funcs )
@@ -1293,7 +1280,7 @@ static BOOL egldrv_pbuffer_create( HDC hdc, int format, BOOL largest, GLenum tex
     *attrib++ = EGL_NONE;
 
     if (!(gl = opengl_drawable_create( sizeof(*gl), &egldrv_pbuffer_funcs, format, NULL ))) return FALSE;
-    if (!(gl->surface = funcs->p_eglCreatePbufferSurface( egl->display, egl_config_for_format( egl, gl->format ), attribs )))
+    if (!(gl->surface = funcs->p_eglCreatePbufferSurface( egl->display, egl_config_for_format( egl, gl->format, NULL ), attribs )))
     {
         opengl_drawable_release( gl );
         return FALSE;

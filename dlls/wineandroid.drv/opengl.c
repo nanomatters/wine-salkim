@@ -64,11 +64,6 @@ static struct gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *ba
 
 static void *opengl_handle;
 
-static EGLConfig egl_config_for_format(int format)
-{
-    return egl->configs[(format - 1) % egl->config_count];
-}
-
 static void android_drawable_destroy( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
@@ -96,7 +91,7 @@ static BOOL android_surface_create( HWND hwnd, int format, struct opengl_drawabl
         FIXME( "Updating drawable %s, multiple surfaces not implemented\n", debugstr_opengl_drawable( *drawable ) );
 
         gl = impl_from_opengl_drawable( *drawable );
-        funcs->p_eglGetConfigAttrib( egl->display, egl_config_for_format(format), EGL_NATIVE_VISUAL_ID, &pf );
+        funcs->p_eglGetConfigAttrib( egl->display, egl_config_for_format(egl, format, NULL), EGL_NATIVE_VISUAL_ID, &pf );
         gl->window->perform( gl->window, NATIVE_WINDOW_SET_BUFFERS_FORMAT, pf );
         gl->base.format = format;
 
@@ -106,7 +101,7 @@ static BOOL android_surface_create( HWND hwnd, int format, struct opengl_drawabl
     else
     {
         static const int attribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-        EGLConfig config = egl_config_for_format( format );
+        EGLConfig config = egl_config_for_format( egl, format, NULL );
         struct client_surface *client;
 
         if (!(client = client_surface_create( sizeof(*client), &android_client_surface_funcs, hwnd ))) return FALSE;

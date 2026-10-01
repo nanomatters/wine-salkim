@@ -147,11 +147,6 @@ static void wayland_drawable_destroy(struct opengl_drawable *base)
     if (gl->wl_egl_window) wl_egl_window_destroy(gl->wl_egl_window);
 }
 
-static EGLConfig egl_config_for_format(int format)
-{
-    return egl->configs[(format - 1) % egl->config_count];
-}
-
 static void wayland_gl_drawable_sync_size(struct wayland_gl_drawable *gl)
 {
     int client_width, client_height;
@@ -170,7 +165,7 @@ static void wayland_gl_drawable_sync_size(struct wayland_gl_drawable *gl)
 
 static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable)
 {
-    EGLConfig config = egl_config_for_format(format);
+    EGLConfig config = egl_config_for_format(egl, format, NULL);
     struct wayland_client_surface *client;
     EGLint attribs[4], *attrib = attribs;
     struct opengl_drawable *previous;
@@ -358,7 +353,7 @@ static const struct opengl_drawable_funcs wayland_pbuffer_funcs =
 static BOOL wayland_pbuffer_create(HDC hdc, int format, BOOL largest, GLenum texture_format, GLenum texture_target,
                                    GLint max_level, GLsizei *width, GLsizei *height, struct opengl_drawable **surface)
 {
-    EGLConfig config = egl_config_for_format(format);
+    EGLConfig config = egl_config_for_format(egl, format, NULL);
     struct wayland_pbuffer *gl;
 
     TRACE("hdc %p, format %d, largest %u, texture_format %#x, texture_target %#x, max_level %#x, width %d, height %d, private %p\n",
