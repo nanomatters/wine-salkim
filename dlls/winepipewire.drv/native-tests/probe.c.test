@@ -1,0 +1,54 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static void test_defaults(void)
+{
+    struct probe probe = {0};
+    char json[512];
+    unsigned int i;
+
+    json[0] = '{';
+    json[1] = '"';
+    for (i = 2; i < 202; ++i) json[i] = 'x';
+    strcpy(json + i, "\":{\"nested\":[1,2]},\"name\":\"sink\"}");
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, json);
+    assert(!strcmp(probe.default_sink, "sink"));
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.source", NULL, "{\"name\":\"source\"}");
+    assert(!strcmp(probe.default_source, "source"));
+
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"other\":\"sink\"}");
+    assert(!probe.default_sink[0] && !strcmp(probe.default_source, "source"));
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.source", NULL, NULL);
+    assert(!probe.default_source[0]);
+
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":\"sink\"}");
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":123}");
+    assert(!probe.default_sink[0]);
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":\"sink\"");
+    assert(!probe.default_sink[0]);
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":\"sink\"} {}");
+    assert(!probe.default_sink[0]);
+
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":\"sink\"}");
+    on_probe_metadata_property(&probe, 1, "default.audio.sink", NULL, NULL);
+    assert(!strcmp(probe.default_sink, "sink"));
+    on_probe_metadata_property(&probe, PW_ID_CORE, NULL, NULL, NULL);
+    assert(!probe.default_sink[0] && !probe.default_source[0]);
+
+    json[0] = '{';
+    strcpy(json + 1, "\"name\":\"");
+    memset(json + 9, 'x', 300);
+    strcpy(json + 309, "\"}");
+    on_probe_metadata_property(&probe, PW_ID_CORE, "default.audio.sink", NULL, json);
+    assert(!probe.default_sink[0]);
+}
+
+int main(void)
+{
+    test_defaults();
+    puts("PipeWire probe tests passed");
+    return 0;
+}

@@ -382,21 +382,31 @@ static int parse_json_str_field(const char *json, const char *field, char *dst, 
     struct spa_json it[2];
     char key[64];
     const char *val;
-    int len;
+    int len, result = -1;
+    BOOL matches;
 
     spa_json_init(&it[0], json, strlen(json));
     if (spa_json_enter_object(&it[0], &it[1]) <= 0)
         return -1;
-    while (spa_json_get_string(&it[1], key, sizeof(key)) > 0)
+    while ((len = spa_json_next(&it[1], &val)) > 0)
     {
-        if (!strcmp(key, field))
-            return spa_json_get_string(&it[1], dst, maxlen) > 0 ? 0 : -1;
+        if (!spa_json_is_string(val, len))
+            return -1;
+        matches = spa_json_parse_stringn(val, len, key, sizeof(key)) > 0 && !strcmp(key, field);
         if ((len = spa_json_next(&it[1], &val)) <= 0)
             return -1;
-        if (spa_json_is_container(val, len) && spa_json_container_len(&it[1], val, len) <= 0)
+        if (matches)
+        {
+            if (!spa_json_is_string(val, len) || spa_json_parse_stringn(val, len, dst, maxlen) <= 0)
+                return -1;
+            result = 0;
+        }
+        else if (spa_json_is_container(val, len) && spa_json_container_len(&it[1], val, len) <= 0)
             return -1;
     }
-    return -1;
+    if (len < 0 || it[1].cur == it[1].end || *it[1].cur != '}' || spa_json_next(&it[0], &val))
+        return -1;
+    return result;
 }
 
 /* SPA channel position -> WASAPI speaker bit */
@@ -1002,15 +1012,21 @@ static int on_probe_metadata_property(void *data, uint32_t subject, const char *
     struct probe *p = data;
     char *dst;
 
-    if (!key || !value)
+    if (subject != PW_ID_CORE)
         return 0;
+    if (!key)
+    {
+        p->default_sink[0] = p->default_source[0] = 0;
+        return 0;
+    }
     if (!strcmp(key, "default.audio.sink"))
         dst = p->default_sink;
     else if (!strcmp(key, "default.audio.source"))
         dst = p->default_source;
     else
         return 0;
-    parse_json_str_field(value, "name", dst, 256);
+    if (!value || parse_json_str_field(value, "name", dst, sizeof(p->default_sink)) < 0)
+        dst[0] = 0;
     return 0;
 }
 
