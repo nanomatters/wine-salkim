@@ -1,0 +1,85 @@
+/* PipeWire endpoint-name regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+#include <iconv.h>
+
+/* Convert valid UTF-8 fixtures without a Wine runtime. WCHAR remains 16-bit. */
+DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
+{
+    iconv_t converter = iconv_open("UTF-16LE", "UTF-8");
+    size_t in = srclen, out = dstlen * sizeof(*dst);
+    char *input = (char *)src, *output = (char *)dst;
+
+    assert(converter != (iconv_t)-1);
+    assert(iconv(converter, &input, &in, &output, &out) != (size_t)-1);
+    assert(!iconv_close(converter));
+    return dstlen - out / sizeof(*dst);
+}
+
+static void check_display(const char *description, const char *nickname, const char *node, const char *expected)
+{
+    struct pw_phys_device device = {0};
+    WCHAR *converted = utf8_to_wstr(expected);
+
+    device.display = utf8_to_wstr(description);
+    assert(device.display && converted);
+    shorten_device_display(&device, nickname, node);
+    assert(!wcscmp(device.display, converted));
+    free(device.display);
+    free(converted);
+}
+
+int main(void)
+{
+    char long_name[64], unicode[126], surrogate[128];
+    struct pw_phys_device *device;
+    WCHAR *expected;
+    unsigned int i;
+    struct list defaults = LIST_INIT(defaults);
+
+    memset(long_name, 'x', 63);
+    long_name[63] = 0;
+    check_display("Normal description", "Nick", "alsa_output.device.stereo", "Normal description");
+    check_display(long_name, "Nick", "alsa_output.device.stereo", "Nick");
+    check_display(long_name, NULL, "alsa_output.device.stereo", "stereo");
+    check_display(long_name, "", "stereo", "stereo");
+    check_display(long_name, long_name, long_name, long_name);
+
+    /* UTF-8 byte count is not a WCHAR count. */
+    for (i = 0; i < 62; i++) memcpy(unicode + i * 2, "\xc3\xa9", 2);
+    unicode[124] = 0;
+    check_display(unicode, "Nick", "alsa_output.device.stereo", unicode);
+    check_display(long_name, unicode, "alsa_output.device.stereo", unicode);
+
+    /* A non-BMP character occupies two WCHARs, not one. Do not truncate it. */
+    memset(surrogate, 'a', 61);
+    strcpy(surrogate + 61, "\xf0\x9f\x98\x80");
+    check_display(surrogate, "Nick", "alsa_output.device.stereo", "Nick");
+    memset(surrogate, 'a', 60);
+    strcpy(surrogate + 60, "\xf0\x9f\x98\x80");
+    check_display(surrogate, "Nick", "alsa_output.device.stereo", surrogate);
+
+    add_default_device(&defaults, Speakers, "", 48000, 100000, 30000);
+    add_default_device(&defaults, Microphone, "", 48000, 100000, 30000);
+    assert(list_count(&defaults) == 2);
+    device = LIST_ENTRY(list_head(&defaults), struct pw_phys_device, entry);
+    expected = utf8_to_wstr("PipeWire Input");
+    assert(!wcscmp(device->display, expected));
+    free(expected);
+    device = LIST_ENTRY(list_tail(&defaults), struct pw_phys_device, entry);
+    expected = utf8_to_wstr("PipeWire Output");
+    assert(!wcscmp(device->display, expected));
+    free(expected);
+    while (!list_empty(&defaults))
+    {
+        device = LIST_ENTRY(list_head(&defaults), struct pw_phys_device, entry);
+        list_remove(&device->entry);
+        free(device->display);
+        free(device);
+    }
+    puts("PipeWire endpoint-name tests passed.");
+    return 0;
+}

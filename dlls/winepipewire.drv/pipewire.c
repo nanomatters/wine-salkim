@@ -315,6 +315,28 @@ static WCHAR *utf8_to_wstr(const char *s)
     return w;
 }
 
+/* Like winepulse, prefer shorter labels for games with small device-name buffers. */
+static void shorten_device_display(struct pw_phys_device *device, const char *nickname, const char *node_name)
+{
+    const char *suffix = strrchr(node_name, '.');
+    const char *alternatives[] = { nickname, suffix && suffix[1] ? suffix + 1 : node_name };
+    WCHAR *display;
+    unsigned int i;
+
+    if (!device || wcslen(device->display) <= 62) return;
+    for (i = 0; i < ARRAY_SIZE(alternatives); i++)
+    {
+        if (!alternatives[i] || !*alternatives[i] || !(display = utf8_to_wstr(alternatives[i]))) continue;
+        if (wcslen(display) <= 62)
+        {
+            free(device->display);
+            device->display = display;
+            return;
+        }
+        free(display);
+    }
+}
+
 static struct pipewire_stream *handle_get_stream(stream_handle h)
 {
     return (struct pipewire_stream *)(UINT_PTR)h;
@@ -924,6 +946,7 @@ struct probe_node
     EDataFlow flow;
     char *node_name;
     char *display;
+    char *nickname;
     struct pw_node *proxy;
     struct spa_hook listener;
     uint32_t channels;
@@ -1108,10 +1131,12 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
         pn->flow = !strcmp(media_class, "Audio/Sink") ? eRender : eCapture;
         pn->node_name = strdup(node_name);
         pn->display = strdup(desc ? desc : (nick ? nick : node_name));
+        pn->nickname = nick ? strdup(nick) : NULL;
         if (!pn->node_name || !pn->display)
         {
             free(pn->node_name);
             free(pn->display);
+            free(pn->nickname);
             free(pn);
             return;
         }
@@ -1230,7 +1255,7 @@ static void add_default_device(struct list *list, EndpointFormFactor form, const
     }
     if (!(def = calloc(1, sizeof(*def) + 1)))
         return;
-    if (!(def->display = utf8_to_wstr("PipeWire")))
+    if (!(def->display = utf8_to_wstr(form == Speakers ? "PipeWire Output" : "PipeWire Input")))
     {
         free(def);
         return;
@@ -1379,6 +1404,7 @@ static void build_device_cache(struct probe *p)
         UINT mask = pn->have_format ? positions_to_mask(pn->position, pn->channels)
                                     : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
         dev = add_device(list, pn->node_name, pn->display, form, rate, channels, mask, def_period, min_period);
+        shorten_device_display(dev, pn->nickname, pn->node_name);
         set_device_identity(dev, p, pn->device_id);
     }
 
@@ -1516,6 +1542,7 @@ static NTSTATUS pipewire_test_connect(void *args)
         list_remove(&pn->entry);
         free(pn->node_name);
         free(pn->display);
+        free(pn->nickname);
         free(pn);
     }
     LIST_FOR_EACH_ENTRY_SAFE(device, device_next, &p.devices, struct probe_device, entry)
