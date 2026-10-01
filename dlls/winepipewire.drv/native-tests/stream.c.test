@@ -6,10 +6,11 @@
 
 #include "test.h"
 
-static unsigned int loop_depth, control_calls, flush_calls;
+static unsigned int loop_depth, control_calls, flush_calls, allocation_calls;
 static int control_result;
 static float last_rate_ratio;
 static enum pw_stream_state test_stream_state = PW_STREAM_STATE_PAUSED;
+static struct pw_buffer *process_buffer;
 
 void pw_thread_loop_lock(struct pw_thread_loop *loop)
 {
@@ -43,6 +44,33 @@ int pw_stream_flush(struct pw_stream *stream, bool drain)
     assert(loop_depth == 1);
     flush_calls++;
     return 0;
+}
+
+struct pw_buffer *pw_stream_dequeue_buffer(struct pw_stream *stream)
+{
+    assert(loop_depth == 1);
+    return process_buffer;
+}
+
+int pw_stream_queue_buffer(struct pw_stream *stream, struct pw_buffer *buffer)
+{
+    assert(loop_depth == 1 && buffer == process_buffer);
+    return 0;
+}
+
+NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE process, void **addr, ULONG_PTR bits,
+                                        SIZE_T *size, ULONG type, ULONG protect)
+{
+    allocation_calls++;
+    if (!(*addr = calloc(1, *size))) return STATUS_NO_MEMORY;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS WINAPI NtFreeVirtualMemory(HANDLE process, void **addr, SIZE_T *size, ULONG type)
+{
+    free(*addr);
+    *addr = NULL;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS WINAPI NtQueryPerformanceCounter(LARGE_INTEGER *counter, LARGE_INTEGER *frequency)
@@ -385,6 +413,103 @@ static void test_buffer_sizes(void)
     assert(!calc_period_bytes(1, 1, 10000000, 4, &bytes));
 }
 
+static void test_render_bounds(void)
+{
+    struct pipewire_stream stream = {0};
+    struct get_render_buffer_params params = {0};
+    struct release_render_buffer_params release = {0};
+    BYTE buffer[64], *data;
+
+    pw_loop_global = (void *)1;
+    stream.pw = (void *)2;
+    stream.dataflow = eRender;
+    stream.info.format = SPA_AUDIO_FORMAT_S16_LE;
+    stream.frame_size = 4;
+    stream.bufsize_frames = 8;
+    stream.real_bufsize_bytes = sizeof(buffer);
+    stream.local_buffer = buffer;
+    stream.held_bytes = 4;
+    params.stream = release.stream = (UINT_PTR)&stream;
+    params.data = &data;
+    params.frames = UINT32_MAX;
+    data = (void *)3;
+
+    pipewire_get_render_buffer(&params);
+    assert(params.result == AUDCLNT_E_BUFFER_TOO_LARGE && !loop_depth);
+    assert(data == (void *)3 && !stream.locked && !allocation_calls);
+
+    params.frames = 8;
+    pipewire_get_render_buffer(&params);
+    assert(params.result == AUDCLNT_E_BUFFER_TOO_LARGE && !loop_depth);
+    params.frames = 7;
+    pipewire_get_render_buffer(&params);
+    assert(params.result == S_OK && !loop_depth);
+    assert(data == buffer + 4 && stream.locked == 28 && !allocation_calls);
+    stream.locked = 0;
+
+    /* Exercise a wrapped acquisition and its actual release. */
+    stream.lcl_offs_bytes = 60;
+    stream.held_bytes = stream.pa_held_bytes = 0;
+    params.frames = 2;
+    pipewire_get_render_buffer(&params);
+    assert(params.result == S_OK && !loop_depth);
+    assert(data == stream.tmp_buffer && stream.locked == -8);
+    assert(allocation_calls == 1);
+    memset(data, 0x5a, 8);
+    release.written_frames = 2;
+    pipewire_release_render_buffer(&release);
+    assert(release.result == S_OK && !stream.locked && !loop_depth);
+    assert(stream.held_bytes == 8 && stream.pa_held_bytes == 8);
+    assert(!memcmp(buffer + 60, "ZZZZ", 4) && !memcmp(buffer, "ZZZZ", 4));
+    free(stream.tmp_buffer);
+
+    /* Both operands fit UINT32, but their sum does not on native i386. */
+    stream.tmp_buffer = NULL;
+    stream.tmp_buffer_bytes = 0;
+    stream.real_bufsize_bytes = UINT32_MAX - 1u;
+    stream.bufsize_frames = stream.real_bufsize_bytes / 8;
+    stream.lcl_offs_bytes = UINT32_MAX - 3u;
+    stream.held_bytes = 8;
+    params.frames = 1;
+    pipewire_get_render_buffer(&params);
+    assert(params.result == S_OK && data == buffer + 6 && stream.locked == 4);
+    assert(!loop_depth && allocation_calls == 1);
+
+    stream.pa_held_bytes = stream.real_bufsize_bytes - 1;
+    release.written_frames = 1;
+    pipewire_release_render_buffer(&release);
+    assert(release.result == S_OK && !stream.locked && !loop_depth);
+    assert(stream.pa_held_bytes == stream.held_bytes && stream.held_bytes == 12);
+    assert(stream.pa_offs_bytes == stream.lcl_offs_bytes);
+}
+
+static void test_capture_offset(void)
+{
+    BYTE ring[64] = {0}, input[] = {1, 2, 3, 4};
+    struct spa_chunk chunk = {.size = sizeof(input)};
+    struct spa_data data = {.data = input, .maxsize = sizeof(input), .chunk = &chunk};
+    struct spa_buffer buffer = {.n_datas = 1, .datas = &data};
+    struct pw_buffer pw_buffer = {.buffer = &buffer};
+    struct pipewire_stream stream = {0};
+
+    pw_loop_global = (void *)1;
+    stream.dataflow = eCapture;
+    stream.frame_size = 4;
+    stream.started = TRUE;
+    stream.capture_ring = ring;
+    stream.capture_ring_size = UINT32_MAX - 1u;
+    stream.cap_read_offs = UINT32_MAX - 3u;
+    stream.cap_held_bytes = 8;
+    process_buffer = &pw_buffer;
+
+    pw_thread_loop_lock(pw_loop_global);
+    on_stream_process(&stream);
+    pw_thread_loop_unlock(pw_loop_global);
+    assert(!memcmp(ring + 6, input, sizeof(input)));
+    assert(stream.cap_held_bytes == 12 && stream.capture_written == sizeof(input));
+    assert(!stream.overrun_count && !loop_depth);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc <= 2);
@@ -394,6 +519,8 @@ int main(int argc, char **argv)
     if (argc == 1 || !strcmp(argv[1], "packet")) test_next_packet();
     if (argc == 1 || !strcmp(argv[1], "alignment")) test_packet_alignment();
     if (argc == 1 || !strcmp(argv[1], "sizes")) test_buffer_sizes();
+    if (argc == 1 || !strcmp(argv[1], "render")) test_render_bounds();
+    if (argc == 1 || !strcmp(argv[1], "capture")) test_capture_offset();
     puts("PipeWire stream tests passed");
     return 0;
 }

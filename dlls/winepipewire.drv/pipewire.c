@@ -2048,7 +2048,7 @@ static void on_stream_process(void *data)
                 silence_buffer(stream->info.format, (BYTE *)d->data + n, need_bytes - n);
                 stream->underrun_count++;
             }
-            stream->pa_offs_bytes = (stream->pa_offs_bytes + n) % stream->real_bufsize_bytes;
+            stream->pa_offs_bytes = ((UINT64)stream->pa_offs_bytes + n) % stream->real_bufsize_bytes;
             __atomic_sub_fetch(&stream->pa_held_bytes, n, __ATOMIC_RELEASE);
         }
         else
@@ -2077,16 +2077,16 @@ static void on_stream_process(void *data)
                 stream->overrun_count++;
             }
             cap_held = __atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE);
-            if (cap_held + n > stream->capture_ring_size)
+            if (cap_held > stream->capture_ring_size - n)
             {
-                SIZE_T drop = cap_held + n - stream->capture_ring_size;
-                stream->cap_read_offs = (stream->cap_read_offs + drop) % stream->capture_ring_size;
+                SIZE_T drop = cap_held - (stream->capture_ring_size - n);
+                stream->cap_read_offs = ((UINT64)stream->cap_read_offs + drop) % stream->capture_ring_size;
                 __atomic_sub_fetch(&stream->cap_held_bytes, drop, __ATOMIC_RELEASE);
                 stream->overrun_count++;
             }
             if (n)
             {
-                SIZE_T woff = (stream->cap_read_offs + stream->cap_held_bytes) % stream->capture_ring_size;
+                SIZE_T woff = ((UINT64)stream->cap_read_offs + stream->cap_held_bytes) % stream->capture_ring_size;
                 SIZE_T first = min(n, stream->capture_ring_size - woff);
                 copy_from_ring(stream->capture_ring + woff, d->data, d->maxsize, offs, first);
                 if (n > first)
@@ -2545,7 +2545,7 @@ static void pipewire_read(struct pipewire_stream *stream)
         copy_from_ring(p->data, stream->capture_ring, stream->capture_ring_size,
                        stream->cap_read_offs, stream->period_bytes);
         clear_unused_sample_bits(stream, p->data, stream->period_bytes);
-        stream->cap_read_offs = (stream->cap_read_offs + stream->period_bytes) % stream->capture_ring_size;
+        stream->cap_read_offs = ((UINT64)stream->cap_read_offs + stream->period_bytes) % stream->capture_ring_size;
         __atomic_sub_fetch(&stream->cap_held_bytes, stream->period_bytes, __ATOMIC_RELEASE);
     }
 }
@@ -2651,8 +2651,7 @@ static void pipewire_period_timer_loop(void *args)
                 if (stream->dataflow == eRender)
                 {
                     UINT32 adv = min(stream->period_bytes, stream->held_bytes);
-                    stream->lcl_offs_bytes += adv;
-                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                    stream->lcl_offs_bytes = ((UINT64)stream->lcl_offs_bytes + adv) % stream->real_bufsize_bytes;
                     stream->held_bytes -= adv;
                 }
                 else
@@ -2951,16 +2950,17 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
         return STATUS_SUCCESS;
     }
 
-    if (stream->held_bytes / stream->frame_size + params->frames > stream->bufsize_frames)
+    if (params->frames > stream->bufsize_frames ||
+        stream->held_bytes / stream->frame_size > stream->bufsize_frames - params->frames)
     {
         pw_thread_loop_unlock(pw_loop_global);
         params->result = AUDCLNT_E_BUFFER_TOO_LARGE;
         return STATUS_SUCCESS;
     }
 
-    bytes = params->frames * stream->frame_size;
-    wri_offs_bytes = (stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
-    if (wri_offs_bytes + bytes > stream->real_bufsize_bytes)
+    bytes = (SIZE_T)params->frames * stream->frame_size;
+    wri_offs_bytes = ((UINT64)stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
+    if (bytes > stream->real_bufsize_bytes - wri_offs_bytes)
     {
         if (!alloc_tmp_buffer(stream, bytes))
         {
@@ -2970,7 +2970,7 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
             return STATUS_SUCCESS;
         }
         *params->data = stream->tmp_buffer;
-        stream->locked = -bytes;
+        stream->locked = -(INT64)bytes;
     }
     else
     {
@@ -2987,7 +2987,7 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
 
 static void pipewire_wrap_buffer(struct pipewire_stream *stream, BYTE *buffer, UINT32 written_bytes)
 {
-    UINT32 wri_offs_bytes = (stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
+    UINT32 wri_offs_bytes = ((UINT64)stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
     UINT32 chunk_bytes = stream->real_bufsize_bytes - wri_offs_bytes;
 
     if (written_bytes <= chunk_bytes)
@@ -3026,7 +3026,7 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
     }
 
     if (stream->locked >= 0)
-        buffer = stream->local_buffer + (stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
+        buffer = stream->local_buffer + ((UINT64)stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
     else
         buffer = stream->tmp_buffer;
 
@@ -3038,7 +3038,8 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
         pipewire_wrap_buffer(stream, buffer, written_bytes);
 
     stream->held_bytes += written_bytes;
-    if (__atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE) > stream->real_bufsize_bytes)
+    if ((UINT64)__atomic_fetch_add(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE) +
+        written_bytes > stream->real_bufsize_bytes)
     {
         WARN("%p PipeWire buffer overflow.\n", stream);
         stream->pa_offs_bytes = stream->lcl_offs_bytes;
