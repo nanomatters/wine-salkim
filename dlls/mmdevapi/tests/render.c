@@ -702,6 +702,63 @@ static void test_formats(AUDCLNT_SHAREMODE mode, BOOL extensible)
     }
 }
 
+static void test_invalid_sample_rate(void)
+{
+    static const WORD tags[] = {WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_EXTENSIBLE};
+    WAVEFORMATEXTENSIBLE format = {{0}};
+    WAVEFORMATEX *closest;
+    IAudioClient *client;
+    IAudioClient3 *client3;
+    HRESULT hr;
+    unsigned int i;
+
+    hr = IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL, (void **)&client);
+    ok(hr == S_OK, "Activate failed: %#lx.\n", hr);
+    if (FAILED(hr)) return;
+
+    hr = IAudioClient_QueryInterface(client, &IID_IAudioClient3, (void **)&client3);
+    if (FAILED(hr)) client3 = NULL;
+
+    format.Format.nChannels = 2;
+    format.Format.wBitsPerSample = 32;
+    format.Format.nBlockAlign = 8;
+    format.Samples.wValidBitsPerSample = 32;
+    format.dwChannelMask = KSAUDIO_SPEAKER_STEREO;
+    format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+    for (i = 0; i < ARRAY_SIZE(tags); ++i)
+    {
+        winetest_push_context("tag %#x", tags[i]);
+        format.Format.wFormatTag = tags[i];
+        format.Format.cbSize = tags[i] == WAVE_FORMAT_EXTENSIBLE ?
+                              sizeof(format) - sizeof(format.Format) : 0;
+
+        closest = (void *)0xdeadbeef;
+        hr = IAudioClient_IsFormatSupported(client, AUDCLNT_SHAREMODE_SHARED, &format.Format, &closest);
+        ok(hr == E_INVALIDARG, "IsFormatSupported returned %#lx.\n", hr);
+        ok(!closest, "Got closest format %p.\n", closest);
+        if (closest && closest != (void *)0xdeadbeef) CoTaskMemFree(closest);
+
+        hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, &format.Format, NULL);
+        ok(hr == E_INVALIDARG, "Initialize returned %#lx.\n", hr);
+
+        if (client3)
+        {
+            hr = IAudioClient3_InitializeSharedAudioStream(client3, 0, 480, &format.Format, NULL);
+            ok(hr == E_INVALIDARG, "InitializeSharedAudioStream returned %#lx.\n", hr);
+        }
+        winetest_pop_context();
+    }
+
+    if (client3)
+    {
+        hr = IAudioClient3_InitializeSharedAudioStream(client3, 0, 480, NULL, NULL);
+        ok(hr == E_POINTER, "InitializeSharedAudioStream returned %#lx.\n", hr);
+        IAudioClient3_Release(client3);
+    }
+    IAudioClient_Release(client);
+}
+
 static void test_references(void)
 {
     IAudioClient *ac, *ac2;
@@ -2865,6 +2922,7 @@ START_TEST(render)
     }
 
     test_audioclient();
+    test_invalid_sample_rate();
     test_references();
     test_marshal();
     if (GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode))

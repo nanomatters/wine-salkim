@@ -338,6 +338,9 @@ static HRESULT validate_wfx(const WAVEFORMATEX *fmt, AUDCLNT_SHAREMODE share_mod
     if (share_mode != AUDCLNT_SHAREMODE_SHARED && share_mode != AUDCLNT_SHAREMODE_EXCLUSIVE)
         return E_INVALIDARG;
 
+    if (!fmt->nSamplesPerSec)
+        return E_INVALIDARG;
+
     if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
         if (fmt->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
             ret = E_INVALIDARG;
@@ -1207,6 +1210,9 @@ static HRESULT WINAPI client_InitializeSharedAudioStream(IAudioClient3 *iface, D
 
     if (!format)
         return E_POINTER;
+
+    if (!format->nSamplesPerSec)
+        return E_INVALIDARG;
 
     period = period_frames * (REFERENCE_TIME)10000000 / format->nSamplesPerSec;
 
