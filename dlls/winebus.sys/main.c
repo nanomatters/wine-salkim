@@ -183,8 +183,6 @@ static BOOL has_unique_serial_number(struct device_desc *desc)
 static WCHAR *get_instance_id(DEVICE_OBJECT *device)
 {
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
-    const WCHAR *serial_str = !*ext->desc.serialnumber ? L"00000000" : ext->desc.serialnumber;
-    DWORD len = wcslen(serial_str) + 33;
     WCHAR *dst;
 
     /*
@@ -200,9 +198,8 @@ static WCHAR *get_instance_id(DEVICE_OBJECT *device)
         return dst;
     }
 
-    if ((dst = ExAllocatePool(PagedPool, len * sizeof(WCHAR))))
-        swprintf(dst, len, L"%u&%08x&%x&%u", ext->desc.version, ext->parent_hash[0],
-                 ext->index, ext->desc.is_gamepad);
+    if ((dst = ExAllocatePool(PagedPool, 22 * sizeof(WCHAR))))
+        swprintf(dst, 22, L"1&%08x&0&%x", ext->parent_hash[0], ext->index);
     return dst;
 }
 
