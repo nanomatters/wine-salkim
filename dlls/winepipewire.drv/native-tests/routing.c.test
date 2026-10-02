@@ -6,7 +6,9 @@
 #include "test.h"
 
 static enum pw_stream_flags connected_flags;
+static enum pw_direction connected_direction;
 static char connected_target[128];
+static BOOL connected_capture_sink;
 static unsigned int connections;
 
 int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst, DWORD dstlen, BOOL strict)
@@ -18,10 +20,13 @@ int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst, DWORD dstlen, BOO
 struct pw_stream *pw_stream_new(struct pw_core *core, const char *name, struct pw_properties *props)
 {
     const char *target = pw_properties_get(props, PW_KEY_TARGET_OBJECT);
+    const char *capture_sink = pw_properties_get(props, PW_KEY_STREAM_CAPTURE_SINK);
 
     assert(core == pw_core_global);
     assert(!strcmp(name, "winepipewire"));
     copy_cstr(connected_target, sizeof(connected_target), target);
+    assert(!capture_sink || !strcmp(capture_sink, "true"));
+    connected_capture_sink = !!capture_sink;
     pw_properties_free(props);
     return (void *)1;
 }
@@ -43,6 +48,7 @@ int pw_stream_connect(struct pw_stream *stream, enum pw_direction direction,
                     PW_STREAM_FLAG_INACTIVE)) ==
            (PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_INACTIVE));
     connected_flags = flags;
+    connected_direction = direction;
     ++connections;
     return 0;
 }
@@ -65,26 +71,66 @@ int pw_stream_queue_buffer(struct pw_stream *stream, struct pw_buffer *buffer)
     return 0;
 }
 
+static void add_test_device(struct list *devices, const char *name)
+{
+    struct pw_phys_device *device = calloc(1, sizeof(*device) + strlen(name) + 1);
+
+    assert(device);
+    strcpy(device->pw_name, name);
+    list_add_tail(devices, &device->entry);
+}
+
 int main(void)
 {
     struct pipewire_stream stream = {0};
-    const char *targets[] = {"sink", "", NULL, "microphone"};
+    static const struct
+    {
+        const char *target;
+        EDataFlow flow;
+        DWORD flags;
+        BOOL capture_sink;
+    } tests[] =
+    {
+        {"sink", eRender, 0, FALSE},
+        {"", eRender, 0, FALSE},
+        {NULL, eRender, 0, FALSE},
+        {"duplex", eRender, 0, FALSE},
+        {"duplex", eRender, AUDCLNT_STREAMFLAGS_LOOPBACK, FALSE},
+        {"microphone", eCapture, 0, FALSE},
+        {"", eCapture, 0, FALSE},
+        {NULL, eCapture, 0, FALSE},
+        {"duplex", eCapture, 0, FALSE},
+        {"duplex", eCapture, AUDCLNT_STREAMFLAGS_LOOPBACK, TRUE},
+        {"sink", eCapture, AUDCLNT_STREAMFLAGS_LOOPBACK, TRUE},
+        {"", eCapture, AUDCLNT_STREAMFLAGS_LOOPBACK, TRUE},
+        {NULL, eCapture, AUDCLNT_STREAMFLAGS_LOOPBACK, TRUE},
+    };
     unsigned int i;
+
+    add_test_device(&g_render_devices, "sink");
+    /* A duplex node exposes a source and a sink with the same target name. */
+    add_test_device(&g_render_devices, "duplex");
+    add_test_device(&g_capture_devices, "duplex");
+    add_test_device(&g_capture_devices, "microphone");
 
     stream.frame_size = 4;
     stream.period_bytes = 1920;
     stream.info.format = SPA_AUDIO_FORMAT_S16_LE;
     stream.info.channels = 2;
     stream.info.rate = 48000;
-    for (i = 0; i < ARRAY_SIZE(targets); ++i)
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
     {
-        stream.dataflow = i == 3 ? eCapture : eRender;
-        assert(pipewire_stream_connect(&stream, targets[i], NULL) == S_OK);
-        assert(!strcmp(connected_target, targets[i] ? targets[i] : ""));
+        stream.dataflow = tests[i].flow;
+        stream.flags = tests[i].flags;
+        assert(pipewire_stream_connect(&stream, tests[i].target, NULL) == S_OK);
+        assert(!strcmp(connected_target, tests[i].target ? tests[i].target : ""));
         assert(!!(connected_flags & PW_STREAM_FLAG_DONT_RECONNECT) ==
-               !!(targets[i] && targets[i][0]));
+               !!(tests[i].target && tests[i].target[0]));
+        assert(connected_direction == (tests[i].flow == eRender ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT));
+        assert(connected_capture_sink == tests[i].capture_sink);
     }
-    assert(connections == ARRAY_SIZE(targets));
+    assert(connections == ARRAY_SIZE(tests));
+    free_device_lists();
     puts("PipeWire endpoint routing checks passed.");
     return 0;
 }

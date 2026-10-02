@@ -2360,9 +2360,7 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
          * an explicitly selected endpoint. Default streams remain movable. */
         flags |= PW_STREAM_FLAG_DONT_RECONNECT;
     }
-    if (stream->dataflow == eCapture &&
-        ((stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK) ||
-         (device && device[0] && device_is_sink(device))))
+    if (stream->dataflow == eCapture && (stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK))
         pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
 
     stream->pw = pw_stream_new(pw_core_global, app ? app : "winepipewire", props);
