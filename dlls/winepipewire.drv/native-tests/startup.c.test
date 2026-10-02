@@ -1,0 +1,114 @@
+/* Native tests of PipeWire startup mute handling.
+ *
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static struct pipewire_stream *current_stream;
+static const struct spa_pod *negotiated_format;
+static unsigned int control_calls;
+static int control_result;
+static BOOL native_muted;
+
+int pw_stream_set_control(struct pw_stream *stream, uint32_t id, uint32_t count,
+                          float *values, ...)
+{
+    va_list args;
+
+    assert(stream == current_stream->pw);
+    assert(id == SPA_PROP_mute && count == 1 && values[0] == 0.0f);
+    va_start(args, values);
+    assert(va_arg(args, uint32_t) == 0);
+    va_end(args);
+    assert(++control_calls <= 2);
+
+    /* A synchronous notification must not repeat the startup control. */
+    stream_events.param_changed(current_stream, SPA_PARAM_Format, negotiated_format);
+    if (control_result >= 0) native_muted = FALSE;
+    return control_result;
+}
+
+/* Keeping the real event table also retains these callbacks. */
+void pw_thread_loop_signal(struct pw_thread_loop *loop, bool wait_for_accept)
+{
+    assert(0);
+}
+
+struct pw_buffer *pw_stream_dequeue_buffer(struct pw_stream *stream)
+{
+    assert(0);
+    return NULL;
+}
+
+int pw_stream_queue_buffer(struct pw_stream *stream, struct pw_buffer *buffer)
+{
+    assert(0);
+    return 0;
+}
+
+static void test_startup_mute(EDataFlow flow, BOOL fail_first)
+{
+    struct pipewire_stream stream = {0};
+    struct spa_audio_info_raw info = {
+        .format = SPA_AUDIO_FORMAT_S16_LE,
+        .rate = 48000,
+        .channels = 2,
+        .position = {SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR},
+    };
+    uint8_t buffer[256];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    unsigned int calls;
+
+    current_stream = &stream;
+    stream.pw = (void *)1;
+    stream.dataflow = flow;
+    stream.vol[0] = 0.25f;
+    stream.vol[1] = 0.5f;
+    stream.device = (char *)"selected endpoint";
+    negotiated_format = spa_format_audio_raw_build(&builder, SPA_PARAM_Format, &info);
+    assert(negotiated_format && stream_events.param_changed);
+    control_calls = 0;
+    control_result = fail_first ? -EIO : 0;
+    native_muted = TRUE; /* Session manager restored the previous stream's mute. */
+
+    stream_events.param_changed(&stream, SPA_PARAM_Format, NULL);
+    stream_events.param_changed(&stream, SPA_PARAM_Props, negotiated_format);
+    stream_events.param_changed(&stream, SPA_PARAM_EnumFormat, negotiated_format);
+    assert(!control_calls && native_muted);
+
+    stream_events.param_changed(&stream, SPA_PARAM_Format, negotiated_format);
+    assert(control_calls == 1);
+    if (fail_first)
+    {
+        assert(native_muted);
+        control_result = 0;
+        stream_events.param_changed(&stream, SPA_PARAM_Format, negotiated_format);
+        assert(control_calls == 2);
+    }
+    assert(!native_muted);
+    assert(stream.vol[0] == 0.25f && stream.vol[1] == 0.5f);
+    assert(!strcmp(stream.device, "selected endpoint"));
+
+    /* A user mute after startup must survive a format change or reconnect. */
+    native_muted = TRUE;
+    calls = control_calls;
+    stream_events.param_changed(&stream, SPA_PARAM_Format, NULL);
+    stream_events.param_changed(&stream, SPA_PARAM_Format, negotiated_format);
+    stream.started = TRUE;
+    stream_events.param_changed(&stream, SPA_PARAM_Format, negotiated_format);
+    stream.started = FALSE;
+    stream_events.param_changed(&stream, SPA_PARAM_Format, negotiated_format);
+    assert(control_calls == calls && native_muted);
+}
+
+int main(void)
+{
+    test_startup_mute(eRender, FALSE);
+    test_startup_mute(eCapture, FALSE);
+    test_startup_mute(eRender, TRUE);
+    test_startup_mute(eCapture, TRUE);
+    puts("PipeWire startup mute tests passed");
+    return 0;
+}

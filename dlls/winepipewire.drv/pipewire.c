@@ -105,6 +105,7 @@ struct pipewire_stream
     UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
     char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
     BOOL pending_error;
+    BOOL initial_mute_set;
 
     DWORD flags;
     AUDCLNT_SHAREMODE share;
@@ -2186,6 +2187,22 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
         pw_thread_loop_signal(pw_loop_global, false);
 }
 
+static void on_stream_param_changed(void *data, uint32_t id, const struct spa_pod *param)
+{
+    struct pipewire_stream *stream = data;
+    float mute = 0.0f;
+
+    if (id != SPA_PARAM_Format || !param || stream->initial_mute_set)
+        return;
+
+    /* Match PA_STREAM_START_UNMUTED. Like pipewire-pulse, wait for the
+     * negotiated format so the session manager has restored stream state.
+     * Later format changes must preserve mute changes made by the user. */
+    stream->initial_mute_set = TRUE;
+    if (pw_stream_set_control(stream->pw, SPA_PROP_mute, 1, &mute, 0) < 0)
+        stream->initial_mute_set = FALSE;
+}
+
 static void on_stream_process(void *data)
 {
     struct pipewire_stream *stream = data;
@@ -2281,6 +2298,7 @@ static void on_stream_process(void *data)
 static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .state_changed = on_stream_state_changed,
+    .param_changed = on_stream_param_changed,
     .process = on_stream_process,
 };
 
