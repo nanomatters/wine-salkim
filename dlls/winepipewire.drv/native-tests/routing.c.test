@@ -1,0 +1,90 @@
+/* PipeWire endpoint routing regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static enum pw_stream_flags connected_flags;
+static char connected_target[128];
+static unsigned int connections;
+
+int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst, DWORD dstlen, BOOL strict)
+{
+    assert(!src && !srclen && !dst && !dstlen && !strict);
+    return 0;
+}
+
+struct pw_stream *pw_stream_new(struct pw_core *core, const char *name, struct pw_properties *props)
+{
+    const char *target = pw_properties_get(props, PW_KEY_TARGET_OBJECT);
+
+    assert(core == pw_core_global);
+    assert(!strcmp(name, "winepipewire"));
+    copy_cstr(connected_target, sizeof(connected_target), target);
+    pw_properties_free(props);
+    return (void *)1;
+}
+
+void pw_stream_add_listener(struct pw_stream *stream, struct spa_hook *listener,
+                            const struct pw_stream_events *events, void *data)
+{
+    assert(stream == (void *)1 && events == &stream_events && data);
+}
+
+int pw_stream_connect(struct pw_stream *stream, enum pw_direction direction,
+                      uint32_t target, enum pw_stream_flags flags,
+                      const struct spa_pod **params, uint32_t n_params)
+{
+    assert(stream == (void *)1 && target == PW_ID_ANY);
+    assert(direction == PW_DIRECTION_INPUT || direction == PW_DIRECTION_OUTPUT);
+    assert(n_params == 1 && params[0]);
+    assert((flags & (PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                    PW_STREAM_FLAG_INACTIVE)) ==
+           (PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_INACTIVE));
+    connected_flags = flags;
+    ++connections;
+    return 0;
+}
+
+enum pw_stream_state pw_stream_get_state(struct pw_stream *stream, const char **error)
+{
+    assert(stream == (void *)1);
+    return PW_STREAM_STATE_PAUSED;
+}
+
+/* The listener holds the real process callback, which needs these symbols. */
+struct pw_buffer *pw_stream_dequeue_buffer(struct pw_stream *stream)
+{
+    return NULL;
+}
+
+int pw_stream_queue_buffer(struct pw_stream *stream, struct pw_buffer *buffer)
+{
+    assert(0);
+    return 0;
+}
+
+int main(void)
+{
+    struct pipewire_stream stream = {0};
+    const char *targets[] = {"sink", "", NULL, "microphone"};
+    unsigned int i;
+
+    stream.frame_size = 4;
+    stream.period_bytes = 1920;
+    stream.info.format = SPA_AUDIO_FORMAT_S16_LE;
+    stream.info.channels = 2;
+    stream.info.rate = 48000;
+    for (i = 0; i < ARRAY_SIZE(targets); ++i)
+    {
+        stream.dataflow = i == 3 ? eCapture : eRender;
+        assert(pipewire_stream_connect(&stream, targets[i], NULL) == S_OK);
+        assert(!strcmp(connected_target, targets[i] ? targets[i] : ""));
+        assert(!!(connected_flags & PW_STREAM_FLAG_DONT_RECONNECT) ==
+               !!(targets[i] && targets[i][0]));
+    }
+    assert(connections == ARRAY_SIZE(targets));
+    puts("PipeWire endpoint routing checks passed.");
+    return 0;
+}

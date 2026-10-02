@@ -2277,6 +2277,8 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
     const struct spa_pod *params[1];
     uint32_t period_frames = stream->period_bytes / stream->frame_size;
     enum pw_stream_state st;
+    enum pw_stream_flags flags = PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                                 PW_STREAM_FLAG_INACTIVE;
     char *app;
     int tries;
 
@@ -2298,7 +2300,12 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
         pw_properties_set(props, PW_KEY_NODE_NAME, "winepipewire");
     pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%u", period_frames, stream->info.rate);
     if (device && device[0])
+    {
         pw_properties_set(props, PW_KEY_TARGET_OBJECT, device);
+        /* Match pipewire-pulse's translation of PA_STREAM_DONT_MOVE for
+         * an explicitly selected endpoint. Default streams remain movable. */
+        flags |= PW_STREAM_FLAG_DONT_RECONNECT;
+    }
     if (stream->dataflow == eCapture &&
         ((stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK) ||
          (device && device[0] && device_is_sink(device))))
@@ -2325,8 +2332,7 @@ static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const cha
         int rc = pw_stream_connect(stream->pw,
                           stream->dataflow == eRender ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT,
                           PW_ID_ANY,
-                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
-                          PW_STREAM_FLAG_INACTIVE,
+                          flags,
                           params, 1);
         if (rc < 0)
         {
