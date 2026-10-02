@@ -955,6 +955,7 @@ struct probe_node
     uint32_t channels;
     uint32_t position[SPA_AUDIO_MAX_CHANNELS];
     int have_format;
+    struct spa_audio_info_raw active_format;
     uint32_t device_id;
 };
 
@@ -998,14 +999,32 @@ static void on_probe_node_param(void *data, int seq, uint32_t id, uint32_t index
 {
     struct probe_node *pn = data;
     struct spa_audio_info_raw info;
+    uint32_t media_type, media_subtype;
 
-    if (!param || id != SPA_PARAM_EnumFormat)
+    if (id != SPA_PARAM_EnumFormat && id != SPA_PARAM_Format)
+        return;
+    if (id == SPA_PARAM_Format) spa_zero(pn->active_format);
+    if (!param) return;
+    if (id == SPA_PARAM_Format && (spa_format_parse(param, &media_type, &media_subtype) < 0 ||
+                                   media_type != SPA_MEDIA_TYPE_audio || media_subtype != SPA_MEDIA_SUBTYPE_raw))
         return;
     spa_zero(info);
     if (spa_format_audio_raw_parse(param, &info) < 0)
         return;
     if (info.channels < 1 || info.channels > SPA_AUDIO_MAX_CHANNELS)
         return;
+    if (id == SPA_PARAM_Format)
+    {
+        WAVEFORMATEXTENSIBLE format;
+
+        /* The running configuration is stronger evidence than advertised
+         * surround capabilities. Keep EnumFormat separately for idle nodes. */
+        if (info.rate > INT_MAX || (info.rate && !build_format(&format, info.rate, info.channels,
+                                                              positions_to_mask(info.position, info.channels))))
+            info.rate = 0;
+        pn->active_format = info;
+        return;
+    }
     /* Keep the configuration with the most channels: best surround coverage. */
     if (!pn->have_format || info.channels > pn->channels)
     {
@@ -1015,8 +1034,27 @@ static void on_probe_node_param(void *data, int seq, uint32_t id, uint32_t index
     }
 }
 
+static void on_probe_node_info(void *data, const struct pw_node_info *info)
+{
+    struct probe_node *pn = data;
+    unsigned int i;
+
+    if (!(info->change_mask & PW_NODE_CHANGE_MASK_PARAMS)) return;
+    for (i = 0; i < info->n_params; ++i)
+    {
+        if (info->params[i].id != SPA_PARAM_Format || !(info->params[i].flags & SPA_PARAM_INFO_READ))
+            continue;
+        /* Do not query unsupported parameters: not every node exposes Format. */
+        if (pw_node_enum_params(pn->proxy, 0, SPA_PARAM_Format, 0, UINT32_MAX, NULL) >= 0)
+            return;
+        break;
+    }
+    spa_zero(pn->active_format);
+}
+
 static const struct pw_node_events probe_node_events = {
     PW_VERSION_NODE_EVENTS,
+    .info = on_probe_node_info,
     .param = on_probe_node_param,
 };
 
@@ -1464,9 +1502,16 @@ static void build_device_cache(struct probe *p)
     LIST_FOR_EACH_ENTRY(pn, &p->nodes, struct probe_node, entry)
     {
         EDataFlow flow;
-        uint32_t channels = pn->have_format ? pn->channels : 2;
+        uint32_t node_rate = rate, channels = pn->have_format ? pn->channels : 2;
         UINT mask = pn->have_format ? positions_to_mask(pn->position, pn->channels)
                                     : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+
+        if (pn->active_format.channels)
+        {
+            channels = pn->active_format.channels;
+            mask = positions_to_mask(pn->active_format.position, channels);
+            if (pn->active_format.rate) node_rate = pn->active_format.rate;
+        }
 
         for (flow = eRender; flow <= eCapture; ++flow)
         {
@@ -1474,7 +1519,7 @@ static void build_device_cache(struct probe *p)
             EndpointFormFactor form = flow == eRender ? Speakers : Microphone;
 
             if (pn->flow != flow && pn->flow != eAll) continue;
-            dev = add_device(list, pn->node_name, pn->display, form, rate, channels, mask, def_period, min_period);
+            dev = add_device(list, pn->node_name, pn->display, form, node_rate, channels, mask, def_period, min_period);
             shorten_device_display(dev, pn->nickname, pn->node_name);
             set_device_identity(dev, p, pn->device_id);
         }
@@ -1590,10 +1635,9 @@ static NTSTATUS pipewire_test_connect(void *args)
     if (p.registry)
         pw_registry_add_listener(p.registry, &p.registry_listener, &probe_registry_events, &p);
 
-    /* First round-trip: globals emitted, nodes/metadata bound, enum_params
-     * issued.  Second: the param events and metadata properties land. */
-    probe_roundtrip(&p);
-    probe_roundtrip(&p);
+    /* Discover globals, receive node info and advertised parameters, then
+     * receive active formats requested by the node-info callbacks. */
+    if (probe_roundtrip(&p) && probe_roundtrip(&p)) probe_roundtrip(&p);
 
     probe_teardown(&p);
     pw_thread_loop_unlock(p.loop);

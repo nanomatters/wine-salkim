@@ -1,0 +1,253 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+struct fixture
+{
+    struct probe probe;
+    struct probe_node node;
+    struct spa_interface proxy;
+    unsigned int format_queries;
+    int query_result;
+};
+
+static const uint32_t mono[] = {SPA_AUDIO_CHANNEL_MONO};
+static const uint32_t stereo[] = {SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR};
+static const uint32_t surround[] = {SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+    SPA_AUDIO_CHANNEL_FC, SPA_AUDIO_CHANNEL_LFE, SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR};
+static const uint32_t surround8[] = {SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+    SPA_AUDIO_CHANNEL_FC, SPA_AUDIO_CHANNEL_LFE, SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR,
+    SPA_AUDIO_CHANNEL_SL, SPA_AUDIO_CHANNEL_SR};
+
+DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
+{
+    DWORD i, count = min(srclen, dstlen);
+
+    for (i = 0; i < count; ++i)
+    {
+        assert((unsigned char)src[i] < 0x80);
+        dst[i] = src[i];
+    }
+    return count;
+}
+
+static int enum_params(void *object, int seq, uint32_t id, uint32_t start, uint32_t num,
+                       const struct spa_pod *filter)
+{
+    struct fixture *fixture = object;
+
+    assert(id == SPA_PARAM_Format && start == 0 && num && !filter);
+    ++fixture->format_queries;
+    return fixture->query_result;
+}
+
+static const struct pw_node_methods node_methods = {
+    .version = PW_VERSION_NODE_METHODS,
+    .enum_params = enum_params,
+};
+
+static void init_fixture(struct fixture *fixture, EDataFlow flow)
+{
+    memset(fixture, 0, sizeof(*fixture));
+    list_init(&fixture->probe.nodes);
+    list_init(&fixture->probe.devices);
+    fixture->probe.clock_rate = 48000;
+    fixture->probe.min_quantum = 128;
+    strcpy(fixture->probe.default_sink, "configured");
+    strcpy(fixture->probe.default_source, "configured");
+    fixture->node.flow = flow;
+    fixture->node.node_name = "configured";
+    fixture->node.display = "Configured device";
+    fixture->node.device_id = SPA_ID_INVALID;
+    fixture->proxy = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Node, PW_VERSION_NODE,
+                                       &node_methods, fixture);
+    fixture->node.proxy = (void *)&fixture->proxy;
+    list_add_tail(&fixture->probe.nodes, &fixture->node.entry);
+}
+
+static void feed_format(struct fixture *fixture, uint32_t id, uint32_t channels,
+                         const uint32_t *positions, uint32_t rate)
+{
+    struct spa_audio_info_raw info = {.format = SPA_AUDIO_FORMAT_F32_LE, .rate = rate,
+                                      .channels = channels};
+    char buffer[1024];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const struct spa_pod *param;
+
+    assert(channels <= SPA_AUDIO_MAX_CHANNELS);
+    if (positions) memcpy(info.position, positions, channels * sizeof(*positions));
+    param = spa_format_audio_raw_build(&builder, id, &info);
+    assert(param);
+    probe_node_events.param(&fixture->node, 0, id, 0, 0, param);
+}
+
+static void check_cache(struct fixture *fixture, uint32_t channels, uint32_t rate, UINT mask)
+{
+    struct pw_phys_device *dev;
+    EDataFlow flow;
+
+    build_device_cache(&fixture->probe);
+    for (flow = eRender; flow <= eCapture; ++flow)
+    {
+        struct list *list = flow == eRender ? &g_render_devices : &g_capture_devices;
+        BOOL present = fixture->node.flow == flow || fixture->node.flow == eAll;
+
+        assert(list_count(list) == (present ? 2 : 1));
+        LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
+        {
+            /* The synthetic default inherits the selected endpoint's format.
+             * Graph periods remain time values even if its sample rate differs. */
+            if (dev->fmt.Format.nChannels != (present ? channels : 2))
+                fprintf(stderr, "flow %u node flow %u: %s has %u channels, expected %u (rate %u)\n",
+                        flow, fixture->node.flow, dev->pw_name, dev->fmt.Format.nChannels,
+                        present ? channels : 2, rate);
+            assert(dev->fmt.Format.nChannels == (present ? channels : 2));
+            assert(dev->fmt.Format.nSamplesPerSec == (present ? rate : 48000));
+            assert(dev->channel_mask == (present ? mask : KSAUDIO_SPEAKER_STEREO));
+            assert(dev->def_period == 100000 && dev->min_period == 26666);
+        }
+    }
+    free_device_lists();
+}
+
+static void test_active_order(void)
+{
+    struct fixture fixture;
+    EDataFlow flow;
+    unsigned int active_first;
+
+    for (flow = eRender; flow <= eAll; ++flow)
+        for (active_first = 0; active_first < 2; ++active_first)
+        {
+            init_fixture(&fixture, flow);
+            if (active_first) feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+            feed_format(&fixture, SPA_PARAM_EnumFormat, 8, surround8, 48000);
+            feed_format(&fixture, SPA_PARAM_EnumFormat, 1, mono, 48000);
+            if (!active_first) feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+            check_cache(&fixture, 2, 44100, KSAUDIO_SPEAKER_STEREO);
+
+            feed_format(&fixture, SPA_PARAM_Format, 1, mono, 96000);
+            check_cache(&fixture, 1, 96000, SPEAKER_FRONT_CENTER);
+            feed_format(&fixture, SPA_PARAM_Format, 6, surround, 96000);
+            check_cache(&fixture, 6, 96000, KSAUDIO_SPEAKER_5POINT1);
+            probe_node_events.param(&fixture.node, 0, SPA_PARAM_Format, 0, 0, NULL);
+            check_cache(&fixture, 8, 48000, KSAUDIO_SPEAKER_7POINT1_SURROUND);
+        }
+}
+
+static void test_readable_format(void)
+{
+    struct fixture fixture;
+    struct spa_param_info param = {.id = SPA_PARAM_Format, .flags = SPA_PARAM_INFO_READ};
+    struct pw_node_info info = {.params = &param, .n_params = 1};
+
+    init_fixture(&fixture, eAll);
+    feed_format(&fixture, SPA_PARAM_EnumFormat, 8, surround8, 48000);
+    probe_node_events.info(&fixture.node, &info);
+    assert(!fixture.format_queries);
+    check_cache(&fixture, 8, 48000, KSAUDIO_SPEAKER_7POINT1_SURROUND);
+
+    info.change_mask = PW_NODE_CHANGE_MASK_PARAMS;
+    param.flags = SPA_PARAM_INFO_WRITE;
+    probe_node_events.info(&fixture.node, &info);
+    assert(!fixture.format_queries);
+    param.flags = SPA_PARAM_INFO_READ;
+    probe_node_events.info(&fixture.node, &info);
+    assert(fixture.format_queries == 1);
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    check_cache(&fixture, 2, 44100, KSAUDIO_SPEAKER_STEREO);
+
+    /* Missing/unreadable Format and a failed request must discard old active
+     * state rather than advertise a configuration the node no longer exposes. */
+    info.n_params = 0;
+    probe_node_events.info(&fixture.node, &info);
+    assert(fixture.format_queries == 1);
+    check_cache(&fixture, 8, 48000, KSAUDIO_SPEAKER_7POINT1_SURROUND);
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    info.n_params = 1;
+    param.flags = SPA_PARAM_INFO_WRITE;
+    probe_node_events.info(&fixture.node, &info);
+    assert(fixture.format_queries == 1);
+    check_cache(&fixture, 8, 48000, KSAUDIO_SPEAKER_7POINT1_SURROUND);
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    param.flags = SPA_PARAM_INFO_READ;
+    fixture.query_result = -ENOENT;
+    probe_node_events.info(&fixture.node, &info);
+    assert(fixture.format_queries == 2);
+    check_cache(&fixture, 8, 48000, KSAUDIO_SPEAKER_7POINT1_SURROUND);
+}
+
+static void test_invalid_format_rate(void)
+{
+    struct fixture fixture;
+    char buffer[256];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const struct spa_pod *param;
+    const uint32_t front3[] = {SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FC};
+
+    init_fixture(&fixture, eAll);
+    feed_format(&fixture, SPA_PARAM_EnumFormat, 6, surround, 48000);
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    feed_format(&fixture, SPA_PARAM_Format, 0, NULL, 44100);
+    check_cache(&fixture, 6, 48000, KSAUDIO_SPEAKER_5POINT1);
+
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    param = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_Format,
+            SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_AUDIO_channels, SPA_POD_Int(SPA_AUDIO_MAX_CHANNELS + 1));
+    assert(param);
+    probe_node_events.param(&fixture.node, 0, SPA_PARAM_Format, 0, 0, param);
+    check_cache(&fixture, 6, 48000, KSAUDIO_SPEAKER_5POINT1);
+
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    param = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    assert(param);
+    probe_node_events.param(&fixture.node, 0, SPA_PARAM_Format, 0, 0, param);
+    check_cache(&fixture, 6, 48000, KSAUDIO_SPEAKER_5POINT1);
+
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    param = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_Format,
+            SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_AUDIO_rate, SPA_POD_Int(44100),
+            SPA_FORMAT_AUDIO_channels, SPA_POD_Int(2));
+    assert(param);
+    probe_node_events.param(&fixture.node, 0, SPA_PARAM_Format, 0, 0, param);
+    check_cache(&fixture, 6, 48000, KSAUDIO_SPEAKER_5POINT1);
+
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, 44100);
+    builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    param = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_Format,
+            SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_iec958),
+            SPA_FORMAT_AUDIO_rate, SPA_POD_Int(44100),
+            SPA_FORMAT_AUDIO_channels, SPA_POD_Int(2));
+    assert(param);
+    probe_node_events.param(&fixture.node, 0, SPA_PARAM_Format, 0, 0, param);
+    check_cache(&fixture, 6, 48000, KSAUDIO_SPEAKER_5POINT1);
+
+    feed_format(&fixture, SPA_PARAM_Format, 1, mono, 0);
+    check_cache(&fixture, 1, 48000, SPEAKER_FRONT_CENTER);
+    feed_format(&fixture, SPA_PARAM_Format, 2, stereo, UINT32_MAX);
+    check_cache(&fixture, 2, 48000, KSAUDIO_SPEAKER_STEREO);
+    feed_format(&fixture, SPA_PARAM_Format, 6, surround, UINT32_MAX / 24 + 1);
+    check_cache(&fixture, 6, 48000, KSAUDIO_SPEAKER_5POINT1);
+    /* Windows channel mapping expands FL/FR/FC to a four-channel container.
+     * Rate validation must use that final block alignment, not just three. */
+    feed_format(&fixture, SPA_PARAM_Format, 3, front3, 300000000);
+    check_cache(&fixture, 4, 48000, KSAUDIO_SPEAKER_SURROUND);
+}
+
+int main(void)
+{
+    test_active_order();
+    test_readable_format();
+    test_invalid_format_rate();
+    puts("PipeWire format tests passed");
+    return 0;
+}

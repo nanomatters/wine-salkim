@@ -1,0 +1,336 @@
+/* PipeWire startup format-query ordering regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+struct mock_proxy
+{
+    struct spa_interface iface;
+    struct spa_hook_list hooks;
+    const void *events;
+    void *data;
+    unsigned int created, destroyed;
+};
+
+static struct mock_proxy core, registry, node;
+static unsigned int rounds, waits, signals, format_queries, enum_round, format_round, fail_round;
+static unsigned int loops, contexts, started, locked;
+static BOOL readable, fail_with_core_error;
+static int pending_seq;
+static char loop_token, context_token, pwloop_token;
+#define MOCK_LOOP ((struct pw_thread_loop *)&loop_token)
+#define MOCK_CONTEXT ((struct pw_context *)&context_token)
+#define MOCK_PWLOOP ((struct pw_loop *)&pwloop_token)
+
+static void add_listener(struct mock_proxy *proxy, struct spa_hook *hook, const void *events, void *data)
+{
+    assert(locked && proxy->created == 1 && !proxy->destroyed && !proxy->events);
+    spa_hook_list_append(&proxy->hooks, hook, events, data);
+    proxy->events = events;
+    proxy->data = data;
+}
+
+static int core_add_listener(void *object, struct spa_hook *hook, const struct pw_core_events *events, void *data)
+{
+    assert(object == &core);
+    add_listener(&core, hook, events, data);
+    return 0;
+}
+
+static int registry_add_listener(void *object, struct spa_hook *hook,
+                                  const struct pw_registry_events *events, void *data)
+{
+    assert(object == &registry);
+    add_listener(&registry, hook, events, data);
+    return 0;
+}
+
+static int node_add_listener(void *object, struct spa_hook *hook, const struct pw_node_events *events, void *data)
+{
+    assert(object == &node);
+    add_listener(&node, hook, events, data);
+    return 0;
+}
+
+static int sync_core(void *object, uint32_t id, int seq)
+{
+    assert(object == &core && locked && id == PW_ID_CORE && !core.destroyed);
+    assert(rounds == waits);
+    ++rounds;
+    pending_seq = seq + 1;
+    return pending_seq;
+}
+
+static struct pw_registry *get_registry(void *object, uint32_t version, size_t size)
+{
+    assert(object == &core && locked && version == PW_VERSION_REGISTRY && !size);
+    assert(!registry.created++);
+    return (void *)&registry.iface;
+}
+
+static void *bind_node(void *object, uint32_t id, const char *type, uint32_t version, size_t size)
+{
+    assert(object == &registry && locked && rounds == 1 && id == 42);
+    assert(!strcmp(type, PW_TYPE_INTERFACE_Node) && version == PW_VERSION_NODE && !size);
+    assert(!node.created++);
+    return &node.iface;
+}
+
+static int enum_params(void *object, int seq, uint32_t id, uint32_t start, uint32_t num,
+                        const struct spa_pod *filter)
+{
+    assert(object == &node && locked && !seq && !start && num == UINT32_MAX && !filter);
+    if (id == SPA_PARAM_EnumFormat)
+    {
+        assert(rounds == 1 && !enum_round);
+        enum_round = rounds + 1;
+    }
+    else
+    {
+        assert(id == SPA_PARAM_Format && rounds == 2 && readable && !format_round);
+        ++format_queries;
+        format_round = rounds + 1;
+    }
+    return 0;
+}
+
+static const struct pw_core_methods core_methods = {
+    .version = PW_VERSION_CORE_METHODS,
+    .add_listener = core_add_listener,
+    .sync = sync_core,
+    .get_registry = get_registry,
+};
+static const struct pw_registry_methods registry_methods = {
+    .version = PW_VERSION_REGISTRY_METHODS,
+    .add_listener = registry_add_listener,
+    .bind = bind_node,
+};
+static const struct pw_node_methods node_methods = {
+    .version = PW_VERSION_NODE_METHODS,
+    .add_listener = node_add_listener,
+    .enum_params = enum_params,
+};
+
+struct pw_thread_loop *pw_thread_loop_new(const char *name, const struct spa_dict *props)
+{
+    assert(!strcmp(name, "winepipewire-probe") && !props && !loops++);
+    return MOCK_LOOP;
+}
+
+struct pw_loop *pw_thread_loop_get_loop(struct pw_thread_loop *loop)
+{
+    assert(loop == MOCK_LOOP && loops == 1);
+    return MOCK_PWLOOP;
+}
+
+struct pw_context *pw_context_new(struct pw_loop *loop, struct pw_properties *props, size_t size)
+{
+    assert(loop == MOCK_PWLOOP && !props && !size && !contexts++);
+    return MOCK_CONTEXT;
+}
+
+int pw_thread_loop_start(struct pw_thread_loop *loop)
+{
+    assert(loop == MOCK_LOOP && !started++);
+    return 0;
+}
+
+void pw_thread_loop_lock(struct pw_thread_loop *loop)
+{
+    assert(loop == MOCK_LOOP && started && !locked++);
+}
+
+struct pw_core *pw_context_connect(struct pw_context *context, struct pw_properties *props, size_t size)
+{
+    assert(context == MOCK_CONTEXT && locked && !props && !size && !core.created++);
+    return (void *)&core.iface;
+}
+
+int pw_thread_loop_get_time(struct pw_thread_loop *loop, struct timespec *deadline, int64_t timeout)
+{
+    assert(loop == MOCK_LOOP && locked && timeout == 2 * SPA_NSEC_PER_SEC);
+    *deadline = (struct timespec){10, 0};
+    return 0;
+}
+
+static void emit_format(uint32_t id)
+{
+    static const uint32_t positions[] = {SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+        SPA_AUDIO_CHANNEL_FC, SPA_AUDIO_CHANNEL_LFE, SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR,
+        SPA_AUDIO_CHANNEL_SL, SPA_AUDIO_CHANNEL_SR};
+    struct spa_audio_info_raw info = {.format = SPA_AUDIO_FORMAT_F32_LE,
+        .rate = id == SPA_PARAM_Format ? 44100 : 48000,
+        .channels = id == SPA_PARAM_Format ? 2 : 8};
+    const struct pw_node_events *events = node.events;
+    char buffer[1024];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const struct spa_pod *pod;
+
+    assert(!node.destroyed);
+    memcpy(info.position, positions, info.channels * sizeof(*positions));
+    pod = spa_format_audio_raw_build(&builder, id, &info);
+    assert(pod);
+    events->param(node.data, 0, id, 0, 0, pod);
+}
+
+int pw_thread_loop_timed_wait_full(struct pw_thread_loop *loop, const struct timespec *deadline)
+{
+    const struct pw_core_events *core_events = core.events;
+
+    assert(loop == MOCK_LOOP && locked && rounds == waits + 1);
+    assert(deadline->tv_sec == 10 && !deadline->tv_nsec);
+    ++waits;
+    if (rounds == fail_round)
+    {
+        if (!fail_with_core_error) return -ETIMEDOUT;
+        core_events->error(core.data, PW_ID_CORE, pending_seq, -EPIPE, "disconnected");
+        return 0;
+    }
+    if (rounds == 1)
+    {
+        static const struct spa_dict_item items[] = {
+            {PW_KEY_MEDIA_CLASS, "Audio/Duplex"},
+            {PW_KEY_NODE_NAME, "configured"},
+            {PW_KEY_NODE_DESCRIPTION, "Configured device"},
+        };
+        const struct spa_dict props = SPA_DICT_INIT_ARRAY(items);
+        const struct pw_registry_events *events = registry.events;
+
+        events->global(registry.data, 42, PW_PERM_ALL, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &props);
+    }
+    if (rounds == 2)
+    {
+        struct spa_param_info param = {.id = SPA_PARAM_Format,
+            .flags = readable ? SPA_PARAM_INFO_READWRITE : SPA_PARAM_INFO_WRITE};
+        const struct pw_node_info info = {.change_mask = PW_NODE_CHANGE_MASK_PARAMS,
+            .n_params = 1, .params = &param};
+        const struct pw_node_events *events = node.events;
+
+        /* Binding was queued by round one's globals. This callback queues a
+         * new request after round two's barrier, so its reply belongs to three. */
+        events->info(node.data, &info);
+    }
+    if (rounds == enum_round) emit_format(SPA_PARAM_EnumFormat);
+    if (rounds == format_round) emit_format(SPA_PARAM_Format);
+    core_events->done(core.data, PW_ID_CORE, pending_seq);
+    return 0;
+}
+
+void pw_thread_loop_signal(struct pw_thread_loop *loop, bool accept)
+{
+    assert(loop == MOCK_LOOP && locked && !accept);
+    ++signals;
+}
+
+void pw_proxy_destroy(struct pw_proxy *proxy)
+{
+    struct mock_proxy *mock = (void *)proxy;
+
+    assert(locked && (mock == &node || mock == &registry));
+    assert(mock->created == 1 && !mock->destroyed++ && spa_list_is_empty(&mock->hooks.list));
+    mock->events = NULL;
+    mock->data = NULL;
+}
+
+int pw_core_disconnect(struct pw_core *proxy)
+{
+    assert(proxy == (void *)&core && locked && !core.destroyed++);
+    assert(registry.destroyed == 1 && node.destroyed == node.created);
+    assert(spa_list_is_empty(&core.hooks.list));
+    core.events = NULL;
+    core.data = NULL;
+    return 0;
+}
+
+void pw_thread_loop_unlock(struct pw_thread_loop *loop)
+{
+    assert(loop == MOCK_LOOP && locked == 1 && core.destroyed);
+    --locked;
+}
+
+void pw_thread_loop_stop(struct pw_thread_loop *loop)
+{
+    assert(loop == MOCK_LOOP && !locked && started == 1);
+    --started;
+}
+
+void pw_context_destroy(struct pw_context *context)
+{
+    assert(context == MOCK_CONTEXT && !started && contexts == 1 && core.destroyed);
+    --contexts;
+}
+
+void pw_thread_loop_destroy(struct pw_thread_loop *loop)
+{
+    assert(loop == MOCK_LOOP && !contexts && !started && loops == 1);
+    --loops;
+}
+
+DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
+{
+    DWORD i, count = min(srclen, dstlen);
+
+    assert(!locked && !started && !loops && !contexts);
+    for (i = 0; i < count; ++i) dst[i] = (unsigned char)src[i];
+    return count;
+}
+
+static void run_probe(BOOL read_format, unsigned int timeout_round, BOOL core_error)
+{
+    struct test_connect_params params = {0};
+    struct pw_phys_device *device;
+    EDataFlow flow;
+
+    memset(&core, 0, sizeof(core));
+    memset(&registry, 0, sizeof(registry));
+    memset(&node, 0, sizeof(node));
+    core.iface = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Core, PW_VERSION_CORE, &core_methods, &core);
+    registry.iface = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Registry, PW_VERSION_REGISTRY, &registry_methods, &registry);
+    node.iface = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &node_methods, &node);
+    spa_hook_list_init(&core.hooks);
+    spa_hook_list_init(&registry.hooks);
+    spa_hook_list_init(&node.hooks);
+    rounds = waits = signals = format_queries = enum_round = format_round = 0;
+    readable = read_format;
+    fail_round = timeout_round;
+    fail_with_core_error = core_error;
+    assert(!pipewire_test_connect(&params) && params.priority == Priority_Preferred);
+    for (flow = eRender; flow <= eCapture; ++flow)
+    {
+        struct list *list = flow == eRender ? &g_render_devices : &g_capture_devices;
+
+        assert(list_count(list) == (timeout_round == 1 ? 1 : 2));
+        LIST_FOR_EACH_ENTRY(device, list, struct pw_phys_device, entry)
+        {
+            BOOL active = device->pw_name[0] && readable && !timeout_round;
+            BOOL advertised = device->pw_name[0] && ((!readable && !timeout_round) || timeout_round >= 3);
+            unsigned int channels = advertised ? 8 : 2;
+
+            assert(device->fmt.Format.nChannels == channels);
+            assert(device->fmt.Format.nSamplesPerSec == (active ? 44100 : 48000));
+            assert(device->channel_mask == (channels == 8 ? KSAUDIO_SPEAKER_7POINT1_SURROUND
+                                                         : KSAUDIO_SPEAKER_STEREO));
+        }
+    }
+    assert(rounds == (timeout_round ? timeout_round : 3) && waits == rounds);
+    assert(signals == rounds - !!timeout_round + !!core_error);
+    assert(format_queries == (readable && (!timeout_round || timeout_round > 2)));
+    assert(core.created == 1 && core.destroyed == 1 && registry.created == 1 && registry.destroyed == 1);
+    assert(node.created == (timeout_round != 1) && node.destroyed == node.created);
+    assert(!locked && !started && !contexts && !loops);
+    free_device_lists();
+}
+
+int main(void)
+{
+    run_probe(TRUE, 0, FALSE);
+    run_probe(FALSE, 0, FALSE);
+    run_probe(TRUE, 1, FALSE);
+    run_probe(TRUE, 2, FALSE);
+    run_probe(TRUE, 3, FALSE);
+    run_probe(TRUE, 2, TRUE);
+    puts("PipeWire startup format ordering checks passed.");
+    return 0;
+}
