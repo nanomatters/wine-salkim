@@ -1753,6 +1753,9 @@ static void udev_add_device(struct udev_device *dev, int fd)
 
     TRACE("udev %s syspath %s\n", debugstr_a(devnode), udev_device_get_syspath(dev));
 
+    if (!(subsystem = udev_device_get_subsystem(dev))) goto failed;
+    ntdll_umbstowcs(subsystem, strlen(subsystem) + 1, desc.parent, ARRAY_SIZE(desc.parent));
+
     get_device_subsystem_info(dev, "hid", &desc, &bus);
     get_device_subsystem_info(dev, "input", &desc, &bus);
     if (bus == BUS_BLUETOOTH) desc.bus_type = BUS_TYPE_BLUETOOTH;
@@ -1760,13 +1763,6 @@ static void udev_add_device(struct udev_device *dev, int fd)
 
     if (desc.bus_type == BUS_TYPE_USB) get_container_id_for_usb_udev_device(dev, &desc);
     if (desc.bus_type == BUS_TYPE_USB) get_device_usb_info(dev, &desc);
-
-    if (!(subsystem = udev_device_get_subsystem(dev)))
-    {
-        WARN("udev_device_get_subsystem failed for %s.\n", debugstr_a(devnode));
-        close(fd);
-        return;
-    }
 
     if (desc.vid == 0x28de && desc.pid == 0x11ff && !strcmp(subsystem, "input"))
     {
@@ -1796,6 +1792,8 @@ static void udev_add_device(struct udev_device *dev, int fd)
 
     if ((desc.is_hidraw = !strcmp(subsystem, "hidraw")) && !hidraw_device_create(dev, fd, devnode, desc)) return;
     if (!strcmp(subsystem, "input") && !lnxev_device_create(dev, fd, devnode, desc)) return;
+
+failed:
     close(fd);
 }
 
