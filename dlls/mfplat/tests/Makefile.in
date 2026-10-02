@@ -2,5 +2,6 @@ TESTDLL   = mfplat.dll
 IMPORTS   = ole32 mfplat user32 d3d9 dxva2 mfuuid propsys uuid strmiids kernelbase
 
 SOURCES = \
+	d3d12.c \
 	mfplat.c \
 	resource.rc

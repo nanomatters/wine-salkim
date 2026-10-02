@@ -22,6 +22,8 @@
 #include "rtworkq.h"
 #include "d3d9.h"
 #include "d3d11.h"
+#include "d3d12.h"
+#include "mfd3d12.h"
 #include "initguid.h"
 #include "dxva2api.h"
 
@@ -75,6 +77,14 @@ struct sample_allocator
         unsigned int bindflags;
         unsigned int miscflags;
         unsigned int buffer_count;
+        unsigned int resource_version;
+        BOOL resource_version_set;
+        BOOL d3d12;
+        D3D12_RESOURCE_DESC d3d12_desc;
+        D3D12_HEAP_PROPERTIES d3d12_heap;
+        D3D12_HEAP_FLAGS d3d12_heap_flags;
+        D3D12_CLEAR_VALUE d3d12_clear_value;
+        BOOL d3d12_clear_value_set;
     } frame_desc;
 
     IMFAttributes *attributes;
@@ -82,6 +92,8 @@ struct sample_allocator
 
     unsigned int free_sample_count;
     unsigned int cold_sample_count;
+    unsigned int retiring_sample_count;
+    UINT64 generation;
     struct list free_samples;
     struct list used_samples;
     CRITICAL_SECTION cs;
@@ -91,6 +103,21 @@ struct queued_sample
 {
     struct list entry;
     IMFSample *sample;
+    BOOL d3d12;
+};
+
+struct sample_retirement
+{
+    IMFAsyncCallback IMFAsyncCallback_iface;
+    LONG refcount;
+    struct sample_allocator *allocator;
+    struct queued_sample *sample;
+    UINT64 generation;
+    IMFD3D12SynchronizationObject **sync_objects;
+    DWORD buffer_count;
+    DWORD buffer_index;
+    BOOL waiting_transfer;
+    HANDLE event;
 };
 
 static struct sample_allocator *impl_from_IMFVideoSampleAllocatorEx(IMFVideoSampleAllocatorEx *iface)
@@ -1216,6 +1243,8 @@ static void sample_allocator_release_samples(struct sample_allocator *allocator)
 
     allocator->free_sample_count = 0;
     allocator->cold_sample_count = 0;
+    allocator->retiring_sample_count = 0;
+    ++allocator->generation;
 }
 
 static void sample_allocator_set_media_type(struct sample_allocator *allocator, IMFMediaType *media_type)
@@ -1344,10 +1373,21 @@ struct surface_service
 {
     IDirectXVideoProcessorService *dxva_service;
     ID3D11Device *d3d11_device;
+    ID3D12Device *d3d12_device;
     HANDLE hdevice;
 };
 
-static HRESULT sample_allocator_get_surface_service(struct sample_allocator *allocator, struct surface_service *service)
+struct d3d12_sample_desc
+{
+    D3D12_RESOURCE_DESC desc;
+    D3D12_HEAP_PROPERTIES heap;
+    D3D12_HEAP_FLAGS heap_flags;
+    D3D12_CLEAR_VALUE clear_value;
+    BOOL clear_value_set;
+};
+
+static HRESULT sample_allocator_get_surface_service(struct sample_allocator *allocator,
+        unsigned int resource_version, BOOL resource_version_set, struct surface_service *service)
 {
     HRESULT hr = S_OK;
 
@@ -1369,10 +1409,20 @@ static HRESULT sample_allocator_get_surface_service(struct sample_allocator *all
     {
         if (SUCCEEDED(hr = IMFDXGIDeviceManager_OpenDeviceHandle(allocator->dxgi_device_manager, &service->hdevice)))
         {
-            if (FAILED(hr = IMFDXGIDeviceManager_GetVideoService(allocator->dxgi_device_manager, service->hdevice,
-                    &IID_ID3D11Device, (void **)&service->d3d11_device)))
+            if (resource_version_set && resource_version == MF_D3D12_RESOURCE)
+                hr = IMFDXGIDeviceManager_GetVideoService(allocator->dxgi_device_manager, service->hdevice,
+                        &IID_ID3D12Device, (void **)&service->d3d12_device);
+            else
             {
-                WARN("Failed to get D3D11 device, hr %#lx.\n", hr);
+                hr = IMFDXGIDeviceManager_GetVideoService(allocator->dxgi_device_manager, service->hdevice,
+                        &IID_ID3D11Device, (void **)&service->d3d11_device);
+                if (hr == E_NOINTERFACE && !resource_version_set)
+                    hr = IMFDXGIDeviceManager_GetVideoService(allocator->dxgi_device_manager, service->hdevice,
+                            &IID_ID3D12Device, (void **)&service->d3d12_device);
+            }
+            if (FAILED(hr))
+            {
+                WARN("Failed to get Direct3D device, hr %#lx.\n", hr);
                 IMFDXGIDeviceManager_CloseDeviceHandle(allocator->dxgi_device_manager, service->hdevice);
             }
         }
@@ -1391,6 +1441,8 @@ static void sample_allocator_release_surface_service(struct sample_allocator *al
         IDirectXVideoProcessorService_Release(service->dxva_service);
     if (service->d3d11_device)
         ID3D11Device_Release(service->d3d11_device);
+    if (service->d3d12_device)
+        ID3D12Device_Release(service->d3d12_device);
 
     if (allocator->d3d9_device_manager)
         IDirect3DDeviceManager9_CloseDeviceHandle(allocator->d3d9_device_manager, service->hdevice);
@@ -1453,6 +1505,20 @@ static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocat
                 ID3D11Texture2D_Release(texture);
             }
         }
+        else if (service->d3d12_device)
+        {
+            ID3D12Resource *resource;
+
+            if (SUCCEEDED(hr = ID3D12Device_CreateCommittedResource(service->d3d12_device,
+                    &allocator->frame_desc.d3d12_heap, allocator->frame_desc.d3d12_heap_flags,
+                    &allocator->frame_desc.d3d12_desc, D3D12_RESOURCE_STATE_COMMON,
+                    allocator->frame_desc.d3d12_clear_value_set ? &allocator->frame_desc.d3d12_clear_value : NULL,
+                    &IID_ID3D12Resource, (void **)&resource)))
+            {
+                hr = MFCreateDXGISurfaceBuffer(&IID_ID3D12Resource, (IUnknown *)resource, 0, FALSE, &buffer);
+                ID3D12Resource_Release(resource);
+            }
+        }
         else
         {
             hr = MFCreate2DMediaBuffer(allocator->frame_desc.width, allocator->frame_desc.height,
@@ -1464,6 +1530,8 @@ static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocat
             hr = IMFSample_AddBuffer(sample, buffer);
             IMFMediaBuffer_Release(buffer);
         }
+        if (FAILED(hr) && service->d3d12_device)
+            break;
     }
 
     if (FAILED(hr))
@@ -1478,17 +1546,89 @@ static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocat
         return E_OUTOFMEMORY;
     }
     (*queued_sample)->sample = sample;
+    (*queued_sample)->d3d12 = !!service->d3d12_device;
 
     return hr;
+}
+
+static HRESULT sample_allocator_initialize_d3d12(unsigned int width, unsigned int height, DXGI_FORMAT format,
+        IMFMediaType *media_type, IMFAttributes *attributes, struct d3d12_sample_desc *frame)
+{
+    static const struct
+    {
+        const GUID *key;
+        D3D12_RESOURCE_FLAGS flag;
+    }
+    resource_flags[] =
+    {
+        {&MF_MT_D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET},
+        {&MF_MT_D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL},
+        {&MF_MT_D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS},
+        {&MF_MT_D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE},
+        {&MF_MT_D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER},
+        {&MF_MT_D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS},
+    };
+    D3D12_RESOURCE_DESC *desc = &frame->desc;
+    D3D12_HEAP_PROPERTIES *heap = &frame->heap;
+    UINT32 value, size;
+    unsigned int i;
+    HRESULT hr;
+
+    memset(frame, 0, sizeof(*frame));
+    desc->Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc->Width = width;
+    desc->Height = height;
+    desc->DepthOrArraySize = 1;
+    desc->MipLevels = 1;
+    desc->Format = format;
+    desc->SampleDesc.Count = 1;
+    if (SUCCEEDED(IMFMediaType_GetUINT32(media_type, &MF_MT_D3D12_TEXTURE_LAYOUT, &value)))
+        desc->Layout = value;
+    for (i = 0; i < ARRAY_SIZE(resource_flags); ++i)
+    {
+        if (SUCCEEDED(IMFMediaType_GetUINT32(media_type, resource_flags[i].key, &value)) && value)
+            desc->Flags |= resource_flags[i].flag;
+    }
+
+    heap->Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap->CreationNodeMask = heap->VisibleNodeMask = 1;
+    frame->heap_flags = desc->Flags &
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ?
+            D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES : D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    frame->clear_value_set = FALSE;
+
+    if (attributes)
+    {
+        if (SUCCEEDED(IMFAttributes_GetUINT32(attributes, &MF_SA_D3D12_HEAP_TYPE, &value)))
+            heap->Type = value;
+        if (SUCCEEDED(IMFAttributes_GetUINT32(attributes, &MF_SA_D3D12_HEAP_FLAGS, &value)))
+            frame->heap_flags = value;
+        hr = IMFAttributes_GetBlobSize(attributes, &MF_SA_D3D12_CLEAR_VALUE, &size);
+        if (hr != MF_E_ATTRIBUTENOTFOUND)
+        {
+            if (FAILED(hr))
+                return hr;
+            if (size != sizeof(frame->clear_value))
+                return E_INVALIDARG;
+            if (FAILED(hr = IMFAttributes_GetBlob(attributes, &MF_SA_D3D12_CLEAR_VALUE,
+                    (BYTE *)&frame->clear_value, size, NULL)))
+                return hr;
+            frame->clear_value_set = TRUE;
+        }
+    }
+
+    return S_OK;
 }
 
 static HRESULT sample_allocator_initialize(struct sample_allocator *allocator, unsigned int sample_count,
         unsigned int max_sample_count, IMFAttributes *attributes, IMFMediaType *media_type)
 {
+    struct d3d12_sample_desc d3d12_frame;
     struct surface_service service;
     struct queued_sample *sample;
     DXGI_FORMAT dxgi_format;
-    unsigned int i, value;
+    unsigned int i, value, resource_version = 0;
+    BOOL resource_version_set = FALSE;
     GUID major, subtype;
     UINT64 frame_size;
     UINT32 usage;
@@ -1509,17 +1649,37 @@ static HRESULT sample_allocator_initialize(struct sample_allocator *allocator, u
     if (sample_count > max_sample_count)
         return E_INVALIDARG;
 
+    if (allocator->dxgi_device_manager)
+    {
+        hr = IMFMediaType_GetUINT32(media_type, &MF_MT_D3D_RESOURCE_VERSION, &resource_version);
+        resource_version_set = SUCCEEDED(hr);
+        if (FAILED(hr) && hr != MF_E_ATTRIBUTENOTFOUND)
+            return hr;
+        if (resource_version_set && resource_version > MF_D3D12_RESOURCE)
+            return E_INVALIDARG;
+    }
+
     usage = D3D11_USAGE_DEFAULT;
     if (attributes)
-    {
-        IMFAttributes_GetUINT32(attributes, &MF_SA_BUFFERS_PER_SAMPLE, &allocator->frame_desc.buffer_count);
         IMFAttributes_GetUINT32(attributes, &MF_SA_D3D11_USAGE, &usage);
-    }
 
     if (usage == D3D11_USAGE_IMMUTABLE || usage > D3D11_USAGE_STAGING)
         return E_INVALIDARG;
 
     dxgi_format = MFMapDX9FormatToDXGIFormat(subtype.Data1);
+
+    if (FAILED(hr = sample_allocator_get_surface_service(allocator, resource_version, resource_version_set, &service)))
+        return hr;
+    if (service.d3d12_device && FAILED(hr = sample_allocator_initialize_d3d12(frame_size >> 32, frame_size,
+            dxgi_format, media_type, attributes, &d3d12_frame)))
+    {
+        sample_allocator_release_surface_service(allocator, &service);
+        return hr;
+    }
+
+    /* Validate the candidate D3D12 configuration before replacing the current pool. */
+    if (attributes)
+        IMFAttributes_GetUINT32(attributes, &MF_SA_BUFFERS_PER_SAMPLE, &allocator->frame_desc.buffer_count);
 
     allocator->frame_desc.bindflags = 0;
     allocator->frame_desc.miscflags = 0;
@@ -1555,9 +1715,17 @@ static HRESULT sample_allocator_initialize(struct sample_allocator *allocator, u
     allocator->frame_desc.width = frame_size >> 32;
     allocator->frame_desc.height = frame_size;
     allocator->frame_desc.buffer_count = max(1, allocator->frame_desc.buffer_count);
-
-    if (FAILED(hr = sample_allocator_get_surface_service(allocator, &service)))
-        return hr;
+    allocator->frame_desc.resource_version_set = resource_version_set;
+    allocator->frame_desc.resource_version = resource_version;
+    allocator->frame_desc.d3d12 = !!service.d3d12_device;
+    if (service.d3d12_device)
+    {
+        allocator->frame_desc.d3d12_desc = d3d12_frame.desc;
+        allocator->frame_desc.d3d12_heap = d3d12_frame.heap;
+        allocator->frame_desc.d3d12_heap_flags = d3d12_frame.heap_flags;
+        allocator->frame_desc.d3d12_clear_value = d3d12_frame.clear_value;
+        allocator->frame_desc.d3d12_clear_value_set = d3d12_frame.clear_value_set;
+    }
 
     sample_allocator_release_samples(allocator);
 
@@ -1568,8 +1736,13 @@ static HRESULT sample_allocator_initialize(struct sample_allocator *allocator, u
             list_add_tail(&allocator->free_samples, &sample->entry);
             allocator->free_sample_count++;
         }
+        else if (service.d3d12_device)
+            break;
     }
-    allocator->cold_sample_count = max_sample_count - allocator->free_sample_count;
+    if (FAILED(hr) && service.d3d12_device)
+        sample_allocator_release_samples(allocator);
+    else
+        allocator->cold_sample_count = max_sample_count - allocator->free_sample_count;
 
     sample_allocator_release_surface_service(allocator, &service);
 
@@ -1622,7 +1795,8 @@ static HRESULT WINAPI sample_allocator_AllocateSample(IMFVideoSampleAllocatorEx 
 
     EnterCriticalSection(&allocator->cs);
 
-    if (list_empty(&allocator->free_samples) && list_empty(&allocator->used_samples))
+    if (list_empty(&allocator->free_samples) && list_empty(&allocator->used_samples) &&
+            !allocator->retiring_sample_count && (!allocator->frame_desc.d3d12 || !allocator->cold_sample_count))
         hr = MF_E_NOT_INITIALIZED;
     else if (list_empty(&allocator->free_samples) && !allocator->cold_sample_count)
         hr = MF_E_SAMPLEALLOCATOR_EMPTY;
@@ -1648,7 +1822,8 @@ static HRESULT WINAPI sample_allocator_AllocateSample(IMFVideoSampleAllocatorEx 
     {
         struct surface_service service;
 
-        if (SUCCEEDED(hr = sample_allocator_get_surface_service(allocator, &service)))
+        if (SUCCEEDED(hr = sample_allocator_get_surface_service(allocator, allocator->frame_desc.resource_version,
+                allocator->frame_desc.resource_version_set, &service)))
         {
             if (SUCCEEDED(hr = sample_allocator_allocate_sample(allocator, &service, &sample)))
             {
@@ -1804,9 +1979,230 @@ static HRESULT WINAPI sample_allocator_tracking_callback_GetParameters(IMFAsyncC
     return E_NOTIMPL;
 }
 
+static struct sample_retirement *impl_from_retirement_IMFAsyncCallback(IMFAsyncCallback *iface)
+{
+    return CONTAINING_RECORD(iface, struct sample_retirement, IMFAsyncCallback_iface);
+}
+
+static HRESULT WINAPI sample_retirement_QueryInterface(IMFAsyncCallback *iface, REFIID riid, void **obj)
+{
+    if (IsEqualIID(riid, &IID_IMFAsyncCallback) || IsEqualIID(riid, &IID_IUnknown))
+    {
+        *obj = iface;
+        IMFAsyncCallback_AddRef(iface);
+        return S_OK;
+    }
+
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI sample_retirement_AddRef(IMFAsyncCallback *iface)
+{
+    struct sample_retirement *retirement = impl_from_retirement_IMFAsyncCallback(iface);
+    return InterlockedIncrement(&retirement->refcount);
+}
+
+static ULONG WINAPI sample_retirement_Release(IMFAsyncCallback *iface)
+{
+    struct sample_retirement *retirement = impl_from_retirement_IMFAsyncCallback(iface);
+    ULONG refcount = InterlockedDecrement(&retirement->refcount);
+    unsigned int i;
+
+    if (!refcount)
+    {
+        for (i = 0; i < retirement->buffer_count; ++i)
+        {
+            if (retirement->sync_objects[i])
+                IMFD3D12SynchronizationObject_Release(retirement->sync_objects[i]);
+        }
+        free(retirement->sync_objects);
+        if (retirement->sample)
+        {
+            IMFSample_Release(retirement->sample->sample);
+            free(retirement->sample);
+        }
+        /* A cancelled transfer wait still has a raw event registered with the fence.
+           Sample destruction drains that transfer before the event can be closed. */
+        if (retirement->event)
+            CloseHandle(retirement->event);
+        IMFVideoSampleAllocatorEx_Release(&retirement->allocator->IMFVideoSampleAllocatorEx_iface);
+        free(retirement);
+    }
+
+    return refcount;
+}
+
+static HRESULT WINAPI sample_retirement_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
+{
+    return E_NOTIMPL;
+}
+
+static void sample_retirement_complete(struct sample_retirement *retirement, HRESULT status)
+{
+    struct sample_allocator *allocator = retirement->allocator;
+    IMFVideoSampleAllocatorNotify *callback = NULL;
+
+    if (FAILED(status))
+        WARN("Failed to retire D3D12 sample, hr %#lx.\n", status);
+
+    EnterCriticalSection(&allocator->cs);
+
+    /* Uninitialization invalidates outstanding retirements without waiting for GPU work. */
+    if (retirement->generation == allocator->generation)
+    {
+        --allocator->retiring_sample_count;
+        if (SUCCEEDED(status))
+        {
+            list_add_tail(&allocator->free_samples, &retirement->sample->entry);
+            ++allocator->free_sample_count;
+            retirement->sample = NULL;
+        }
+        else
+            ++allocator->cold_sample_count;
+
+        if ((callback = allocator->callback))
+            IMFVideoSampleAllocatorNotify_AddRef(callback);
+    }
+
+    LeaveCriticalSection(&allocator->cs);
+
+    if (callback)
+    {
+        IMFVideoSampleAllocatorNotify_NotifyRelease(callback);
+        IMFVideoSampleAllocatorNotify_Release(callback);
+    }
+}
+
+static HRESULT sample_retirement_wait(struct sample_retirement *retirement)
+{
+    IMFMediaBuffer *buffer;
+    IRtwqAsyncResult *result;
+    RTWQWORKITEM_KEY key;
+    HRESULT hr;
+
+    if (retirement->buffer_index == retirement->buffer_count)
+    {
+        sample_retirement_complete(retirement, S_OK);
+        return S_OK;
+    }
+
+    ResetEvent(retirement->event);
+    if (FAILED(hr = RtwqCreateAsyncResult(NULL, (IRtwqAsyncCallback *)&retirement->IMFAsyncCallback_iface,
+            NULL, &result)))
+        return hr;
+
+    /* Register the wait first, so registration failure cannot leave the sync object
+       pointing at an event whose retirement owner is about to be destroyed. */
+    hr = RtwqPutWaitingWorkItem(retirement->event, 0, result, &key);
+    IRtwqAsyncResult_Release(result);
+    if (FAILED(hr))
+        return hr;
+
+    if (retirement->waiting_transfer)
+    {
+        if (SUCCEEDED(hr = IMFSample_GetBufferByIndex(retirement->sample->sample,
+                retirement->buffer_index, &buffer)))
+        {
+            hr = mf_d3d12_surface_buffer_signal_transfer(buffer, retirement->event);
+            IMFMediaBuffer_Release(buffer);
+        }
+    }
+    else
+        hr = mf_d3d12_sync_object_signal_retirement(
+                retirement->sync_objects[retirement->buffer_index], retirement->event);
+    if (FAILED(hr))
+        RtwqCancelWorkItem(key);
+
+    return hr;
+}
+
+static HRESULT WINAPI sample_retirement_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+{
+    struct sample_retirement *retirement = impl_from_retirement_IMFAsyncCallback(iface);
+    HRESULT hr;
+
+    /* A failed registration is completed by its caller, not by the cancelled wait. */
+    if (FAILED(IMFAsyncResult_GetStatus(result)))
+        return S_OK;
+
+    if (retirement->waiting_transfer)
+    {
+        retirement->waiting_transfer = FALSE;
+        hr = sample_retirement_wait(retirement);
+    }
+    else if (SUCCEEDED(hr = IMFD3D12SynchronizationObject_Reset(
+            retirement->sync_objects[retirement->buffer_index])))
+    {
+        ++retirement->buffer_index;
+        retirement->waiting_transfer = TRUE;
+        hr = sample_retirement_wait(retirement);
+    }
+    if (FAILED(hr))
+        sample_retirement_complete(retirement, hr);
+
+    return S_OK;
+}
+
+static const IMFAsyncCallbackVtbl sample_retirement_vtbl =
+{
+    sample_retirement_QueryInterface,
+    sample_retirement_AddRef,
+    sample_retirement_Release,
+    sample_retirement_GetParameters,
+    sample_retirement_Invoke,
+};
+
+static void sample_retirement_start(struct sample_retirement *retirement)
+{
+    IMFMediaBuffer *buffer;
+    IMFDXGIBuffer *dxgi_buffer;
+    unsigned int i;
+    HRESULT hr;
+
+    if (FAILED(hr = IMFSample_GetBufferCount(retirement->sample->sample, &retirement->buffer_count)))
+        goto failed;
+    if (retirement->buffer_count && !(retirement->sync_objects = calloc(retirement->buffer_count,
+            sizeof(*retirement->sync_objects))))
+    {
+        hr = E_OUTOFMEMORY;
+        /* The count is also used when releasing the collected interfaces. */
+        retirement->buffer_count = 0;
+        goto failed;
+    }
+    if (!(retirement->event = CreateEventW(NULL, TRUE, FALSE, NULL)))
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        goto failed;
+    }
+
+    for (i = 0; i < retirement->buffer_count; ++i)
+    {
+        if (FAILED(hr = IMFSample_GetBufferByIndex(retirement->sample->sample, i, &buffer)))
+            goto failed;
+        hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMFDXGIBuffer, (void **)&dxgi_buffer);
+        IMFMediaBuffer_Release(buffer);
+        if (FAILED(hr))
+            goto failed;
+        hr = IMFDXGIBuffer_GetUnknown(dxgi_buffer, &MF_D3D12_SYNCHRONIZATION_OBJECT,
+                &IID_IMFD3D12SynchronizationObject, (void **)&retirement->sync_objects[i]);
+        IMFDXGIBuffer_Release(dxgi_buffer);
+        if (FAILED(hr))
+            goto failed;
+    }
+
+    retirement->waiting_transfer = TRUE;
+    if (SUCCEEDED(hr = sample_retirement_wait(retirement)))
+        return;
+
+failed:
+    sample_retirement_complete(retirement, hr);
+}
+
 static HRESULT WINAPI sample_allocator_tracking_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
 {
     struct sample_allocator *allocator = impl_from_IMFAsyncCallback(iface);
+    struct sample_retirement *retirement = NULL;
     struct queued_sample *iter;
     IUnknown *object = NULL;
     IMFSample *sample = NULL;
@@ -1827,6 +2223,27 @@ static HRESULT WINAPI sample_allocator_tracking_callback_Invoke(IMFAsyncCallback
         if (sample == iter->sample)
         {
             list_remove(&iter->entry);
+            if (iter->d3d12)
+            {
+                if ((retirement = calloc(1, sizeof(*retirement))))
+                {
+                    retirement->IMFAsyncCallback_iface.lpVtbl = &sample_retirement_vtbl;
+                    retirement->refcount = 1;
+                    retirement->allocator = allocator;
+                    IMFVideoSampleAllocatorEx_AddRef(&allocator->IMFVideoSampleAllocatorEx_iface);
+                    retirement->sample = iter;
+                    IMFSample_AddRef(iter->sample);
+                    retirement->generation = allocator->generation;
+                    ++allocator->retiring_sample_count;
+                }
+                else
+                {
+                    WARN("Failed to allocate D3D12 sample retirement.\n");
+                    ++allocator->cold_sample_count;
+                    free(iter);
+                }
+                break;
+            }
             list_add_tail(&allocator->free_samples, &iter->entry);
             IMFSample_AddRef(iter->sample);
             allocator->free_sample_count++;
@@ -1836,10 +2253,16 @@ static HRESULT WINAPI sample_allocator_tracking_callback_Invoke(IMFAsyncCallback
 
     IMFSample_Release(sample);
 
-    if (allocator->callback)
+    if (!retirement && allocator->callback)
         IMFVideoSampleAllocatorNotify_NotifyRelease(allocator->callback);
 
     LeaveCriticalSection(&allocator->cs);
+
+    if (retirement)
+    {
+        sample_retirement_start(retirement);
+        IMFAsyncCallback_Release(&retirement->IMFAsyncCallback_iface);
+    }
 
     return S_OK;
 }

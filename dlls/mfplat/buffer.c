@@ -80,12 +80,18 @@ struct buffer
         IMFD3D12SynchronizationObject *sync_obj;
         IMFD3D12SynchronizationObjectCommands *sync_cmd;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT chroma_layout;
+        unsigned int plane_count, plane_stride;
+        DWORD staging_size;
         void *data;
         BOOL keep_transfer;
         ID3D12Resource *upload, *readback, *transfer;
         ID3D12CommandQueue *queue;
         ID3D12Fence *fence;
         UINT64 fence_value;
+        HANDLE fence_event;
+        BOOL transfer_pending, signal_failed;
+        HRESULT transfer_error;
         size_t alloc_index;
         ID3D12GraphicsCommandList *list;
         struct d3d12_list_allocator
@@ -97,6 +103,9 @@ struct buffer
 
     CRITICAL_SECTION cs;
 };
+
+static HRESULT d3d12_surface_buffer_wait_transfer(struct buffer *buffer);
+static const IMFMediaBufferVtbl d3d12_surface_1d_buffer_vtbl;
 
 static void copy_image(const struct buffer *buffer, BYTE *dest, LONG dest_stride, const BYTE *src,
         LONG src_stride, DWORD width, DWORD lines)
@@ -187,6 +196,14 @@ static ULONG WINAPI memory_buffer_Release(IMFMediaBuffer *iface)
 
     if (!refcount)
     {
+        if (buffer->d3d12_surface.transfer_pending
+                && FAILED(d3d12_surface_buffer_wait_transfer(buffer))
+                && SUCCEEDED(ID3D12Device_GetDeviceRemovedReason(buffer->d3d12_surface.device)))
+        {
+            /* A failed fence signal cannot prove that the GPU has stopped using these objects. */
+            WARN("Retaining D3D12 buffer %p with an uncompleted transfer.\n", buffer);
+            return 0;
+        }
         if (buffer->d3d9_surface.surface)
             IDirect3DSurface9_Release(buffer->d3d9_surface.surface);
         if (buffer->dxgi_surface.texture)
@@ -199,13 +216,15 @@ static ULONG WINAPI memory_buffer_Release(IMFMediaBuffer *iface)
         if (buffer->d3d12_surface.resource)
         {
             ID3D12Device_Release(buffer->d3d12_surface.device);
-            ID3D12Resource_Release(buffer->d3d12_surface.resource);
+            /* The bound synchronization object retains the texture for pending GPU users. */
+            if (!buffer->d3d12_surface.sync_obj) ID3D12Resource_Release(buffer->d3d12_surface.resource);
             if (buffer->d3d12_surface.sync_obj) IMFD3D12SynchronizationObject_Release(buffer->d3d12_surface.sync_obj);
             if (buffer->d3d12_surface.sync_cmd) IMFD3D12SynchronizationObjectCommands_Release(buffer->d3d12_surface.sync_cmd);
             if (buffer->d3d12_surface.readback) ID3D12Resource_Release(buffer->d3d12_surface.readback);
             if (buffer->d3d12_surface.upload) ID3D12Resource_Release(buffer->d3d12_surface.upload);
             if (buffer->d3d12_surface.queue) ID3D12CommandQueue_Release(buffer->d3d12_surface.queue);
             if (buffer->d3d12_surface.fence) ID3D12Fence_Release(buffer->d3d12_surface.fence);
+            if (buffer->d3d12_surface.fence_event) CloseHandle(buffer->d3d12_surface.fence_event);
             if (buffer->d3d12_surface.list) ID3D12GraphicsCommandList_Release(buffer->d3d12_surface.list);
             if (buffer->d3d12_surface.alloc[0].allocator) ID3D12CommandAllocator_Release(buffer->d3d12_surface.alloc[0].allocator);
             if (buffer->d3d12_surface.alloc[1].allocator) ID3D12CommandAllocator_Release(buffer->d3d12_surface.alloc[1].allocator);
@@ -1373,12 +1392,73 @@ static const IMFDXGIBufferVtbl dxgi_buffer_vtbl =
     dxgi_buffer_SetUnknown,
 };
 
+static HRESULT d3d12_surface_buffer_wait_transfer(struct buffer *buffer)
+{
+    UINT64 completed;
+    DWORD result;
+    HRESULT hr;
+
+    if (!buffer->d3d12_surface.transfer_pending)
+        return S_OK;
+    if (buffer->d3d12_surface.signal_failed)
+        return buffer->d3d12_surface.transfer_error;
+
+    completed = ID3D12Fence_GetCompletedValue(buffer->d3d12_surface.fence);
+    if (completed == ~(UINT64)0)
+    {
+        hr = ID3D12Device_GetDeviceRemovedReason(buffer->d3d12_surface.device);
+        return FAILED(hr) ? hr : DXGI_ERROR_DEVICE_REMOVED;
+    }
+    if (completed < buffer->d3d12_surface.fence_value)
+    {
+        ResetEvent(buffer->d3d12_surface.fence_event);
+        if (FAILED(hr = ID3D12Fence_SetEventOnCompletion(buffer->d3d12_surface.fence,
+                buffer->d3d12_surface.fence_value, buffer->d3d12_surface.fence_event)))
+            return hr;
+        do
+        {
+            result = WaitForSingleObject(buffer->d3d12_surface.fence_event, 100);
+            if (result == WAIT_FAILED)
+                return HRESULT_FROM_WIN32(GetLastError());
+            if (FAILED(hr = ID3D12Device_GetDeviceRemovedReason(buffer->d3d12_surface.device)))
+                return hr;
+        } while (result == WAIT_TIMEOUT);
+    }
+    buffer->d3d12_surface.transfer_pending = FALSE;
+    return S_OK;
+}
+
+HRESULT mf_d3d12_surface_buffer_signal_transfer(IMFMediaBuffer *iface, HANDLE event)
+{
+    struct buffer *buffer;
+    HRESULT hr = S_OK;
+
+    if (!event) return E_INVALIDARG;
+    if (iface->lpVtbl != &d3d12_surface_1d_buffer_vtbl) return E_NOINTERFACE;
+    buffer = impl_from_IMFMediaBuffer(iface);
+    EnterCriticalSection(&buffer->cs);
+    if (FAILED(buffer->d3d12_surface.transfer_error))
+        hr = buffer->d3d12_surface.transfer_error;
+    else if (buffer->d3d12_surface.transfer_pending)
+        hr = ID3D12Fence_SetEventOnCompletion(buffer->d3d12_surface.fence,
+                buffer->d3d12_surface.fence_value, event);
+    else if (!SetEvent(event))
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    LeaveCriticalSection(&buffer->cs);
+    return hr;
+}
+
 static HRESULT d3d12_surface_buffer_copy_transfer_resource(struct buffer *buffer, MF2DBuffer_LockFlags flags)
 {
     struct d3d12_list_allocator *current_alloc = &buffer->d3d12_surface.alloc[buffer->d3d12_surface.alloc_index];
     D3D12_RESOURCE_BARRIER pre_barrier, post_barrier;
     D3D12_TEXTURE_COPY_LOCATION res_loc, tx_loc;
-    HRESULT hr;
+    unsigned int i;
+    HRESULT hr, signal_hr, wait_hr;
+
+    if (!buffer->d3d12_surface.fence_event
+            && !(buffer->d3d12_surface.fence_event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+        return HRESULT_FROM_WIN32(GetLastError());
 
     if (!buffer->d3d12_surface.queue)
     {
@@ -1434,60 +1514,82 @@ static HRESULT d3d12_surface_buffer_copy_transfer_resource(struct buffer *buffer
 
     res_loc.pResource = buffer->d3d12_surface.resource;
     res_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    res_loc.SubresourceIndex = buffer->dxgi_surface.sub_resource_idx;
     tx_loc.pResource = buffer->d3d12_surface.transfer;
     tx_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    tx_loc.PlacedFootprint = buffer->d3d12_surface.layout;
 
     pre_barrier.Type = post_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     pre_barrier.Flags = post_barrier.Flags = 0;
     pre_barrier.Transition.pResource = post_barrier.Transition.pResource = buffer->d3d12_surface.resource;
-    pre_barrier.Transition.Subresource = post_barrier.Transition.Subresource = buffer->dxgi_surface.sub_resource_idx;
     pre_barrier.Transition.StateBefore = post_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     pre_barrier.Transition.StateAfter = post_barrier.Transition.StateBefore =
         flags == MF2DBuffer_LockFlags_Write ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
 
-    ID3D12GraphicsCommandList_ResourceBarrier(buffer->d3d12_surface.list, 1, &pre_barrier);
-    ID3D12GraphicsCommandList_CopyTextureRegion(buffer->d3d12_surface.list,
-        flags == MF2DBuffer_LockFlags_Write ? &res_loc : &tx_loc, 0, 0, 0,
-        flags == MF2DBuffer_LockFlags_Write ? &tx_loc : &res_loc, NULL);
-    ID3D12GraphicsCommandList_ResourceBarrier(buffer->d3d12_surface.list, 1, &post_barrier);
+    for (i = 0; i < buffer->d3d12_surface.plane_count; ++i)
+    {
+        res_loc.SubresourceIndex = buffer->dxgi_surface.sub_resource_idx + i * buffer->d3d12_surface.plane_stride;
+        tx_loc.PlacedFootprint = i ? buffer->d3d12_surface.chroma_layout : buffer->d3d12_surface.layout;
+        pre_barrier.Transition.Subresource = post_barrier.Transition.Subresource = res_loc.SubresourceIndex;
+        ID3D12GraphicsCommandList_ResourceBarrier(buffer->d3d12_surface.list, 1, &pre_barrier);
+        ID3D12GraphicsCommandList_CopyTextureRegion(buffer->d3d12_surface.list,
+            flags == MF2DBuffer_LockFlags_Write ? &res_loc : &tx_loc, 0, 0, 0,
+            flags == MF2DBuffer_LockFlags_Write ? &tx_loc : &res_loc, NULL);
+        ID3D12GraphicsCommandList_ResourceBarrier(buffer->d3d12_surface.list, 1, &post_barrier);
+    }
     hr = ID3D12GraphicsCommandList_Close(buffer->d3d12_surface.list);
     if (FAILED(hr))
         return hr;
 
-    if (flags != MF2DBuffer_LockFlags_Write)
-        IMFD3D12SynchronizationObjectCommands_EnqueueResourceReadyWait(buffer->d3d12_surface.sync_cmd, buffer->d3d12_surface.queue);
+    if (flags != MF2DBuffer_LockFlags_Write
+            && FAILED(hr = IMFD3D12SynchronizationObjectCommands_EnqueueResourceReadyWait(
+            buffer->d3d12_surface.sync_cmd, buffer->d3d12_surface.queue)))
+        return hr;
 
     ID3D12CommandQueue_ExecuteCommandLists(buffer->d3d12_surface.queue, 1, (ID3D12CommandList **) &buffer->d3d12_surface.list);
     buffer->d3d12_surface.fence_value++;
+    buffer->d3d12_surface.transfer_pending = TRUE;
     current_alloc->free_value = buffer->d3d12_surface.fence_value;
-    ID3D12CommandQueue_Signal(buffer->d3d12_surface.queue, buffer->d3d12_surface.fence, buffer->d3d12_surface.fence_value);
-
     if (flags == MF2DBuffer_LockFlags_Write)
     {
-        IMFD3D12SynchronizationObjectCommands_EnqueueResourceReady(buffer->d3d12_surface.sync_cmd, buffer->d3d12_surface.queue);
+        hr = IMFD3D12SynchronizationObjectCommands_EnqueueResourceReady(buffer->d3d12_surface.sync_cmd,
+                buffer->d3d12_surface.queue);
     }
     else
     {
-        IMFD3D12SynchronizationObjectCommands_EnqueueResourceRelease(buffer->d3d12_surface.sync_cmd, buffer->d3d12_surface.queue);
-
-        ID3D12Fence_SetEventOnCompletion(buffer->d3d12_surface.fence, buffer->d3d12_surface.fence_value, NULL);
+        hr = IMFD3D12SynchronizationObjectCommands_EnqueueResourceRelease(buffer->d3d12_surface.sync_cmd,
+                buffer->d3d12_surface.queue);
     }
 
-    return S_OK;
+    /* Cover the synchronization fence operations as well as the texture copy. */
+    signal_hr = ID3D12CommandQueue_Signal(buffer->d3d12_surface.queue,
+            buffer->d3d12_surface.fence, buffer->d3d12_surface.fence_value);
+    if (FAILED(signal_hr))
+    {
+        buffer->d3d12_surface.signal_failed = TRUE;
+        buffer->d3d12_surface.transfer_error = signal_hr;
+        return signal_hr;
+    }
+
+    if (flags != MF2DBuffer_LockFlags_Write)
+    {
+        wait_hr = d3d12_surface_buffer_wait_transfer(buffer);
+        if (SUCCEEDED(hr)) hr = wait_hr;
+    }
+    if (FAILED(hr)) buffer->d3d12_surface.transfer_error = hr;
+    return hr;
 }
 
 static HRESULT d3d12_surface_buffer_create_transfer_resource(struct buffer *buffer, ID3D12Resource **resource, MF2DBuffer_LockFlags flags)
 {
     D3D12_HEAP_PROPERTIES heap_prop = { .Type = flags == MF2DBuffer_LockFlags_Write ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK };
     D3D12_RESOURCE_DESC desc;
-    D3D12_SUBRESOURCE_FOOTPRINT footprint = buffer->d3d12_surface.layout.Footprint;
+    D3D12_RANGE empty_range = {0};
+    void *data;
+    HRESULT hr;
 
     memset(&desc, 0, sizeof(desc));
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Alignment = 0;
-    desc.Width = footprint.RowPitch * footprint.Height;
+    desc.Width = buffer->d3d12_surface.staging_size;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -1496,15 +1598,35 @@ static HRESULT d3d12_surface_buffer_create_transfer_resource(struct buffer *buff
     desc.SampleDesc.Quality = 0;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    return ID3D12Device_CreateCommittedResource(buffer->d3d12_surface.device, &heap_prop, D3D12_HEAP_FLAG_NONE, &desc,
+    hr = ID3D12Device_CreateCommittedResource(buffer->d3d12_surface.device, &heap_prop, D3D12_HEAP_FLAG_NONE, &desc,
         flags == MF2DBuffer_LockFlags_Write ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST,
         NULL, &IID_ID3D12Resource, (void **) resource);
+    if (FAILED(hr)) return hr;
+
+    /* Single-channel media strides can include bytes which are not part of the texture row. */
+    hr = ID3D12Resource_Map(*resource, 0, &empty_range, &data);
+    if (SUCCEEDED(hr))
+    {
+        memset(data, 0, buffer->d3d12_surface.staging_size);
+        ID3D12Resource_Unmap(*resource, 0, NULL);
+    }
+    else
+    {
+        ID3D12Resource_Release(*resource);
+        *resource = NULL;
+    }
+    return hr;
 }
 
 static HRESULT d3d12_surface_buffer_map(struct buffer *buffer, MF2DBuffer_LockFlags flags)
 {
     HRESULT hr = S_OK;
     D3D12_RANGE empty_range = { 0, 0 };
+
+    if (FAILED(hr = d3d12_surface_buffer_wait_transfer(buffer)))
+        return hr;
+    if (FAILED(buffer->d3d12_surface.transfer_error))
+        return buffer->d3d12_surface.transfer_error;
 
     if (!buffer->d3d12_surface.transfer)
     {
@@ -1578,6 +1700,11 @@ static HRESULT WINAPI d3d12_surface_buffer_Lock(IMFMediaBuffer *iface, BYTE **da
                     buffer->d3d12_surface.layout.Footprint.RowPitch, buffer->_2d.width, buffer->_2d.height);
                 d3d12_surface_buffer_unmap(buffer, MF2DBuffer_LockFlags_Read);
             }
+        }
+        if (FAILED(hr))
+        {
+            free(buffer->_2d.linear_buffer);
+            buffer->_2d.linear_buffer = NULL;
         }
     }
 
@@ -1657,7 +1784,7 @@ static HRESULT d3d12_surface_buffer_lock(struct buffer *buffer, MF2DBuffer_LockF
         if (buffer_start)
             *buffer_start = *scanline0;
         if (buffer_length)
-            *buffer_length = *pitch * buffer->_2d.height;
+            *buffer_length = buffer->d3d12_surface.staging_size;
     }
 
     return hr;
@@ -1765,6 +1892,36 @@ static HRESULT WINAPI d3d12_surface_buffer_GetResource(IMFDXGIBuffer *iface, REF
     return ID3D12Resource_QueryInterface(buffer->d3d12_surface.resource, riid, obj);
 }
 
+static HRESULT WINAPI d3d12_surface_buffer_ContiguousCopyTo(IMF2DBuffer2 *iface, BYTE *dest, DWORD length)
+{
+    struct buffer *buffer = impl_from_IMF2DBuffer2(iface);
+    BYTE *scanline, *start;
+    DWORD size;
+    LONG pitch;
+    HRESULT hr;
+
+    if (length < buffer->_2d.plane_size) return E_INVALIDARG;
+    if (FAILED(hr = IMF2DBuffer2_Lock2DSize(iface, MF2DBuffer_LockFlags_Read, &scanline, &pitch, &start, &size)))
+        return hr;
+    copy_image(buffer, dest, buffer->_2d.width, start, pitch, buffer->_2d.width, buffer->_2d.height);
+    return IMF2DBuffer2_Unlock2D(iface);
+}
+
+static HRESULT WINAPI d3d12_surface_buffer_ContiguousCopyFrom(IMF2DBuffer2 *iface, const BYTE *src, DWORD length)
+{
+    struct buffer *buffer = impl_from_IMF2DBuffer2(iface);
+    BYTE *scanline, *start;
+    DWORD size;
+    LONG pitch;
+    HRESULT hr;
+
+    if (length < buffer->_2d.plane_size) return E_INVALIDARG;
+    if (FAILED(hr = IMF2DBuffer2_Lock2DSize(iface, MF2DBuffer_LockFlags_Write, &scanline, &pitch, &start, &size)))
+        return hr;
+    copy_image(buffer, start, pitch, src, buffer->_2d.width, buffer->_2d.width, buffer->_2d.height);
+    return IMF2DBuffer2_Unlock2D(iface);
+}
+
 static const IMFMediaBufferVtbl d3d12_surface_1d_buffer_vtbl =
 {
     dxgi_1d_2d_buffer_QueryInterface,
@@ -1787,8 +1944,8 @@ static const IMF2DBuffer2Vtbl d3d12_surface_buffer_vtbl =
     d3d12_surface_buffer_GetScanline0AndPitch,
     memory_2d_buffer_IsContiguousFormat,
     memory_2d_buffer_GetContiguousLength,
-    memory_2d_buffer_ContiguousCopyTo,
-    memory_2d_buffer_ContiguousCopyFrom,
+    d3d12_surface_buffer_ContiguousCopyTo,
+    d3d12_surface_buffer_ContiguousCopyFrom,
     d3d12_surface_buffer_Lock2DSize,
     memory_2d_buffer_Copy2DTo,
 };
@@ -2101,9 +2258,9 @@ static HRESULT create_d3d12_surface_buffer(IUnknown *surface, unsigned int sub_r
     ID3D12Device *device = NULL;
     ID3D12Resource *resource = NULL;
     D3D12_RESOURCE_DESC desc;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
-    UINT64 total_bytes;
-    unsigned int stride;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout, chroma_layout = {0};
+    UINT64 total_bytes, staging_size;
+    unsigned int stride, plane_count, plane_stride;
     D3DFORMAT format;
     GUID subtype;
     BOOL is_yuv;
@@ -2119,19 +2276,52 @@ static HRESULT create_d3d12_surface_buffer(IUnknown *surface, unsigned int sub_r
         goto end;
 
     desc = ID3D12Resource_GetDesc(resource);
-    ID3D12Device_GetCopyableFootprints(device, &desc, sub_resource_idx, 1, 0, &layout, NULL, NULL, &total_bytes);
-    TRACE("format %#x, %u x %u.\n", layout.Footprint.Format, layout.Footprint.Width, layout.Footprint.Height);
-
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    plane_stride = desc.MipLevels * desc.DepthOrArraySize;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+            || !plane_stride || sub_resource_idx >= plane_stride)
     {
         hr = MF_E_INVALIDMEDIATYPE;
         goto end;
     }
 
-    memcpy(&subtype, &MFVideoFormat_Base, sizeof(subtype));
-    subtype.Data1 = format = MFMapDXGIFormatToDX9Format(layout.Footprint.Format);
+    ID3D12Device_GetCopyableFootprints(device, &desc, sub_resource_idx, 1, 0, &layout, NULL, NULL, &total_bytes);
+    TRACE("format %#x, %u x %u.\n", layout.Footprint.Format, layout.Footprint.Width, layout.Footprint.Height);
+    plane_count = desc.Format == DXGI_FORMAT_NV12 || desc.Format == DXGI_FORMAT_P010
+            || desc.Format == DXGI_FORMAT_P016 ? 2 : 1;
+    staging_size = (UINT64)layout.Footprint.RowPitch * layout.Footprint.Height;
+    if (plane_count == 2)
+    {
+        /* The mapped video image has one pitch and contiguous Y and UV planes. */
+        if (layout.Footprint.Height & 1)
+        {
+            hr = MF_E_INVALIDMEDIATYPE;
+            goto end;
+        }
+        ID3D12Device_GetCopyableFootprints(device, &desc, sub_resource_idx + plane_stride,
+                1, staging_size, &chroma_layout, NULL, NULL, &total_bytes);
+        if (chroma_layout.Offset != staging_size
+                || chroma_layout.Footprint.RowPitch != layout.Footprint.RowPitch
+                || chroma_layout.Footprint.Height != layout.Footprint.Height / 2)
+        {
+            hr = MF_E_INVALIDMEDIATYPE;
+            goto end;
+        }
+        staging_size += (UINT64)chroma_layout.Footprint.RowPitch * chroma_layout.Footprint.Height;
+        if (total_bytes != ~(UINT64)0) total_bytes += chroma_layout.Offset;
+    }
+    if (total_bytes == ~(UINT64)0 || staging_size > MAXDWORD)
+    {
+        hr = E_INVALIDARG;
+        goto end;
+    }
 
-    if (!(stride = mf_format_get_stride(&subtype, layout.Footprint.Width, &is_yuv)))
+    memcpy(&subtype, &MFVideoFormat_Base, sizeof(subtype));
+    subtype.Data1 = format = MFMapDXGIFormatToDX9Format(plane_count == 2 ? desc.Format : layout.Footprint.Format);
+
+    stride = desc.Format == DXGI_FORMAT_P016 ? layout.Footprint.Width * 2
+            : mf_format_get_stride(&subtype, layout.Footprint.Width, &is_yuv);
+    if (!stride || stride > layout.Footprint.RowPitch
+            || (UINT64)stride * layout.Footprint.Height * (plane_count == 2 ? 3 : 2) / 2 > MAXDWORD)
     {
         hr = MF_E_INVALIDMEDIATYPE;
         goto end;
@@ -2149,6 +2339,10 @@ static HRESULT create_d3d12_surface_buffer(IUnknown *surface, unsigned int sub_r
     object->refcount = 1;
     InitializeCriticalSection(&object->cs);
     object->d3d12_surface.layout = layout;
+    object->d3d12_surface.chroma_layout = chroma_layout;
+    object->d3d12_surface.plane_count = plane_count;
+    object->d3d12_surface.plane_stride = plane_stride;
+    object->d3d12_surface.staging_size = staging_size;
     object->d3d12_surface.device = device;
     object->d3d12_surface.resource = resource;
     object->dxgi_surface.sub_resource_idx = sub_resource_idx;
@@ -2156,20 +2350,19 @@ static HRESULT create_d3d12_surface_buffer(IUnknown *surface, unsigned int sub_r
     device = NULL;
     resource = NULL;
 
-    MFGetPlaneSize(format,
-        layout.Footprint.Width, layout.Footprint.Height, &object->_2d.plane_size);
+    object->_2d.plane_size = (UINT64)stride * layout.Footprint.Height * (plane_count == 2 ? 3 : 2) / 2;
     object->_2d.width = stride;
     object->_2d.height = layout.Footprint.Height;
-    object->_2d.copy_image = get_2d_buffer_copy_func(format);
+    object->_2d.copy_image = plane_count == 2 ? copy_image_nv12 : get_2d_buffer_copy_func(format);
 
     object->max_length = total_bytes;
 
     if (FAILED(hr = init_attributes_object(&object->dxgi_surface.attributes, 0)))
         goto end;
 
-    if (FAILED(hr = MFCreateD3D12SynchronizationObject(object->d3d12_surface.device,
-            &IID_IMFD3D12SynchronizationObject, (void **) &object->d3d12_surface.sync_obj)))
+    if (FAILED(hr = mf_create_d3d12_sync_object(object->d3d12_surface.resource, &object->d3d12_surface.sync_obj)))
         goto end;
+    ID3D12Resource_Release(object->d3d12_surface.resource);
 
     if (FAILED(hr = IMFD3D12SynchronizationObject_QueryInterface(object->d3d12_surface.sync_obj,
             &IID_IMFD3D12SynchronizationObjectCommands, (void **) &object->d3d12_surface.sync_cmd)))

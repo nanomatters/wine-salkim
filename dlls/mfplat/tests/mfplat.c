@@ -13515,7 +13515,6 @@ static void test_sample_allocator_d3d12(void)
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 
     hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type);
-    todo_wine
     ok(hr == S_OK || broken(hr == MF_E_UNEXPECTED) /* Some Win10 versions fail. */, "Unexpected hr %#lx.\n", hr);
     if (FAILED(hr)) goto done;
 
