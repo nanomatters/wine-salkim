@@ -11,6 +11,13 @@
 #endif
 #include PIPEWIRE_TEST_SOURCE
 
+#ifndef PIPEWIRE_TEST_PROCESS_EXITING
+BOOL ntdll_process_is_exiting(void)
+{
+    return FALSE;
+}
+#endif
+
 /* No Wine runtime or audio server is needed for these deterministic tests.
  * Unused driver entry points are removed by the linker's section GC. */
 unsigned char __wine_dbg_get_channel_flags(struct __wine_debug_channel *channel)

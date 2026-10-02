@@ -1,0 +1,298 @@
+/* Process shutdown with abandoned PipeWire locks.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+
+#define PIPEWIRE_TEST_PROCESS_EXITING
+#include "test.h"
+
+static BOOL exiting;
+
+BOOL ntdll_process_is_exiting(void)
+{
+    return exiting;
+}
+
+enum pw_stream_state pw_stream_get_state(struct pw_stream *stream, const char **error)
+{
+    assert(!exiting && stream == (void *)2);
+    return PW_STREAM_STATE_PAUSED;
+}
+
+/* None of these Wine services may run during the shutdown calls below. */
+NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE process, void **addr, ULONG_PTR bits,
+                                      SIZE_T *size, ULONG type, ULONG protect)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtFreeVirtualMemory(HANDLE process, void **addr, SIZE_T *size, ULONG type)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtQueryPerformanceCounter(LARGE_INTEGER *counter, LARGE_INTEGER *frequency)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtWaitForSingleObject(HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtClose(HANDLE handle)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtDelayExecution(BOOLEAN alertable, const LARGE_INTEGER *timeout)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtSetEvent(HANDLE handle, LONG *state)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtSetInformationThread(HANDLE handle, THREADINFOCLASS class, const void *info, ULONG size)
+{
+    abort();
+}
+
+NTSTATUS WINAPI NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size)
+{
+    abort();
+}
+
+NTSTATUS WINAPI PsCreateSystemThread(HANDLE *handle, ULONG access, OBJECT_ATTRIBUTES *attr,
+                                    HANDLE process, CLIENT_ID *id, PRTL_THREAD_START_ROUTINE start, void *arg)
+{
+    abort();
+}
+
+NTSTATUS WINAPI PsTerminateSystemThread(NTSTATUS status)
+{
+    abort();
+}
+
+void WINAPI RtlInitUnicodeString(UNICODE_STRING *str, const WCHAR *buffer)
+{
+    abort();
+}
+
+int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst, DWORD dstlen, BOOL strict)
+{
+    abort();
+}
+
+DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
+{
+    abort();
+}
+
+static void init_loop(void)
+{
+    assert(pipewire_process_attach(NULL) == STATUS_SUCCESS);
+    assert((pw_loop_global = pw_thread_loop_new("shutdown-test", NULL)));
+}
+
+static void test_normal_teardown(void)
+{
+    struct pipewire_stream *stream;
+    struct get_buffer_size_params size;
+    struct release_stream_params release;
+    UINT32 frames = 0;
+
+    init_loop();
+    assert((stream = calloc(1, sizeof(*stream))));
+    stream->pw = (void *)2;
+    stream->bufsize_frames = 321;
+    list_add_tail(&g_streams, &stream->entry);
+    size = (struct get_buffer_size_params){.stream = (UINT_PTR)stream, .frames = &frames};
+    assert(pipewire_get_buffer_size(&size) == STATUS_SUCCESS);
+    assert(size.result == S_OK && frames == 321);
+
+    stream->pw = NULL;
+    release = (struct release_stream_params){.stream = (UINT_PTR)stream};
+    assert(pipewire_release_stream(&release) == STATUS_SUCCESS);
+    assert(release.result == S_OK && list_empty(&g_streams));
+    assert(pipewire_process_detach(NULL) == STATUS_SUCCESS);
+    assert(pipewire_main_loop_stop(NULL) == STATUS_SUCCESS);
+    assert(!pw_loop_global);
+    assert(!pthread_mutex_trylock(&pw_init_mutex));
+    assert(!pthread_mutex_unlock(&pw_init_mutex));
+}
+
+static void *abandon_locks(void *arg)
+{
+    if (arg)
+        assert(!pthread_mutex_lock(&pw_init_mutex));
+    else
+        pw_thread_loop_lock(pw_loop_global);
+    /* Match the owner death caused by Wine's SIGQUIT -> pthread_exit path. */
+    pthread_exit(NULL);
+}
+
+static void test_shutdown_init(void)
+{
+    pthread_t owner;
+
+    init_loop();
+    assert(!pthread_create(&owner, NULL, abandon_locks, (void *)1));
+    assert(!pthread_join(owner, NULL));
+    assert(pthread_mutex_trylock(&pw_init_mutex) == EBUSY);
+    exiting = TRUE;
+    assert(pipewire_process_attach(NULL) == STATUS_SUCCESS);
+    assert(pipewire_main_loop_start(NULL) == STATUS_SUCCESS);
+    assert(pipewire_main_loop_stop(NULL) == STATUS_SUCCESS);
+#ifdef _WIN64
+    assert(pipewire_wow64_process_attach(NULL) == STATUS_SUCCESS);
+#endif
+}
+
+#define CHECK_STREAM_CALL(name) do { \
+    struct name##_params params = {.stream = invalid_stream, .result = E_FAIL}; \
+    assert(pipewire_##name(&params) == STATUS_SUCCESS); \
+    assert(params.result == AUDCLNT_E_DEVICE_INVALIDATED); \
+} while (0)
+
+static void test_shutdown(void)
+{
+    void *poison = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    stream_handle invalid_stream = (UINT_PTR)poison;
+    struct create_stream_params create = {.fmt = poison};
+    struct release_stream_params release = {.stream = invalid_stream, .result = E_FAIL};
+    struct set_volumes_params volumes = {.stream = invalid_stream};
+    struct get_loopback_capture_device_params loopback = {.device = poison};
+    struct get_endpoint_ids_params endpoints = {0};
+    struct get_mix_format_params format = {.device = poison};
+    struct get_device_period_params period = {.device = poison};
+    struct get_prop_value_params prop = {.device = poison};
+    struct is_format_supported_params support = {.fmt_in = poison};
+    struct test_connect_params probe = {.priority = Priority_Preferred};
+    pthread_t owner;
+
+    assert(poison != MAP_FAILED);
+    init_loop();
+    assert(!pthread_create(&owner, NULL, abandon_locks, NULL));
+    assert(!pthread_join(owner, NULL));
+    exiting = TRUE;
+    /* A killed probe could have left the device lists half updated. */
+    g_render_devices.next = g_capture_devices.next = poison;
+
+    CHECK_STREAM_CALL(stop);
+    assert(pipewire_process_detach(NULL) == STATUS_SUCCESS);
+    assert(pipewire_test_connect(&probe) == STATUS_SUCCESS);
+    assert(probe.priority == Priority_Unavailable);
+    assert(pipewire_create_stream(&create) == STATUS_SUCCESS);
+    assert(create.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(pipewire_release_stream(&release) == STATUS_SUCCESS);
+    assert(release.result == S_OK);
+    assert(pipewire_set_volumes(&volumes) == STATUS_SUCCESS);
+    CHECK_STREAM_CALL(start);
+    CHECK_STREAM_CALL(reset);
+    CHECK_STREAM_CALL(get_render_buffer);
+    CHECK_STREAM_CALL(release_render_buffer);
+    CHECK_STREAM_CALL(get_capture_buffer);
+    CHECK_STREAM_CALL(release_capture_buffer);
+    CHECK_STREAM_CALL(get_current_padding);
+    CHECK_STREAM_CALL(get_buffer_size);
+    CHECK_STREAM_CALL(get_latency);
+    CHECK_STREAM_CALL(get_next_packet_size);
+    CHECK_STREAM_CALL(get_frequency);
+    CHECK_STREAM_CALL(get_position);
+    CHECK_STREAM_CALL(set_event_handle);
+    CHECK_STREAM_CALL(set_sample_rate);
+    CHECK_STREAM_CALL(is_started);
+    assert(pipewire_get_loopback_capture_device(&loopback) == STATUS_SUCCESS);
+    assert(loopback.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    loopback.device = "";
+    assert(pipewire_get_loopback_capture_device(&loopback) == STATUS_SUCCESS);
+    assert(loopback.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(pipewire_get_endpoint_ids(&endpoints) == STATUS_SUCCESS);
+    assert(endpoints.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(pipewire_get_mix_format(&format) == STATUS_SUCCESS);
+    assert(format.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(pipewire_get_device_period(&period) == STATUS_SUCCESS);
+    assert(period.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(pipewire_get_prop_value(&prop) == STATUS_SUCCESS);
+    assert(prop.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(pipewire_is_format_supported(&support) == STATUS_SUCCESS);
+    assert(support.result == AUDCLNT_E_DEVICE_INVALIDATED);
+
+#ifdef _WIN64
+    {
+        struct { stream_handle stream; HRESULT result; } release32 = {invalid_stream, E_FAIL};
+        struct { stream_handle stream; HRESULT result; PTR32 latency; } latency32 = {invalid_stream, E_FAIL, 1};
+
+        assert(pipewire_wow64_release_stream(&release32) == STATUS_SUCCESS);
+        assert(release32.result == S_OK);
+        assert(pipewire_wow64_get_latency(&latency32) == STATUS_SUCCESS);
+        assert(latency32.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    }
+#ifdef MAP_32BIT
+    {
+        UINT32 *output = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+        struct
+        {
+            stream_handle stream;
+            UINT32 frames;
+            HRESULT result;
+            PTR32 data;
+        } render32 = {invalid_stream, 1, E_FAIL, PtrToUlong(output)};
+        struct
+        {
+            stream_handle stream;
+            HRESULT result;
+            PTR32 data, frames, flags, devpos, qpcpos;
+        } capture32 = {invalid_stream, E_FAIL, PtrToUlong(output),
+                        PtrToUlong(output + 1), PtrToUlong(output + 2), 1, 1};
+
+        assert(output != MAP_FAILED && (UINT_PTR)output <= UINT32_MAX - 4096);
+        output[0] = 0xdeadbeef;
+        assert(pipewire_wow64_get_render_buffer(&render32) == STATUS_SUCCESS);
+        assert(render32.result == AUDCLNT_E_DEVICE_INVALIDATED && !output[0]);
+        output[0] = 0xdeadbeef;
+        output[1] = 123;
+        output[2] = 456;
+        assert(pipewire_wow64_get_capture_buffer(&capture32) == STATUS_SUCCESS);
+        assert(capture32.result == AUDCLNT_E_DEVICE_INVALIDATED && !output[0]);
+        assert(output[1] == 123 && output[2] == 456);
+        assert(!munmap(output, 4096));
+    }
+#endif
+#endif
+    /* The child exits without trying to destroy the abandoned mutexes. */
+}
+
+static void run_child(void (*test)(void))
+{
+    pid_t child = fork();
+    int status;
+
+    assert(child >= 0);
+    if (!child)
+    {
+        alarm(5);
+        test();
+        _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+int main(void)
+{
+    run_child(test_normal_teardown);
+    run_child(test_shutdown);
+    run_child(test_shutdown_init);
+    puts("PipeWire shutdown checks passed.");
+    return 0;
+}

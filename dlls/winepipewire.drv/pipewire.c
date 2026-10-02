@@ -89,6 +89,15 @@ WINE_DEFAULT_DEBUG_CHANNEL(pipewire);
  * callers; left 0 for native 64-bit processes. */
 static ULONG_PTR zero_bits = 0;
 
+/* ExitProcess kills Wine threads before DLL detach, possibly with a PipeWire
+ * lock held or its objects partly updated. Leave them for process teardown. */
+static BOOL pipewire_is_exiting(HRESULT *result)
+{
+    if (!ntdll_process_is_exiting()) return FALSE;
+    *result = AUDCLNT_E_DEVICE_INVALIDATED;
+    return TRUE;
+}
+
 /* ----------------------------------------------------------------------
  * Stream and device structures (struct pulse_stream transplant)
  * ---------------------------------------------------------------------- */
@@ -750,6 +759,7 @@ static void pipewire_set_plugin_dirs(void)
 
 static NTSTATUS pipewire_process_attach(void *args)
 {
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
     pthread_mutex_lock(&pw_init_mutex);
     pipewire_set_plugin_dirs();
     pw_init(NULL, NULL);
@@ -760,13 +770,9 @@ static NTSTATUS pipewire_process_attach(void *args)
 
 static NTSTATUS pipewire_process_detach(void *args)
 {
-    /* May run at process exit (DLL_PROCESS_DETACH with lpvReserved set), with
-     * the pw_thread_loop still running: it is a raw pthread that process
-     * termination does not stop, and main_loop_stop is skipped on that path.
-     * Do not take the loop lock (a killed thread may have held it) and do not
-     * pw_deinit() here (it dlcloses the PipeWire modules under the live loop
-     * thread).  Clean library teardown happens in pipewire_main_loop_stop on
-     * the FreeLibrary path; at process exit the OS reclaims everything. */
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
+    /* main_loop_stop tears down the library after stopping the native loop.
+     * Do not unload PipeWire modules while that thread is still running. */
     free_device_lists();
     return STATUS_SUCCESS;
 }
@@ -872,6 +878,7 @@ static HRESULT pipewire_connect(const WCHAR *appname)
 
 static NTSTATUS pipewire_main_loop_start(void *args)
 {
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
     pthread_mutex_lock(&pw_init_mutex);
     if (pw_loop_global)
         goto out;
@@ -905,6 +912,7 @@ out:
 
 static NTSTATUS pipewire_main_loop_stop(void *args)
 {
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
     pthread_mutex_lock(&pw_init_mutex);
     if (pw_loop_global)
     {
@@ -1588,12 +1596,12 @@ static NTSTATUS pipewire_test_connect(void *args)
     struct probe_node *pn, *next;
     struct probe_device *device, *device_next;
 
+    params->priority = Priority_Unavailable;
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
     free_device_lists();
     list_init(&g_render_devices);
     list_init(&g_capture_devices);
     g_default_sink[0] = g_default_source[0] = '\0';
-
-    params->priority = Priority_Unavailable;
 
     memset(&p, 0, sizeof(p));
     list_init(&p.nodes);
@@ -1682,6 +1690,7 @@ static NTSTATUS pipewire_get_endpoint_ids(void *args)
     unsigned int offset;
     struct pw_phys_device *dev;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     params->num = list_count(list);
     offset = needed = params->num * sizeof(*params->endpoints);
 
@@ -1737,8 +1746,10 @@ static struct pw_phys_device *find_device(EDataFlow flow, const char *name)
 static NTSTATUS pipewire_get_mix_format(void *args)
 {
     struct get_mix_format_params *params = args;
-    struct pw_phys_device *dev = find_device(params->flow, params->device);
+    struct pw_phys_device *dev;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
+    dev = find_device(params->flow, params->device);
     if (dev)
     {
         *params->fmt = dev->fmt;
@@ -1773,6 +1784,7 @@ static NTSTATUS pipewire_get_device_period(void *args)
 {
     struct get_device_period_params *params = args;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     params->result = get_device_period_helper(params->flow, params->device,
                                                params->def_period, params->min_period);
     return STATUS_SUCCESS;
@@ -1822,8 +1834,10 @@ static NTSTATUS pipewire_get_prop_value(void *args)
         {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
     };
     struct get_prop_value_params *params = args;
-    struct pw_phys_device *dev = find_device(params->flow, params->device);
+    struct pw_phys_device *dev;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
+    dev = find_device(params->flow, params->device);
     if (!dev)
     {
         params->result = E_FAIL;
@@ -2021,6 +2035,7 @@ static NTSTATUS pipewire_is_format_supported(void *args)
     struct is_format_supported_params *params = args;
     struct pipewire_stream stream;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
     else if (FAILED(pipewire_info_from_waveformat(&stream, params->fmt_in)))
@@ -2482,6 +2497,7 @@ static NTSTATUS pipewire_create_stream(void *args)
     UINT32 i;
     HRESULT hr;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     TRACE("flow %d share %#x flags %#x period %lld dur %lld fmt %uch/%uHz/%ubit dev %s name %s.\n",
           params->flow, params->share, params->flags, (long long)params->period,
           (long long)params->duration, params->fmt->nChannels, params->fmt->nSamplesPerSec,
@@ -2652,6 +2668,11 @@ static NTSTATUS pipewire_release_stream(void *args)
     struct pipewire_period *dead_period = NULL;
     SIZE_T size;
 
+    if (ntdll_process_is_exiting())
+    {
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
     pw_thread_loop_lock(pw_loop_global);
     TRACE("stream %p.\n", stream);
     if (stream->underrun_count || stream->overrun_count || stream->bad_buffer_count)
@@ -2784,6 +2805,7 @@ static void pipewire_period_timer_loop(void *args)
 
         NtDelayExecution(FALSE, &delay);
 
+        if (ntdll_process_is_exiting()) break;
         pw_thread_loop_lock(pw_loop_global);
         delay.QuadPart = -(INT64)period->period_usec * 10;
 
@@ -2941,6 +2963,7 @@ static NTSTATUS pipewire_start(void *args)
     struct start_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     TRACE("stream %p.\n", stream);
     params->result = S_OK;
     pw_thread_loop_lock(pw_loop_global);
@@ -2992,6 +3015,7 @@ static NTSTATUS pipewire_stop(void *args)
     struct stop_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     TRACE("stream %p.\n", stream);
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
@@ -3026,6 +3050,7 @@ static NTSTATUS pipewire_reset(void *args)
     struct reset_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     TRACE("stream %p.\n", stream);
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
@@ -3137,6 +3162,7 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
     size_t bytes;
     UINT32 wri_offs_bytes;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3218,6 +3244,7 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
     UINT32 written_bytes, locked_bytes;
     BYTE *buffer;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream->locked || !params->written_frames)
     {
@@ -3269,6 +3296,7 @@ static NTSTATUS pipewire_get_capture_buffer(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
     ACPacket *packet;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3310,6 +3338,7 @@ static NTSTATUS pipewire_release_capture_buffer(void *args)
     struct release_capture_buffer_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream->locked && params->done)
     {
@@ -3346,6 +3375,7 @@ static NTSTATUS pipewire_get_current_padding(void *args)
     struct get_current_padding_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3369,6 +3399,7 @@ static NTSTATUS pipewire_get_buffer_size(void *args)
     struct get_buffer_size_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     params->result = S_OK;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
@@ -3385,6 +3416,7 @@ static NTSTATUS pipewire_get_latency(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
     REFERENCE_TIME lat;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3405,6 +3437,7 @@ static NTSTATUS pipewire_get_next_packet_size(void *args)
     struct get_next_packet_size_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3427,6 +3460,7 @@ static NTSTATUS pipewire_get_frequency(void *args)
     struct get_frequency_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3449,6 +3483,7 @@ static NTSTATUS pipewire_get_position(void *args)
     struct get_position_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
     {
@@ -3488,6 +3523,7 @@ static NTSTATUS pipewire_set_volumes(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
     unsigned int i;
 
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     if (stream_valid(stream))
         for (i = 0; i < stream->info.channels; i++)
@@ -3503,6 +3539,7 @@ static NTSTATUS pipewire_set_event_handle(void *args)
     struct pipewire_stream *stream = handle_get_stream(params->stream);
     HRESULT hr = S_OK;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     TRACE("stream %p event %p.\n", stream, params->event);
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
@@ -3527,6 +3564,7 @@ static NTSTATUS pipewire_set_sample_rate(void *args)
     float ratio;
     SIZE_T period_bytes;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     TRACE("stream %p rate %f.\n", stream, params->rate);
     pw_thread_loop_lock(pw_loop_global);
     if (!stream_valid(stream))
@@ -3584,6 +3622,7 @@ static NTSTATUS pipewire_is_started(void *args)
     struct is_started_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
     params->result = stream_valid(stream) && stream->started ? S_OK : S_FALSE;
     pw_thread_loop_unlock(pw_loop_global);
@@ -3688,6 +3727,7 @@ static NTSTATUS pipewire_get_loopback_capture_device(void *args)
     char current_sink[256];
     UINT32 needed;
 
+    if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     /* Resolve the render device string to a concrete sink node name; an
      * empty string means the session-manager default sink.  create_stream
      * then sets PW_KEY_STREAM_CAPTURE_SINK for that name. */
@@ -3799,6 +3839,7 @@ static NTSTATUS pipewire_wow64_process_attach(void *args)
 {
     SYSTEM_BASIC_INFORMATION info;
 
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
     NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
     zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
 

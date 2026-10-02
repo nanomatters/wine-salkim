@@ -962,6 +962,11 @@ done:
 BOOL terminate_process_running;
 LONG terminate_process_exit_code;
 
+BOOL ntdll_process_is_exiting(void)
+{
+    return process_exiting;
+}
+
 /******************************************************************************
  *              NtTerminateProcess  (NTDLL.@)
  */

@@ -12,7 +12,7 @@ CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fshort-wchar -ffunctio
 LDFLAGS += -Wl,--gc-sections
 LDLIBS += $(shell $(PKG_CONFIG) --libs libpipewire-0.3)
 LDLIBS += $(shell $(PKG_CONFIG) --libs libudev 2>/dev/null)
-TESTS = identity plugins lifecycle stream probe names endpoints routing controls sync loopback formats format_probe startup
+TESTS = identity plugins lifecycle stream probe names endpoints routing controls sync loopback formats format_probe startup shutdown
 
 .PHONY: all check
 all: $(addprefix $(BUILD_DIR)/,$(TESTS))
