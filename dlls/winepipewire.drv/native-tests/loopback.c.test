@@ -1,0 +1,256 @@
+/* Current-default loopback regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#define pw_proxy_destroy test_proxy_destroy
+#include "test.h"
+
+enum { NORMAL, NO_METADATA, REMOVED, NODE_REMOVED, SOURCE_ONLY, TIMEOUT, CORE_ERROR,
+       NO_REGISTRY, BIND_ERROR, CORE_LISTENER_ERROR, CORE_LISTENER_PARTIAL,
+       REGISTRY_LISTENER_ERROR, REGISTRY_LISTENER_PARTIAL,
+       METADATA_LISTENER_ERROR, METADATA_LISTENER_PARTIAL, NONCORE_ERROR };
+static unsigned int scenario, queries, syncs, waits, loop_depth, destroyed;
+static const char *default_name;
+static const struct pw_core_events *core_events_test;
+static const struct pw_registry_events *registry_events_test;
+static const struct pw_metadata_events *metadata_events_test;
+static void *core_data, *registry_data, *metadata_data;
+static struct spa_hook_list hooks;
+static struct spa_interface core, registry, metadata;
+
+int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst, DWORD dstlen, BOOL strict)
+{
+    assert(0);
+    return 0;
+}
+
+void pw_thread_loop_lock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global && !loop_depth++);
+}
+
+void pw_thread_loop_unlock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global && loop_depth-- == 1);
+}
+
+void pw_thread_loop_signal(struct pw_thread_loop *loop, bool accept)
+{
+    assert(loop_depth == 1 && loop == pw_loop_global && !accept);
+}
+
+void test_proxy_destroy(struct pw_proxy *proxy)
+{
+    assert(loop_depth == 1 && (proxy == (void *)&registry || proxy == (void *)&metadata));
+    ++destroyed;
+}
+
+static int add_core_listener(void *object, struct spa_hook *listener,
+                             const struct pw_core_events *events, void *data)
+{
+    assert(loop_depth == 1);
+    if (scenario == CORE_LISTENER_ERROR) return -EIO;
+    core_events_test = events;
+    core_data = data;
+    spa_hook_list_append(&hooks, listener, events, data);
+    return scenario == CORE_LISTENER_PARTIAL ? -EIO : 0;
+}
+
+static int sync_core(void *object, uint32_t id, int seq)
+{
+    assert(loop_depth == 1 && id == PW_ID_CORE);
+    ++syncs;
+    waits = 0;
+    return syncs;
+}
+
+static struct pw_registry *get_registry(void *object, uint32_t version, size_t size)
+{
+    assert(loop_depth == 1 && version == PW_VERSION_REGISTRY && !size);
+    ++queries;
+    syncs = 0;
+    return scenario == NO_REGISTRY ? NULL : (void *)&registry;
+}
+
+static int add_registry_listener(void *object, struct spa_hook *listener,
+                                 const struct pw_registry_events *events, void *data)
+{
+    if (scenario == REGISTRY_LISTENER_ERROR) return -EIO;
+    registry_events_test = events;
+    registry_data = data;
+    spa_hook_list_append(&hooks, listener, events, data);
+    return scenario == REGISTRY_LISTENER_PARTIAL ? -EIO : 0;
+}
+
+static void *bind_metadata(void *object, uint32_t id, const char *type, uint32_t version, size_t size)
+{
+    assert(id == 17 && !strcmp(type, PW_TYPE_INTERFACE_Metadata));
+    assert(version == PW_VERSION_METADATA && !size);
+    return scenario == BIND_ERROR ? NULL : &metadata;
+}
+
+static int add_metadata_listener(void *object, struct spa_hook *listener,
+                                 const struct pw_metadata_events *events, void *data)
+{
+    if (scenario == METADATA_LISTENER_ERROR) return -EIO;
+    metadata_events_test = events;
+    metadata_data = data;
+    spa_hook_list_append(&hooks, listener, events, data);
+    return scenario == METADATA_LISTENER_PARTIAL ? -EIO : 0;
+}
+
+int pw_thread_loop_get_time(struct pw_thread_loop *loop, struct timespec *deadline, int64_t timeout)
+{
+    assert(loop_depth == 1 && timeout == 2 * SPA_NSEC_PER_SEC);
+    *deadline = (struct timespec){12, 0};
+    return 0;
+}
+
+int pw_thread_loop_timed_wait_full(struct pw_thread_loop *loop, const struct timespec *deadline)
+{
+    struct spa_dict_item item = {PW_KEY_METADATA_NAME, "default"};
+    struct spa_dict props = SPA_DICT_INIT(&item, 1);
+    struct spa_dict_item node_items[] = {{PW_KEY_NODE_NAME, "first"}, {PW_KEY_MEDIA_CLASS, "Audio/Sink"}};
+    struct spa_dict node_props = SPA_DICT_INIT_ARRAY(node_items);
+    char json[256];
+
+    assert(loop_depth == 1 && deadline->tv_sec == 12);
+    if (scenario == TIMEOUT) return -ETIMEDOUT;
+    if (scenario == CORE_ERROR)
+    {
+        core_events_test->error(core_data, PW_ID_CORE, 0, -EPIPE, "disconnected");
+        return 0;
+    }
+    if (scenario == NONCORE_ERROR)
+    {
+        core_events_test->error(core_data, 17, 0, -EINVAL, "unrelated object error");
+        assert(!((struct probe *)core_data)->core_error);
+    }
+    /* A wake for another stream or sync must not complete this snapshot. */
+    if (!waits++)
+    {
+        core_events_test->done(core_data, PW_ID_CORE, syncs + 100);
+        return 0;
+    }
+    if (syncs == 1)
+    {
+        registry_events_test->global(registry_data, 1, 0, PW_TYPE_INTERFACE_Node,
+                                      PW_VERSION_NODE, &node_props);
+        node_items[0].value = "other";
+        node_items[1].value = scenario == SOURCE_ONLY ? "Audio/Source/Virtual" : "Audio/Duplex";
+        registry_events_test->global(registry_data, 2, 0, PW_TYPE_INTERFACE_Node,
+                                      PW_VERSION_NODE, &node_props);
+        if (scenario != NO_METADATA)
+            registry_events_test->global(registry_data, 17, 0, PW_TYPE_INTERFACE_Metadata,
+                                          PW_VERSION_METADATA, &props);
+    }
+    if (syncs == 2 && scenario != NO_METADATA && scenario != BIND_ERROR)
+    {
+        snprintf(json, sizeof(json), "{\"name\":\"%s\"}", default_name ? default_name : "");
+        metadata_events_test->property(metadata_data, PW_ID_CORE, "default.audio.sink", NULL,
+                                       default_name ? json : NULL);
+        if (scenario == REMOVED) registry_events_test->global_remove(registry_data, 17);
+        if (scenario == NODE_REMOVED) registry_events_test->global_remove(registry_data, 2);
+    }
+    core_events_test->done(core_data, PW_ID_CORE, syncs);
+    return 0;
+}
+
+static HRESULT get_target(const char *device, char *buffer, UINT32 *size)
+{
+    struct get_loopback_capture_device_params params = {0};
+
+    params.device = device;
+    params.ret_device = buffer;
+    params.ret_device_len = *size;
+    assert(pipewire_get_loopback_capture_device(&params) == STATUS_SUCCESS);
+    assert(!loop_depth && spa_list_is_empty(&hooks.list));
+    *size = params.ret_device_len;
+    return params.result;
+}
+
+int main(void)
+{
+    struct pw_core_methods core_methods = {
+        .version = PW_VERSION_CORE_METHODS, .add_listener = add_core_listener,
+        .sync = sync_core, .get_registry = get_registry,
+    };
+    struct pw_registry_methods registry_methods = {
+        .version = PW_VERSION_REGISTRY_METHODS, .add_listener = add_registry_listener,
+        .bind = bind_metadata,
+    };
+    struct pw_metadata_methods metadata_methods = {
+        .version = PW_VERSION_METADATA_METHODS, .add_listener = add_metadata_listener,
+    };
+    struct pw_phys_device *a = calloc(1, sizeof(*a) + 6), *b = calloc(1, sizeof(*b) + 6);
+    char buffer[128];
+    UINT32 size;
+    unsigned int before, i;
+    const unsigned int errors[] = {NO_METADATA, REMOVED, NODE_REMOVED, SOURCE_ONLY,
+                                   TIMEOUT, CORE_ERROR, NO_REGISTRY, BIND_ERROR,
+                                   CORE_LISTENER_ERROR, CORE_LISTENER_PARTIAL,
+                                   REGISTRY_LISTENER_ERROR, REGISTRY_LISTENER_PARTIAL,
+                                   METADATA_LISTENER_ERROR, METADATA_LISTENER_PARTIAL};
+
+    assert(a && b);
+    strcpy(a->pw_name, "first");
+    strcpy(b->pw_name, "other");
+    list_add_tail(&g_render_devices, &a->entry);
+    list_add_tail(&g_render_devices, &b->entry);
+    strcpy(g_default_sink, "first");
+    core = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Core, PW_VERSION_CORE, &core_methods, NULL);
+    registry = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Registry, PW_VERSION_REGISTRY, &registry_methods, NULL);
+    metadata = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Metadata, PW_VERSION_METADATA, &metadata_methods, NULL);
+    spa_hook_list_init(&hooks);
+    pw_loop_global = (void *)1;
+    pw_core_global = (void *)&core;
+
+    default_name = "first";
+    size = 0;
+    assert(get_target("", NULL, &size) == STATUS_BUFFER_TOO_SMALL && size == 6);
+    size = sizeof(buffer);
+    assert(get_target("", buffer, &size) == S_OK && !strcmp(buffer, "first"));
+    default_name = "other";
+    assert(get_target("", buffer, &size) == S_OK && !strcmp(buffer, "other"));
+    assert(!strcmp(g_default_sink, "first"));
+
+    before = queries;
+    assert(get_target("first", buffer, &size) == S_OK && !strcmp(buffer, "first"));
+    assert(queries == before);
+    assert(get_target("unknown", buffer, &size) == E_FAIL && queries == before);
+
+    size = 1;
+    buffer[0] = 'x';
+    assert(get_target(NULL, buffer, &size) == STATUS_BUFFER_TOO_SMALL && size == 6 && buffer[0] == 'x');
+    size = sizeof(buffer);
+    default_name = NULL;
+    assert(get_target("", buffer, &size) == AUDCLNT_E_DEVICE_INVALIDATED);
+    default_name = "new-hotplug-output";
+    assert(get_target("", buffer, &size) == AUDCLNT_E_DEVICE_INVALIDATED);
+    default_name = "other";
+    for (i = 0; i < ARRAY_SIZE(errors); ++i)
+    {
+        scenario = errors[i];
+        before = destroyed;
+        assert(get_target("", buffer, &size) == AUDCLNT_E_DEVICE_INVALIDATED);
+        /* Every created temporary proxy is destroyed even if listener
+         * registration failed before or after appending its hook. */
+        assert(destroyed - before == (scenario == NO_REGISTRY ? 0 :
+               scenario == NO_METADATA || scenario == TIMEOUT || scenario == CORE_ERROR ||
+               scenario == BIND_ERROR || scenario == CORE_LISTENER_ERROR ||
+               scenario == CORE_LISTENER_PARTIAL || scenario == REGISTRY_LISTENER_ERROR ||
+               scenario == REGISTRY_LISTENER_PARTIAL ? 1 : 2));
+    }
+    scenario = NONCORE_ERROR;
+    assert(get_target("", buffer, &size) == S_OK && !strcmp(buffer, "other"));
+    assert(destroyed);
+    pw_loop_global = NULL;
+    assert(get_target("", buffer, &size) == AUDCLNT_E_ENDPOINT_CREATE_FAILED);
+    list_remove(&a->entry);
+    list_remove(&b->entry);
+    free(a);
+    free(b);
+    puts("PipeWire current-default loopback checks passed.");
+    return 0;
+}

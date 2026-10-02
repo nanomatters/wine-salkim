@@ -3530,11 +3530,102 @@ static NTSTATUS pipewire_is_started(void *args)
     return STATUS_SUCCESS;
 }
 
+static void loopback_query_global(void *data, uint32_t id, uint32_t permissions,
+                                 const char *type, uint32_t version, const struct spa_dict *props)
+{
+    struct probe *probe = data;
+    const char *name;
+
+    if (!type || !props) return;
+    if (!strcmp(type, PW_TYPE_INTERFACE_Node))
+    {
+        struct probe_node *node;
+        EDataFlow flow;
+
+        name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+        if (!get_node_flow(spa_dict_lookup(props, PW_KEY_MEDIA_CLASS), &flow) || flow == eCapture ||
+            !name || !name[0] || !device_is_sink(name)) return;
+        if (!(node = calloc(1, sizeof(*node))))
+        {
+            probe->core_error = TRUE;
+            return;
+        }
+        if (!(node->node_name = strdup(name)))
+        {
+            free(node);
+            probe->core_error = TRUE;
+            return;
+        }
+        node->id = id;
+        list_add_tail(&probe->nodes, &node->entry);
+        return;
+    }
+    if (strcmp(type, PW_TYPE_INTERFACE_Metadata) || probe->meta_default) return;
+    name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
+    if (!name || strcmp(name, "default")) return;
+
+    probe->meta_default = pw_registry_bind(probe->registry, id, type, min(version, PW_VERSION_METADATA), 0);
+    if (probe->meta_default)
+    {
+        probe->meta_default_id = id;
+        if (pw_metadata_add_listener(probe->meta_default, &probe->meta_default_listener,
+                                      &probe_metadata_events, probe) < 0)
+            probe->core_error = TRUE;
+    }
+}
+
+static const struct pw_registry_events loopback_query_registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global = loopback_query_global,
+    .global_remove = on_probe_registry_global_remove,
+};
+
+/* Called with the loop lock held. Snapshot the default metadata and live
+ * sink names, without binding devices or probing formats. */
+static HRESULT get_current_loopback_sink(char *sink, size_t size)
+{
+    struct probe query = {0}, *probe = &query;
+    struct probe_node *node, *next;
+    HRESULT result = AUDCLNT_E_DEVICE_INVALIDATED;
+
+    list_init(&probe->nodes);
+    list_init(&probe->devices);
+    probe->loop = pw_loop_global;
+    probe->core = pw_core_global;
+    if (!(probe->registry = pw_core_get_registry(probe->core, PW_VERSION_REGISTRY, 0))) return result;
+    if (pw_core_add_listener(probe->core, &probe->core_listener, &probe_core_events, probe) < 0 ||
+        pw_registry_add_listener(probe->registry, &probe->registry_listener, &loopback_query_registry_events, probe) < 0)
+        goto done;
+    /* The first sync discovers and binds metadata. The second receives its
+     * properties. Unrelated stream notifications cannot complete a sync. */
+    if (probe_roundtrip(probe) && probe_roundtrip(probe) && probe->default_sink[0])
+        LIST_FOR_EACH_ENTRY(node, &probe->nodes, struct probe_node, entry)
+            if (!strcmp(node->node_name, probe->default_sink))
+            {
+                copy_cstr(sink, size, probe->default_sink);
+                result = S_OK;
+                break;
+            }
+done:
+    LIST_FOR_EACH_ENTRY_SAFE(node, next, &probe->nodes, struct probe_node, entry)
+        release_probe_node(node);
+    if (probe->meta_default)
+    {
+        spa_hook_remove(&probe->meta_default_listener);
+        pw_proxy_destroy((struct pw_proxy *)probe->meta_default);
+    }
+    spa_hook_remove(&probe->registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)probe->registry);
+    spa_hook_remove(&probe->core_listener);
+    return result;
+}
+
 static NTSTATUS pipewire_get_loopback_capture_device(void *args)
 {
     struct get_loopback_capture_device_params *params = args;
     const char *device = params->device;
     const char *sink;
+    char current_sink[256];
     UINT32 needed;
 
     /* Resolve the render device string to a concrete sink node name; an
@@ -3551,7 +3642,20 @@ static NTSTATUS pipewire_get_loopback_capture_device(void *args)
         sink = device;
     }
     else
-        sink = g_default_sink;
+    {
+        if (!pw_loop_global)
+        {
+            params->result = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+            return STATUS_SUCCESS;
+        }
+        pw_thread_loop_lock(pw_loop_global);
+        params->result = pipewire_connect(params->name);
+        if (SUCCEEDED(params->result))
+            params->result = get_current_loopback_sink(current_sink, sizeof(current_sink));
+        pw_thread_loop_unlock(pw_loop_global);
+        if (FAILED(params->result)) return STATUS_SUCCESS;
+        sink = current_sink;
+    }
 
     needed = strlen(sink) + 1;
     if (params->ret_device_len < needed || !params->ret_device)
