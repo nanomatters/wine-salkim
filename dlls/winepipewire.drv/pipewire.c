@@ -976,6 +976,7 @@ struct probe
     struct spa_hook core_listener;
     struct spa_hook registry_listener;
     int sync_seq;
+    BOOL sync_done;
     struct list nodes;
     struct list devices;
     struct pw_metadata *meta_default;
@@ -1266,7 +1267,10 @@ static void on_probe_core_done(void *data, uint32_t id, int seq)
 {
     struct probe *p = data;
     if (id == PW_ID_CORE && seq == p->sync_seq)
+    {
+        p->sync_done = TRUE;
         pw_thread_loop_signal(p->loop, false);
+    }
 }
 
 static void on_probe_core_error(void *data, uint32_t id, int seq, int res, const char *message)
@@ -1287,12 +1291,18 @@ static const struct pw_core_events probe_core_events = {
 };
 
 /* Round-trip the core; must be called with the loop lock held. */
-static void probe_roundtrip(struct probe *p)
+static BOOL probe_roundtrip(struct probe *p)
 {
-    if (p->core_error)
-        return;
+    struct timespec deadline;
+
+    if (p->core_error) return FALSE;
+    p->sync_done = FALSE;
     p->sync_seq = pw_core_sync(p->core, PW_ID_CORE, p->sync_seq);
-    pw_thread_loop_timed_wait(p->loop, 2);
+    if (p->sync_seq < 0 || pw_thread_loop_get_time(p->loop, &deadline, 2 * SPA_NSEC_PER_SEC) < 0)
+        return FALSE;
+    while (!p->sync_done && !p->core_error)
+        if (pw_thread_loop_timed_wait_full(p->loop, &deadline) < 0) return FALSE;
+    return !p->core_error;
 }
 
 /* Synthetic default endpoint at index 0 (empty pw_name -> session manager

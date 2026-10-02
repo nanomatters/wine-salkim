@@ -1,0 +1,86 @@
+/* PipeWire core round-trip regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+enum { MATCHED, SPURIOUS, TIMEOUT, CORE_ERROR, SYNC_ERROR, TIME_ERROR, WAIT_ERROR };
+static unsigned int scenario, waits, sync_calls, time_calls, signals;
+static struct probe *current;
+
+static int sync_core(void *object, uint32_t id, int seq)
+{
+    assert(object == current && id == PW_ID_CORE);
+    ++sync_calls;
+    return scenario == SYNC_ERROR ? -EPIPE : seq + 1;
+}
+
+int pw_thread_loop_get_time(struct pw_thread_loop *loop, struct timespec *deadline, int64_t timeout)
+{
+    assert(loop == current->loop && timeout == 2 * SPA_NSEC_PER_SEC);
+    ++time_calls;
+    *deadline = (struct timespec){5, 0};
+    return scenario == TIME_ERROR ? -EIO : 0;
+}
+
+void pw_thread_loop_signal(struct pw_thread_loop *loop, bool accept)
+{
+    assert(loop == current->loop && !accept);
+    ++signals;
+}
+
+int pw_thread_loop_timed_wait_full(struct pw_thread_loop *loop, const struct timespec *deadline)
+{
+    assert(loop == current->loop && deadline->tv_sec == 5 && !deadline->tv_nsec);
+    ++waits;
+    if (scenario == TIMEOUT) return -ETIMEDOUT;
+    if (scenario == WAIT_ERROR) return -EIO;
+    if (scenario == CORE_ERROR)
+    {
+        on_probe_core_error(current, PW_ID_CORE, current->sync_seq, -EPIPE, "disconnected");
+        return 0;
+    }
+    if (scenario == SPURIOUS && waits <= 3)
+    {
+        if (waits == 2) on_probe_core_done(current, PW_ID_CORE, current->sync_seq - 1);
+        if (waits == 3) on_probe_core_done(current, 1, current->sync_seq);
+        assert(!current->sync_done && !signals);
+        return 0;
+    }
+    on_probe_core_done(current, PW_ID_CORE, current->sync_seq);
+    return 0;
+}
+
+int main(void)
+{
+    struct pw_core_methods methods = {.version = PW_VERSION_CORE_METHODS, .sync = sync_core};
+    struct spa_interface core;
+    struct probe probe = {.loop = (void *)1};
+    unsigned int i;
+
+    current = &probe;
+    core = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Core, PW_VERSION_CORE, &methods, &probe);
+    probe.core = (void *)&core;
+    for (i = 0; i <= WAIT_ERROR; ++i)
+    {
+        scenario = i;
+        waits = signals = sync_calls = time_calls = 0;
+        probe.sync_seq = 7;
+        probe.sync_done = TRUE;
+        probe.core_error = FALSE;
+        assert(!!probe_roundtrip(&probe) == (i == MATCHED || i == SPURIOUS));
+        assert(sync_calls == 1);
+        assert(time_calls == (i != SYNC_ERROR));
+        if (i == MATCHED || i == SPURIOUS)
+            assert(probe.sync_done && signals == 1 && waits == (i == SPURIOUS ? 4 : 1));
+        else
+            assert(!probe.sync_done);
+        assert(probe.core_error == (i == CORE_ERROR));
+    }
+    sync_calls = 0;
+    probe.core_error = TRUE;
+    assert(!probe_roundtrip(&probe) && !sync_calls);
+    puts("PipeWire core round-trip checks passed.");
+    return 0;
+}
