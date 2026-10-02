@@ -114,6 +114,13 @@ static inline BOOL mf_array_reserve(void **elements, size_t *capacity, size_t co
 
 extern unsigned int mf_format_get_stride(const GUID *subtype, unsigned int width, BOOL *is_yuv);
 
+struct ID3D12Resource;
+struct IMFD3D12SynchronizationObject;
+extern HRESULT mf_create_d3d12_sync_object(struct ID3D12Resource *resource,
+        struct IMFD3D12SynchronizationObject **object);
+extern HRESULT mf_d3d12_sync_object_signal_retirement(struct IMFD3D12SynchronizationObject *object, HANDLE event);
+extern HRESULT mf_d3d12_surface_buffer_signal_transfer(IMFMediaBuffer *buffer, HANDLE event);
+
 static inline const char *debugstr_propvar(const PROPVARIANT *v)
 {
     if (!v)

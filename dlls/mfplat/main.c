@@ -8921,21 +8921,40 @@ struct d3d12_sync_object_release
     HANDLE event;
 };
 
+struct d3d12_producer
+{
+    IUnknown IUnknown_iface;
+    LONG refcount;
+    struct list entry;
+    ID3D12Fence *fence;
+    HANDLE event;
+    UINT64 value;
+    BOOL pending;
+    BOOL discard;
+};
+
 struct d3d12_sync_object
 {
     IMFD3D12SynchronizationObject IMFD3D12SynchronizationObject_iface;
     IMFD3D12SynchronizationObjectCommands IMFD3D12SynchronizationObjectCommands_iface;
     IRtwqAsyncCallback async_release_iface;
+    IRtwqAsyncCallback async_ready_iface;
     LONG refcount;
     CRITICAL_SECTION cs;
     ID3D12Device *device;
+    ID3D12Resource *resource;
     ID3D12Fence *ready_fence;
     UINT64 generation;
     unsigned int release_wait;
+    unsigned int ready_wait;
     HANDLE final_release_event;
+    HANDLE retirement_event;
+    struct list producers;
     struct list release_freelist;
     struct list *release_freelist_cursor;
 };
+
+static const IRtwqAsyncCallbackVtbl d3d12_sync_object_async_ready_vtbl;
 
 static struct d3d12_sync_object *impl_from_IMFD3D12SynchronizationObject(IMFD3D12SynchronizationObject *iface)
 {
@@ -8949,6 +8968,8 @@ static struct d3d12_sync_object *impl_from_IMFD3D12SynchronizationObjectCommands
 
 static struct d3d12_sync_object *d3d12_sync_object_from_IRtwqAsyncCallback(IRtwqAsyncCallback *iface)
 {
+    if (iface->lpVtbl == &d3d12_sync_object_async_ready_vtbl)
+        return CONTAINING_RECORD(iface, struct d3d12_sync_object, async_ready_iface);
     return CONTAINING_RECORD(iface, struct d3d12_sync_object, async_release_iface);
 }
 
@@ -8993,6 +9014,10 @@ static ULONG WINAPI d3d12_sync_object_Release(IMFD3D12SynchronizationObject *ifa
     if (!refcount)
     {
         struct d3d12_sync_object_release *cursor, *cursor2;
+        struct d3d12_producer *producer, *producer2;
+
+        LIST_FOR_EACH_ENTRY_SAFE(producer, producer2, &syncobj->producers, struct d3d12_producer, entry)
+            IUnknown_Release(&producer->IUnknown_iface);
 
         LIST_FOR_EACH_ENTRY_SAFE(cursor, cursor2, &syncobj->release_freelist,
                 struct d3d12_sync_object_release, entry)
@@ -9003,6 +9028,10 @@ static ULONG WINAPI d3d12_sync_object_Release(IMFD3D12SynchronizationObject *ifa
             free(cursor);
         }
 
+        if (syncobj->resource)
+            ID3D12Resource_Release(syncobj->resource);
+        if (syncobj->retirement_event)
+            CloseHandle(syncobj->retirement_event);
         ID3D12Device_Release(syncobj->device);
         ID3D12Fence_Release(syncobj->ready_fence);
         DeleteCriticalSection(&syncobj->cs);
@@ -9066,9 +9095,13 @@ static ULONG WINAPI d3d12_sync_object_commands_Release(IMFD3D12SynchronizationOb
     return d3d12_sync_object_Release(&impl_from_IMFD3D12SynchronizationObjectCommands(iface)->IMFD3D12SynchronizationObject_iface);
 }
 
+static HRESULT d3d12_sync_object_enqueue_producer(struct d3d12_sync_object *syncobj,
+        ID3D12CommandQueue *queue, RTWQWORKITEM_KEY *cancel_key);
+
 static HRESULT WINAPI d3d12_sync_object_commands_EnqueueResourceReady(IMFD3D12SynchronizationObjectCommands *iface, ID3D12CommandQueue *producer_queue)
 {
     struct d3d12_sync_object *syncobj = impl_from_IMFD3D12SynchronizationObjectCommands(iface);
+    RTWQWORKITEM_KEY cancel_key = 0;
     HRESULT hr;
 
     TRACE("%p, %p.\n", iface, producer_queue);
@@ -9077,8 +9110,12 @@ static HRESULT WINAPI d3d12_sync_object_commands_EnqueueResourceReady(IMFD3D12Sy
         return E_INVALIDARG;
 
     EnterCriticalSection(&syncobj->cs);
-    hr = ID3D12CommandQueue_Signal(producer_queue, syncobj->ready_fence, syncobj->generation);
+    if (syncobj->resource)
+        hr = d3d12_sync_object_enqueue_producer(syncobj, producer_queue, &cancel_key);
+    else
+        hr = ID3D12CommandQueue_Signal(producer_queue, syncobj->ready_fence, syncobj->generation);
     LeaveCriticalSection(&syncobj->cs);
+    if (cancel_key) RtwqCancelWorkItem(cancel_key);
 
     return hr;
 }
@@ -9133,6 +9170,13 @@ static HRESULT d3d12_sync_object_create_release(struct d3d12_sync_object *syncob
         if (!relobj)
             return E_OUTOFMEMORY;
         relobj->event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (!relobj->event)
+        {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            if (SUCCEEDED(hr)) hr = E_OUTOFMEMORY;
+            free(relobj);
+            return hr;
+        }
         list_add_after(syncobj->release_freelist_cursor, &relobj->entry);
     }
 
@@ -9145,6 +9189,130 @@ static HRESULT d3d12_sync_object_create_release(struct d3d12_sync_object *syncob
 
     *out = relobj;
     return S_OK;
+}
+
+static struct d3d12_producer *impl_from_producer_IUnknown(IUnknown *iface)
+{
+    return CONTAINING_RECORD(iface, struct d3d12_producer, IUnknown_iface);
+}
+
+static HRESULT WINAPI d3d12_producer_QueryInterface(IUnknown *iface, REFIID riid, void **obj)
+{
+    *obj = NULL;
+    if (!IsEqualIID(riid, &IID_IUnknown))
+        return E_NOINTERFACE;
+    *obj = iface;
+    IUnknown_AddRef(iface);
+    return S_OK;
+}
+
+static ULONG WINAPI d3d12_producer_AddRef(IUnknown *iface)
+{
+    return InterlockedIncrement(&impl_from_producer_IUnknown(iface)->refcount);
+}
+
+static ULONG WINAPI d3d12_producer_Release(IUnknown *iface)
+{
+    struct d3d12_producer *producer = impl_from_producer_IUnknown(iface);
+    ULONG refcount = InterlockedDecrement(&producer->refcount);
+
+    if (!refcount)
+    {
+        if (producer->fence) ID3D12Fence_Release(producer->fence);
+        if (producer->event) CloseHandle(producer->event);
+        free(producer);
+    }
+    return refcount;
+}
+
+static const IUnknownVtbl d3d12_producer_vtbl =
+{
+    d3d12_producer_QueryInterface,
+    d3d12_producer_AddRef,
+    d3d12_producer_Release,
+};
+
+static HRESULT d3d12_sync_object_get_producer(struct d3d12_sync_object *syncobj, struct d3d12_producer **out)
+{
+    struct d3d12_producer *producer;
+    HRESULT hr;
+
+    LIST_FOR_EACH_ENTRY(producer, &syncobj->producers, struct d3d12_producer, entry)
+    {
+        if (!producer->pending)
+        {
+            *out = producer;
+            return S_OK;
+        }
+    }
+
+    if (!(producer = calloc(1, sizeof(*producer))))
+        return E_OUTOFMEMORY;
+    producer->IUnknown_iface.lpVtbl = &d3d12_producer_vtbl;
+    producer->refcount = 1;
+    if (!(producer->event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        if (SUCCEEDED(hr)) hr = E_OUTOFMEMORY;
+    }
+    else
+        hr = ID3D12Device_CreateFence(syncobj->device, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&producer->fence);
+    if (FAILED(hr))
+    {
+        IUnknown_Release(&producer->IUnknown_iface);
+        return hr;
+    }
+    list_add_tail(&syncobj->producers, &producer->entry);
+    *out = producer;
+    return S_OK;
+}
+
+static HRESULT d3d12_sync_object_enqueue_producer(struct d3d12_sync_object *syncobj,
+        ID3D12CommandQueue *queue, RTWQWORKITEM_KEY *cancel_key)
+{
+    struct d3d12_producer *producer;
+    IRtwqAsyncResult *result;
+    RTWQWORKITEM_KEY key;
+    HRESULT hr, ready_hr;
+
+    if (FAILED(hr = d3d12_sync_object_get_producer(syncobj, &producer)))
+        return hr;
+    if (FAILED(hr = RtwqCreateAsyncResult(&producer->IUnknown_iface, &syncobj->async_ready_iface, NULL, &result)))
+        return hr;
+    hr = RtwqPutWaitingWorkItem(producer->event, 0, result, &key);
+    IRtwqAsyncResult_Release(result);
+    if (FAILED(hr))
+        return hr;
+
+    /* Every registered callback, including cancellation, owns one pending producer.
+       Account for it before a completed or removed fence can dispatch the callback. */
+    ++syncobj->ready_wait;
+    producer->pending = TRUE;
+    ++producer->value;
+
+    /* The public ready fence can be signalled repeatedly at the same generation,
+       or rewound by an older producer after Reset. Track each producer separately,
+       including its public signal, before allowing the allocator to reset it. */
+    hr = ID3D12Fence_SetEventOnCompletion(producer->fence, producer->value, producer->event);
+    if (FAILED(hr))
+        goto cancel;
+    ready_hr = ID3D12CommandQueue_Signal(queue, syncobj->ready_fence, syncobj->generation);
+    hr = ID3D12CommandQueue_Signal(queue, producer->fence, producer->value);
+    if (SUCCEEDED(hr))
+        return ready_hr;
+    if (SUCCEEDED(ready_hr))
+    {
+        /* The public signal was accepted. Without a completion signal we cannot
+           safely release the texture while the device still has work in flight. */
+        WARN("Retaining D3D12 producer after completion signal failed, hr %#lx.\n", hr);
+        return hr;
+    }
+
+cancel:
+    producer->discard = TRUE;
+    *cancel_key = key;
+    return hr;
 }
 
 static HRESULT WINAPI d3d12_sync_object_commands_EnqueueResourceRelease(IMFD3D12SynchronizationObjectCommands *iface, ID3D12CommandQueue *consumer_queue)
@@ -9228,18 +9396,61 @@ static HRESULT WINAPI d3d12_sync_object_async_release_GetParameters(IRtwqAsyncCa
     return E_NOTIMPL;
 }
 
+static void d3d12_sync_object_signal_retirement(struct d3d12_sync_object *syncobj)
+{
+    if (!syncobj->release_wait && !syncobj->ready_wait && syncobj->retirement_event)
+    {
+        SetEvent(syncobj->retirement_event);
+        CloseHandle(syncobj->retirement_event);
+        syncobj->retirement_event = NULL;
+    }
+}
+
+static HRESULT WINAPI d3d12_sync_object_async_ready_Invoke(IRtwqAsyncCallback *iface, IRtwqAsyncResult *result)
+{
+    struct d3d12_sync_object *syncobj = d3d12_sync_object_from_IRtwqAsyncCallback(iface);
+    struct d3d12_producer *producer;
+    IUnknown *object;
+
+    if (FAILED(IRtwqAsyncResult_GetObject(result, &object)))
+        return E_UNEXPECTED;
+    producer = impl_from_producer_IUnknown(object);
+
+    EnterCriticalSection(&syncobj->cs);
+    if (producer->discard)
+    {
+        list_remove(&producer->entry);
+        IUnknown_Release(&producer->IUnknown_iface);
+    }
+    else
+        producer->pending = FALSE;
+    --syncobj->ready_wait;
+    d3d12_sync_object_signal_retirement(syncobj);
+    LeaveCriticalSection(&syncobj->cs);
+    IUnknown_Release(object);
+    return S_OK;
+}
+
 static HRESULT WINAPI d3d12_sync_object_async_release_Invoke(IRtwqAsyncCallback *iface, IRtwqAsyncResult *result)
 {
     struct d3d12_sync_object *syncobj = d3d12_sync_object_from_IRtwqAsyncCallback(iface);
 
     TRACE("%p, %p.\n", iface, result);
 
+    /* Cancelling a failed enqueue also invokes the callback, without a pending release. */
+    if (FAILED(IRtwqAsyncResult_GetStatus(result)))
+        return S_OK;
+
     EnterCriticalSection(&syncobj->cs);
-    if (!--syncobj->release_wait && syncobj->final_release_event)
+    if (!--syncobj->release_wait)
     {
-        SetEvent(syncobj->final_release_event);
-        syncobj->final_release_event = NULL;
+        if (syncobj->final_release_event)
+        {
+            SetEvent(syncobj->final_release_event);
+            syncobj->final_release_event = NULL;
+        }
     }
+    d3d12_sync_object_signal_retirement(syncobj);
     LeaveCriticalSection(&syncobj->cs);
     return S_OK;
 }
@@ -9273,6 +9484,15 @@ static const IRtwqAsyncCallbackVtbl d3d12_sync_object_async_release_vtbl =
     d3d12_sync_object_async_release_Invoke,
 };
 
+static const IRtwqAsyncCallbackVtbl d3d12_sync_object_async_ready_vtbl =
+{
+    d3d12_sync_object_async_release_QueryInterface,
+    d3d12_sync_object_async_release_AddRef,
+    d3d12_sync_object_async_release_Release,
+    d3d12_sync_object_async_release_GetParameters,
+    d3d12_sync_object_async_ready_Invoke,
+};
+
 /***********************************************************************
  *      MFCreateD3D12SynchronizationObject (mfplat.@)
  */
@@ -9300,10 +9520,12 @@ HRESULT WINAPI MFCreateD3D12SynchronizationObject(ID3D12Device *device, REFIID r
     syncobj->IMFD3D12SynchronizationObject_iface.lpVtbl = &d3d12_sync_object_vtbl;
     syncobj->IMFD3D12SynchronizationObjectCommands_iface.lpVtbl = &d3d12_sync_object_commands_vtbl;
     syncobj->async_release_iface.lpVtbl = &d3d12_sync_object_async_release_vtbl;
+    syncobj->async_ready_iface.lpVtbl = &d3d12_sync_object_async_ready_vtbl;
     InitializeCriticalSection(&syncobj->cs);
     ID3D12Device_AddRef(device);
     syncobj->device = device;
     syncobj->generation = 1;
+    list_init(&syncobj->producers);
     list_init(&syncobj->release_freelist);
     syncobj->release_freelist_cursor = &syncobj->release_freelist;
 
@@ -9311,6 +9533,62 @@ HRESULT WINAPI MFCreateD3D12SynchronizationObject(ID3D12Device *device, REFIID r
     IMFD3D12SynchronizationObject_Release(&syncobj->IMFD3D12SynchronizationObject_iface);
 
     return hr;
+}
+
+HRESULT mf_d3d12_sync_object_signal_retirement(IMFD3D12SynchronizationObject *object, HANDLE event)
+{
+    struct d3d12_sync_object *syncobj;
+    HANDLE owned_event;
+    HRESULT hr = S_OK;
+
+    if (!object || !event)
+        return E_INVALIDARG;
+    if (object->lpVtbl != &d3d12_sync_object_vtbl)
+        return E_NOINTERFACE;
+
+    syncobj = impl_from_IMFD3D12SynchronizationObject(object);
+    EnterCriticalSection(&syncobj->cs);
+    if (syncobj->release_wait || syncobj->ready_wait)
+    {
+        /* Unlike the public API, retirement must survive cancellation of the allocator wait. */
+        if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &owned_event,
+                0, FALSE, DUPLICATE_SAME_ACCESS))
+            hr = HRESULT_FROM_WIN32(GetLastError());
+        else
+        {
+            if (syncobj->retirement_event)
+                CloseHandle(syncobj->retirement_event);
+            syncobj->retirement_event = owned_event;
+        }
+    }
+    else if (!SetEvent(event))
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    LeaveCriticalSection(&syncobj->cs);
+    return hr;
+}
+
+HRESULT mf_create_d3d12_sync_object(ID3D12Resource *resource, IMFD3D12SynchronizationObject **object)
+{
+    struct d3d12_sync_object *syncobj;
+    ID3D12Device *device;
+    HRESULT hr;
+
+    if (!resource || !object)
+        return E_INVALIDARG;
+    *object = NULL;
+
+    if (FAILED(hr = ID3D12Resource_GetDevice(resource, &IID_ID3D12Device, (void **)&device)))
+        return hr;
+    hr = MFCreateD3D12SynchronizationObject(device, &IID_IMFD3D12SynchronizationObject, (void **)object);
+    ID3D12Device_Release(device);
+    if (FAILED(hr))
+        return hr;
+
+    /* Pending producer and consumer callbacks retain the texture after its buffer is released. */
+    syncobj = impl_from_IMFD3D12SynchronizationObject(*object);
+    ID3D12Resource_AddRef(resource);
+    syncobj->resource = resource;
+    return S_OK;
 }
 
 struct shared_dxgi_manager
