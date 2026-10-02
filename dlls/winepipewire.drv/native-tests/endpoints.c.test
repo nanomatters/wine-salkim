@@ -1,0 +1,195 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#define pw_proxy_destroy test_proxy_destroy
+#include "test.h"
+
+static unsigned int bound, destroyed;
+
+void test_proxy_destroy(struct pw_proxy *proxy)
+{
+    assert(proxy);
+    ++destroyed;
+}
+
+DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen)
+{
+    DWORD i, count = min(srclen, dstlen);
+
+    for (i = 0; i < count; ++i)
+    {
+        assert((unsigned char)src[i] < 0x80);
+        dst[i] = src[i];
+    }
+    return count;
+}
+
+static void *bind_node(void *object, uint32_t id, const char *type, uint32_t version, size_t size)
+{
+    assert(!strcmp(type, PW_TYPE_INTERFACE_Node));
+    ++bound;
+    return NULL;
+}
+
+static const struct pw_registry_methods registry_methods = {
+    .version = PW_VERSION_REGISTRY_METHODS,
+    .bind = bind_node,
+};
+
+static struct spa_interface registry = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Registry,
+        PW_VERSION_REGISTRY, &registry_methods, NULL);
+
+static void init_probe(struct probe *probe)
+{
+    memset(probe, 0, sizeof(*probe));
+    probe->registry = (void *)&registry;
+    list_init(&probe->nodes);
+    list_init(&probe->devices);
+}
+
+static void add_node(struct probe *probe, uint32_t id, const char *media_class, const char *name)
+{
+    struct spa_dict_item items[] = {
+        {PW_KEY_MEDIA_CLASS, media_class}, {PW_KEY_NODE_NAME, name},
+        {PW_KEY_NODE_DESCRIPTION, name}, {PW_KEY_DEVICE_ID, "77"},
+    };
+    struct spa_dict props = SPA_DICT_INIT_ARRAY(items);
+
+    on_probe_registry_global(probe, id, 0, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &props);
+}
+
+static struct pw_phys_device *find_endpoint(struct list *list, const char *name)
+{
+    struct pw_phys_device *dev;
+
+    LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
+        if (!strcmp(dev->pw_name, name)) return dev;
+    return NULL;
+}
+
+static void test_classes(void)
+{
+    struct probe probe;
+    struct probe_node *node;
+    unsigned int old_bound = bound;
+
+    init_probe(&probe);
+    add_node(&probe, 1, NULL, "ignored");
+    add_node(&probe, 2, "Video/Source", "ignored");
+    add_node(&probe, 3, "Audio/Sink/Virtual", "ignored");
+    add_node(&probe, 4, "Audio/Source/Virtual", "");
+    assert(list_empty(&probe.nodes) && bound == old_bound);
+
+    add_node(&probe, 5, "Audio/Sink", "sink");
+    add_node(&probe, 6, "Audio/Source", "source");
+    add_node(&probe, 7, "Audio/Source/Virtual", "virtual");
+    add_node(&probe, 8, "Audio/Duplex", "duplex");
+    assert(list_count(&probe.nodes) == 4 && bound == old_bound + 4);
+    node = LIST_ENTRY(list_tail(&probe.nodes), struct probe_node, entry);
+    assert(node->id == 8 && node->flow == eAll);
+
+    build_device_cache(&probe);
+    assert(list_count(&g_render_devices) == 3 && list_count(&g_capture_devices) == 4);
+    assert(find_endpoint(&g_render_devices, "sink") && !find_endpoint(&g_capture_devices, "sink"));
+    assert(find_endpoint(&g_capture_devices, "source") && !find_endpoint(&g_render_devices, "source"));
+    assert(find_endpoint(&g_capture_devices, "virtual") && !find_endpoint(&g_render_devices, "virtual"));
+    assert(find_endpoint(&g_render_devices, "duplex") && find_endpoint(&g_capture_devices, "duplex"));
+    free_device_lists();
+    on_probe_registry_global_remove(&probe, 5);
+    on_probe_registry_global_remove(&probe, 6);
+    on_probe_registry_global_remove(&probe, 7);
+    on_probe_registry_global_remove(&probe, 8);
+    assert(list_empty(&probe.nodes));
+}
+
+static void test_duplex_format_identity_lifetime(void)
+{
+    struct spa_dict_item items[] = {
+        {PW_KEY_DEVICE_BUS, "pci"}, {PW_KEY_DEVICE_VENDOR_ID, "1234"},
+        {PW_KEY_DEVICE_PRODUCT_ID, "5678"},
+    };
+    struct spa_dict props = SPA_DICT_INIT_ARRAY(items);
+    struct pw_device_info info = {.change_mask = PW_DEVICE_CHANGE_MASK_PROPS, .props = &props};
+    struct spa_audio_info_raw format = {.format = SPA_AUDIO_FORMAT_F32_LE, .rate = 48000,
+        .channels = 1, .position = {SPA_AUDIO_CHANNEL_MONO}};
+    char buffer[256];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    struct probe probe;
+    struct probe_node *node;
+    struct probe_device *device;
+    struct pw_phys_device *render, *capture, *render_default, *capture_default;
+    const struct spa_pod *param;
+    unsigned int old_bound = bound, old_destroyed = destroyed;
+
+    init_probe(&probe);
+    add_node(&probe, 10, "Audio/Duplex", "duplex");
+    assert(list_count(&probe.nodes) == 1 && bound == old_bound + 1);
+    node = LIST_ENTRY(list_head(&probe.nodes), struct probe_node, entry);
+    param = spa_format_audio_raw_build(&builder, SPA_PARAM_EnumFormat, &format);
+    assert(param);
+    on_probe_node_param(node, 0, SPA_PARAM_EnumFormat, 0, 0, param);
+    assert(node->have_format && node->channels == 1);
+
+    device = calloc(1, sizeof(*device));
+    assert(device);
+    device->id = 77;
+    on_probe_device_info(device, &info);
+    assert(device->info);
+    list_add_tail(&probe.devices, &device->entry);
+    strcpy(probe.default_sink, "duplex");
+    strcpy(probe.default_source, "duplex");
+    build_device_cache(&probe);
+
+    render = find_endpoint(&g_render_devices, "duplex");
+    capture = find_endpoint(&g_capture_devices, "duplex");
+    render_default = find_endpoint(&g_render_devices, "");
+    capture_default = find_endpoint(&g_capture_devices, "");
+    assert(render && capture && render != capture && render_default && capture_default);
+    assert(render->form == Speakers && capture->form == Microphone);
+    assert(render->fmt.Format.nChannels == 1 && capture->fmt.Format.nChannels == 1);
+    assert(render->channel_mask == capture->channel_mask);
+    assert(render_default->fmt.Format.nChannels == 1 && capture_default->fmt.Format.nChannels == 1);
+    assert(render->bus == DEVICE_BUS_PCI && capture->bus == DEVICE_BUS_PCI);
+    assert(render->vendor == 0x1234 && capture->vendor == render->vendor);
+    assert(render->product == 0x5678 && capture->product == render->product);
+    free_device_lists();
+
+    node->proxy = (void *)1;
+    spa_list_init(&node->listener.link);
+    on_probe_registry_global_remove(&probe, 10);
+    assert(list_empty(&probe.nodes) && destroyed == old_destroyed + 1);
+    on_probe_registry_global_remove(&probe, 10);
+    assert(destroyed == old_destroyed + 1);
+    on_probe_registry_global_remove(&probe, 77);
+    assert(list_empty(&probe.devices));
+}
+
+static void test_same_name_replacement(void)
+{
+    struct probe probe;
+
+    init_probe(&probe);
+    add_node(&probe, 20, "Audio/Duplex", "same");
+    add_node(&probe, 21, "Audio/Source/Virtual", "same");
+    build_device_cache(&probe);
+    assert(list_count(&g_render_devices) == 2 && list_count(&g_capture_devices) == 2);
+    free_device_lists();
+
+    on_probe_registry_global_remove(&probe, 20);
+    build_device_cache(&probe);
+    assert(list_count(&g_render_devices) == 1 && list_count(&g_capture_devices) == 2);
+    assert(!find_endpoint(&g_render_devices, "same") && find_endpoint(&g_capture_devices, "same"));
+    free_device_lists();
+    on_probe_registry_global_remove(&probe, 21);
+    assert(list_empty(&probe.nodes));
+}
+
+int main(void)
+{
+    test_classes();
+    test_duplex_format_identity_lifetime();
+    test_same_name_replacement();
+    puts("PipeWire endpoint tests passed");
+    return 0;
+}

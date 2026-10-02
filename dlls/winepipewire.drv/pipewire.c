@@ -1118,6 +1118,17 @@ static const struct pw_metadata_events probe_settings_events = {
     .property = on_probe_settings_property,
 };
 
+static BOOL get_node_flow(const char *media_class, EDataFlow *flow)
+{
+    if (!media_class) return FALSE;
+    if (!strcmp(media_class, "Audio/Sink")) *flow = eRender;
+    else if (!strcmp(media_class, "Audio/Source") || !strcmp(media_class, "Audio/Source/Virtual"))
+        *flow = eCapture;
+    else if (!strcmp(media_class, "Audio/Duplex")) *flow = eAll;
+    else return FALSE;
+    return TRUE;
+}
+
 static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissions,
                                       const char *type, uint32_t version,
                                       const struct spa_dict *props)
@@ -1134,11 +1145,10 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
         const char *desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
         const char *nick = spa_dict_lookup(props, PW_KEY_NODE_NICK);
         struct probe_node *pn;
+        EDataFlow flow;
         UINT64 device_id;
 
-        if (!media_class || !node_name || !node_name[0])
-            return;
-        if (strcmp(media_class, "Audio/Sink") && strcmp(media_class, "Audio/Source"))
+        if (!get_node_flow(media_class, &flow) || !node_name || !node_name[0])
             return;
 
         if (!(pn = calloc(1, sizeof(*pn))))
@@ -1146,7 +1156,7 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
         pn->id = id;
         pn->device_id = parse_unsigned(spa_dict_lookup(props, PW_KEY_DEVICE_ID), 10, UINT32_MAX,
                                        &device_id) ? device_id : SPA_ID_INVALID;
-        pn->flow = !strcmp(media_class, "Audio/Sink") ? eRender : eCapture;
+        pn->flow = flow;
         pn->node_name = strdup(node_name);
         pn->display = strdup(desc ? desc : (nick ? nick : node_name));
         pn->nickname = nick ? strdup(nick) : NULL;
@@ -1443,14 +1453,21 @@ static void build_device_cache(struct probe *p)
 
     LIST_FOR_EACH_ENTRY(pn, &p->nodes, struct probe_node, entry)
     {
-        struct list *list = (pn->flow == eRender) ? &g_render_devices : &g_capture_devices;
-        EndpointFormFactor form = (pn->flow == eRender) ? Speakers : Microphone;
+        EDataFlow flow;
         uint32_t channels = pn->have_format ? pn->channels : 2;
         UINT mask = pn->have_format ? positions_to_mask(pn->position, pn->channels)
                                     : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
-        dev = add_device(list, pn->node_name, pn->display, form, rate, channels, mask, def_period, min_period);
-        shorten_device_display(dev, pn->nickname, pn->node_name);
-        set_device_identity(dev, p, pn->device_id);
+
+        for (flow = eRender; flow <= eCapture; ++flow)
+        {
+            struct list *list = flow == eRender ? &g_render_devices : &g_capture_devices;
+            EndpointFormFactor form = flow == eRender ? Speakers : Microphone;
+
+            if (pn->flow != flow && pn->flow != eAll) continue;
+            dev = add_device(list, pn->node_name, pn->display, form, rate, channels, mask, def_period, min_period);
+            shorten_device_display(dev, pn->nickname, pn->node_name);
+            set_device_identity(dev, p, pn->device_id);
+        }
     }
 
     add_default_device(&g_render_devices, Speakers, g_default_sink, rate, def_period, min_period);
