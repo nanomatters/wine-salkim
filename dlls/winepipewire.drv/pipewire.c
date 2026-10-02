@@ -2939,7 +2939,12 @@ static NTSTATUS pipewire_stop(void *args)
     }
 
     if (pw_stream_set_active(stream->pw, false) < 0)
+    {
         WARN("pw_stream_set_active(false) failed for stream %p.\n", stream);
+        pw_thread_loop_unlock(pw_loop_global);
+        params->result = E_FAIL;
+        return STATUS_SUCCESS;
+    }
     stream->started = FALSE;
     pw_thread_loop_unlock(pw_loop_global);
     params->result = S_OK;
@@ -2975,7 +2980,12 @@ static NTSTATUS pipewire_reset(void *args)
     }
 
     if (pw_stream_flush(stream->pw, false) < 0)
+    {
         WARN("pw_stream_flush failed for stream %p.\n", stream);
+        pw_thread_loop_unlock(pw_loop_global);
+        params->result = E_FAIL;
+        return STATUS_SUCCESS;
+    }
 
     if (stream->dataflow == eRender)
     {

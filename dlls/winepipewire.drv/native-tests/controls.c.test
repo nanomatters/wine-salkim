@@ -1,0 +1,232 @@
+/* Native tests of PipeWire stream stop and reset controls.
+ *
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static unsigned int loop_depth, deactivate_calls, flush_calls;
+static int deactivate_result, flush_result;
+static enum pw_stream_state backend_state;
+
+void pw_thread_loop_lock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global && !loop_depth++);
+}
+
+void pw_thread_loop_unlock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global && loop_depth-- == 1);
+}
+
+enum pw_stream_state pw_stream_get_state(struct pw_stream *stream, const char **error)
+{
+    assert(stream == (void *)2 && loop_depth == 1);
+    return backend_state;
+}
+
+int pw_stream_set_active(struct pw_stream *stream, bool active)
+{
+    assert(stream == (void *)2 && loop_depth == 1 && !active);
+    deactivate_calls++;
+    if (!deactivate_result) backend_state = PW_STREAM_STATE_PAUSED;
+    return deactivate_result;
+}
+
+int pw_stream_flush(struct pw_stream *stream, bool drain)
+{
+    assert(stream == (void *)2 && loop_depth == 1 && !drain);
+    flush_calls++;
+    return flush_result;
+}
+
+struct fixture
+{
+    struct pipewire_stream stream;
+    ACPacket packets[4];
+    BYTE audio[64], capture[64], temporary[8];
+};
+
+static void init_fixture(struct fixture *fixture, EDataFlow flow, BOOL started)
+{
+    struct pipewire_stream *stream = &fixture->stream;
+    unsigned int i;
+
+    assert(!loop_depth);
+    memset(fixture, 0, sizeof(*fixture));
+    memset(fixture->audio, 0x5a, sizeof(fixture->audio));
+    memset(fixture->capture, 0x3c, sizeof(fixture->capture));
+    memset(fixture->temporary, 0x77, sizeof(fixture->temporary));
+    pw_loop_global = (void *)1;
+    stream->pw = (void *)2;
+    stream->dataflow = flow;
+    stream->started = started;
+    stream->frame_size = 4;
+    stream->period_bytes = 8;
+    stream->bufsize_frames = 8;
+    stream->real_bufsize_bytes = sizeof(fixture->audio);
+    stream->local_buffer = fixture->audio;
+    stream->tmp_buffer = fixture->temporary;
+    stream->tmp_buffer_bytes = sizeof(fixture->temporary);
+    stream->lcl_offs_bytes = 4;
+    stream->pa_offs_bytes = 12;
+    stream->held_bytes = 24;
+    stream->pa_held_bytes = 16;
+    stream->clock_written = 1000;
+    stream->clock_lastpos = 976;
+    stream->capture_ring = fixture->capture;
+    stream->capture_ring_size = sizeof(fixture->capture);
+    stream->cap_read_offs = 8;
+    stream->cap_held_bytes = 16;
+    stream->capture_written = 1024;
+    list_init(&stream->packet_free_head);
+    list_init(&stream->packet_filled_head);
+    for (i = 0; i < ARRAY_SIZE(fixture->packets); ++i)
+    {
+        fixture->packets[i].data = fixture->audio + 8 * i;
+        fixture->packets[i].devpos = 976 + 8 * i;
+    }
+    list_add_tail(&stream->packet_free_head, &fixture->packets[0].entry);
+    stream->locked_ptr = &fixture->packets[1];
+    list_add_tail(&stream->packet_filled_head, &fixture->packets[2].entry);
+    list_add_tail(&stream->packet_filled_head, &fixture->packets[3].entry);
+    backend_state = started ? PW_STREAM_STATE_STREAMING : PW_STREAM_STATE_PAUSED;
+    deactivate_calls = flush_calls = 0;
+    deactivate_result = flush_result = 0;
+}
+
+static void assert_unchanged(const struct fixture *fixture, const struct fixture *before)
+{
+    assert(!memcmp(fixture, before, sizeof(*fixture)));
+    assert(!loop_depth);
+}
+
+static void test_stop(EDataFlow flow)
+{
+    struct fixture fixture, before;
+    struct stop_params params = {0};
+    NTSTATUS status;
+
+    init_fixture(&fixture, flow, TRUE);
+    /* Stop must preserve an acquired buffer as well as queued audio. */
+    fixture.stream.locked = flow == eRender ? -8 : 2;
+    params.stream = (UINT_PTR)&fixture.stream;
+    memcpy(&before, &fixture, sizeof(before));
+    deactivate_result = -EIO;
+
+    status = pipewire_stop(&params);
+    assert(status == STATUS_SUCCESS && params.result == E_FAIL);
+    assert(deactivate_calls == 1 && !flush_calls);
+    assert_unchanged(&fixture, &before);
+
+    deactivate_result = 0;
+    status = pipewire_stop(&params);
+    assert(status == STATUS_SUCCESS && params.result == S_OK);
+    assert(deactivate_calls == 2 && !flush_calls);
+    before.stream.started = FALSE;
+    assert_unchanged(&fixture, &before);
+
+    status = pipewire_stop(&params);
+    assert(status == STATUS_SUCCESS && params.result == S_FALSE);
+    assert(deactivate_calls == 2 && !flush_calls);
+    assert_unchanged(&fixture, &before);
+
+    fixture.stream.started = TRUE;
+    memcpy(&before, &fixture, sizeof(before));
+    backend_state = PW_STREAM_STATE_ERROR;
+    status = pipewire_stop(&params);
+    assert(status == STATUS_SUCCESS && params.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(deactivate_calls == 2 && !flush_calls);
+    assert_unchanged(&fixture, &before);
+}
+
+static void test_reset(EDataFlow flow)
+{
+    struct fixture fixture, before;
+    struct reset_params params = {0};
+    struct list *entry;
+    NTSTATUS status;
+    unsigned int i;
+
+    init_fixture(&fixture, flow, FALSE);
+    params.stream = (UINT_PTR)&fixture.stream;
+    memcpy(&before, &fixture, sizeof(before));
+    flush_result = -EIO;
+
+    status = pipewire_reset(&params);
+    assert(status == STATUS_SUCCESS && params.result == E_FAIL);
+    assert(flush_calls == 1 && !deactivate_calls);
+    assert_unchanged(&fixture, &before);
+
+    flush_result = 0;
+    status = pipewire_reset(&params);
+    assert(status == STATUS_SUCCESS && params.result == S_OK && !loop_depth);
+    assert(flush_calls == 2 && !deactivate_calls);
+    assert(!fixture.stream.clock_written && !fixture.stream.clock_lastpos);
+    assert(!fixture.stream.held_bytes && !fixture.stream.started && !fixture.stream.locked);
+    assert(fixture.stream.local_buffer == before.stream.local_buffer);
+    assert(fixture.stream.frame_size == before.stream.frame_size);
+    assert(fixture.stream.bufsize_frames == before.stream.bufsize_frames);
+    assert(!memcmp(fixture.audio, before.audio, sizeof(fixture.audio)));
+    if (flow == eRender)
+    {
+        assert(!fixture.stream.lcl_offs_bytes && !fixture.stream.pa_offs_bytes);
+        assert(!fixture.stream.pa_held_bytes);
+    }
+    else
+    {
+        assert(!fixture.stream.capture_written && !fixture.stream.cap_read_offs);
+        assert(!fixture.stream.cap_held_bytes && !fixture.stream.locked_ptr);
+        assert(list_empty(&fixture.stream.packet_filled_head));
+        entry = list_head(&fixture.stream.packet_free_head);
+        for (i = 0; i < ARRAY_SIZE(fixture.packets); ++i)
+        {
+            assert(entry == &fixture.packets[i].entry);
+            entry = entry->next;
+        }
+        assert(entry == &fixture.stream.packet_free_head);
+    }
+
+    /* Reset must reject active streams and outstanding buffer acquisitions. */
+    init_fixture(&fixture, flow, TRUE);
+    fixture.stream.locked = flow == eRender ? 8 : 2;
+    memcpy(&before, &fixture, sizeof(before));
+    status = pipewire_reset(&params);
+    assert(status == STATUS_SUCCESS && params.result == AUDCLNT_E_NOT_STOPPED);
+    assert(!flush_calls && !deactivate_calls);
+    assert_unchanged(&fixture, &before);
+
+    fixture.stream.started = FALSE;
+    backend_state = PW_STREAM_STATE_PAUSED;
+    memcpy(&before, &fixture, sizeof(before));
+    status = pipewire_reset(&params);
+    assert(status == STATUS_SUCCESS && params.result == AUDCLNT_E_BUFFER_OPERATION_PENDING);
+    assert(!flush_calls && !deactivate_calls);
+    assert_unchanged(&fixture, &before);
+
+    fixture.stream.locked = 0;
+    backend_state = PW_STREAM_STATE_ERROR;
+    memcpy(&before, &fixture, sizeof(before));
+    status = pipewire_reset(&params);
+    assert(status == STATUS_SUCCESS && params.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(!flush_calls && !deactivate_calls);
+    assert_unchanged(&fixture, &before);
+}
+
+int main(int argc, char **argv)
+{
+    assert(argc <= 2);
+    if (argc == 1 || !strcmp(argv[1], "stop"))
+    {
+        test_stop(eRender);
+        test_stop(eCapture);
+    }
+    if (argc == 1 || !strcmp(argv[1], "reset"))
+    {
+        test_reset(eRender);
+        test_reset(eCapture);
+    }
+    puts("PipeWire control tests passed");
+    return 0;
+}
