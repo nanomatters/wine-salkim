@@ -1517,25 +1517,27 @@ struct set_thread_info_request
     int          priority;
     int          base_priority;
     affinity_t   affinity;
+    affinity_t   system_affinity;
     client_ptr_t entry_point;
     obj_handle_t token;
     int          disable_boost;
     unsigned int mask;
     /* VARARG(desc,unicode_str); */
-    char __pad_52[4];
+    char __pad_60[4];
 };
 struct set_thread_info_reply
 {
     struct reply_header __header;
 };
-#define SET_THREAD_INFO_PRIORITY        0x01
-#define SET_THREAD_INFO_BASE_PRIORITY   0x02
-#define SET_THREAD_INFO_AFFINITY        0x04
-#define SET_THREAD_INFO_TOKEN           0x08
-#define SET_THREAD_INFO_ENTRYPOINT      0x10
-#define SET_THREAD_INFO_DESCRIPTION     0x20
-#define SET_THREAD_INFO_DBG_HIDDEN      0x40
-#define SET_THREAD_INFO_DISABLE_BOOST   0x80
+#define SET_THREAD_INFO_PRIORITY        0x001
+#define SET_THREAD_INFO_BASE_PRIORITY   0x002
+#define SET_THREAD_INFO_AFFINITY        0x004
+#define SET_THREAD_INFO_GROUP_AFFINITY  0x008
+#define SET_THREAD_INFO_TOKEN           0x010
+#define SET_THREAD_INFO_ENTRYPOINT      0x020
+#define SET_THREAD_INFO_DESCRIPTION     0x040
+#define SET_THREAD_INFO_DBG_HIDDEN      0x080
+#define SET_THREAD_INFO_DISABLE_BOOST   0x100
 
 
 
@@ -7559,6 +7561,6 @@ union generic_reply
     struct get_cursor_data_reply get_cursor_data_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 948
+#define SERVER_PROTOCOL_VERSION 949
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
