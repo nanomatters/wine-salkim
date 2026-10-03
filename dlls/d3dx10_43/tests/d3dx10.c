@@ -10035,6 +10035,146 @@ static void test_sprite(void)
     ok(!refcount, "Unexpected refcount.\n");
 }
 
+static void test_sprite_draw(void)
+{
+    static const unsigned int counts[] = {0, 1, 2, 3, 4, 6};
+    static const unsigned int colors[] = {0xff0000ff, 0xff00ff00};
+    static const D3DXMATRIX identity = {._11 = 1.0f, ._22 = 1.0f, ._33 = 1.0f, ._44 = 1.0f};
+    ID3D10Texture2D *target = NULL, *textures[2] = {NULL, NULL};
+    ID3D10ShaderResourceView *views[2] = {NULL, NULL};
+    ID3D10RenderTargetView *rtv = NULL;
+    D3D10_TEXTURE2D_DESC texture_desc = {0};
+    D3D10_SUBRESOURCE_DATA data = {0};
+    ID3DX10Sprite *sprite = NULL;
+    D3D10_VIEWPORT viewport = {0};
+    D3DXMATRIX view, projection;
+    D3DX10_SPRITE *sprites;
+    unsigned int i, j, buffered;
+    const float black[4] = {0};
+    ID3D10Device *device;
+    SYSTEM_INFO info;
+    DWORD old_protect;
+    BYTE *memory = NULL;
+    HRESULT hr;
+    RECT rect;
+    BOOL ret;
+
+    if (!(device = create_device()))
+    {
+        skip("Failed to create device, skipping sprite drawing tests.\n");
+        return;
+    }
+
+    texture_desc.Width = texture_desc.Height = 1;
+    texture_desc.MipLevels = texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.BindFlags = D3D10_BIND_SHADER_RESOURCE;
+    data.SysMemPitch = sizeof(*colors);
+    for (i = 0; i < ARRAY_SIZE(textures); ++i)
+    {
+        data.pSysMem = &colors[i];
+        hr = ID3D10Device_CreateTexture2D(device, &texture_desc, &data, &textures[i]);
+        ok(hr == S_OK, "Failed to create texture, hr %#lx.\n", hr);
+        if (FAILED(hr)) goto done;
+        hr = ID3D10Device_CreateShaderResourceView(device, (ID3D10Resource *)textures[i], NULL, &views[i]);
+        ok(hr == S_OK, "Failed to create view, hr %#lx.\n", hr);
+        if (FAILED(hr)) goto done;
+    }
+
+    texture_desc.Width = texture_desc.Height = 64;
+    texture_desc.BindFlags = D3D10_BIND_RENDER_TARGET;
+    hr = ID3D10Device_CreateTexture2D(device, &texture_desc, NULL, &target);
+    ok(hr == S_OK, "Failed to create render target, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = ID3D10Device_CreateRenderTargetView(device, (ID3D10Resource *)target, NULL, &rtv);
+    ok(hr == S_OK, "Failed to create render target view, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    ID3D10Device_OMSetRenderTargets(device, 1, &rtv, NULL);
+    viewport.Width = viewport.Height = 64;
+    viewport.MaxDepth = 1.0f;
+    ID3D10Device_RSSetViewports(device, 1, &viewport);
+
+    hr = D3DX10CreateSprite(device, 2, &sprite);
+    ok(hr == S_OK, "Failed to create sprite, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+
+    GetSystemInfo(&info);
+    memory = VirtualAlloc(NULL, 2 * info.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!memory, "Failed to allocate sprite data, error %lu.\n", GetLastError());
+    if (!memory) goto done;
+    ret = VirtualProtect(memory + info.dwPageSize, info.dwPageSize, PAGE_NOACCESS, &old_protect);
+    ok(ret, "Failed to protect guard page, error %lu.\n", GetLastError());
+    if (!ret) goto done;
+
+    for (buffered = 0; buffered < 2; ++buffered)
+    {
+        for (i = 0; i < ARRAY_SIZE(counts); ++i)
+        {
+            winetest_push_context("buffered %u, count %u", buffered, counts[i]);
+            /* End the array at an inaccessible page to catch empty tail batches. */
+            sprites = (D3DX10_SPRITE *)(memory + info.dwPageSize - counts[i] * sizeof(*sprites));
+            memset(sprites, 0, counts[i] * sizeof(*sprites));
+            for (j = 0; j < counts[i]; ++j)
+            {
+                sprites[j].matWorld = identity;
+                sprites[j].TexSize.x = sprites[j].TexSize.y = 1.0f;
+                sprites[j].ColorModulate.r = sprites[j].ColorModulate.g = 1.0f;
+                sprites[j].ColorModulate.b = sprites[j].ColorModulate.a = 1.0f;
+                sprites[j].pTexture = views[j % ARRAY_SIZE(views)];
+            }
+            ID3D10Device_ClearRenderTargetView(device, rtv, black);
+            hr = ID3DX10Sprite_Begin(sprite, 0);
+            ok(hr == S_OK, "Failed to begin, hr %#lx.\n", hr);
+            if (buffered)
+                hr = ID3DX10Sprite_DrawSpritesBuffered(sprite, sprites, counts[i]);
+            else
+                hr = ID3DX10Sprite_DrawSpritesImmediate(sprite, sprites, counts[i], 0, 0);
+            ok(hr == S_OK, "Failed to draw, hr %#lx.\n", hr);
+            hr = ID3DX10Sprite_End(sprite);
+            ok(hr == S_OK, "Failed to end, hr %#lx.\n", hr);
+            SetRect(&rect, 31, 31, 33, 33);
+            check_texture_sub_resource_u32(target, 0, &rect,
+                    counts[i] ? colors[(counts[i] - 1) % ARRAY_SIZE(colors)] : 0);
+            winetest_pop_context();
+        }
+    }
+
+    view = projection = identity;
+    view._41 = 0.5f;
+    projection._11 = 0.5f;
+    hr = ID3DX10Sprite_SetViewTransform(sprite, &view);
+    ok(hr == S_OK, "Failed to set view, hr %#lx.\n", hr);
+    hr = ID3DX10Sprite_SetProjectionTransform(sprite, &projection);
+    ok(hr == S_OK, "Failed to set projection, hr %#lx.\n", hr);
+    sprites = (D3DX10_SPRITE *)(memory + info.dwPageSize - sizeof(*sprites));
+    sprites->pTexture = views[0];
+    ID3D10Device_ClearRenderTargetView(device, rtv, black);
+    hr = ID3DX10Sprite_Begin(sprite, 0);
+    ok(hr == S_OK, "Failed to begin, hr %#lx.\n", hr);
+    hr = ID3DX10Sprite_DrawSpritesImmediate(sprite, sprites, 1, 0, 0);
+    ok(hr == S_OK, "Failed to draw, hr %#lx.\n", hr);
+    hr = ID3DX10Sprite_End(sprite);
+    ok(hr == S_OK, "Failed to end, hr %#lx.\n", hr);
+    SetRect(&rect, 36, 31, 37, 32);
+    check_texture_sub_resource_u32(target, 0, &rect, colors[0]);
+    SetRect(&rect, 52, 31, 53, 32);
+    check_texture_sub_resource_u32(target, 0, &rect, 0);
+
+done:
+    if (memory) VirtualFree(memory, 0, MEM_RELEASE);
+    if (sprite) ID3DX10Sprite_Release(sprite);
+    if (rtv) ID3D10RenderTargetView_Release(rtv);
+    if (target) ID3D10Texture2D_Release(target);
+    for (i = 0; i < ARRAY_SIZE(textures); ++i)
+    {
+        if (views[i]) ID3D10ShaderResourceView_Release(views[i]);
+        if (textures[i]) ID3D10Texture2D_Release(textures[i]);
+    }
+    ID3D10Device_ClearState(device);
+    ID3D10Device_Release(device);
+}
+
 static void test_create_effect_from_memory(void)
 {
     D3D10_EFFECT_DESC desc;
@@ -10393,6 +10533,7 @@ START_TEST(d3dx10)
     test_save_texture();
     test_font();
     test_sprite();
+    test_sprite_draw();
     test_create_effect_from_memory();
     test_create_effect_from_file();
     test_create_effect_from_resource();
