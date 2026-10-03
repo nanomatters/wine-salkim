@@ -24,3 +24,15 @@ operations, every allocation failure while splitting a destroyed queue's input,
 repeated deferred-repair failure, deferred repair before attachment, foreground
 component retention, and desktop migration with mixed-direction incident edges
 or an initially unattached queue.
+
+The desktop fixture uses the same dependency stubs and inserts the actual
+set_thread_desktop handler. Build and run it separately:
+
+    python3 server/native-tests/thread_input/desktop.py . --output "$fixture_dir/desktop"
+    "$fixture_dir/desktop-asan"
+    "$fixture_dir/desktop-32"
+
+It checks that busy threads and every detachment allocation failure preserve
+the desktop handle, membership lists, process default, reply locator and input
+graph. It also covers successful retries, same-desktop requests and validation
+failures.

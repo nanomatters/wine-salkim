@@ -879,23 +879,27 @@ DECL_HANDLER(set_thread_desktop)
 
     /* when changing desktop, we can't have any users on the current one */
     if (old_desktop != new_desktop && current->desktop_users > 0)
-        set_error( STATUS_DEVICE_BUSY );
-    else
     {
-        current->desktop = req->handle;  /* FIXME: should we close the old one? */
-        if (old_desktop != new_desktop)
-        {
-            if (old_desktop) remove_desktop_thread( old_desktop, current );
-            add_desktop_thread( new_desktop, current );
-        }
-        reply->locator = get_shared_object_locator( new_desktop->shared );
+        set_error( STATUS_DEVICE_BUSY );
+        goto done;
     }
+    if (old_desktop != new_desktop && current->queue)
+    {
+        detach_thread_input( current->queue, NULL, new_desktop );
+        if (get_error()) goto done;
+    }
+    current->desktop = req->handle;  /* FIXME: should we close the old one? */
+    if (old_desktop != new_desktop)
+    {
+        if (old_desktop) remove_desktop_thread( old_desktop, current );
+        add_desktop_thread( new_desktop, current );
+    }
+    reply->locator = get_shared_object_locator( new_desktop->shared );
 
     if (!current->process->desktop)
         set_process_default_desktop( current->process, new_desktop, req->handle );
 
-    if (old_desktop != new_desktop && current->queue) detach_thread_input( current->queue, NULL, new_desktop );
-
+done:
     if (old_desktop) release_object( old_desktop );
     release_object( new_desktop );
     release_object( winstation );
