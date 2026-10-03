@@ -70,6 +70,92 @@ static void register_class(void)
 
 static HDESK initial_desktop;
 
+struct input_desktop_params
+{
+    HANDLE ready, proceed;
+    HDESK desktop;
+};
+
+static DWORD WINAPI input_desktop_thread( void *param )
+{
+    struct input_desktop_params *args = param;
+    HDESK original = GetThreadDesktop( GetCurrentThreadId() );
+    MSG msg;
+
+    PeekMessageW( &msg, NULL, 0, 0, PM_NOREMOVE );
+    SetEvent( args->ready );
+    ok( WaitForSingleObject( args->proceed, 5000 ) == WAIT_OBJECT_0, "Thread was not released\n" );
+    ok( SetThreadDesktop( args->desktop ), "SetThreadDesktop failed, error %lu\n", GetLastError() );
+    ok( GetThreadDesktop( GetCurrentThreadId() ) == args->desktop, "Unexpected thread desktop\n" );
+    SetEvent( args->ready );
+    ok( WaitForSingleObject( args->proceed, 5000 ) == WAIT_OBJECT_0, "Thread was not released\n" );
+    ok( SetThreadDesktop( original ), "Restoring desktop failed, error %lu\n", GetLastError() );
+    return 0;
+}
+
+static void test_input_desktop_attachment(void)
+{
+    struct input_desktop_params args;
+    GUITHREADINFO info = {sizeof(info)};
+    HDESK original = GetThreadDesktop( GetCurrentThreadId() );
+    HANDLE worker;
+    DWORD id;
+    HWND window;
+
+    args.desktop = CreateDesktopA( "input_attachment", NULL, NULL, 0, DESKTOP_ALL_ACCESS, NULL );
+    ok( !!args.desktop, "CreateDesktop failed, error %lu\n", GetLastError() );
+    if (!args.desktop) return;
+    window = CreateWindowW( L"static", L"attachment", WS_POPUP, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
+    ok( !!window, "CreateWindow failed, error %lu\n", GetLastError() );
+    if (!window)
+    {
+        CloseDesktop( args.desktop );
+        return;
+    }
+    args.ready = CreateEventW( NULL, FALSE, FALSE, NULL );
+    args.proceed = CreateEventW( NULL, FALSE, FALSE, NULL );
+    worker = CreateThread( NULL, 0, input_desktop_thread, &args, 0, &id );
+    ok( !!worker, "CreateThread failed, error %lu\n", GetLastError() );
+    if (!worker)
+    {
+        CloseHandle( args.ready );
+        CloseHandle( args.proceed );
+        DestroyWindow( window );
+        CloseDesktop( args.desktop );
+        return;
+    }
+    ok( WaitForSingleObject( args.ready, 5000 ) == WAIT_OBJECT_0, "Thread was not ready\n" );
+
+    SetActiveWindow( window );
+    SetFocus( window );
+    ok( AttachThreadInput( GetCurrentThreadId(), id, TRUE ), "AttachThreadInput failed\n" );
+    ok( GetGUIThreadInfo( id, &info ), "GetGUIThreadInfo failed\n" );
+    ok( info.hwndActive == window && info.hwndFocus == window, "Attached input was not shared\n" );
+
+    /* A rejected desktop switch must not detach the existing input graph. */
+    SetLastError( 0xdeadbeef );
+    ok( !SetThreadDesktop( args.desktop ), "Desktop switch with a window succeeded\n" );
+    ok( GetLastError() == ERROR_BUSY, "Unexpected error %lu\n", GetLastError() );
+    ok( GetThreadDesktop( GetCurrentThreadId() ) == original, "Desktop changed after a failed switch\n" );
+    ok( GetGUIThreadInfo( id, &info ), "GetGUIThreadInfo failed\n" );
+    ok( info.hwndActive == window && info.hwndFocus == window, "Failed switch detached input\n" );
+
+    /* A successful switch detaches all incident edges without moving its peers. */
+    SetEvent( args.proceed );
+    ok( WaitForSingleObject( args.ready, 5000 ) == WAIT_OBJECT_0, "Thread did not switch desktop\n" );
+    ok( GetGUIThreadInfo( id, &info ), "GetGUIThreadInfo failed\n" );
+    ok( !info.hwndActive && !info.hwndFocus, "New desktop inherited the old input\n" );
+    ok( GetActiveWindow() == window && GetFocus() == window, "Peer input changed after the switch\n" );
+
+    SetEvent( args.proceed );
+    ok( WaitForSingleObject( worker, 5000 ) == WAIT_OBJECT_0, "Thread did not exit\n" );
+    CloseHandle( worker );
+    CloseHandle( args.ready );
+    CloseHandle( args.proceed );
+    DestroyWindow( window );
+    ok( CloseDesktop( args.desktop ), "CloseDesktop failed, error %lu\n", GetLastError() );
+}
+
 static DWORD CALLBACK thread( LPVOID arg )
 {
     HDESK d1, d2;
@@ -1130,6 +1216,7 @@ START_TEST(winstation)
     }
     test_inputdesktop();
     test_inputdesktop2();
+    test_input_desktop_attachment();
     test_enumstations();
     test_enumdesktops();
     test_handles();
