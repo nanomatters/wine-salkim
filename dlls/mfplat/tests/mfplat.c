@@ -6495,6 +6495,7 @@ struct activate_object
 {
     IMFActivate IMFActivate_iface;
     LONG refcount;
+    unsigned int activate_count;
 };
 
 static HRESULT WINAPI activate_object_QueryInterface(IMFActivate *iface, REFIID riid, void **obj)
@@ -6514,12 +6515,16 @@ static HRESULT WINAPI activate_object_QueryInterface(IMFActivate *iface, REFIID 
 
 static ULONG WINAPI activate_object_AddRef(IMFActivate *iface)
 {
-    return 2;
+    struct activate_object *object = CONTAINING_RECORD(iface, struct activate_object, IMFActivate_iface);
+
+    return InterlockedIncrement(&object->refcount);
 }
 
 static ULONG WINAPI activate_object_Release(IMFActivate *iface)
 {
-    return 1;
+    struct activate_object *object = CONTAINING_RECORD(iface, struct activate_object, IMFActivate_iface);
+
+    return InterlockedDecrement(&object->refcount);
 }
 
 static HRESULT WINAPI activate_object_GetItem(IMFActivate *iface, REFGUID key, PROPVARIANT *value)
@@ -6678,6 +6683,10 @@ static HRESULT WINAPI activate_object_CopyAllItems(IMFActivate *iface, IMFAttrib
 
 static HRESULT WINAPI activate_object_ActivateObject(IMFActivate *iface, REFIID riid, void **obj)
 {
+    struct activate_object *object = CONTAINING_RECORD(iface, struct activate_object, IMFActivate_iface);
+
+    ++object->activate_count;
+    *obj = NULL;
     return E_NOTIMPL;
 }
 
@@ -6733,11 +6742,19 @@ static const IMFActivateVtbl activate_object_vtbl =
 
 static void test_local_handlers(void)
 {
-    IMFActivate local_activate = { &activate_object_vtbl };
+    static struct activate_object local = {{&activate_object_vtbl}, 1};
+    IMFActivate *local_activate = &local.IMFActivate_iface;
+    IMFSourceResolver *resolver = NULL;
+    IMFAttributes *attributes = NULL;
+    IMFByteStream *bytestream = NULL;
+    IUnknown *object = NULL;
+    IStream *stream = NULL;
     static const WCHAR localW[] = L"local";
+    MF_OBJECT_TYPE type;
+    ULONG refcount;
     HRESULT hr;
 
-    if (!pMFRegisterLocalSchemeHandler)
+    if (!pMFRegisterLocalSchemeHandler || !pMFRegisterLocalByteStreamHandler)
     {
         win_skip("Local handlers are not supported.\n");
         return;
@@ -6752,30 +6769,63 @@ static void test_local_handlers(void)
     hr = pMFRegisterLocalSchemeHandler(localW, NULL);
     ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
 
-    hr = pMFRegisterLocalSchemeHandler(NULL, &local_activate);
+    hr = pMFRegisterLocalSchemeHandler(NULL, local_activate);
     ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
 
-    hr = pMFRegisterLocalSchemeHandler(localW, &local_activate);
+    hr = pMFRegisterLocalSchemeHandler(localW, local_activate);
     ok(hr == S_OK, "Failed to register scheme handler, hr %#lx.\n", hr);
 
-    hr = pMFRegisterLocalSchemeHandler(localW, &local_activate);
+    hr = pMFRegisterLocalSchemeHandler(localW, local_activate);
     ok(hr == S_OK, "Failed to register scheme handler, hr %#lx.\n", hr);
 
     hr = pMFRegisterLocalByteStreamHandler(NULL, NULL, NULL);
     ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
 
-    hr = pMFRegisterLocalByteStreamHandler(NULL, NULL, &local_activate);
+    hr = pMFRegisterLocalByteStreamHandler(NULL, NULL, local_activate);
     ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
 
-    hr = pMFRegisterLocalByteStreamHandler(NULL, localW, &local_activate);
+    refcount = local.refcount;
+    hr = pMFRegisterLocalByteStreamHandler(NULL, localW, local_activate);
     ok(hr == S_OK, "Failed to register stream handler, hr %#lx.\n", hr);
+    ok(local.refcount > refcount, "Activation object was not retained.\n");
 
-    hr = pMFRegisterLocalByteStreamHandler(localW, NULL, &local_activate);
+    refcount = local.refcount;
+    hr = pMFRegisterLocalByteStreamHandler(localW, NULL, local_activate);
     ok(hr == S_OK, "Failed to register stream handler, hr %#lx.\n", hr);
+    ok(local.refcount > refcount, "Activation object was not retained.\n");
 
-    hr = pMFRegisterLocalByteStreamHandler(localW, localW, &local_activate);
+    refcount = local.refcount;
+    hr = pMFRegisterLocalByteStreamHandler(localW, localW, local_activate);
     ok(hr == S_OK, "Failed to register stream handler, hr %#lx.\n", hr);
+    ok(local.refcount > refcount, "Activation object was not retained.\n");
 
+    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
+    ok(hr == S_OK, "Failed to create stream, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = pMFCreateMFByteStreamOnStream(stream, &bytestream);
+    ok(hr == S_OK, "Failed to create byte stream, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = IMFByteStream_QueryInterface(bytestream, &IID_IMFAttributes, (void **)&attributes);
+    ok(hr == S_OK, "Failed to get attributes, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = IMFAttributes_SetString(attributes, &MF_BYTESTREAM_CONTENT_TYPE, localW);
+    ok(hr == S_OK, "Failed to set content type, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    hr = MFCreateSourceResolver(&resolver);
+    ok(hr == S_OK, "Failed to create resolver, hr %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+    local.activate_count = 0;
+    hr = IMFSourceResolver_CreateObjectFromByteStream(resolver, bytestream, NULL,
+            MF_RESOLUTION_MEDIASOURCE, NULL, &type, &object);
+    trace("Byte-stream resolution returned %#lx.\n", hr);
+    ok(local.activate_count, "Registered byte-stream activation object was not called.\n");
+
+done:
+    if (object) IUnknown_Release(object);
+    if (resolver) IMFSourceResolver_Release(resolver);
+    if (attributes) IMFAttributes_Release(attributes);
+    if (bytestream) IMFByteStream_Release(bytestream);
+    if (stream) IStream_Release(stream);
     hr = MFShutdown();
     ok(hr == S_OK, "Failed to shut down, hr %#lx.\n", hr);
 }
