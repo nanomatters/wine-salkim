@@ -1827,11 +1827,48 @@ static void test_hmac_sha256(void)
         /* Rejected algorithms must not invalidate the in-progress hash. */
         ret = CryptHashData(hash, (const BYTE *)tests[i].data + 1, strlen(tests[i].data) - 1, 0);
         ok(ret, "CryptHashData failed, error %#lx.\n", GetLastError());
+
+        for (j = 0; j < 2; ++j)
+        {
+            size = 0;
+            ret = CryptGetHashParam(hash, HP_HASHVAL, NULL, &size, 0);
+            ok(ret, "Size query failed, error %#lx.\n", GetLastError());
+            ok(size == sizeof(digest), "Unexpected digest size %lu.\n", size);
+        }
+
+        size = sizeof(digest) - 1;
+        memset(digest, 0xcc, sizeof(digest));
+        SetLastError(0xdeadbeef);
+        ret = CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0);
+        ok(!ret && GetLastError() == ERROR_MORE_DATA, "Short buffer: ret %d, error %#lx.\n",
+           ret, GetLastError());
+        ok(size == sizeof(digest), "Unexpected digest size %lu.\n", size);
+
         size = sizeof(digest);
         ret = CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0);
         ok(ret, "CryptGetHashParam failed, error %#lx.\n", GetLastError());
         ok(size == sizeof(digest), "Unexpected digest size %lu.\n", size);
         ok(!memcmp(digest, tests[i].digest, sizeof(digest)), "Unexpected HMAC-SHA256 digest.\n");
+
+        size = 0;
+        ret = CryptGetHashParam(hash, HP_HASHVAL, NULL, &size, 0);
+        ok(ret, "Finished size query failed, error %#lx.\n", GetLastError());
+        ok(size == sizeof(digest), "Unexpected digest size %lu.\n", size);
+
+        for (j = 0; j < 2; ++j)
+        {
+            memset(digest, 0xcc, sizeof(digest));
+            size = sizeof(digest);
+            ret = CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0);
+            ok(ret, "Repeated retrieval failed, error %#lx.\n", GetLastError());
+            ok(size == sizeof(digest), "Unexpected digest size %lu.\n", size);
+            ok(!memcmp(digest, tests[i].digest, sizeof(digest)), "Unexpected repeated HMAC digest.\n");
+        }
+
+        SetLastError(0xdeadbeef);
+        ret = CryptHashData(hash, (const BYTE *)tests[i].data, 1, 0);
+        ok(!ret && GetLastError() == NTE_BAD_HASH_STATE, "Finished hash: ret %d, error %#lx.\n",
+           ret, GetLastError());
 
     destroy_hash:
         CryptDestroyHash(hash);
@@ -2024,6 +2061,12 @@ static void test_hmac_info(void)
         SetLastError(0xdeadbeef);
         result = CryptGetHashParam(hash, HP_HASHVAL, digest, &digest_size, 0);
         ok(!result, "CryptGetHashParam succeeded\n");
+        ok(GetLastError() == NTE_BAD_ALGID, "Unexpected error %08lx\n", GetLastError());
+
+        digest_size = 0;
+        SetLastError(0xdeadbeef);
+        result = CryptGetHashParam(hash, HP_HASHVAL, NULL, &digest_size, 0);
+        ok(!result, "Uninitialized HMAC size query succeeded\n");
         ok(GetLastError() == NTE_BAD_ALGID, "Unexpected error %08lx\n", GetLastError());
 
         result = CryptSetHashParam(hash, HP_HMAC_INFO, (BYTE *)&hmac_info, 0);
