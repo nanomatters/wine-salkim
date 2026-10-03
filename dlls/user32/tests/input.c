@@ -4800,6 +4800,77 @@ static DWORD WINAPI test_AttachThreadInput_thread(void *param)
     return 0;
 }
 
+static void test_AttachThreadInput_graph(void)
+{
+    struct test_AttachThreadInput_params args[3] = {{0}};
+    GUITHREADINFO info = {sizeof(info)};
+    HANDLE threads[3];
+    DWORD ids[3], main_id = GetCurrentThreadId();
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(args); ++i)
+    {
+        args[i].start_event = CreateEventW( NULL, FALSE, FALSE, NULL );
+        threads[i] = CreateThread( NULL, 0, test_AttachThreadInput_thread, &args[i], 0, &ids[i] );
+        ok_ptr( threads[i], !=, NULL );
+        ok_ret( WAIT_OBJECT_0, WaitForSingleObject( args[i].start_event, 5000 ) );
+        ok_ret( TRUE, CloseHandle( args[i].start_event ) );
+    }
+
+    /* Removing one side of a cycle must not split its remaining connected paths. */
+    ok_ret( TRUE, AttachThreadInput( ids[0], main_id, TRUE ) );
+    ok_ret( TRUE, AttachThreadInput( ids[0], ids[1], TRUE ) );
+    ok_ret( TRUE, AttachThreadInput( ids[1], main_id, TRUE ) );
+    SetActiveWindow( args[1].hwnd );
+    SetFocus( args[1].hwnd );
+    ok_ptr( GetActiveWindow(), ==, args[1].hwnd );
+    ok_ptr( GetFocus(), ==, args[1].hwnd );
+
+    ok_ret( TRUE, AttachThreadInput( ids[0], main_id, FALSE ) );
+    ok_ret( TRUE, GetGUIThreadInfo( ids[0], &info ) );
+    ok_ptr( info.hwndActive, ==, args[1].hwnd );
+    ok_ptr( info.hwndFocus, ==, args[1].hwnd );
+
+    /* The final bridge removal separates main, but leaves the other two attached. */
+    ok_ret( TRUE, AttachThreadInput( ids[1], main_id, FALSE ) );
+    ok_ptr( GetActiveWindow(), ==, NULL );
+    ok_ptr( GetFocus(), ==, NULL );
+    ok_ret( TRUE, GetGUIThreadInfo( ids[0], &info ) );
+    ok_ptr( info.hwndActive, ==, args[1].hwnd );
+    ok_ptr( info.hwndFocus, ==, args[1].hwnd );
+    ok_ret( TRUE, AttachThreadInput( ids[0], ids[1], FALSE ) );
+
+    /* A detached branch must not leave an edge pointing to an exited queue. */
+    ok_ret( TRUE, AttachThreadInput( ids[0], main_id, TRUE ) );
+    ok_ret( TRUE, AttachThreadInput( ids[0], ids[1], TRUE ) );
+    SetActiveWindow( args[1].hwnd );
+    SetFocus( args[1].hwnd );
+    ok_ret( TRUE, AttachThreadInput( ids[0], main_id, FALSE ) );
+    ok_ptr( GetActiveWindow(), ==, NULL );
+    ok_ptr( GetFocus(), ==, NULL );
+    ok_ret( TRUE, GetGUIThreadInfo( ids[0], &info ) );
+    ok_ptr( info.hwndActive, ==, args[1].hwnd );
+    ok_ptr( info.hwndFocus, ==, args[1].hwnd );
+
+    ok_ret( TRUE, PostMessageA( args[0].hwnd, WM_QUIT, 0, 0 ) );
+    ok_ret( WAIT_OBJECT_0, WaitForSingleObject( threads[0], 5000 ) );
+    ok_ret( TRUE, CloseHandle( threads[0] ) );
+    ok_ret( TRUE, AttachThreadInput( main_id, ids[2], TRUE ) );
+    ok_ptr( GetActiveWindow(), ==, NULL );
+    ok_ptr( GetFocus(), ==, NULL );
+    ok_ret( TRUE, GetGUIThreadInfo( ids[1], &info ) );
+    ok_ptr( info.hwndActive, ==, args[1].hwnd );
+    ok_ptr( info.hwndFocus, ==, args[1].hwnd );
+    ok_ret( TRUE, AttachThreadInput( main_id, ids[2], FALSE ) );
+
+    for (i = 1; i < ARRAY_SIZE(args); ++i)
+    {
+        ok_ret( TRUE, PostMessageA( args[i].hwnd, WM_QUIT, 0, 0 ) );
+        ok_ret( WAIT_OBJECT_0, WaitForSingleObject( threads[i], 5000 ) );
+        ok_ret( TRUE, CloseHandle( threads[i] ) );
+    }
+}
+
 static void test_AttachThreadInput(void)
 {
     HANDLE thread1, thread2, thread3;
@@ -5191,13 +5262,15 @@ static void test_AttachThreadInput(void)
     ok_ret( 0, WaitForSingleObject( thread1, 5000 ) );
     ok_ret( 1, CloseHandle( thread1 ) );
 
-    todo_wine ok_ptr( GetActiveWindow(), ==, NULL );
-    todo_wine ok_ptr( GetFocus(), ==, NULL );
+    ok_ptr( GetActiveWindow(), ==, NULL );
+    ok_ptr( GetFocus(), ==, NULL );
 
     ok_ret( 1, PostMessageA( args3.hwnd, WM_QUIT, 0, 0 ) );
     ok_ret( 0, WaitForSingleObject( thread3, 5000 ) );
     ok_ret( 1, CloseHandle( thread3 ) );
 
+
+    test_AttachThreadInput_graph();
 
     DestroyWindow( hwnd );
     DestroyWindow( hwnd2 );

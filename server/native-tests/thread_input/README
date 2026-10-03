@@ -1,0 +1,26 @@
+These focused native tests compile selected functions extracted from the current
+Wine server source. They use deterministic allocation, object, window-owner and
+shared-memory stubs. They complement, but do not replace, the actual wineserver
+and user32 integration tests.
+
+The runner needs Python 3, GCC with AddressSanitizer and UndefinedBehaviorSanitizer,
+and an i386 C development environment. From the Wine source root, build into a
+temporary directory without changing the source or installed Wine:
+
+    fixture_dir=$(mktemp -d)
+    python3 server/native-tests/thread_input/graph.py . --output "$fixture_dir/graph"
+    "$fixture_dir/graph-asan"
+    "$fixture_dir/graph-32"
+
+The graph fixture inserts the actual create_thread_input, assign_thread_input,
+mark_input_component, split_thread_input, repair_thread_input, remove_queue_input,
+attach_thread_input and detach_thread_input functions. It also extracts the
+cursor, keystate and input teardown sequence from msg_queue_destroy.
+
+Checks cover duplicate, reverse, cyclic and branching attachments, component
+membership, input and desktop references, active/focus ownership, cursor and
+keystate totals, every allocation failure in attachment and desktop-detachment
+operations, every allocation failure while splitting a destroyed queue's input,
+repeated deferred-repair failure, deferred repair before attachment, foreground
+component retention, and desktop migration with mixed-direction incident edges
+or an initially unattached queue.
