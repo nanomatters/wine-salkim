@@ -1649,7 +1649,9 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
             wayland_surface_calc_confine(surface, data, clip, &surface_clip);
             confine_rect = &surface_clip;
         }
-        covers_vscreen = wayland_win_data_is_fullscreen(data) &&
+        /* Virtual-desktop input uses the desktop's client geometry, not the
+         * host fullscreen classification used for presentation. */
+        covers_vscreen = (data->virtual_desktop || wayland_win_data_is_fullscreen(data)) &&
                           wayland_win_data_covers_virtual_screen(data);
         wayland_surface_coords_from_screen(surface, data, cursor_pos.x,
                                            cursor_pos.y, &warp_x, &warp_y);
