@@ -2875,6 +2875,7 @@ static void test_audio_clock_adjustment(void)
     HRESULT hr;
     IAudioClient *ac;
     IAudioClockAdjustment *aca;
+    REFERENCE_TIME initial_latency, latency;
     UINT bufsize, expected_bufsize;
     WAVEFORMATEX *pwfx;
     HANDLE event;
@@ -2910,8 +2911,16 @@ static void test_audio_clock_adjustment(void)
     hr = IAudioClient_SetEventHandle(ac, event);
     ok(hr == S_OK, "SetEventHandle failed: %08lx\n", hr);
 
+    hr = IAudioClient_GetStreamLatency(ac, &initial_latency);
+    ok(hr == S_OK, "GetStreamLatency failed: %08lx\n", hr);
+
     hr = IAudioClient_Start(ac);
     ok(hr == S_OK, "Start failed: %08lx\n", hr);
+
+    hr = IAudioClient_GetStreamLatency(ac, &latency);
+    ok(hr == S_OK, "GetStreamLatency failed: %08lx\n", hr);
+    ok(latency == initial_latency, "Latency changed after starting: %s, expected %s\n",
+       wine_dbgstr_longlong(latency), wine_dbgstr_longlong(initial_latency));
 
     hr = IAudioClockAdjustment_SetSampleRate(aca, 48000.00f);
     todo_wine_if(hr == E_NOTIMPL) ok(hr == S_OK, "SetSampleRate failed: %08lx\n", hr);
@@ -2922,6 +2931,11 @@ static void test_audio_clock_adjustment(void)
     hr = IAudioClient_GetBufferSize(ac, &bufsize);
     ok(bufsize == expected_bufsize, "unexpected bufsize %d expected %d\n", bufsize, expected_bufsize);
 
+    hr = IAudioClient_GetStreamLatency(ac, &latency);
+    ok(hr == S_OK, "GetStreamLatency failed: %08lx\n", hr);
+    ok(latency == initial_latency, "Latency changed after rate adjustment: %s, expected %s\n",
+       wine_dbgstr_longlong(latency), wine_dbgstr_longlong(initial_latency));
+
     hr = IAudioClockAdjustment_SetSampleRate(aca, 44100.00f);
     todo_wine_if(hr == E_NOTIMPL) ok(hr == S_OK, "SetSampleRate failed: %08lx\n", hr);
 
@@ -2931,6 +2945,31 @@ static void test_audio_clock_adjustment(void)
     hr = IAudioClient_GetBufferSize(ac, &bufsize);
     ok(bufsize == expected_bufsize, "unexpected bufsize %d expected %d\n", bufsize, expected_bufsize);
 
+    /* A non-integral number of frames per period exposes rounding changes. */
+    hr = IAudioClockAdjustment_SetSampleRate(aca, 44101.00f);
+    todo_wine_if(hr == E_NOTIMPL) ok(hr == S_OK, "SetSampleRate failed: %08lx\n", hr);
+
+    hr = IAudioClient_GetStreamLatency(ac, &latency);
+    ok(hr == S_OK, "GetStreamLatency failed: %08lx\n", hr);
+    ok(latency == initial_latency, "Latency changed after rate adjustment: %s, expected %s\n",
+       wine_dbgstr_longlong(latency), wine_dbgstr_longlong(initial_latency));
+
+    hr = IAudioClient_Stop(ac);
+    ok(hr == S_OK, "Stop failed: %08lx\n", hr);
+    hr = IAudioClient_GetStreamLatency(ac, &latency);
+    ok(hr == S_OK, "GetStreamLatency failed: %08lx\n", hr);
+    ok(latency == initial_latency, "Latency changed after stopping: %s, expected %s\n",
+       wine_dbgstr_longlong(latency), wine_dbgstr_longlong(initial_latency));
+
+    hr = IAudioClient_Reset(ac);
+    ok(hr == S_OK, "Reset failed: %08lx\n", hr);
+    hr = IAudioClient_GetStreamLatency(ac, &latency);
+    ok(hr == S_OK, "GetStreamLatency failed: %08lx\n", hr);
+    ok(latency == initial_latency, "Latency changed after resetting: %s, expected %s\n",
+       wine_dbgstr_longlong(latency), wine_dbgstr_longlong(initial_latency));
+
+    CloseHandle(event);
+    CoTaskMemFree(pwfx);
     IAudioClockAdjustment_Release(aca);
     IAudioClient_Release(ac);
 }

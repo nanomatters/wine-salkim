@@ -123,6 +123,7 @@ struct pipewire_stream
 
     REFERENCE_TIME def_period;
     REFERENCE_TIME duration;
+    REFERENCE_TIME latency; /* Fixed at initialization, including frame rounding. */
 
     INT64 locked; /* Render bytes (negative for wrapping) or capture frames. */
     BOOL started;
@@ -2582,6 +2583,8 @@ static NTSTATUS pipewire_create_stream(void *args)
         goto exit;
 
     stream->rate_connected = stream->info.rate;
+    stream->latency = (REFERENCE_TIME)(stream->period_bytes / stream->frame_size)
+                     * 10000000 / stream->info.rate + stream->def_period;
 
     list_init(&stream->packet_free_head);
     list_init(&stream->packet_filled_head);
@@ -3414,7 +3417,6 @@ static NTSTATUS pipewire_get_latency(void *args)
 {
     struct get_latency_params *params = args;
     struct pipewire_stream *stream = handle_get_stream(params->stream);
-    REFERENCE_TIME lat;
 
     if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
     pw_thread_loop_lock(pw_loop_global);
@@ -3424,8 +3426,7 @@ static NTSTATUS pipewire_get_latency(void *args)
         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
         return STATUS_SUCCESS;
     }
-    lat = stream->period_bytes / stream->frame_size;
-    *params->latency = (lat * 10000000) / stream->info.rate + stream->def_period;
+    *params->latency = stream->latency;
     TRACE("stream %p latency %u ms.\n", stream, (unsigned)(*params->latency / 10000));
     pw_thread_loop_unlock(pw_loop_global);
     params->result = S_OK;
