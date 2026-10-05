@@ -1736,7 +1736,7 @@ static void fixup_steaminput_vidpid( struct device_desc *desc )
 static void udev_add_device(struct udev_device *dev, int fd)
 {
     struct device_desc desc = { .interface = -1, .bus_id = -1 };
-    const char *subsystem, *devnode;
+    const char *subsystem, *devnode, *tmp;
     int bus = 0;
 
     if (!(devnode = udev_device_get_devnode(dev)))
@@ -1755,6 +1755,7 @@ static void udev_add_device(struct udev_device *dev, int fd)
 
     if (!(subsystem = udev_device_get_subsystem(dev))) goto failed;
     ntdll_umbstowcs(subsystem, strlen(subsystem) + 1, desc.parent, ARRAY_SIZE(desc.parent));
+    if ((tmp = udev_device_get_sysnum(dev))) sscanf(tmp, "%u", &desc.index);
 
     get_device_subsystem_info(dev, "hid", &desc, &bus);
     get_device_subsystem_info(dev, "input", &desc, &bus);
