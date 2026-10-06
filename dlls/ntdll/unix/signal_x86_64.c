@@ -960,7 +960,8 @@ static inline struct thread_data *init_handler( void *sigcontext )
     struct amd64_thread_data *amd64_data;
 
     clear_alignment_flag();
-    if (!(amd64_data = amd64_thread_data( data ))) return data;
+    /* Unix system threads never switch to PE TLS or enable syscall dispatch. */
+    if (data->system_thread || !(amd64_data = amd64_thread_data( data ))) return data;
 
 #ifdef __linux__
     amd64_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
@@ -988,7 +989,7 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
 {
     struct amd64_thread_data *amd64_data = amd64_thread_data( data );
 
-    if (!amd64_data) return;
+    if (data->system_thread || !amd64_data) return;
 #ifdef __linux__
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext) ))

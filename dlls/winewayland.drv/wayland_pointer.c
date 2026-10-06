@@ -175,11 +175,8 @@ static void wayland_pointer_update_window_zorder(HWND hwnd, POINT point)
     SERVER_END_REQ;
 
     if (!changed) return;
-    NtUserNotifyWinEvent(EVENT_OBJECT_REORDER, NtUserGetDesktopWindow(), OBJID_CLIENT, 0);
-    /* Keyboard focus may have arrived before the pointer enter. Refresh the
-     * foreground notification only after observers can see the corrected order. */
-    if (hwnd == NtUserGetForegroundWindow())
-        NtUserNotifyWinEvent(EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0);
+    /* In-context hooks require a PE callback stack, unlike event dispatch. */
+    NtUserPostMessage(hwnd, WM_WAYLAND_NOTIFY_REORDER, 0, 0);
 }
 
 static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)

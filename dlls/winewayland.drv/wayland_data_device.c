@@ -59,6 +59,23 @@ struct wayland_data_offer
 };
 
 static HWND clipboard_hwnd;
+static HANDLE clipboard_thread;
+static DWORD clipboard_thread_id;
+static pthread_mutex_t clipboard_mutex = PTHREAD_MUTEX_INITIALIZER;
+static ULONG_PTR clipboard_event_id;
+static struct clipboard_event
+{
+    struct clipboard_event *next;
+    ULONG_PTR id;
+    UINT message;
+    struct wayland_data_offer *offer;
+    struct data_device_format *format;
+    int fd;
+} *clipboard_events;
+
+static void wayland_data_offer_destroy(struct wayland_data_offer *data_offer);
+static void apply_selection(struct wayland_data_device *data_device,
+                            struct wayland_data_offer *data_offer);
 static const WCHAR rich_text_formatW[] = {'R','i','c','h',' ','T','e','x','t',' ','F','o','r','m','a','t',0};
 static const WCHAR pngW[] = {'P','N','G',0};
 static const WCHAR jfifW[] = {'J','F','I','F',0};
@@ -313,6 +330,123 @@ static void wayland_data_source_export(struct data_device_format *format, int fd
     free(params.data);
 }
 
+static void discard_clipboard_events(struct clipboard_event *event)
+{
+    struct clipboard_event *next;
+
+    while (event)
+    {
+        next = event->next;
+        if (event->offer) wayland_data_offer_destroy(event->offer);
+        if (event->fd >= 0) close(event->fd);
+        free(event);
+        event = next;
+    }
+}
+
+static struct clipboard_event *clear_clipboard_owner(void)
+{
+    struct clipboard_event *events = clipboard_events;
+
+    clipboard_events = NULL;
+    clipboard_hwnd = NULL;
+    clipboard_thread_id = 0;
+    if (clipboard_thread) NtClose(clipboard_thread);
+    clipboard_thread = NULL;
+    return events;
+}
+
+void wayland_clipboard_destroy_window(HWND hwnd)
+{
+    struct clipboard_event *events = NULL;
+
+    pthread_mutex_lock(&clipboard_mutex);
+    if (hwnd == clipboard_hwnd) events = clear_clipboard_owner();
+    pthread_mutex_unlock(&clipboard_mutex);
+    discard_clipboard_events(events);
+}
+
+int wayland_clipboard_dispatch_timeout(void)
+{
+    int timeout;
+
+    pthread_mutex_lock(&clipboard_mutex);
+    timeout = clipboard_events ? 1000 : -1;
+    pthread_mutex_unlock(&clipboard_mutex);
+    return timeout;
+}
+
+void wayland_clipboard_cleanup_thread(void)
+{
+    static const LARGE_INTEGER timeout;
+    struct clipboard_event *events = NULL;
+
+    /* TerminateThread skips driver teardown. A successful post can then be
+     * discarded by the server, leaving its pipe open in this process. */
+    pthread_mutex_lock(&clipboard_mutex);
+    if (clipboard_events && !NtWaitForSingleObject(clipboard_thread, FALSE, &timeout))
+        events = clear_clipboard_owner();
+    pthread_mutex_unlock(&clipboard_mutex);
+    discard_clipboard_events(events);
+}
+
+static void queue_clipboard_event(UINT message, struct wayland_data_offer *offer,
+                                  struct data_device_format *format, int fd)
+{
+    struct clipboard_event *event, **tail;
+
+    if (!(event = calloc(1, sizeof(*event))))
+    {
+        if (offer) wayland_data_offer_destroy(offer);
+        if (fd >= 0) close(fd);
+        return;
+    }
+    event->message = message;
+    event->offer = offer;
+    event->format = format;
+    event->fd = fd;
+
+    pthread_mutex_lock(&clipboard_mutex);
+    if (!++clipboard_event_id) ++clipboard_event_id;
+    event->id = clipboard_event_id;
+    if (clipboard_hwnd && NtUserPostMessage(clipboard_hwnd, message, event->id, 0))
+    {
+        for (tail = &clipboard_events; *tail; tail = &(*tail)->next) continue;
+        *tail = event;
+        event = NULL;
+    }
+    pthread_mutex_unlock(&clipboard_mutex);
+    discard_clipboard_events(event);
+}
+
+static void process_clipboard_event(HWND hwnd, UINT message, WPARAM id, LPARAM reserved)
+{
+    struct clipboard_event *event = NULL;
+
+    /* Driver messages are not private. Only consume resources actually queued
+     * by this driver, once, and on the clipboard window's thread. */
+    pthread_mutex_lock(&clipboard_mutex);
+    if (hwnd == clipboard_hwnd && clipboard_thread_id == GetCurrentThreadId() &&
+        !reserved && clipboard_events &&
+        clipboard_events->id == id && clipboard_events->message == message)
+    {
+        event = clipboard_events;
+        clipboard_events = event->next;
+        event->next = NULL;
+    }
+    pthread_mutex_unlock(&clipboard_mutex);
+    if (!event) return;
+
+    if (message == WM_WAYLAND_CLIPBOARD_SELECTION)
+    {
+        apply_selection(&process_wayland.data_device, event->offer);
+        event->offer = NULL;
+    }
+    else
+        wayland_data_source_export(event->format, event->fd);
+    discard_clipboard_events(event);
+}
+
 static void data_control_source_send(void *data,
                                      struct zwlr_data_control_source_v1 *source,
                                      const char *mime_type, int32_t fd)
@@ -323,9 +457,11 @@ static void data_control_source_send(void *data,
     if ((normalized = normalize_mime_type(mime_type)) &&
         (format = data_device_format_for_mime_type(normalized)))
     {
-        wayland_data_source_export(format, fd);
+        /* Clipboard rendering can call back into PE code. */
+        queue_clipboard_event(WM_WAYLAND_CLIPBOARD_EXPORT, NULL, format, fd);
     }
-    close(fd);
+    else close(fd);
+    free((char *)normalized);
 }
 
 static void data_control_source_cancelled(void *data,
@@ -389,6 +525,7 @@ static void data_control_offer_offer(void *data,
     {
         *p = normalized;
     }
+    else free((char *)normalized);
 }
 
 static const struct zwlr_data_control_offer_v1_listener data_control_offer_listener =
@@ -562,8 +699,8 @@ static void data_control_device_data_offer(
     wayland_data_offer_create(zwlr_data_control_offer_v1);
 }
 
-static void handle_selection(struct wayland_data_device *data_device,
-                             struct wayland_data_offer *data_offer)
+static void apply_selection(struct wayland_data_device *data_device,
+                            struct wayland_data_offer *data_offer)
 {
     char **p;
 
@@ -633,6 +770,14 @@ done:
     }
     pthread_mutex_unlock(&data_device->mutex);
 
+}
+
+static void handle_selection(struct wayland_data_device *data_device,
+                             struct wayland_data_offer *data_offer)
+{
+    /* Emptying the clipboard can free PE-owned handles through user callbacks.
+     * Keep the offer alive until the clipboard window applies the selection. */
+    queue_clipboard_event(WM_WAYLAND_CLIPBOARD_SELECTION, data_offer, NULL, -1);
 }
 
 static void data_control_device_selection(
@@ -711,15 +856,7 @@ static void data_source_target(void *data, struct wl_data_source *source,
 static void data_source_send(void *data, struct wl_data_source *source,
                              const char *mime_type, int32_t fd)
 {
-    struct data_device_format *format;
-    const char *normalized;
-
-    if ((normalized = normalize_mime_type(mime_type)) &&
-        (format = data_device_format_for_mime_type(normalized)))
-    {
-        wayland_data_source_export(format, fd);
-    }
-    close(fd);
+    data_control_source_send(data, NULL, mime_type, fd);
 }
 
 static void data_source_cancelled(void *data, struct wl_data_source *source)
@@ -1060,6 +1197,9 @@ static BOOL is_winewayland_clipboard_hwnd(HWND hwnd)
 
 LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
+    struct clipboard_event *events;
+    HANDLE thread;
+
     switch (msg)
     {
     case WM_NCCREATE:
@@ -1072,7 +1212,15 @@ LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         {
             return FALSE;
         }
+        if (NtDuplicateObject(NtCurrentProcess(), NtCurrentThread(), NtCurrentProcess(),
+                              &thread, SYNCHRONIZE, 0, 0)) return FALSE;
+        pthread_mutex_lock(&clipboard_mutex);
+        events = clear_clipboard_owner();
         clipboard_hwnd = hwnd;
+        clipboard_thread = thread;
+        clipboard_thread_id = GetCurrentThreadId();
+        pthread_mutex_unlock(&clipboard_mutex);
+        discard_clipboard_events(events);
         NtUserAddClipboardFormatListener(hwnd);
         pthread_mutex_lock(&process_wayland.seat.mutex);
         if (process_wayland.seat.wl_seat) wayland_data_device_init();
@@ -1088,6 +1236,10 @@ LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_DESTROYCLIPBOARD:
         destroy_clipboard();
         break;
+    case WM_WAYLAND_CLIPBOARD_SELECTION:
+    case WM_WAYLAND_CLIPBOARD_EXPORT:
+        process_clipboard_event(hwnd, msg, wparam, lparam);
+        return 0;
     }
 
     return NtUserMessageCall(hwnd, msg, wparam, lparam, NULL, NtUserDefWindowProc, FALSE);

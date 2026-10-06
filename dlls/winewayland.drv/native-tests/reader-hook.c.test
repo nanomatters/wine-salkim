@@ -1,0 +1,35 @@
+/* In-context WinEvent hook for the standalone reader-callbacks probe. */
+#include <windows.h>
+
+static LONG count;
+static DWORD thread_id;
+
+__declspec(dllexport) void CALLBACK reader_event(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                                LONG object, LONG child, DWORD thread, DWORD time)
+{
+    (void)hook;
+    (void)event;
+    (void)hwnd;
+    (void)object;
+    (void)child;
+    (void)thread;
+    (void)time;
+    thread_id = GetCurrentThreadId();
+    InterlockedIncrement(&count);
+}
+
+__declspec(dllexport) LONG WINAPI reader_count(void)
+{
+    return count;
+}
+
+__declspec(dllexport) DWORD WINAPI reader_thread(void)
+{
+    return thread_id;
+}
+
+__declspec(dllexport) void WINAPI reader_reset(void)
+{
+    count = 0;
+    thread_id = 0;
+}

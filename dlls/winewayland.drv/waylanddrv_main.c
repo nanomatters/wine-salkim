@@ -41,6 +41,20 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 char *process_name = NULL;
 static char *process_activate_token;
 static int dmabuf_epoll_fd = -1;
+static pthread_mutex_t reader_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reader_cond = PTHREAD_COND_INITIALIZER;
+static HWND reader_desktop;
+static BOOL reader_ready;
+
+static void wayland_read_events_thread(void *arg);
+
+static void WAYLAND_SetDesktopWindow(HWND hwnd)
+{
+    pthread_mutex_lock(&reader_mutex);
+    if (!reader_desktop) reader_desktop = hwnd;
+    pthread_cond_signal(&reader_cond);
+    pthread_mutex_unlock(&reader_mutex);
+}
 
 /* The event contains an identity, not a surface pointer: it may outlive both
  * the registration and the HWND. Callers serialize changes with win_data_mutex. */
@@ -79,6 +93,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
     .pSetCursor = WAYLAND_SetCursor,
     .pSetCursorPos = WAYLAND_SetCursorPos,
+    .pSetDesktopWindow = WAYLAND_SetDesktopWindow,
     .pSetLayeredWindowAttributes = WAYLAND_SetLayeredWindowAttributes,
     .pSetWindowIcons = WAYLAND_SetWindowIcons,
     .pSetWindowStyle = WAYLAND_SetWindowStyle,
@@ -163,15 +178,37 @@ BOOL wayland_process_activation_token_pending(void)
 
 static NTSTATUS waylanddrv_unix_init(void *arg)
 {
+    HANDLE thread;
+    NTSTATUS status;
+
     wayland_init_process_name();
     wayland_init_activation_token();
 
     if ((dmabuf_epoll_fd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto err;
     if (!wayland_process_init()) goto err;
 
+    /* Normally the thread loading the driver already knows its desktop. The
+     * desktop process itself can load us earlier, before creating that window. */
+    WAYLAND_SetDesktopWindow(ULongToHandle(NtUserGetThreadInfo()->top_window));
+
+    /* Event dispatch is driver-internal work, not an application thread.
+     * A system thread has its own TEB without running PE loader callbacks. */
+    if ((status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                      wayland_read_events_thread, NULL)))
+    {
+        ERR("Failed to create event thread, status %#x\n", (unsigned int)status);
+        goto err;
+    }
+    NtClose(thread);
+
     /* Other threads can call the driver as soon as it is published. Finish
      * initializing the window mutex and Wayland objects before exposing it. */
     __wine_set_user_driver(&waylanddrv_funcs, WINE_GDI_DRIVER_VERSION);
+
+    pthread_mutex_lock(&reader_mutex);
+    reader_ready = TRUE;
+    pthread_cond_signal(&reader_cond);
+    pthread_mutex_unlock(&reader_mutex);
 
     return 0;
 
@@ -202,7 +239,7 @@ static int dispatch_events(void)
         fds[0].events |= POLLOUT;
     }
 
-    ret = poll(fds, ARRAY_SIZE(fds), -1);
+    ret = poll(fds, ARRAY_SIZE(fds), wayland_clipboard_dispatch_timeout());
     if (ret < 0 || !(fds[0].revents & (POLLIN | POLLERR | POLLHUP)))
         wl_display_cancel_read(display);
     else if (wl_display_read_events(display) < 0)
@@ -211,6 +248,7 @@ static int dispatch_events(void)
 
     /* Release the prepared read before dispatching anything that can take
      * driver locks or issue Wayland requests, including frame imports. */
+    wayland_clipboard_cleanup_thread();
     if (wl_display_dispatch_queue_pending(display, queue) < 0) return -1;
     if (!(fds[1].revents & POLLIN)) return 0;
 
@@ -223,11 +261,21 @@ static int dispatch_events(void)
     return 0;
 }
 
-static NTSTATUS waylanddrv_unix_read_events(void *arg)
+static void wayland_read_events_thread(void *arg)
 {
     int error;
     uint32_t id, proto_err;
     const struct wl_interface *interface;
+
+    /* A Unix reader must not initialize the desktop or builtin classes through
+     * PE callbacks. Wait for win32u to supply an existing desktop, then seed the
+     * reader's own desktop cache before any handler can call back into win32u.
+     * This also keeps event dispatch behind driver publication. */
+    pthread_mutex_lock(&reader_mutex);
+    while (!reader_ready || !reader_desktop)
+        pthread_cond_wait(&reader_cond, &reader_mutex);
+    NtUserGetThreadInfo()->top_window = HandleToULong(reader_desktop);
+    pthread_mutex_unlock(&reader_mutex);
 
     while (dispatch_events() != -1) continue;
     /* This function only returns on a fatal error, e.g., if our connection
@@ -245,7 +293,8 @@ static NTSTATUS waylanddrv_unix_read_events(void *arg)
     }
     else ERR("%s when dispatching event queue\n", strerror(error));
 
-    return STATUS_UNSUCCESSFUL;
+    /* Losing the display connection is fatal, just as for the PE reader. */
+    NtTerminateProcess(NtCurrentProcess(), 1);
 }
 
 static NTSTATUS waylanddrv_unix_init_clipboard(void *arg)
@@ -261,7 +310,6 @@ static NTSTATUS waylanddrv_unix_init_clipboard(void *arg)
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     waylanddrv_unix_init,
-    waylanddrv_unix_read_events,
     waylanddrv_unix_init_clipboard,
 };
 
@@ -272,7 +320,6 @@ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     waylanddrv_unix_init,
-    waylanddrv_unix_read_events,
     waylanddrv_unix_init_clipboard,
 };
 

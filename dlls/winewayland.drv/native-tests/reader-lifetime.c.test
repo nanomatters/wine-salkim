@@ -1,0 +1,135 @@
+/* Standalone PE regression probe. Run only in a disposable Wine prefix. */
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
+
+typedef LONG (WINAPI *query_thread_fn)(HANDLE, ULONG, void *, ULONG, ULONG *);
+static unsigned int readers_killed, paints, sizes;
+static DWORD reader_scan_error;
+
+static void WINAPI startup(PVOID module, DWORD reason, PVOID reserved)
+{
+    query_thread_fn query;
+    MODULEENTRY32W mod = {sizeof(mod)};
+    THREADENTRY32 thread = {sizeof(thread)};
+    HANDLE modules, threads, handle;
+    HDC dc;
+    BYTE *base = NULL;
+    DWORD size = 0, pid = GetCurrentProcessId();
+    void *entry;
+
+    (void)module;
+    (void)reserved;
+    if (reason != DLL_PROCESS_ATTACH) return;
+
+    /* Like the reported game, lazily load the driver under the loader lock. */
+    dc = GetDC(NULL);
+    if (!dc) { reader_scan_error = 1; return; }
+    ReleaseDC(NULL, dc);
+    query = (query_thread_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+    if (!query) { reader_scan_error = 2; return; }
+    modules = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (modules == INVALID_HANDLE_VALUE) { reader_scan_error = 3; return; }
+    if (Module32FirstW(modules, &mod)) do
+    {
+        if (lstrcmpiW(mod.szModule, L"winewayland.drv")) continue;
+        base = mod.modBaseAddr;
+        size = mod.modBaseSize;
+        break;
+    } while (Module32NextW(modules, &mod));
+    CloseHandle(modules);
+    if (!base) { reader_scan_error = 4; return; }
+
+    threads = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (threads == INVALID_HANDLE_VALUE) { reader_scan_error = 5; return; }
+    if (Thread32First(threads, &thread)) do
+    {
+        if (thread.th32OwnerProcessID != pid || thread.th32ThreadID == GetCurrentThreadId()) continue;
+        handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_TERMINATE,
+                            FALSE, thread.th32ThreadID);
+        if (!handle) continue;
+        entry = NULL;
+        if (!query(handle, 9 /* ThreadQuerySetWin32StartAddress */, &entry, sizeof(entry), NULL) &&
+            (ULONG_PTR)entry >= (ULONG_PTR)base && (ULONG_PTR)entry < (ULONG_PTR)base + size)
+        {
+            if (SuspendThread(handle) == (DWORD)-1 || !TerminateThread(handle, 0))
+                reader_scan_error = 6;
+            else readers_killed++;
+        }
+        CloseHandle(handle);
+    } while (Thread32Next(threads, &thread));
+    CloseHandle(threads);
+}
+
+/* MinGW's startup invokes this while holding the PE loader lock. */
+PIMAGE_TLS_CALLBACK reader_callback __attribute__((section(".CRT$XLB"), used)) = startup;
+
+static DWORD WINAPI app_thread(void *arg)
+{
+    SetEvent((HANDLE)arg);
+    Sleep(INFINITE);
+    return 0;
+}
+
+static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_PAINT)
+    {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        FillRect(dc, &ps.rcPaint, (HBRUSH)(COLOR_WINDOW + 1));
+        EndPaint(hwnd, &ps);
+        paints++;
+        return 0;
+    }
+    if (msg == WM_SIZE) sizes++;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int main(void)
+{
+    WNDCLASSW cls = {0};
+    HANDLE event, thread;
+    DWORD exit_code;
+    HWND hwnd;
+    MSG msg;
+    ULONGLONG end;
+    unsigned int step = 0;
+
+    printf("startup scan: pid=%04lx, error=%lu, PE readers terminated=%u\n",
+           GetCurrentProcessId(), reader_scan_error, readers_killed);
+    if (reader_scan_error) return 1;
+
+    /* Application threads must remain enumerable and normally terminable. */
+    event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    thread = CreateThread(NULL, 0, app_thread, event, 0, NULL);
+    if (!event || !thread || WaitForSingleObject(event, 5000) != WAIT_OBJECT_0 ||
+        !TerminateThread(thread, 123) || WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        !GetExitCodeThread(thread, &exit_code) || exit_code != 123) return 2;
+    CloseHandle(thread);
+    CloseHandle(event);
+
+    cls.lpfnWndProc = wndproc;
+    cls.hInstance = GetModuleHandleW(NULL);
+    cls.lpszClassName = L"WaylandReaderLifetime";
+    if (!RegisterClassW(&cls)) return 3;
+    hwnd = CreateWindowW(cls.lpszClassName, L"Wayland reader regression", WS_OVERLAPPEDWINDOW,
+                         40, 40, 400, 250, NULL, NULL, cls.hInstance, NULL);
+    if (!hwnd) return 4;
+    ShowWindow(hwnd, SW_SHOW);
+    end = GetTickCount64() + 2500;
+    while (GetTickCount64() < end)
+    {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (++step % 20 == 0)
+            ShowWindow(hwnd, step % 40 ? SW_MAXIMIZE : SW_RESTORE);
+        Sleep(10);
+    }
+    DestroyWindow(hwnd);
+    printf("application thread termination: passed. paint=%u size=%u\n", paints, sizes);
+    return paints && sizes ? 0 : 5;
+}

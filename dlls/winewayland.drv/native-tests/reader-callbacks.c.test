@@ -1,0 +1,90 @@
+/* Standalone PE probe. Use a disposable prefix and private Wayland compositor. */
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef LONG (WINAPI *count_fn)(void);
+typedef DWORD (WINAPI *thread_fn)(void);
+typedef void (WINAPI *reset_fn)(void);
+
+static void pump(void)
+{
+    MSG msg;
+
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    Sleep(10);
+}
+
+int main(int argc, char **argv)
+{
+    static const char source[] = "reader-clipboard-source";
+    static const WCHAR replacement[] = L"reader-clipboard-replacement";
+    HMODULE hook_dll;
+    WINEVENTPROC callback;
+    HWINEVENTHOOK hook;
+    count_fn count;
+    thread_fn thread;
+    reset_fn reset;
+    HWND hwnd;
+    HGLOBAL data;
+    ULONGLONG deadline;
+    BOOL imported = FALSE;
+
+    if (argc != 3) return 1;
+    if (!(hook_dll = LoadLibraryA(argv[1]))) return 2;
+    callback = (WINEVENTPROC)GetProcAddress(hook_dll, "reader_event");
+    count = (count_fn)GetProcAddress(hook_dll, "reader_count");
+    thread = (thread_fn)GetProcAddress(hook_dll, "reader_thread");
+    reset = (reset_fn)GetProcAddress(hook_dll, "reader_reset");
+    if (!callback || !count || !thread || !reset) return 3;
+    hook = SetWinEventHook(EVENT_OBJECT_REORDER, EVENT_OBJECT_REORDER, hook_dll, callback,
+                           GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
+    if (!hook) return 4;
+    hwnd = CreateWindowW(L"STATIC", L"Reader callback regression", WS_OVERLAPPEDWINDOW,
+                         40, 40, 400, 250, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (!hwnd) return 5;
+    ShowWindow(hwnd, SW_SHOW);
+    reset();
+    /* Exercise the driver's handoff on the owning PE thread. This is not an
+     * injection of a real pointer event or a compositor stacking test. */
+    if (!PostMessageW(hwnd, strtoul(argv[2], NULL, 0), 0, 0)) return 6;
+    deadline = GetTickCount64() + 5000;
+    while (!count() && GetTickCount64() < deadline) pump();
+    if (!count() || thread() != GetCurrentThreadId()) return 7;
+    UnhookWinEvent(hook);
+    printf("in-context WinEvent: passed on UI thread\n");
+
+    if (!(data = GlobalAlloc(GMEM_MOVEABLE, sizeof(source)))) return 8;
+    memcpy(GlobalLock(data), source, sizeof(source));
+    GlobalUnlock(data);
+    if (!OpenClipboard(hwnd)) return 9;
+    if (!EmptyClipboard() || !SetClipboardData(CF_TEXT, data)) return 10;
+    CloseClipboard();
+    /* Requesting UTF-8 from the Wayland side requires Unicode synthesis from
+     * CF_TEXT. This can call back into user32 from the driver export handler. */
+    printf("clipboard source ready\n");
+    fflush(stdout);
+    deadline = GetTickCount64() + 15000;
+    while (GetTickCount64() < deadline)
+    {
+        pump();
+        if (GetClipboardOwner() == hwnd || !OpenClipboard(hwnd)) continue;
+        if ((data = GetClipboardData(CF_UNICODETEXT)))
+        {
+            const WCHAR *text = GlobalLock(data);
+            imported = text && !lstrcmpW(text, replacement);
+            if (text) GlobalUnlock(data);
+        }
+        CloseClipboard();
+        if (imported) break;
+    }
+    DestroyWindow(hwnd);
+    FreeLibrary(hook_dll);
+    printf("clipboard import: %s\n", imported ? "passed" : "failed");
+    return imported ? 0 : 11;
+}

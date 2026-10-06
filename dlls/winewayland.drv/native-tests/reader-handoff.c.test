@@ -1,0 +1,272 @@
+/* Test callback delivery and lifetime using the production queue functions. */
+#include <assert.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef void *HWND, *HANDLE;
+typedef uintptr_t WPARAM, ULONG_PTR;
+typedef intptr_t LPARAM;
+typedef unsigned int UINT, DWORD;
+typedef union { int64_t QuadPart; } LARGE_INTEGER;
+#define FALSE 0
+struct wl_data_source;
+struct zwlr_data_control_source_v1;
+struct ext_data_control_source_v1;
+struct wayland_data_device { int unused; };
+struct wayland_data_offer { int unused; };
+struct data_device_format { const char *mime_type; };
+static struct data_device_format supported_formats[] = {{"text/plain;charset=utf-8"}, {NULL}};
+enum { WM_WAYLAND_CLIPBOARD_EXPORT = 1, WM_WAYLAND_CLIPBOARD_SELECTION };
+static struct { struct wayland_data_device data_device; } process_wayland;
+static HWND clipboard_hwnd;
+static HANDLE clipboard_thread;
+static DWORD clipboard_thread_id, current_thread_id;
+static pthread_mutex_t clipboard_mutex = PTHREAD_MUTEX_INITIALIZER;
+static ULONG_PTR clipboard_event_id;
+static struct clipboard_event
+{
+    struct clipboard_event *next;
+    ULONG_PTR id;
+    UINT message;
+    struct wayland_data_offer *offer;
+    struct data_device_format *format;
+    int fd;
+} *clipboard_events;
+static int post_fails, posts, closed, destroyed, applied, exported, owner_dead, waits, handle_closed;
+static int allocation_fails;
+static unsigned int last_message;
+static WPARAM last_wp;
+static LPARAM last_lp;
+static struct wayland_data_offer *last_offer;
+
+static DWORD GetCurrentThreadId(void)
+{
+    return current_thread_id;
+}
+
+static void *test_calloc(size_t count, size_t size)
+{
+    return allocation_fails ? NULL : calloc(count, size);
+}
+#define calloc test_calloc
+
+static const char *normalize_mime_type(const char *mime)
+{
+    return strdup(!strcmp(mime, "text/plain") ? "text/plain;charset=utf-8" : mime);
+}
+static struct data_device_format *data_device_format_for_mime_type(const char *mime)
+{
+    return !strcmp(mime, supported_formats[0].mime_type) ? &supported_formats[0] : NULL;
+}
+static int NtUserPostMessage(HWND hwnd, unsigned int msg, WPARAM wp, LPARAM lp)
+{
+    assert(hwnd == (HWND)0x1234 || hwnd == (HWND)0x5678);
+    posts++;
+    last_message = msg;
+    last_wp = wp;
+    last_lp = lp;
+    return !post_fails;
+}
+static int NtWaitForSingleObject(HANDLE handle, int alertable, const LARGE_INTEGER *timeout)
+{
+    assert(handle == (HANDLE)0x9876 && !alertable && !timeout->QuadPart);
+    waits++;
+    return owner_dead ? 0 : 0x102;
+}
+static int NtClose(HANDLE handle)
+{
+    assert(handle == (HANDLE)0x9876);
+    handle_closed++;
+    return 0;
+}
+static int test_close(int fd)
+{
+    assert(fd == 37);
+    closed++;
+    return 0;
+}
+#define close test_close
+static void wayland_data_offer_destroy(struct wayland_data_offer *offer)
+{
+    assert(offer);
+    destroyed++;
+}
+static void apply_selection(struct wayland_data_device *device, struct wayland_data_offer *offer)
+{
+    assert(device == &process_wayland.data_device);
+    assert(!pthread_mutex_trylock(&clipboard_mutex));
+    pthread_mutex_unlock(&clipboard_mutex);
+    applied++;
+    last_offer = offer;
+}
+static void wayland_data_source_export(struct data_device_format *format, int fd)
+{
+    assert(format == &supported_formats[0] && fd == 37);
+    assert(!pthread_mutex_trylock(&clipboard_mutex));
+    pthread_mutex_unlock(&clipboard_mutex);
+    exported++;
+}
+
+/* HANDOFF_FUNCTIONS */
+
+static void reset(void)
+{
+    assert(!clipboard_events);
+    clipboard_hwnd = (HWND)0x1234;
+    clipboard_thread = (HANDLE)0x9876;
+    clipboard_thread_id = current_thread_id = 42;
+    posts = closed = destroyed = applied = exported = post_fails = 0;
+    owner_dead = waits = handle_closed = 0;
+    allocation_fails = 0;
+    last_message = 0;
+    last_wp = last_lp = 0;
+    last_offer = NULL;
+}
+
+static void deliver(void)
+{
+    process_clipboard_event(clipboard_hwnd, last_message, last_wp, last_lp);
+}
+
+int main(void)
+{
+    struct wayland_data_offer offer;
+    WPARAM stale, first;
+
+    reset();
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    assert(posts == 1 && !closed && last_message == WM_WAYLAND_CLIPBOARD_EXPORT);
+    assert(last_wp && !last_lp && !exported);
+    assert(wayland_clipboard_dispatch_timeout() == 1000);
+    deliver();
+    assert(exported == 1 && closed == 1);
+    assert(wayland_clipboard_dispatch_timeout() == -1);
+    deliver();
+    assert(exported == 1 && closed == 1); /* Replayed token. */
+
+    reset();
+    post_fails = 1;
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    assert(posts == 1 && closed == 1 && !clipboard_events);
+
+    reset();
+    clipboard_hwnd = NULL;
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    assert(!posts && closed == 1 && !clipboard_events);
+
+    reset();
+    data_control_source_send(NULL, NULL, "not-a-supported-format", 37);
+    assert(!posts && closed == 1 && !clipboard_events);
+
+    reset();
+    data_source_send(NULL, NULL, "text/plain", 37);
+    deliver();
+    assert(posts == 1 && exported == 1 && closed == 1);
+
+    reset();
+    ext_data_control_source_send(NULL, NULL, "text/plain", 37);
+    deliver();
+    assert(posts == 1 && exported == 1 && closed == 1);
+
+    reset();
+    handle_selection(&process_wayland.data_device, &offer);
+    assert(posts == 1 && !destroyed && last_message == WM_WAYLAND_CLIPBOARD_SELECTION);
+    assert(last_wp && !last_lp);
+    deliver();
+    assert(applied == 1 && last_offer == &offer && !destroyed);
+    deliver();
+    assert(applied == 1 && !destroyed);
+
+    reset();
+    handle_selection(&process_wayland.data_device, NULL);
+    deliver();
+    assert(applied == 1 && !last_offer && !destroyed);
+
+    reset();
+    post_fails = 1;
+    handle_selection(&process_wayland.data_device, &offer);
+    assert(posts == 1 && destroyed == 1 && !clipboard_events);
+
+    reset();
+    clipboard_hwnd = NULL;
+    handle_selection(&process_wayland.data_device, &offer);
+    assert(!posts && destroyed == 1 && !clipboard_events);
+
+    reset();
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    process_clipboard_event((HWND)0x5678, last_message, last_wp, 0);
+    process_clipboard_event(clipboard_hwnd, last_message, last_wp, 37);
+    process_clipboard_event(clipboard_hwnd, last_message, last_wp + 1, 0);
+    process_clipboard_event(clipboard_hwnd, WM_WAYLAND_CLIPBOARD_SELECTION, last_wp, 0);
+    current_thread_id = 43;
+    deliver();
+    current_thread_id = 42;
+    assert(!closed && !exported && !applied && clipboard_events);
+    deliver();
+    assert(exported == 1 && closed == 1);
+
+    reset();
+    process_clipboard_event(clipboard_hwnd, WM_WAYLAND_CLIPBOARD_SELECTION, 1, 0);
+    process_clipboard_event(clipboard_hwnd, WM_WAYLAND_CLIPBOARD_EXPORT, 0, 37);
+    assert(!closed && !destroyed && !applied && !exported);
+
+    reset();
+    handle_selection(&process_wayland.data_device, &offer);
+    first = last_wp;
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    deliver(); /* Even a valid later token cannot reorder the pending work. */
+    assert(!exported && !closed && !applied);
+    process_clipboard_event(clipboard_hwnd, WM_WAYLAND_CLIPBOARD_SELECTION, first, 0);
+    deliver();
+    assert(applied == 1 && exported == 1 && closed == 1 && !clipboard_events);
+
+    reset();
+    allocation_fails = 1;
+    handle_selection(&process_wayland.data_device, &offer);
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    assert(!posts && destroyed == 1 && closed == 1 && !clipboard_events);
+
+    reset();
+    handle_selection(&process_wayland.data_device, &offer);
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    wayland_clipboard_destroy_window((HWND)0x5678);
+    assert(clipboard_events && !closed && !destroyed);
+    stale = last_wp;
+    wayland_clipboard_destroy_window(clipboard_hwnd);
+    assert(closed == 1 && destroyed == 1 && handle_closed == 1);
+    assert(!clipboard_hwnd && !clipboard_thread && !clipboard_events);
+    assert(wayland_clipboard_dispatch_timeout() == -1);
+    process_clipboard_event((HWND)0x1234, last_message, stale, 0);
+    assert(closed == 1 && !exported);
+
+    reset();
+    /* Recreating the same HWND must not make an old token valid again. */
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    process_clipboard_event(clipboard_hwnd, last_message, stale, 0);
+    assert(!exported && !closed);
+    deliver();
+    assert(exported == 1 && closed == 1);
+
+    reset();
+    wayland_clipboard_cleanup_thread();
+    assert(!waits); /* No polling when there are no pending resources. */
+    handle_selection(&process_wayland.data_device, &offer);
+    data_control_source_send(NULL, NULL, "text/plain", 37);
+    wayland_clipboard_cleanup_thread();
+    assert(waits == 1 && !closed && clipboard_events);
+    /* Model a successful post discarded when its target thread dies. */
+    owner_dead = 1;
+    wayland_clipboard_cleanup_thread();
+    assert(closed == 1 && destroyed == 1 && handle_closed == 1);
+    assert(!clipboard_events && !clipboard_hwnd && !clipboard_thread_id);
+    wayland_clipboard_cleanup_thread();
+    assert(closed == 1 && waits == 2);
+    deliver();
+    assert(!exported && closed == 1);
+
+    puts("reader callback handoff: seventeen cases passed");
+    return 0;
+}

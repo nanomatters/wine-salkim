@@ -1,0 +1,202 @@
+/* Test production startup with a concurrent reader and injected platform calls. */
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef long NTSTATUS;
+typedef uintptr_t HANDLE;
+typedef uintptr_t HWND;
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xc0000001)
+#define THREAD_ALL_ACCESS 0x1fffff
+#define EPOLL_CLOEXEC 0x80000
+#define WINE_GDI_DRIVER_VERSION 108
+#define NtCurrentProcess() ((HANDLE)-1)
+#define ULongToHandle(value) ((HWND)(value))
+#define HandleToULong(value) ((unsigned int)(value))
+#define ERR(...) fprintf(stderr, __VA_ARGS__)
+
+struct wl_interface { const char *name; };
+static struct { void *wl_display; } process_wayland;
+static const int waylanddrv_funcs;
+static int dmabuf_epoll_fd = -1;
+static pthread_mutex_t reader_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reader_cond = PTHREAD_COND_INITIALIZER;
+static HWND reader_desktop;
+static BOOL reader_ready;
+static _Thread_local struct thread_info { unsigned int top_window; } thread_info;
+static struct thread_info *NtUserGetThreadInfo(void) { return &thread_info; }
+static int epoll_fail, process_fail, thread_fail, sequence, published, closed_fd;
+static int process_initialized, closed_handle, display_error;
+static atomic_int dispatch_count, terminated;
+static pthread_t reader;
+static sem_t waiting;
+static void (*reader_entry)(void *);
+static void wayland_read_events_thread(void *arg);
+
+static int test_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+    assert(!sem_post(&waiting));
+    return pthread_cond_wait(cond, mutex);
+}
+#define pthread_cond_wait test_cond_wait
+
+static void *start_reader(void *arg)
+{
+    assert(!thread_info.top_window);
+    reader_entry(arg);
+    return NULL;
+}
+static void wayland_init_process_name(void) {}
+static void wayland_init_activation_token(void) {}
+static int epoll_create1(int flags)
+{
+    assert(flags == EPOLL_CLOEXEC);
+    assert(++sequence == 1);
+    return epoll_fail ? -1 : 17;
+}
+static BOOL wayland_process_init(void)
+{
+    assert(++sequence == 2);
+    assert(dmabuf_epoll_fd == 17);
+    process_initialized = !process_fail;
+    return process_initialized;
+}
+static NTSTATUS PsCreateSystemThread(HANDLE *handle, unsigned int access, void *attr,
+                                     HANDLE process, void *id, void (*entry)(void *), void *param)
+{
+    assert(++sequence == 3);
+    assert(process_initialized && !published);
+    assert(access == THREAD_ALL_ACCESS && !attr && !process && !id && !param);
+    assert(entry == wayland_read_events_thread);
+    reader_entry = entry;
+    if (thread_fail) return STATUS_UNSUCCESSFUL;
+    *handle = 0x74;
+    assert(!pthread_create(&reader, NULL, start_reader, NULL));
+    /* Deterministically run the reader before publication, not just after init. */
+    assert(!sem_wait(&waiting));
+    assert(!dispatch_count);
+    return 0;
+}
+static NTSTATUS NtClose(HANDLE handle)
+{
+    assert(++sequence == 4);
+    assert(handle == 0x74 && !published);
+    closed_handle++;
+    return 0;
+}
+static void __wine_set_user_driver(const int *funcs, int version)
+{
+    assert(++sequence == 5);
+    assert(reader_entry && closed_handle && process_initialized);
+    assert(funcs == &waylanddrv_funcs && version == WINE_GDI_DRIVER_VERSION);
+    assert(!dispatch_count);
+    published++;
+}
+static int test_close(int fd)
+{
+    assert(fd == 17);
+    closed_fd++;
+    return 0;
+}
+#define close test_close
+static int dispatch_events(void)
+{
+    /* An output event may be the first callback. Desktop lookup must already
+     * be a cache hit and must not initialize classes or load a PE driver. */
+    assert(published && thread_info.top_window == 0x100);
+    errno = EPIPE;
+    return ++dispatch_count < 3 ? 0 : -1;
+}
+static int wl_display_get_error(void *display)
+{
+    return display_error;
+}
+static uint32_t wl_display_get_protocol_error(void *display,
+                                             const struct wl_interface **interface, uint32_t *id)
+{
+    static const struct wl_interface test_interface = {"test_surface"};
+    *interface = &test_interface;
+    *id = 7;
+    return 2;
+}
+static NTSTATUS NtTerminateProcess(HANDLE process, NTSTATUS status)
+{
+    assert(process == NtCurrentProcess() && status == 1);
+    assert(dispatch_count == 3);
+    terminated++;
+    return 0;
+}
+
+/* READER_FUNCTIONS */
+
+static void reset(void)
+{
+    dmabuf_epoll_fd = -1;
+    epoll_fail = process_fail = thread_fail = sequence = published = closed_fd = 0;
+    process_initialized = closed_handle = dispatch_count = terminated = display_error = 0;
+    reader_entry = NULL;
+    reader_desktop = 0;
+    reader_ready = FALSE;
+    thread_info.top_window = 0x100;
+    assert(!sem_init(&waiting, 0, 0));
+}
+
+static void finish(void)
+{
+    assert(!pthread_join(reader, NULL));
+    assert(dispatch_count == 3 && terminated == 1);
+    assert(!sem_destroy(&waiting));
+}
+
+int main(void)
+{
+    reset();
+    assert(!waylanddrv_unix_init(NULL));
+    assert(sequence == 5 && published == 1 && closed_handle == 1 && !closed_fd);
+    finish();
+
+    reset();
+    epoll_fail = 1;
+    assert(waylanddrv_unix_init(NULL) == STATUS_UNSUCCESSFUL);
+    assert(sequence == 1 && !reader_entry && !published && !closed_fd);
+    assert(!sem_destroy(&waiting));
+
+    reset();
+    process_fail = 1;
+    assert(waylanddrv_unix_init(NULL) == STATUS_UNSUCCESSFUL);
+    assert(sequence == 2 && !reader_entry && !published && closed_fd == 1);
+    assert(dmabuf_epoll_fd == -1);
+    assert(!sem_destroy(&waiting));
+
+    reset();
+    thread_fail = 1;
+    assert(waylanddrv_unix_init(NULL) == STATUS_UNSUCCESSFUL);
+    assert(sequence == 3 && !published && !closed_handle && closed_fd == 1);
+    assert(dmabuf_epoll_fd == -1);
+    assert(!sem_destroy(&waiting));
+
+    reset();
+    thread_info.top_window = 0;
+    assert(!waylanddrv_unix_init(NULL));
+    /* Desktop-process bootstrap has published the driver, but has not yet
+     * created its desktop. Publication alone must not allow dispatch. */
+    assert(!sem_wait(&waiting));
+    assert(!dispatch_count);
+    WAYLAND_SetDesktopWindow(0x100);
+    finish();
+
+    reset();
+    display_error = EPROTO;
+    assert(!waylanddrv_unix_init(NULL));
+    finish();
+    puts("reader startup: six cases passed, including concurrent startup");
+    return 0;
+}

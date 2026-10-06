@@ -93,6 +93,9 @@ enum wayland_window_message
     WM_WAYLAND_DMABUF_FRAME,
     WM_WAYLAND_EXPOSE,
     WM_WAYLAND_MINIMIZE,
+    WM_WAYLAND_NOTIFY_REORDER,
+    WM_WAYLAND_CLIPBOARD_SELECTION,
+    WM_WAYLAND_CLIPBOARD_EXPORT,
 };
 
 #define WAYLAND_ACTIVATION_TOKEN_MAGIC 0x54434158 /* XACT */
@@ -1121,6 +1124,9 @@ RGNDATA *get_region_data(HRGN region);
 
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+void wayland_clipboard_destroy_window(HWND hwnd);
+int wayland_clipboard_dispatch_timeout(void);
+void wayland_clipboard_cleanup_thread(void);
 BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
 LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void WAYLAND_DestroyWindow(HWND hwnd);

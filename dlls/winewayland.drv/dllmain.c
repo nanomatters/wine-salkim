@@ -27,18 +27,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
-static DWORD WINAPI wayland_read_events_thread(void *arg)
-{
-    NTSTATUS status = WAYLANDDRV_UNIX_CALL(read_events, NULL);
-
-    /* This thread terminates only if an unrecoverable error occurred
-     * during event reading (e.g., the connection to the Wayland
-     * compositor is broken). */
-    ERR("Failed to read events from the compositor, status %#lx, terminating process\n", status);
-    TerminateProcess(GetCurrentProcess(), 1);
-    return 0;
-}
-
 static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
@@ -108,8 +96,6 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
     SetEnvironmentVariableW(L"XDG_ACTIVATION_TOKEN", NULL);
     SetEnvironmentVariableW(L"DESKTOP_STARTUP_ID", NULL);
 
-    /* Read wayland events from a dedicated thread. */
-    CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
     /* Handle clipboard events in a dedicated thread, if needed. */
     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));

@@ -1,0 +1,112 @@
+/* Exercise the unmodified signal TLS helpers with injected platform state. */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+struct amd64_thread_data { void *pthread_teb; char syscall_dispatch; };
+struct thread_data { int system_thread; void *teb; struct amd64_thread_data cpu; };
+typedef struct { uintptr_t rsp; uint16_t ds, es; } ucontext_t;
+static struct thread_data current;
+static uint16_t fs32_sel;
+static const uint16_t ds64_sel = 0x2b;
+static int arch_calls, on_signal_stack, on_syscall_stack;
+static void *restored_tls;
+#define ARCH_SET_FS 0x1002
+#define RSP_sig(ctx) ((ctx)->rsp)
+#define DS_sig(ctx) ((ctx)->ds)
+#define ES_sig(ctx) ((ctx)->es)
+static void clear_alignment_flag(void) {}
+static struct thread_data *get_current_thread_data(void) { return &current; }
+static struct amd64_thread_data *amd64_thread_data(struct thread_data *data)
+{
+    return data->teb ? &data->cpu : NULL;
+}
+static int arch_prctl(int op, void *tls)
+{
+    assert(op == ARCH_SET_FS);
+    arch_calls++;
+    restored_tls = tls;
+    return 0;
+}
+static int is_inside_signal_stack(struct thread_data *data, void *sp)
+{
+    (void)data;
+    (void)sp;
+    return on_signal_stack;
+}
+static int is_inside_syscall(struct thread_data *data, uintptr_t sp)
+{
+    (void)data;
+    (void)sp;
+    return on_syscall_stack;
+}
+static int is_16bit(ucontext_t *ctx) { (void)ctx; return 0; }
+
+/* SIGNAL_FUNCTIONS */
+
+static void reset(void)
+{
+    current = (struct thread_data){.teb = &current, .cpu = {.syscall_dispatch = 7}};
+    fs32_sel = 0;
+    arch_calls = on_signal_stack = on_syscall_stack = 0;
+    restored_tls = NULL;
+}
+
+int main(void)
+{
+    ucontext_t context = {0};
+
+    reset();
+    current.system_thread = 1;
+    fs32_sel = 0x63;
+    assert(init_handler(&context) == &current);
+    assert(!arch_calls && current.cpu.syscall_dispatch == 7);
+    leave_handler(&current, &context);
+    assert(!arch_calls && current.cpu.syscall_dispatch == 7);
+
+    reset();
+    current.system_thread = 1;
+    current.teb = NULL;
+    fs32_sel = 0x63;
+    assert(init_handler(&context) == &current);
+    leave_handler(&current, &context);
+    assert(!arch_calls && current.cpu.syscall_dispatch == 7);
+
+    reset();
+    current.teb = NULL;
+    fs32_sel = 0x63;
+    assert(init_handler(&context) == &current);
+    leave_handler(&current, &context);
+    assert(!arch_calls && current.cpu.syscall_dispatch == 7);
+
+    reset();
+    init_handler(&context);
+    assert(!arch_calls && !current.cpu.syscall_dispatch);
+    leave_handler(&current, &context);
+    assert(current.cpu.syscall_dispatch == 1);
+
+    reset();
+    fs32_sel = 0x63;
+    current.cpu.pthread_teb = &context;
+    init_handler(&context);
+    assert(arch_calls == 1 && restored_tls == &context && !current.cpu.syscall_dispatch);
+    /* Do not actually install a 32-bit segment selector in this native test. */
+    fs32_sel = 0;
+    leave_handler(&current, &context);
+    assert(current.cpu.syscall_dispatch == 1);
+
+    reset();
+    on_signal_stack = 1;
+    init_handler(&context);
+    leave_handler(&current, &context);
+    assert(!current.cpu.syscall_dispatch);
+
+    reset();
+    on_syscall_stack = 1;
+    init_handler(&context);
+    leave_handler(&current, &context);
+    assert(!current.cpu.syscall_dispatch);
+    puts("reader signal TLS: seven cases passed");
+    return 0;
+}

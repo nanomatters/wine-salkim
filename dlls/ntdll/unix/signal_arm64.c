@@ -1374,7 +1374,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     CHPE_V2_CPU_AREA_INFO *chpe;
     CONTEXT context;
 
-    if (!data->teb)
+    if (!data->teb || data->system_thread)
     {
         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
     }

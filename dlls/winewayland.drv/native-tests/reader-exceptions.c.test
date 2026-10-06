@@ -1,0 +1,142 @@
+/* Exercise real Unix system-thread exception handling in a disposable prefix.
+ * Build once as a Unix library and once as a PE executable. */
+#ifdef WINE_UNIX_LIB
+
+#include "config.h"
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "winternl.h"
+#include "wine/unixlib.h"
+
+struct test_args { unsigned int fatal, failures; };
+
+static void check(struct test_args *args, BOOL condition, const char *name)
+{
+    printf("%s: %s\n", name, condition ? "passed" : "FAILED");
+    fflush(stdout);
+    if (!condition) args->failures++;
+}
+
+static void test_thread(void *opaque)
+{
+    struct test_args *args = opaque;
+    unsigned int src = 0x12345678, dst = 0;
+    SIZE_T copied;
+    NTSTATUS status;
+    void *page;
+    volatile int recovered = 0;
+
+    check(args, NtCurrentTeb() != NULL, "system-thread TEB");
+    page = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED)
+    {
+        check(args, FALSE, "fault page allocation");
+        return;
+    }
+
+    if (args->fatal)
+    {
+        puts("raising unhandled system-thread access violation");
+        fflush(stdout);
+        *(volatile unsigned int *)page = 1;
+        check(args, FALSE, "unhandled access violation returned");
+        return;
+    }
+
+    copied = 99;
+    status = NtReadVirtualMemory(NtCurrentProcess(), page, &dst, sizeof(dst), &copied);
+    check(args, status == STATUS_PARTIAL_COPY && copied == 0, "guarded invalid source");
+
+    copied = 99;
+    status = NtReadVirtualMemory(NtCurrentProcess(), &src, page, sizeof(src), &copied);
+    check(args, status == STATUS_ACCESS_VIOLATION && copied == 0, "guarded invalid destination");
+
+    __TRY
+    {
+        *(volatile unsigned int *)page = 1;
+    }
+    __EXCEPT
+    {
+        recovered = 1;
+    }
+    __ENDTRY
+    check(args, recovered, "Unix library exception handler");
+
+    status = NtReadVirtualMemory(NtCurrentProcess(), &src, &dst, sizeof(src), &copied);
+    check(args, status == STATUS_SUCCESS && copied == sizeof(src) && src == dst,
+          "copy after recovered faults");
+    check(args, !pthread_kill(pthread_self(), SIGUSR1), "system-thread suspend signal");
+    check(args, NtCurrentTeb() != NULL, "TEB after suspend signal");
+    munmap(page, 4096);
+}
+
+static NTSTATUS run_test(void *opaque)
+{
+    struct test_args *args = opaque;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+    HANDLE thread;
+
+    args->failures = 0;
+    if ((status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                      test_thread, args)))
+        return status;
+    timeout.QuadPart = -100000000;
+    status = NtWaitForSingleObject(thread, FALSE, &timeout);
+    NtClose(thread);
+    return status;
+}
+
+const unixlib_entry_t __wine_unix_call_funcs[] = {run_test};
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] = {run_test};
+
+#else
+
+#include <windows.h>
+#include <winternl.h>
+#include <stdio.h>
+#include <string.h>
+
+struct test_args { unsigned int fatal, failures; };
+typedef NTSTATUS (WINAPI *unix_call_t)(ULONGLONG, unsigned int, void *);
+typedef NTSTATUS (WINAPI *query_memory_t)(HANDLE, const void *, int, void *, SIZE_T, SIZE_T *);
+
+static LONG CALLBACK unexpected_exception(EXCEPTION_POINTERS *exception)
+{
+    printf("UNEXPECTED PE exception handler: %#lx\n", exception->ExceptionRecord->ExceptionCode);
+    fflush(stdout);
+    ExitProcess(90);
+}
+
+int main(int argc, char **argv)
+{
+    static WCHAR library[] = L"reader-exceptions.so";
+    UNICODE_STRING name = {sizeof(library) - sizeof(WCHAR), sizeof(library), library};
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    query_memory_t query = (query_memory_t)GetProcAddress(ntdll, "NtQueryVirtualMemory");
+    unix_call_t *dispatch = (unix_call_t *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher");
+    ULONGLONG handles[2];
+    struct test_args args = {argc > 1 && !strcmp(argv[1], "fatal"), 0};
+    NTSTATUS status;
+
+    if (!query || !dispatch) return 2;
+    AddVectoredExceptionHandler(1, unexpected_exception);
+    status = query(GetCurrentProcess(), &name, 1002 /* MemoryWineLoadUnixLibByName */,
+                   handles, sizeof(handles), NULL);
+    if (status)
+    {
+        printf("Unix helper load failed: %#lx\n", (ULONG)status);
+        return 3;
+    }
+    status = (*dispatch)(handles[1], 0, &args);
+    printf("system-thread test returned %#lx, failures %u\n", (ULONG)status, args.failures);
+    return status || args.failures || args.fatal;
+}
+
+#endif

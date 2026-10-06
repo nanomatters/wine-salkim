@@ -1584,6 +1584,7 @@ void WAYLAND_DestroyWindow(HWND hwnd)
 
     TRACE("%p\n", hwnd);
 
+    wayland_clipboard_destroy_window(hwnd);
     if (!(data = wayland_win_data_get(hwnd))) return;
     queue_subsurface_updates(hwnd);
     queue_inferred_popup_updates(hwnd);
@@ -2075,6 +2076,14 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_WAYLAND_CONFIGURE:
         wayland_configure_window(hwnd);
         return 0;
+    case WM_WAYLAND_NOTIFY_REORDER:
+        NtUserNotifyWinEvent(EVENT_OBJECT_REORDER, NtUserGetDesktopWindow(), OBJID_CLIENT, 0);
+        if (hwnd == NtUserGetForegroundWindow())
+            NtUserNotifyWinEvent(EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0);
+        return 0;
+    case WM_WAYLAND_CLIPBOARD_SELECTION:
+    case WM_WAYLAND_CLIPBOARD_EXPORT:
+        return WAYLAND_ClipboardWindowProc(hwnd, msg, wp, lp);
     case WM_WAYLAND_SET_FOREGROUND:
     {
         BOOL layer_menu;

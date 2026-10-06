@@ -1706,7 +1706,7 @@ NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
     union select_op select_op;
     sigset_t old_set;
 
-    if (!data->teb)
+    if (!data->teb || data->system_thread)
     {
         ERR_(seh)( "Exception %x in system thread at %p\n", rec->ExceptionCode, rec->ExceptionAddress );
         NtTerminateProcess( NtCurrentProcess(), rec->ExceptionCode );
