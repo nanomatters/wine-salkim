@@ -221,6 +221,11 @@ static DWORD64 make_esr( ULONG ec, ULONG info )
     return ((DWORD64)ec << 26) | (info & 0xffff);
 }
 
+/* Preserve all CPSR bits not covered by user context in signal handlers.
+ * Additionally, preserve the host SSBS bit, which is allowed to be set on
+ * Windows, but is volatile and restored on kernel transition anyway. */
+static const ULONG cpsr_host_mask = ~cpsr_user_mask | 0x1000;
+
 /***********************************************************************
  *           context_init_empty_xstate
  *
@@ -322,7 +327,7 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
     context->Lr   = LR_sig(sigcontext);     /* Link register */
     context->Sp   = SP_sig(sigcontext);     /* Stack pointer */
     context->Pc   = PC_sig(sigcontext);     /* Program Counter */
-    context->Cpsr = PSTATE_sig(sigcontext); /* Current State Register */
+    context->Cpsr = PSTATE_sig(sigcontext) & cpsr_user_mask; /* Current State Register */
     for (i = 0; i <= 28; i++) context->X[i] = REGn_sig( i, sigcontext );
     if (save_fpu( context->V, &context->Fpcr, &context->Fpsr, sigcontext ))
         context->ContextFlags |= CONTEXT_FLOATING_POINT;
@@ -356,7 +361,7 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 
     FP_sig(sigcontext)     = context->Fp;   /* Frame pointer */
     LR_sig(sigcontext)     = context->Lr;   /* Link register */
-    PSTATE_sig(sigcontext) = context->Cpsr; /* Current State Register */
+    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & cpsr_host_mask) | (context->Cpsr & ~cpsr_host_mask);
     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = context->X[i];
     restore_fpu( context, sigcontext );
 }
@@ -442,7 +447,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         frame->lr    = context->Lr;
         frame->sp    = context->Sp;
         frame->pc    = context->Pc;
-        frame->cpsr  = context->Cpsr;
+        frame->cpsr  = context->Cpsr & cpsr_user_mask;
         if (is_emulated_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
         else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
     }
@@ -622,7 +627,7 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
             wow_frame->Sp = context->Sp;
             wow_frame->Lr = context->Lr;
             wow_frame->Pc = context->Pc & ~1;
-            wow_frame->Cpsr = context->Cpsr;
+            wow_frame->Cpsr = context->Cpsr & cpsr_user_mask;
             if (context->Cpsr & 0x20) wow_frame->Pc |= 1; /* thumb */
         }
         if (flags & CONTEXT_FLOATING_POINT)
@@ -1398,7 +1403,7 @@ static void save_syscall_entry_frame( struct thread_data *data, ucontext_t *sigc
     frame->lr = REGn_sig( 9, sigcontext );
     frame->sp = SP_sig(sigcontext);
     frame->pc = LR_sig(sigcontext);
-    frame->cpsr = PSTATE_sig(sigcontext);
+    frame->cpsr = PSTATE_sig(sigcontext) & cpsr_user_mask;
     frame->restore_flags = 0;
     frame->syscall_id = REGn_sig( 8, sigcontext );
     save_fpu( frame->v, &frame->fpcr, &frame->fpsr, sigcontext );
@@ -1512,7 +1517,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     }
     FP_sig(sigcontext)     = frame->fp;
     LR_sig(sigcontext)     = frame->lr;
-    PSTATE_sig(sigcontext) = frame->cpsr;
+    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & cpsr_host_mask) | (frame->cpsr & ~cpsr_host_mask);
     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = frame->x[i];
 
 #ifdef linux
