@@ -49,3 +49,11 @@ returns `S_FALSE` for a partial read without exposing the actual byte count.
 Those responses must neither reach WG as a complete buffer nor enter the
 cache. These are parser read-thread unit tests, not playback or performance
 tests.
+
+## Video output padding
+
+The `video_padding` target includes the production GStreamer transform code and
+uses real GStreamer video buffers to check padding replication. It requires
+the native `gstreamer-video-1.0` and `gstreamer-audio-1.0` development packages
+and the configured Wine build's `config.h`. `make check` runs both native tests.
+No game or video decoder plugin is needed.
