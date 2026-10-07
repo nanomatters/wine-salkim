@@ -59,3 +59,9 @@ and the configured Wine build's `config.h`. `make check` runs both native tests.
 No game or video decoder plugin is needed.
 Coverage includes partial-pixel row padding, invalid strides, planar formats and
 nonzero aperture offsets, including subsampled planes with odd top padding.
+It also covers shared read-only buffers that already wrap the destination sample,
+matching and unrelated game IDs, zero padding, timestamps, reference balance,
+undersized destinations and incomplete source frames. The checks run the real
+copy, mapping and padding helpers rather than replacing GStreamer providers.
+Exact-sized aliased buffers with left padding exercise writable wrapping without
+copying the same planes again. Incompatible formats and dimensions still fail.
