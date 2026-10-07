@@ -73,6 +73,7 @@ static HWND di_em_win;
 static HANDLE dinput_thread;
 static UINT input_thread_user_count;
 static struct input_thread_state *input_thread_state;
+static HANDLE stop_event;
 
 static CRITICAL_SECTION dinput_hook_crit;
 static CRITICAL_SECTION_DEBUG dinput_critsect_debug =
@@ -424,6 +425,8 @@ static DWORD WINAPI dinput_thread_proc( void *params )
     DestroyWindow( di_em_win );
     di_em_win = NULL;
 
+    if (stop_event) SetEvent( stop_event );
+
     if (this_module != NULL) FreeLibraryAndExitThread( this_module, 0 );
     return 0;
 }
@@ -436,8 +439,14 @@ void input_thread_start(void)
 
     if (!(start_event = CreateEventW( NULL, FALSE, FALSE, NULL )))
         ERR( "Failed to create start event, error %lu\n", GetLastError() );
+    else if (!(stop_event = CreateEventW( NULL, FALSE, FALSE, NULL )))
+        ERR( "Failed to create stop event, error %lu\n", GetLastError() );
     else if (!(dinput_thread = CreateThread( NULL, 0, dinput_thread_proc, start_event, 0, NULL )))
+    {
         ERR( "Failed to create internal thread, error %lu\n", GetLastError() );
+        CloseHandle( stop_event );
+        stop_event = NULL;
+    }
     else
         WaitForSingleObject( start_event, INFINITE );
 
@@ -486,7 +495,9 @@ void input_thread_remove_user(void)
         TRACE( "Stopping input thread.\n" );
 
         SendMessageW( di_em_win, INPUT_THREAD_NOTIFY, NOTIFY_THREAD_STOP, 0 );
-        WaitForSingleObject( dinput_thread, INFINITE );
+        WaitForSingleObject( stop_event, INFINITE );
+        CloseHandle( stop_event );
+        stop_event = NULL;
         CloseHandle( dinput_thread );
         dinput_thread = NULL;
     }
