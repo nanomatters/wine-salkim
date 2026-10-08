@@ -1,0 +1,376 @@
+/* Production layout selection with mocked accepted win32u snapshots. */
+#include <assert.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+#include "winuser.h"
+#include "winternl.h"
+#include "ntuser.h"
+#define WINE_UNIX_LIB
+#include "wine/gdi_driver.h"
+#include <wayland-util.h>
+
+#undef TRACE
+#undef ERR
+#define TRACE(...) ((void)0)
+#define ERR(...) ((void)0)
+struct wayland_output_mode { int width, height; };
+struct wayland_output_state
+{
+    const char *name;
+    int logical_x, logical_y, logical_w, logical_h;
+    struct wayland_output_mode *current_mode;
+};
+struct wayland_output { struct wl_list link; struct wayland_output_state current; };
+struct output_info { struct wayland_output_state *output; int x, y; BOOL is_primary; };
+static struct
+{
+    struct wl_array output_info_array;
+    BOOL output_layout_accepted;
+    struct wl_list output_list;
+    pthread_mutex_t output_mutex;
+} process_wayland;
+static struct wayland_output outputs[3];
+static struct wayland_output_mode modes[3];
+static struct ntuser_display_output accepted[3];
+static UINT accepted_count, query_calls, lock_depth, lock_calls, unlock_calls, checks;
+static BOOL query_fails, grow_during_query;
+static const char *published_primary;
+static struct ntuser_display_output published[3];
+static UINT published_count;
+static struct
+{
+    UINT primary_name, gpu, source, monitor, modes;
+} callback_counts;
+#define CHECK(value) do { assert(value); ++checks; } while (0)
+
+static int lock_output(pthread_mutex_t *mutex)
+{
+    assert(mutex == &process_wayland.output_mutex && !lock_depth);
+    ++lock_depth;
+    ++lock_calls;
+    return 0;
+}
+static int unlock_output(pthread_mutex_t *mutex)
+{
+    assert(mutex == &process_wayland.output_mutex && lock_depth == 1);
+    --lock_depth;
+    ++unlock_calls;
+    return 0;
+}
+#define pthread_mutex_lock lock_output
+#define pthread_mutex_unlock unlock_output
+
+ULONG_PTR WINAPI NtUserCallOneParam(ULONG_PTR value, ULONG code)
+{
+    struct ntuser_display_layout *layout = (void *)value;
+    UINT capacity = layout->count;
+    assert(code == NtUserCallOneParam_GetDisplayLayout && !lock_depth);
+    ++query_calls;
+    if (query_fails) { layout->count = 0; return FALSE; }
+    if (grow_during_query && query_calls == 2) ++accepted_count;
+    layout->count = accepted_count;
+    if (capacity < accepted_count || !layout->outputs) return FALSE;
+    memcpy(layout->outputs, accepted, accepted_count * sizeof(*accepted));
+    return TRUE;
+}
+
+/* PRODUCTION_LAYOUT */
+/* PRODUCTION_UPDATE */
+
+static void wayland_add_device_gpu(const struct gdi_device_manager *manager, void *param)
+{
+    assert(lock_depth == 1);
+    ++callback_counts.gpu;
+    published_count = 0;
+    published_primary = NULL;
+}
+static void wayland_add_device_source(const struct gdi_device_manager *manager,
+                                      void *param, DWORD flags, struct output_info *info)
+{
+    struct ntuser_display_output *output;
+
+    assert(lock_depth == 1);
+    assert(published_count < ARRAY_SIZE(published) && info->output->current_mode);
+    ++callback_counts.source;
+    output = &published[published_count++];
+    strcpy(output->name, info->output->name);
+    output->rect = (RECT){info->x, info->y,
+                         info->x + info->output->current_mode->width,
+                         info->y + info->output->current_mode->height};
+    output->state_flags = flags;
+    if (flags & DISPLAY_DEVICE_PRIMARY_DEVICE) published_primary = info->output->name;
+}
+static void wayland_add_device_monitor(const struct gdi_device_manager *manager,
+                                       void *param, struct output_info *info, struct output_info *primary)
+{
+    assert(lock_depth == 1);
+    ++callback_counts.monitor;
+}
+static void wayland_add_device_modes(const struct gdi_device_manager *manager,
+                                     void *param, struct output_info *info, struct output_info *primary)
+{
+    assert(lock_depth == 1);
+    ++callback_counts.modes;
+}
+/* PRODUCTION_PUBLISHER */
+
+static struct output_info *info(const char *name)
+{
+    struct output_info *value;
+    wl_array_for_each(value, &process_wayland.output_info_array)
+        if (!strcmp(value->output->name, name)) return value;
+    return NULL;
+}
+static void reset(void)
+{
+    UINT i;
+    wl_array_release(&process_wayland.output_info_array);
+    wl_array_init(&process_wayland.output_info_array);
+    process_wayland.output_layout_accepted = FALSE;
+    wl_list_init(&process_wayland.output_list);
+    modes[0] = (struct wayland_output_mode){5120, 2160};
+    modes[1] = (struct wayland_output_mode){3840, 1600};
+    modes[2] = (struct wayland_output_mode){1920, 1080};
+    outputs[0].current = (struct wayland_output_state){"DP-3", 0, 0, 5120, 2160, &modes[0]};
+    outputs[1].current = (struct wayland_output_state){"DP-2", 5120, 334, 3840, 1600, &modes[1]};
+    outputs[2].current = (struct wayland_output_state){"HDMI-A-1", -1920, 0, 1920, 1080, &modes[2]};
+    for (i = 0; i < 2; ++i) wl_list_insert(process_wayland.output_list.prev, &outputs[i].link);
+    accepted[0] = (struct ntuser_display_output){"DP-3", {0, 0, 5120, 2160},
+                         DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE};
+    accepted[1] = (struct ntuser_display_output){"DP-2", {5120, 334, 8960, 1934},
+                         DISPLAY_DEVICE_ATTACHED_TO_DESKTOP};
+    accepted[2] = (struct ntuser_display_output){"HDMI-A-1", {-1920, 0, 0, 1080},
+                         DISPLAY_DEVICE_ATTACHED_TO_DESKTOP};
+    accepted_count = 2;
+    query_calls = lock_depth = lock_calls = unlock_calls = 0;
+    query_fails = grow_during_query = FALSE;
+    published_primary = NULL;
+    published_count = 0;
+    memset(published, 0, sizeof(published));
+    memset(&callback_counts, 0, sizeof(callback_counts));
+    unsetenv("WAYLANDDRV_PRIMARY_MONITOR");
+    output_info_array_update();
+}
+static void test_read_and_failure(void)
+{
+    reset();
+    CHECK(info("DP-3")->is_primary && info("DP-3")->x == 0);
+    CHECK(output_info_array_sync_shared_layout() && query_calls == 2 && !lock_depth);
+    setenv("WAYLANDDRV_PRIMARY_MONITOR", "DP-2", 1);
+    query_fails = TRUE;
+    output_info_array_update();
+    CHECK(!output_info_array_sync_shared_layout());
+    CHECK(info("DP-3")->is_primary && info("DP-2")->x == 5120 && info("DP-2")->y == 334);
+    query_fails = FALSE;
+    accepted[1].rect.right -= 1;
+    CHECK(!output_info_array_sync_shared_layout() && info("DP-2")->x == 5120);
+    accepted[1].rect.right += 1;
+    strcpy(accepted[1].name, "missing");
+    CHECK(!output_info_array_sync_shared_layout());
+    strcpy(accepted[1].name, "DP-3");
+    CHECK(!output_info_array_sync_shared_layout());
+    reset();
+    accepted_count = 1;
+    CHECK(!output_info_array_sync_shared_layout() && info("DP-2")->x == 5120);
+    accepted_count = 2;
+    accepted[1].state_flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
+    CHECK(!output_info_array_sync_shared_layout());
+    accepted[1].state_flags = 0;
+    CHECK(!output_info_array_sync_shared_layout());
+    accepted[1].state_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP;
+    query_calls = 0;
+    grow_during_query = TRUE;
+    CHECK(!output_info_array_sync_shared_layout() && query_calls == 2 && info("DP-2")->x == 5120);
+}
+static void test_remove_then_reenable(void)
+{
+    reset();
+    CHECK(output_info_array_sync_shared_layout());
+    wl_list_remove(&outputs[0].link);
+    outputs[1].current.logical_x = outputs[1].current.logical_y = 0;
+    output_info_array_update();
+    CHECK(info("DP-2")->x == 5120 && info("DP-2")->y == 334);
+    CHECK(!output_info_array_sync_shared_layout());
+    accepted[0] = (struct ntuser_display_output){"DP-2", {0, 0, 3840, 1600},
+                 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE};
+    accepted_count = 1;
+    CHECK(output_info_array_sync_shared_layout());
+    CHECK(info("DP-2")->is_primary && !info("DP-2")->x && !info("DP-2")->y);
+
+    /* A busy or partial publication must not reset the surviving origin. */
+    setenv("WAYLANDDRV_PRIMARY_MONITOR", "DP-3", 1);
+    outputs[1].current.logical_x = 5120;
+    outputs[1].current.logical_y = 334;
+    wl_list_insert(process_wayland.output_list.prev, &outputs[0].link);
+    output_info_array_update();
+    query_fails = TRUE;
+    CHECK(!output_info_array_sync_shared_layout());
+    CHECK(info("DP-2")->is_primary && !info("DP-2")->x && !info("DP-2")->y);
+    query_fails = FALSE;
+    CHECK(!output_info_array_sync_shared_layout());
+    accepted[1] = (struct ntuser_display_output){"DP-3", {-5120, -334, 0, 1826},
+                            DISPLAY_DEVICE_ATTACHED_TO_DESKTOP};
+    accepted_count = 2;
+    CHECK(output_info_array_sync_shared_layout());
+    CHECK(info("DP-2")->is_primary && !info("DP-2")->x && !info("DP-2")->y);
+    CHECK(info("DP-3")->x == -5120 && info("DP-3")->y == -334);
+}
+static const char *get_primary_name(void *param)
+{
+    assert(lock_depth == 1);
+    ++callback_counts.primary_name;
+    return param;
+}
+static const struct gdi_device_manager manager = {.get_primary_name = get_primary_name};
+
+static void remove_output(UINT index)
+{
+    struct output_info *value;
+
+    /* Mirror removal's array refresh before the output object is released. */
+    wl_list_remove(&outputs[index].link);
+    output_info_array_update();
+    wl_array_for_each(value, &process_wayland.output_info_array)
+        CHECK(value->output != &outputs[index].current);
+    memset(&outputs[index].current, 0, sizeof(outputs[index].current));
+}
+
+static void check_pending_publication(void)
+{
+    struct ntuser_display_output accepted_before[3], published_before[3];
+    struct wl_array array_before = process_wayland.output_info_array;
+    BOOL layout_accepted_before = process_wayland.output_layout_accepted;
+    UINT accepted_count_before = accepted_count, published_count_before = published_count;
+    UINT locks_before = lock_calls, unlocks_before = unlock_calls;
+    typeof(callback_counts) callbacks_before = callback_counts;
+    const char *primary_before = published_primary;
+
+    memcpy(accepted_before, accepted, sizeof(accepted));
+    memcpy(published_before, published, sizeof(published));
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, NULL) == STATUS_PENDING);
+    CHECK(!lock_depth && lock_calls == locks_before + 1 && unlock_calls == unlocks_before + 1);
+    CHECK(!memcmp(&callback_counts, &callbacks_before, sizeof(callback_counts)));
+    CHECK(process_wayland.output_layout_accepted == layout_accepted_before);
+    CHECK(process_wayland.output_info_array.data == array_before.data &&
+          process_wayland.output_info_array.size == array_before.size &&
+          process_wayland.output_info_array.alloc == array_before.alloc);
+    CHECK(accepted_count == accepted_count_before && !memcmp(accepted, accepted_before, sizeof(accepted)));
+    CHECK(published_count == published_count_before && published_primary == primary_before &&
+          !memcmp(published, published_before, sizeof(published)));
+}
+
+static void check_publication_count(UINT count)
+{
+    CHECK(!lock_depth && lock_calls == unlock_calls);
+    CHECK(callback_counts.primary_name == 1 && callback_counts.gpu == 1);
+    CHECK(callback_counts.source == count && callback_counts.monitor == count && callback_counts.modes == count);
+    CHECK(published_count == count && process_wayland.output_layout_accepted);
+}
+
+static void test_publication(void)
+{
+    reset();
+    setenv("WAYLANDDRV_PRIMARY_MONITOR", "DP-3", 1);
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, "DP-2") == STATUS_SUCCESS && !lock_depth);
+    CHECK(!strcmp(published_primary, "DP-2"));
+    CHECK(info("DP-2")->is_primary && !info("DP-2")->x && !info("DP-2")->y);
+    outputs[1].current.logical_x = -3840;
+    outputs[1].current.logical_y = -100;
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, "DP-2") == STATUS_SUCCESS);
+    CHECK(info("DP-3")->x == 3840 && info("DP-3")->y == 100);
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, "missing") == STATUS_SUCCESS);
+    CHECK(!strcmp(published_primary, "DP-3"));
+}
+
+static void test_pending_successor(void)
+{
+    reset();
+    CHECK(output_info_array_sync_shared_layout());
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, "DP-3") == STATUS_SUCCESS);
+    check_publication_count(2);
+    memset(&callback_counts, 0, sizeof(callback_counts));
+    outputs[2].current.current_mode = NULL;
+    wl_list_insert(process_wayland.output_list.prev, &outputs[2].link);
+    remove_output(0);
+    remove_output(1);
+    CHECK(!wl_list_empty(&process_wayland.output_list) && !process_wayland.output_info_array.size);
+
+    check_pending_publication();
+    check_pending_publication();
+
+    /* A successor's done event makes the real mode available for publication. */
+    outputs[2].current.current_mode = &modes[2];
+    output_info_array_update();
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, NULL) == STATUS_SUCCESS);
+    check_publication_count(1);
+    CHECK(!strcmp(published[0].name, "HDMI-A-1") &&
+          published[0].rect.left == 0 && published[0].rect.top == 0 &&
+          published[0].rect.right == 1920 && published[0].rect.bottom == 1080);
+    CHECK(published[0].state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+}
+
+static void test_pending_successor_removed(void)
+{
+    reset();
+    CHECK(output_info_array_sync_shared_layout());
+    outputs[2].current.current_mode = NULL;
+    wl_list_insert(process_wayland.output_list.prev, &outputs[2].link);
+    remove_output(0);
+    remove_output(1);
+    check_pending_publication();
+
+    /* A truly empty list must publish removal even if its last output never completed. */
+    remove_output(2);
+    CHECK(wl_list_empty(&process_wayland.output_list));
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, NULL) == STATUS_SUCCESS);
+    check_publication_count(0);
+}
+
+static void test_ready_survivor_with_pending_output(void)
+{
+    reset();
+    CHECK(output_info_array_sync_shared_layout());
+    outputs[2].current.current_mode = NULL;
+    wl_list_insert(process_wayland.output_list.prev, &outputs[2].link);
+    remove_output(0);
+    CHECK(info("DP-2") && !info("HDMI-A-1"));
+
+    /* A pending unrelated announcement cannot delay publishing the ready survivor. */
+    CHECK(WAYLAND_UpdateDisplayDevices(&manager, "DP-2") == STATUS_SUCCESS);
+    check_publication_count(1);
+    CHECK(!strcmp(published[0].name, "DP-2") &&
+          published[0].rect.left == 0 && published[0].rect.top == 0 &&
+          published[0].rect.right == 3840 && published[0].rect.bottom == 1600);
+    CHECK(published[0].state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+}
+
+static void test_startup_all_pending(void)
+{
+    reset();
+    outputs[0].current.current_mode = outputs[1].current.current_mode = NULL;
+    output_info_array_update();
+    CHECK(!process_wayland.output_layout_accepted && !process_wayland.output_info_array.size);
+    check_pending_publication();
+    check_pending_publication();
+    CHECK(!process_wayland.output_layout_accepted);
+}
+int main(void)
+{
+    test_read_and_failure();
+    test_remove_then_reenable();
+    test_publication();
+    test_pending_successor();
+    test_pending_successor_removed();
+    test_ready_survivor_with_pending_output();
+    test_startup_all_pending();
+    wl_array_release(&process_wayland.output_info_array);
+    printf("%u accepted-layout regression checks passed\n", checks);
+    return 0;
+}

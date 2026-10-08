@@ -204,35 +204,93 @@ static void output_info_array_select_primary(struct wl_array *output_info_array)
     }
 }
 
-static void output_info_array_arrange_physical_coords(struct wl_array *output_info_array)
+static void output_info_array_arrange_physical_coords(struct wl_array *array, const char *primary_name)
 {
     struct output_info *info;
-    size_t num_outputs = output_info_array->size / sizeof(struct output_info);
-    int steps = 0;
+    size_t count = array->size / sizeof(*info), steps = 0;
+    BOOL have_primary = FALSE;
 
-    /* Set the initial physical pixel coordinates. */
-    wl_array_for_each(info, output_info_array)
+    wl_array_for_each(info, array)
     {
         info->x = info->output->logical_x;
         info->y = info->output->logical_y;
-        info->is_primary = FALSE;
+        info->is_primary = primary_name && !strcmp(primary_name, info->output->name);
+        have_primary |= info->is_primary;
     }
-
-    /* Try to iteratively resolve overlaps, but be defensive and set an upper
-     * iteration bound to ensure we avoid infinite loops. */
-    while (output_info_array_resolve_overlaps(output_info_array) &&
-           ++steps < num_outputs)
+    while (output_info_array_resolve_overlaps(array) && ++steps < count)
         continue;
 
-    output_info_array_select_primary(output_info_array);
+    if (!have_primary) output_info_array_select_primary(array);
+    if (count)
+    {
+        qsort(array->data, count, sizeof(*info), output_info_cmp_primary_x_y);
+        output_info_array_set_origin(array, array->data);
+    }
+}
 
-    /* Enumerate the selected primary first, then follow the layout order. */
-    qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
-          output_info_cmp_primary_x_y);
+static const struct ntuser_display_output *find_display_output(const struct ntuser_display_layout *layout,
+                                                               const struct output_info *info)
+{
+    const struct ntuser_display_output *found = NULL;
+    UINT i;
 
-    /* Keep every output consumer in the primary-relative Windows space. */
-    if (num_outputs)
-        output_info_array_set_origin(output_info_array, output_info_array->data);
+    for (i = 0; i < layout->count; ++i)
+    {
+        const struct ntuser_display_output *output = &layout->outputs[i];
+
+        if (strcmp(output->name, info->output->name)) continue;
+        if (found || !(output->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ||
+            output->rect.right - output->rect.left != info->output->current_mode->width ||
+            output->rect.bottom - output->rect.top != info->output->current_mode->height)
+            return NULL;
+        found = output;
+    }
+    return found;
+}
+
+/* Read win32u's accepted physical layout without holding driver locks.
+ * A partial topology or failed read must never change this process's origin. */
+BOOL output_info_array_sync_shared_layout(void)
+{
+    struct ntuser_display_layout layout = {0};
+    struct wl_array *array = &process_wayland.output_info_array;
+    struct output_info *info;
+    BOOL ret = FALSE;
+    UINT capacity, primary_count = 0;
+
+    NtUserCallOneParam((UINT_PTR)&layout, NtUserCallOneParam_GetDisplayLayout);
+    capacity = layout.count;
+    if (!capacity || !(layout.outputs = calloc(capacity, sizeof(*layout.outputs)))) return FALSE;
+    if (!NtUserCallOneParam((UINT_PTR)&layout, NtUserCallOneParam_GetDisplayLayout)) goto done;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    if (layout.count != array->size / sizeof(*info)) goto unlock;
+    wl_array_for_each(info, array)
+    {
+        const struct ntuser_display_output *output = find_display_output(&layout, info);
+
+        if (!output) goto unlock;
+        if (output->state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE) ++primary_count;
+    }
+    if (primary_count != 1) goto unlock;
+
+    wl_array_for_each(info, array)
+    {
+        const struct ntuser_display_output *output = find_display_output(&layout, info);
+
+        info->x = output->rect.left;
+        info->y = output->rect.top;
+        info->is_primary = !!(output->state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+    }
+    qsort(array->data, layout.count, sizeof(*info), output_info_cmp_primary_x_y);
+    process_wayland.output_layout_accepted = TRUE;
+    ret = TRUE;
+
+unlock:
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+done:
+    free(layout.outputs);
+    return ret;
 }
 
 static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,
@@ -374,15 +432,14 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
     free(modes);
 }
 
-void output_info_array_update(void)
+static void output_info_array_update_layout(const char *primary_name, BOOL publishing)
 {
-    struct output_info *output_info;
+    struct output_info *output_info, *previous;
     struct wayland_output *output;
     struct wl_array *output_info_array = &process_wayland.output_info_array;
+    struct wl_array old = *output_info_array;
 
-    /* reset the output info array */
-    wl_array_release(&process_wayland.output_info_array);
-    wl_array_init(&process_wayland.output_info_array);
+    wl_array_init(output_info_array);
 
     wl_list_for_each(output, &process_wayland.output_list, link)
     {
@@ -392,7 +449,29 @@ void output_info_array_update(void)
         else ERR("Failed to allocate space for output_info\n");
     }
 
-    output_info_array_arrange_physical_coords(output_info_array);
+    /* Initial output events describe a partial topology. Recompute that
+     * provisional layout until it has been published or synchronized with
+     * win32u. Only an accepted layout may be retained across later events. */
+    if (!publishing && process_wayland.output_layout_accepted && old.size)
+        wl_array_for_each(previous, &old)
+            if (previous->is_primary) primary_name = previous->output->name;
+    output_info_array_arrange_physical_coords(output_info_array, primary_name);
+    if (!publishing && process_wayland.output_layout_accepted)
+        wl_array_for_each(output_info, output_info_array)
+            wl_array_for_each(previous, &old)
+                if (previous->output == output_info->output)
+                {
+                    output_info->x = previous->x;
+                    output_info->y = previous->y;
+                    output_info->is_primary = previous->is_primary;
+                    break;
+                }
+    wl_array_release(&old);
+}
+
+void output_info_array_update(void)
+{
+    output_info_array_update_layout(NULL, FALSE);
 }
 
 static int scale_output_coordinate(int offset, int physical_size, int logical_size)
@@ -496,12 +575,30 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
 {
     DWORD state_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
     struct output_info *primary = NULL, *output_info;
+    struct wayland_output *output;
+    BOOL have_ready_output = FALSE;
 
     TRACE("\n");
 
     pthread_mutex_lock(&process_wayland.output_mutex);
 
-    output_info_array_update();
+    wl_list_for_each(output, &process_wayland.output_list, link)
+        if (output->current.current_mode)
+        {
+            have_ready_output = TRUE;
+            break;
+        }
+
+    /* An announced replacement may still be waiting for its initial mode.
+     * Keep the published Win32 devices until done or removal retries the update.
+     * This must precede add_gpu, which clears the previous device list. */
+    if (!have_ready_output && !wl_list_empty(&process_wayland.output_list))
+    {
+        pthread_mutex_unlock(&process_wayland.output_mutex);
+        return STATUS_PENDING;
+    }
+
+    output_info_array_update_layout(device_manager->get_primary_name(param), TRUE);
 
     /* Populate GDI devices. */
     wayland_add_device_gpu(device_manager, param);
@@ -514,6 +611,8 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
         wayland_add_device_modes(device_manager, param, output_info, primary);
         state_flags &= ~DISPLAY_DEVICE_PRIMARY_DEVICE;
     }
+
+    process_wayland.output_layout_accepted = TRUE;
 
     pthread_mutex_unlock(&process_wayland.output_mutex);
 

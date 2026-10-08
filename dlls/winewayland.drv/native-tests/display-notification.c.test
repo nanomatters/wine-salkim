@@ -1,0 +1,432 @@
+/* Extract the display-change policy and exact topology comparator verbatim.
+ * Publication replaces immutable sources. Message transport is injected. */
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+#include "winuser.h"
+#include "wine/list.h"
+
+#define WM_WINE_CLIPCURSOR 0x8000u
+#define SET_CURSOR_FSCLIP 1u
+#define ERR(...) (++errors)
+
+struct source
+{
+    LONG refcount;
+    struct list entry;
+    char name[MAX_PATH];
+    UINT state_flags, dpi, depth;
+    DEVMODEW current, physical;
+};
+enum stage { PUBLISH, PRIMARY_MODE, DESKTOP, NOTIFY_APPS, CLIP_CURSOR, NOTIFY_DESKTOP, SYNC_APPS, RECLIP };
+struct notification { unsigned int generation; WPARAM bpp; LPARAM size; };
+static struct list sources = LIST_INIT(sources);
+static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct source staged[4];
+static unsigned int staged_count, generation, live_sources, acquires, releases;
+static struct notification pending[8];
+static enum stage stages[16];
+static unsigned int stage_count, pending_count, delivered, app_monitor_count;
+static unsigned int geometry_updates, desktop_messages, errors, sync_calls;
+static BOOL cache_ok, primary_ok, allocation_fails;
+static RECT desktop_bounds;
+
+static void record(enum stage stage)
+{
+    assert(stage_count < sizeof(stages) / sizeof(stages[0]));
+    stages[stage_count++] = stage;
+}
+
+static struct source *source_acquire(struct source *source)
+{
+    assert(pthread_mutex_trylock(&display_lock) == EBUSY);
+    ++source->refcount;
+    ++acquires;
+    return source;
+}
+
+static void source_release(struct source *source)
+{
+    assert(source->refcount > 0);
+    ++releases;
+    if (!--source->refcount)
+    {
+        --live_sources;
+        free(source);
+    }
+}
+
+static void clear_sources(void)
+{
+    struct source *source;
+    while (!list_empty(&sources))
+    {
+        source = LIST_ENTRY(list_head(&sources), struct source, entry);
+        list_remove(&source->entry);
+        source_release(source);
+    }
+}
+
+static BOOL update_display_cache(BOOL force)
+{
+    struct source *source;
+    unsigned int i;
+    assert(force);
+    record(PUBLISH);
+    if (!cache_ok) return FALSE;
+    pthread_mutex_lock(&display_lock);
+    clear_sources();
+    for (i = 0; i < staged_count; ++i)
+    {
+        source = malloc(sizeof(*source));
+        assert(source);
+        *source = staged[i];
+        source->refcount = 1;
+        ++live_sources;
+        list_add_tail(&sources, &source->entry);
+    }
+    ++generation;
+    pthread_mutex_unlock(&display_lock);
+    return TRUE;
+}
+
+static BOOL get_primary_source_mode(DEVMODEW *mode)
+{
+    struct source *source;
+    assert(mode->dmSize == sizeof(*mode));
+    assert(stage_count == 1 && stages[0] == PUBLISH);
+    record(PRIMARY_MODE);
+    if (!primary_ok) return FALSE;
+    LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
+        if (source->state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE)
+        {
+            *mode = source->current;
+            return TRUE;
+        }
+    return FALSE;
+}
+
+static unsigned int attached_count(void)
+{
+    struct source *source;
+    unsigned int count = 0;
+    LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
+        if (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ++count;
+    return count;
+}
+
+static HWND get_desktop_window(void) { return (HWND)(UINT_PTR)0x10020; }
+static HWND mock_foreground(void) { return (HWND)(UINT_PTR)0x20088; }
+
+static void check_mode(UINT msg, WPARAM bpp, LPARAM size)
+{
+    struct source *source;
+    assert(msg == WM_DISPLAYCHANGE);
+    LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
+        if (source->state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE)
+        {
+            assert(bpp == source->current.dmBitsPerPel);
+            assert(LOWORD(size) == source->current.dmPelsWidth);
+            assert(HIWORD(size) == source->current.dmPelsHeight);
+            return;
+        }
+    assert(!"missing primary");
+}
+
+static void update_desktop_bounds(void)
+{
+    struct source *source;
+    RECT bounds = {0};
+    BOOL first = TRUE;
+    ++desktop_messages;
+    LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
+    {
+        RECT rect;
+        if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+        rect = (RECT){source->physical.dmPosition.x, source->physical.dmPosition.y,
+                      source->physical.dmPosition.x + source->physical.dmPelsWidth,
+                      source->physical.dmPosition.y + source->physical.dmPelsHeight};
+        if (first) bounds = rect;
+        else
+        {
+            if (rect.left < bounds.left) bounds.left = rect.left;
+            if (rect.top < bounds.top) bounds.top = rect.top;
+            if (rect.right > bounds.right) bounds.right = rect.right;
+            if (rect.bottom > bounds.bottom) bounds.bottom = rect.bottom;
+        }
+        first = FALSE;
+    }
+    if (!memcmp(&desktop_bounds, &bounds, sizeof(bounds))) return;
+    desktop_bounds = bounds;
+    ++geometry_updates;
+}
+
+static LRESULT send_message(HWND hwnd, UINT msg, WPARAM bpp, LPARAM size)
+{
+    assert(hwnd == get_desktop_window());
+    assert(stage_count == 2 && stages[1] == PRIMARY_MODE);
+    check_mode(msg, bpp, size);
+    record(DESKTOP);
+    update_desktop_bounds();
+    return 0;
+}
+
+static BOOL send_notify_message(HWND hwnd, UINT msg, WPARAM bpp, LPARAM size, BOOL ansi)
+{
+    assert(!ansi);
+    check_mode(msg, bpp, size);
+    if (hwnd == get_desktop_window())
+    {
+        record(NOTIFY_DESKTOP);
+        update_desktop_bounds();
+        return TRUE;
+    }
+    assert(hwnd == HWND_BROADCAST);
+    assert(stage_count == 3 && stages[2] == DESKTOP);
+    assert(pending_count < sizeof(pending) / sizeof(pending[0]));
+    record(NOTIFY_APPS);
+    pending[pending_count++] = (struct notification){generation, bpp, size};
+    return TRUE;
+}
+
+static LRESULT send_message_timeout(HWND hwnd, UINT msg, WPARAM bpp, LPARAM size,
+                                    UINT flags, UINT timeout, BOOL ansi)
+{
+    assert(hwnd == HWND_BROADCAST && flags == SMTO_ABORTIFHUNG && timeout == 2000 && !ansi);
+    check_mode(msg, bpp, size);
+    record(SYNC_APPS);
+    ++sync_calls;
+    ++delivered;
+    app_monitor_count = attached_count();
+    return 0;
+}
+
+static BOOL mock_clip_cursor(const RECT *rect)
+{
+    assert(!rect);
+    record(CLIP_CURSOR);
+    return TRUE;
+}
+
+static BOOL mock_post_message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    assert(hwnd == mock_foreground() && msg == WM_WINE_CLIPCURSOR && wp == SET_CURSOR_FSCLIP && !lp);
+    record(RECLIP);
+    return TRUE;
+}
+
+static void *snapshot_alloc(size_t size)
+{
+    return allocation_fails ? NULL : malloc(size);
+}
+
+#define NtUserClipCursor mock_clip_cursor
+#define NtUserGetForegroundWindow mock_foreground
+#define NtUserPostMessage mock_post_message
+#define malloc snapshot_alloc
+
+/* PRODUCTION_NOTIFICATION */
+
+#undef malloc
+
+static void reset_call(void)
+{
+    stage_count = pending_count = desktop_messages = geometry_updates = errors = sync_calls = 0;
+    acquires = releases = 0;
+    allocation_fails = FALSE;
+    cache_ok = primary_ok = TRUE;
+}
+
+static void fill_source(struct source *source, const char *name, LONG x, LONG y,
+                        UINT width, UINT height, BOOL primary)
+{
+    memset(source, 0, sizeof(*source));
+    strcpy(source->name, name);
+    source->state_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP;
+    if (primary) source->state_flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
+    source->dpi = 96;
+    source->current.dmSize = sizeof(DEVMODEW);
+    source->current.dmFields = DM_POSITION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
+                               DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION | DM_DISPLAYFIXEDOUTPUT;
+    source->current.dmPosition.x = x;
+    source->current.dmPosition.y = y;
+    source->current.dmBitsPerPel = 32;
+    source->current.dmPelsWidth = width;
+    source->current.dmPelsHeight = height;
+    source->current.dmDisplayFrequency = 60;
+    source->physical = source->current;
+}
+
+static void host_change(BOOL expected_change)
+{
+    unsigned int old_delivered = delivered;
+    reset_call();
+    display_mode_changed(FALSE, TRUE);
+    assert(stage_count == (expected_change ? 4u : 3u));
+    assert(stages[0] == PUBLISH && stages[1] == PRIMARY_MODE && stages[2] == DESKTOP);
+    assert(desktop_messages == 1 && pending_count == (expected_change ? 1u : 0u) && !sync_calls && !errors);
+    assert(delivered == old_delivered && live_sources == staged_count);
+    if (pending_count)
+    {
+        assert(pending[0].generation == generation);
+        check_mode(WM_DISPLAYCHANGE, pending[0].bpp, pending[0].size);
+        app_monitor_count = attached_count();
+        ++delivered;
+        pending_count = 0;
+    }
+    assert(delivered == old_delivered + !!expected_change);
+}
+
+int main(void)
+{
+    const enum stage app_order[] = {PUBLISH, PRIMARY_MODE, CLIP_CURSOR, NOTIFY_DESKTOP, SYNC_APPS, RECLIP};
+    struct source tmp;
+    unsigned int old_delivered, old_generation;
+
+    pthread_mutex_lock(&display_lock);
+    assert(!display_sources_changed(NULL, 0));
+    pthread_mutex_unlock(&display_lock);
+    /* First publication differs from a valid empty source list. */
+    staged_count = 2;
+    fill_source(&staged[0], "DP-3", 0, 0, 5120, 2160, TRUE);
+    fill_source(&staged[1], "DP-2", 5120, 334, 3840, 1600, FALSE);
+    host_change(TRUE);
+    host_change(FALSE);
+    /* Enumeration order and non-display DEVMODE fields are not topology. */
+    tmp = staged[0]; staged[0] = staged[1]; staged[1] = tmp;
+    staged[0].current.dmDriverVersion = 123;
+    staged[0].current.dmSpecVersion = 456;
+    staged[0].current.dmDriverExtra = 789;
+    staged[0].current.dmICMMethod = DMICMMETHOD_SYSTEM;
+    staged[0].current.dmDeviceName[0] = 'x';
+    host_change(FALSE);
+    staged[0].current.dmFields |= DM_FORMNAME;
+    host_change(FALSE);
+    staged[0].current.dmDisplayFlags = DM_INTERLACED; /* absent field is ignored */
+    host_change(FALSE);
+    staged[0].current.dmFields |= DM_DISPLAYFLAGS;
+    host_change(TRUE);
+    /* Detached sources do not change attached topology. */
+    staged_count = 3;
+    fill_source(&staged[2], "HDMI-A-1", 0, 0, 1920, 1080, FALSE);
+    staged[2].state_flags = 0;
+    host_change(FALSE);
+    staged_count = 2;
+    host_change(FALSE);
+
+    /* Disable, restore, then disable the other monitor. */
+    staged_count = 1;
+    fill_source(&staged[0], "DP-2", 0, 0, 3840, 1600, TRUE);
+    host_change(TRUE);
+    assert(app_monitor_count == 1 && geometry_updates == 1);
+    staged_count = 2;
+    fill_source(&staged[1], "DP-3", -5120, -334, 5120, 2160, FALSE);
+    host_change(TRUE);
+    assert(app_monitor_count == 2);
+    staged_count = 1;
+    fill_source(&staged[0], "DP-3", 0, 0, 5120, 2160, TRUE);
+    host_change(TRUE);
+
+    /* In-place monitor replacement and rearrangement retain desktop bounds. */
+    staged_count = 2;
+    fill_source(&staged[0], "DP-2", 0, 0, 1920, 1600, TRUE);
+    fill_source(&staged[1], "DP-3", 1920, 0, 1920, 1600, FALSE);
+    host_change(TRUE);
+    staged_count = 1;
+    fill_source(&staged[0], "DP-2", 0, 0, 3840, 1600, TRUE);
+    host_change(TRUE);
+    assert(!geometry_updates);
+    staged_count = 2;
+    fill_source(&staged[0], "DP-2", 0, 0, 1920, 1600, TRUE);
+    fill_source(&staged[1], "DP-3", 1920, 0, 1920, 1600, FALSE);
+    host_change(TRUE);
+    staged[0].current.dmPosition.x = staged[0].physical.dmPosition.x = 1920;
+    staged[1].current.dmPosition.x = staged[1].physical.dmPosition.x = 0;
+    host_change(TRUE);
+    assert(!geometry_updates);
+    staged[0].state_flags &= ~DISPLAY_DEVICE_PRIMARY_DEVICE;
+    staged[1].state_flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
+    host_change(TRUE);
+    assert(!geometry_updates);
+
+    ++staged[1].current.dmDisplayFrequency;
+    host_change(TRUE);
+    ++staged[1].physical.dmDisplayFrequency;
+    host_change(TRUE);
+    ++staged[1].current.dmDisplayOrientation;
+    host_change(TRUE);
+    ++staged[1].physical.dmDisplayFixedOutput;
+    host_change(TRUE);
+    staged[1].depth = 16;
+    host_change(TRUE);
+    staged[1].dpi = 144;
+    host_change(TRUE);
+    host_change(FALSE);
+    ++staged[1].physical.dmPelsWidth;
+    host_change(TRUE);
+    ++staged[1].current.dmPelsHeight;
+    host_change(TRUE);
+    staged[1].current.dmBitsPerPel = 24;
+    host_change(TRUE);
+    /* Connector replacement changes identity without changing union bounds. */
+    strcpy(staged[0].name, "HDMI-A-1");
+    host_change(TRUE);
+    assert(!geometry_updates);
+    strcpy(staged[0].name, "DP-2");
+    host_change(TRUE);
+    assert(!geometry_updates);
+
+    /* Invalid connector identities never suppress a notification. */
+    strcpy(staged[0].name, staged[1].name);
+    host_change(TRUE);
+    host_change(TRUE);
+    staged[0].name[0] = 0;
+    host_change(TRUE);
+    host_change(TRUE);
+    strcpy(staged[0].name, "DP-2");
+    host_change(TRUE);
+    host_change(FALSE);
+
+    /* OOM is conservative and both failure exits release captured sources. */
+    reset_call();
+    allocation_fails = TRUE;
+    display_mode_changed(FALSE, TRUE);
+    assert(pending_count == 1 && !acquires && live_sources == staged_count);
+    old_delivered = delivered;
+    old_generation = generation;
+    reset_call();
+    cache_ok = FALSE;
+    display_mode_changed(FALSE, TRUE);
+    assert(stage_count == 1 && stages[0] == PUBLISH && errors == 1);
+    assert(!desktop_messages && !pending_count && delivered == old_delivered);
+    assert(generation == old_generation && live_sources == staged_count && acquires == releases);
+    reset_call();
+    primary_ok = FALSE;
+    display_mode_changed(FALSE, TRUE);
+    assert(stage_count == 2 && stages[1] == PRIMARY_MODE && errors == 1);
+    assert(!desktop_messages && !pending_count && delivered == old_delivered);
+    assert(live_sources == staged_count);
+
+    /* Existing non-Wayland host path does not acquire or notify applications. */
+    reset_call();
+    ++staged[0].current.dmDisplayFrequency;
+    display_mode_changed(FALSE, FALSE);
+    assert(stage_count == 3 && desktop_messages == 1 && !pending_count && !sync_calls && !errors && !acquires);
+    /* Application-initiated mode changes retain the synchronous path. */
+    reset_call();
+    display_mode_changed(TRUE, FALSE);
+    assert(stage_count == sizeof(app_order) / sizeof(app_order[0]));
+    assert(!memcmp(stages, app_order, sizeof(app_order)));
+    assert(desktop_messages == 1 && sync_calls == 1 && !pending_count && !errors && !acquires);
+    assert(delivered == old_delivered + 1);
+    clear_sources();
+    assert(!live_sources);
+    puts("PASS: Wayland topology changes notify asynchronously, duplicate events are skipped, old paths and reference cleanup retained");
+    return 0;
+}

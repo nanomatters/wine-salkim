@@ -1155,6 +1155,20 @@ static inline HWND NtUserGetTaskmanWindow(void)
     return UlongToHandle( NtUserCallNoParam( NtUserCallNoParam_GetTaskmanWindow ));
 }
 
+/* Accepted host display layout, independent of emulated display modes. */
+struct ntuser_display_output
+{
+    char name[MAX_PATH];
+    RECT rect;
+    UINT state_flags;
+};
+
+struct ntuser_display_layout
+{
+    UINT count; /* input capacity, output required count */
+    struct ntuser_display_output *outputs;
+};
+
 /* NtUserCallOneParam codes, not compatible with Windows */
 enum
 {
@@ -1174,6 +1188,8 @@ enum
     NtUserCallOneParam_D3DKMTOpenAdapterFromGdiDisplayName,
     NtUserCallOneParam_GetAsyncKeyboardState,
     NtUserCallOneParam_UnregisterTouchWindow,
+    NtUserCallOneParam_GetDisplayLayout,
+    NtUserCallOneParam_DisplayModeChanged,
     /* temporary exports */
     NtUserGetDeskPattern,
 };

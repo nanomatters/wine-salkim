@@ -266,6 +266,7 @@ static void wayland_output_done(struct wayland_output *output)
     }
 
     maybe_init_display_devices();
+    wayland_window_update_outputs();
 }
 
 static void output_handle_geometry(void *data, struct wl_output *wl_output,

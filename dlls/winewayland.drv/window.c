@@ -161,6 +161,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
     struct wayland_client_surface *stashed_client = data->stashed_client;
     struct wayland_shm_buffer *window_contents = data->window_contents;
+    struct wayland_output *fullscreen_output = data->application_fullscreen_output;
 
     TRACE("hwnd=%p\n", data->hwnd);
 
@@ -171,6 +172,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
 
     pthread_mutex_unlock(&win_data_mutex);
+    if (fullscreen_output) wayland_output_release(fullscreen_output);
     if (stashed_client) client_surface_release(&stashed_client->client);
     if (window_contents) wayland_shm_buffer_unref(window_contents);
     free(data->window_text);
@@ -301,6 +303,23 @@ static BOOL wayland_window_style_allows_fullscreen(DWORD style)
     return (style & WS_POPUP) && !(style & WS_MAXIMIZE);
 }
 
+static BOOL wayland_win_data_preserves_fullscreen(const struct wayland_win_data *data,
+                                                  const struct window_rects *rects,
+                                                  DWORD style, UINT swp_flags)
+{
+    /* A desktop refresh sends unchanged window-state updates before output
+     * reconciliation can move the HWND into the newly accepted layout.
+     * Preserve the application request, not a target inferred from its old
+     * rectangle. Only our own position update waives the geometry check.
+     * Style and visibility changes are always reconsidered. */
+    return data->is_fullscreen && style == data->style &&
+           wayland_window_style_allows_fullscreen(style) &&
+           !(style & WS_MINIMIZE) && !(swp_flags & SWP_HIDEWINDOW) &&
+           (data->updating_output ||
+            (EqualRect(&data->rects.window, &rects->window) &&
+             EqualRect(&data->rects.client, &rects->client)));
+}
+
 static BOOL wayland_window_matches_display_mode(const struct window_rects *rects,
                                                 RECT *fullscreen_rect)
 {
@@ -342,8 +361,8 @@ done:
     return ret;
 }
 
-BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
-                                          BOOL active, RECT *rect)
+static BOOL wayland_win_data_get_requested_fullscreen_rect(const struct wayland_win_data *data,
+                                                           BOOL active, RECT *rect)
 {
     struct wayland_surface *surface = data->wayland_surface;
 
@@ -353,9 +372,13 @@ BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
     if (!data->virtual_desktop || !data->is_fullscreen ||
         !wayland_window_style_allows_fullscreen(data->style))
     {
-        if (!data->application_fullscreen) return FALSE;
-        *rect = data->application_fullscreen_rect;
-        return TRUE;
+        /* A removed target ends its output claim, not fullscreen intent. The
+         * cached rectangle belongs to the old layout and cannot select a new
+         * output. Presentation may still follow a surviving entered output. */
+        return data->is_fullscreen &&
+               (data->has_present_rect || wayland_window_style_allows_fullscreen(data->style)) &&
+               data->application_fullscreen_output &&
+               wayland_output_get_layout_rect(data->application_fullscreen_output->wl_output, rect);
     }
 
     /* Virtual desktop coordinates do not identify a physical output. Present
@@ -368,12 +391,69 @@ BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
     return wayland_output_get_primary_rect(rect);
 }
 
+/* An explicit Vulkan monitor remains application-owned. Compositor placement
+ * is an observation, not permission to replace its fullscreen claim. */
+static BOOL wayland_win_data_has_fixed_output(const struct wayland_win_data *data, BOOL active)
+{
+    struct wayland_client_surface *client = data->client_surface;
+    struct wayland_fullscreen_request *request;
+
+    if (!client || list_empty(&client->fullscreen_requests)) return FALSE;
+    if (!active)
+    {
+        request = LIST_ENTRY(list_tail(&client->fullscreen_requests),
+                             struct wayland_fullscreen_request, entry);
+        return !request->invalid && request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED;
+    }
+    LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests, struct wayland_fullscreen_request, entry)
+        if (request->owner == client->fullscreen_active_owner)
+            return !request->invalid && request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED;
+    return FALSE;
+}
+
+BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
+                                          BOOL active, RECT *rect)
+{
+    struct wayland_surface *surface = data->wayland_surface;
+
+    if (!wayland_win_data_get_requested_fullscreen_rect(data, active, rect))
+    {
+        if (!data->is_fullscreen || (!data->has_present_rect &&
+            !wayland_window_style_allows_fullscreen(data->style)) ||
+            !surface || !surface->presentation_output)
+            return FALSE;
+        return wayland_output_get_layout_rect(surface->presentation_output->wl_output, rect);
+    }
+    if (!wayland_win_data_has_fixed_output(data, active) && surface &&
+        surface->presentation_output)
+        wayland_output_get_layout_rect(surface->presentation_output->wl_output, rect);
+    return TRUE;
+}
+
+static BOOL wayland_win_data_has_fixed_fullscreen_size(const struct wayland_win_data *data,
+                                                       BOOL active)
+{
+    RECT rect;
+
+    return data->virtual_desktop || data->has_present_rect ||
+           (data->client_surface &&
+            wayland_client_surface_get_fullscreen_rect(data->client_surface, active, &rect));
+}
+
 BOOL wayland_win_data_get_presentation_rect(const struct wayland_win_data *data,
                                             BOOL active, RECT *rect)
 {
     struct wayland_output *output;
     RECT target_rect = {0};
     BOOL fullscreen = wayland_win_data_get_fullscreen_rect(data, active, &target_rect);
+
+    /* Output identity selects an origin, not the size of an ordinary window.
+     * A configure may resize it before the compositor sends surface.enter. */
+    if (fullscreen && !wayland_win_data_has_fixed_fullscreen_size(data, active))
+    {
+        target_rect.right = target_rect.left + data->rects.client.right - data->rects.client.left;
+        target_rect.bottom = target_rect.top + data->rects.client.bottom - data->rects.client.top;
+    }
 
     if (!data->has_present_rect)
     {
@@ -397,15 +477,6 @@ BOOL wayland_win_data_get_presentation_rect(const struct wayland_win_data *data,
 
     *rect = data->present_rect;
     return TRUE;
-}
-
-static BOOL wayland_win_data_has_fixed_fullscreen_size(const struct wayland_win_data *data)
-{
-    RECT rect;
-
-    return data->virtual_desktop || data->has_present_rect ||
-           (data->client_surface &&
-            wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect));
 }
 
 BOOL wayland_win_data_is_fullscreen(const struct wayland_win_data *data)
@@ -437,14 +508,6 @@ static BOOL wayland_win_data_retargets_fullscreen(const struct wayland_win_data 
         return FALSE;
     if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         return FALSE;
-
-    /* Keep a fullscreen request stable across no-op position updates while a
-     * compositor configure or output-layout refresh is in flight. */
-    if (EqualRect(&data->rects.window, &new_rects->window))
-    {
-        *fullscreen_rect = data->application_fullscreen_rect;
-        return TRUE;
-    }
 
     if (!EqualRect(&new_rects->window, &new_rects->client)) return FALSE;
     if (!(new_output = wayland_output_for_rect(&new_rects->client,
@@ -587,7 +650,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     conf->resizeable = (style & WS_THICKFRAME) && !fullscreen;
     conf->state = window_state;
     conf->managed = data->managed;
-    conf->preserve_fullscreen_size = wayland_win_data_has_fixed_fullscreen_size(data);
+    conf->preserve_fullscreen_size = wayland_win_data_has_fixed_fullscreen_size(data, TRUE);
     conf->virtual_size.cx = conf->virtual_size.cy = 0;
     if (data->virtual_desktop && !conf->minimized &&
         (parent || (has_presentation_rect && (window_state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))) &&
@@ -611,7 +674,18 @@ static BOOL should_keep_toplevel_mapped(struct wayland_surface *surface,
 {
     if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
     if (explicitly_hidden) return FALSE;
-    if (!(style & WS_MINIMIZE)) return !(style & WS_VISIBLE);
+    if (!(style & WS_MINIMIZE))
+    {
+        /* A fullscreen toplevel is placed by the compositor. After output
+         * removal its Win32 origin may be outside the new layout until enter.
+         * Keep it mapped so the replacement configure can be acknowledged. */
+        return !(style & WS_VISIBLE) ||
+               (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) ||
+               (surface->processing.serial &&
+                (surface->processing.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) ||
+               (surface->queued.serial &&
+                (surface->queued.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN));
+    }
 
     return !surface->current.caps ||
            (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
@@ -774,7 +848,8 @@ static void queue_subsurface_updates(HWND owner)
     }
 }
 
-static void wayland_surface_update_state_toplevel(struct wayland_surface *surface);
+static void wayland_surface_update_state_toplevel(struct wayland_surface *surface,
+                                                 const struct wayland_win_data *data);
 
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
                                                     struct wayland_surface *toplevel_surface,
@@ -938,7 +1013,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         {
             /* Send initial state before the empty commit that requests the
              * first configure. */
-            wayland_surface_update_state_toplevel(surface);
+            wayland_surface_update_state_toplevel(surface, data);
             wayland_surface_commit(surface);
             wl_display_flush(process_wayland.wl_display);
             *initial_state_committed = TRUE;
@@ -976,7 +1051,8 @@ static BOOL wayland_surface_has_pending_state(struct wayland_surface *surface,
     return FALSE;
 }
 
-static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
+static void wayland_surface_update_state_toplevel(struct wayland_surface *surface,
+                                                 const struct wayland_win_data *data)
 {
     const struct wayland_window_config *window = &surface->window;
     const RECT *rect = &window->rect;
@@ -1030,10 +1106,20 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         }
         if (window->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
         {
-            struct wayland_output *output;
+            struct wayland_output *output = NULL;
             struct wl_output *wl_output = NULL;
+            RECT requested_rect;
 
-            if ((output = wayland_output_for_rect(rect, NULL, NULL)))
+            /* Send application intent, not the presentation rectangle derived
+             * from enter/leave. Otherwise observing B after requesting A would
+             * turn into another fullscreen request and fight compositor policy. */
+            if (wayland_win_data_get_requested_fullscreen_rect(data, TRUE, &requested_rect))
+                output = wayland_output_for_rect(&requested_rect, NULL, NULL);
+            else if (surface->presentation_output && surface->fullscreen_requested)
+                wl_output = (struct wl_output *)surface->requested_output;
+            else
+                output = wayland_output_for_rect(rect, NULL, NULL);
+            if (output)
                 wl_output = output->wl_output;
 
             if (surface->fullscreen_requested && surface->requested_output == wl_output)
@@ -1089,7 +1175,7 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
-        wayland_surface_update_state_toplevel(surface);
+        wayland_surface_update_state_toplevel(surface, data);
         break;
     }
 
@@ -1604,7 +1690,13 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 
     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
 
-    if (!data && !(data = wayland_win_data_create(hwnd, rects))) return FALSE;
+    if (!data)
+    {
+        /* Join the desktop's coordinate map before interpreting the first
+         * Win32 rectangle, not after a surface has already been presented. */
+        output_info_array_sync_shared_layout();
+        if (!(data = wayland_win_data_create(hwnd, rects))) return FALSE;
+    }
     wayland_win_data_update_restore_rect(data, style, rects);
 
     wayland_win_data_release(data);
@@ -1645,9 +1737,28 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL application_fullscreen = FALSE;
     RECT application_fullscreen_rect = {0};
     BOOL use_layer_shell = FALSE;
+    BOOL preserve_fullscreen = FALSE;
+    BOOL updating_output = FALSE;
+    BOOL update_fullscreen_target = FALSE;
+
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        updating_output = data->updating_output;
+        preserve_fullscreen = wayland_win_data_preserves_fullscreen(data, new_rects, style, swp_flags);
+        /* The waiver belongs to this driver position update, not application
+         * changes from the subsequent WM_WINDOWPOSCHANGED/WM_SIZE handlers. */
+        data->updating_output = FALSE;
+        if (preserve_fullscreen)
+        {
+            fullscreen = data->is_fullscreen;
+            application_fullscreen = data->application_fullscreen;
+            application_fullscreen_rect = data->application_fullscreen_rect;
+        }
+        wayland_win_data_release(data);
+    }
 
     /* Infer application fullscreen only when win32u has not supplied fullscreen intent. */
-    if (!fullscreen && hwnd == root && (style & WS_VISIBLE) &&
+    if (!preserve_fullscreen && !fullscreen && hwnd == root && (style & WS_VISIBLE) &&
         !(style & WS_MINIMIZE) && !(swp_flags & SWP_HIDEWINDOW) &&
         wayland_window_style_allows_fullscreen(style))
     {
@@ -1770,6 +1881,62 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                                    previous_host != external_host);
     update_inferred = hwnd == root && (!(swp_flags & SWP_NOZORDER) ||
                                       data->visible != visible || ((data->style ^ style) & WS_MINIMIZE));
+    if (!preserve_fullscreen)
+    {
+        BOOL moved = data->rects.client.left != new_rects->client.left ||
+                     data->rects.client.top != new_rects->client.top;
+
+        update_fullscreen_target = moved && !updating_output && !data->virtual_desktop &&
+                                   (style & WS_VISIBLE) && !(style & WS_MINIMIZE) &&
+                                   !(swp_flags & SWP_HIDEWINDOW);
+
+        if (!fullscreen || data->virtual_desktop || !(style & WS_VISIBLE) ||
+            (style & WS_MINIMIZE) || (swp_flags & SWP_HIDEWINDOW))
+        {
+            if (data->application_fullscreen_output)
+                wayland_output_release(data->application_fullscreen_output);
+            data->application_fullscreen_output = NULL;
+        }
+        else if (!updating_output &&
+                 (moved || !data->is_fullscreen || !data->application_fullscreen_output))
+        {
+            struct wayland_output *output;
+
+            /* Retain Win32 monitor intent even when win32u supplied fullscreen.
+             * A deferred configure or output reconciliation may move the HWND
+             * again before this request can be sent. A resize alone does not
+             * replace an existing target with the observed output. */
+            output = wayland_output_for_rect(application_fullscreen ?
+                                              &application_fullscreen_rect : &new_rects->client,
+                                              NULL, NULL);
+            if (data->application_fullscreen_output)
+                wayland_output_release(data->application_fullscreen_output);
+            data->application_fullscreen_output = output;
+        }
+        if (data->wayland_surface && moved && !updating_output)
+        {
+            struct wayland_surface *wayland_surface = data->wayland_surface;
+            struct wl_output *observed = wayland_surface_get_output(wayland_surface);
+            BOOL keep_fullscreen_request = wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+                                           observed && observed == wayland_surface->requested_output &&
+                                           !wayland_surface->queued.serial && !wayland_surface->processing.serial &&
+                                           (wayland_surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
+            RECT fullscreen_rect;
+
+            wayland_surface_reset_presentation_output(wayland_surface);
+            /* Moving back to a previously requested output is a new request.
+             * Keep the invalidation until pending configures have completed,
+             * but retain a settled request when already on that output.
+             * A changed target is detected by the state update itself. */
+            if (update_fullscreen_target && !keep_fullscreen_request &&
+                wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+                !wayland_win_data_has_fixed_output(data, TRUE) &&
+                ((fullscreen && (has_present_rect || wayland_window_style_allows_fullscreen(style))) ||
+                 (data->client_surface && wayland_client_surface_get_fullscreen_rect(
+                      data->client_surface, TRUE, &fullscreen_rect))))
+                wayland_surface->fullscreen_requested = FALSE;
+        }
+    }
     data->rects = *new_rects;
     data->toplevel = subsurface_parent ? subsurface_parent : root;
     data->owner = window_owner;
@@ -1789,7 +1956,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->application_fullscreen_rect = application_fullscreen_rect;
     data->managed = managed;
     if (surface) wayland_window_surface_set_external_host(surface, external_host);
-    if (data->client_surface)
+    if (data->client_surface && update_fullscreen_target)
         wayland_client_surface_update_fullscreen_target(data->client_surface,
                                                         &new_rects->client);
     wayland_win_data_update_restore_rect(data, style, new_rects);
@@ -1853,6 +2020,43 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (hwnd == NtUserGetForegroundWindow()) reapply_cursor_clipping();
 }
 
+static void wayland_win_data_refresh_output_targets(struct wayland_win_data *data,
+                                                    const struct wl_output *removed)
+{
+    struct wayland_surface *surface = data->wayland_surface;
+    struct wayland_output *output = data->application_fullscreen_output;
+
+    if (!removed) return;
+    if (data->client_surface)
+        wayland_client_surface_refresh_fullscreen_targets(data->client_surface, removed);
+    if (output && output->wl_output == removed)
+    {
+        wayland_output_release(output);
+        data->application_fullscreen_output = NULL;
+    }
+    if (!surface) return;
+    if (surface->requested_output == removed)
+    {
+        surface->requested_output = NULL;
+        surface->fullscreen_requested = FALSE;
+    }
+    if (surface->presentation_output && surface->presentation_output->wl_output == removed)
+        wayland_surface_reset_presentation_output(surface);
+}
+
+void wayland_window_update_outputs(void)
+{
+    struct wayland_win_data *data;
+
+    wayland_win_data_lock();
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (data->wayland_surface)
+            wayland_surface_queue_output_update(data->wayland_surface);
+    }
+    wayland_win_data_unlock();
+}
+
 void wayland_window_remove_output(struct wl_output *output)
 {
     struct wayland_win_data *data;
@@ -1861,9 +2065,113 @@ void wayland_window_remove_output(struct wl_output *output)
     RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
     {
         if (data->wayland_surface)
+        {
             wayland_surface_update_output(data->wayland_surface, output, FALSE);
+            wayland_surface_queue_output_update(data->wayland_surface);
+        }
+        wayland_win_data_refresh_output_targets(data, output);
     }
     wayland_win_data_unlock();
+}
+
+static BOOL wayland_win_data_update_presentation_output(struct wayland_win_data *data)
+{
+    struct wayland_surface *surface = data->wayland_surface;
+    struct wayland_output *output;
+    struct wl_output *observed;
+    RECT rect;
+
+    if (!surface || !wayland_surface_is_toplevel(surface) || !data->visible ||
+        (data->style & WS_MINIMIZE) ||
+        !(observed = wayland_surface_get_output(surface)) ||
+        !wayland_output_get_layout_rect(observed, &rect))
+        return FALSE;
+    if (surface->presentation_output && surface->presentation_output->wl_output == observed)
+        return FALSE;
+    if (!(output = wayland_output_get(observed))) return FALSE;
+    wayland_surface_reset_presentation_output(surface);
+    surface->presentation_output = output;
+    return TRUE;
+}
+
+static void wayland_window_update_output(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    RECT target, rect;
+    BOOL reposition = FALSE, was_updating_output = FALSE;
+    BOOL layout_ready;
+
+    /* A desktop publication can complete after this process's output events.
+     * Read its shared coordinate map before interpreting any HWND rectangle. */
+    layout_ready = output_info_array_sync_shared_layout();
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    if (!(surface = data->wayland_surface))
+    {
+        wayland_win_data_release(data);
+        return;
+    }
+    surface->output_update_queued = FALSE;
+    if (!layout_ready && !data->virtual_desktop)
+    {
+        wayland_win_data_release(data);
+        return;
+    }
+    wayland_win_data_update_presentation_output(data);
+
+    if (!wayland_surface_is_toplevel(surface) || !data->visible ||
+        (data->style & WS_MINIMIZE))
+    {
+        wayland_win_data_release(data);
+        return;
+    }
+
+    /* Apply the compositor's size first. The configure handler queues another
+     * reconciliation once its Win32 resize has completed. */
+    if (surface->queued.serial ||
+        (surface->processing.serial && !surface->processing.processed))
+    {
+        wayland_win_data_release(data);
+        return;
+    }
+
+    /* Ambiguous/transient memberships retain the last placement but cannot
+     * move a window. An explicit Vulkan fullscreen target is not retargeted. */
+    if (!data->virtual_desktop && wayland_win_data_is_fullscreen(data) &&
+        !wayland_win_data_has_fixed_output(data, TRUE) &&
+        surface->presentation_output &&
+        wayland_surface_get_output(surface) == surface->presentation_output->wl_output &&
+        wayland_output_get_layout_rect(surface->presentation_output->wl_output, &target))
+    {
+        /* A fullscreen configure identifies its origin. Windowed placement
+         * cannot be inferred from output membership and remains unchanged. */
+        rect = data->rects.window;
+        OffsetRect(&rect, target.left - data->rects.client.left,
+                    target.top - data->rects.client.top);
+        reposition = !EqualRect(&rect, &data->rects.window);
+    }
+    if (reposition)
+    {
+        was_updating_output = data->updating_output;
+        data->updating_output = TRUE;
+    }
+    else wayland_win_data_refresh_fullscreen(data);
+    wayland_win_data_release(data);
+
+    if (reposition)
+    {
+        TRACE("hwnd=%p applying observed output position %s\n", hwnd, wine_dbgstr_rect(&rect));
+        NtUserSetRawWindowPos(hwnd, rect, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER |
+                             SWP_NOOWNERZORDER | SWP_NOSENDCHANGING, FALSE);
+        if ((data = wayland_win_data_get(hwnd)))
+        {
+            data->updating_output = was_updating_output;
+            wayland_win_data_refresh_fullscreen(data);
+            wayland_win_data_release(data);
+        }
+    }
+    ensure_window_surface_contents(hwnd, NULL);
 }
 
 static void wayland_configure_window(HWND hwnd)
@@ -1882,6 +2190,7 @@ static void wayland_configure_window(HWND hwnd)
     BOOL needs_exit_size_move = FALSE;
     BOOL resume_state_update;
     BOOL position_fullscreen = FALSE;
+    BOOL was_updating_output = FALSE;
     struct wayland_win_data *data;
     RECT output_rect, rect;
 
@@ -1955,7 +2264,7 @@ static void wayland_configure_window(HWND hwnd)
 
     /* Explicit presentation modes and virtual desktops own their render extent.
      * Ordinary xdg fullscreen follows the compositor extent as a Win32 resize. */
-    if (wayland_win_data_has_fixed_fullscreen_size(data) &&
+    if (wayland_win_data_has_fixed_fullscreen_size(data, TRUE) &&
         (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
         (surface->window.state & managed_state) == (state & managed_state))
     {
@@ -1969,7 +2278,7 @@ static void wayland_configure_window(HWND hwnd)
     if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
     rect = wayland_win_data_configure_window_rect(data, window_width, window_height);
     if (!data->virtual_desktop && (state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-        surface->fullscreen_requested &&
+        wayland_win_data_has_fixed_output(data, TRUE) && surface->fullscreen_requested &&
         wayland_output_get_layout_rect(surface->requested_output, &output_rect))
     {
         const RECT *surface_rect = wayland_win_data_configure_surface_rect(data);
@@ -2050,6 +2359,11 @@ static void wayland_configure_window(HWND hwnd)
             surface->xdg_surface && surface->processing.serial &&
             !surface->processing.processed)
             wayland_win_data_update_wayland_state(data);
+        if (state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+        {
+            was_updating_output = data->updating_output;
+            data->updating_output = TRUE;
+        }
         wayland_win_data_release(data);
     }
 
@@ -2061,6 +2375,15 @@ static void wayland_configure_window(HWND hwnd)
      * Still update retained producer geometry; a replacement frame need not
      * arrive while the application recreates its swapchain. No locks are held. */
     ensure_window_surface_contents(hwnd, NULL);
+
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        if (state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+            data->updating_output = was_updating_output;
+        if ((state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) && data->wayland_surface)
+            wayland_surface_queue_output_update(data->wayland_surface);
+        wayland_win_data_release(data);
+    }
 }
 
 /**********************************************************************
@@ -2071,10 +2394,16 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg)
     {
     case WM_WAYLAND_INIT_DISPLAY_DEVICES:
-        NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
+        NtUserCallOneParam(TRUE, NtUserCallOneParam_DisplayModeChanged);
+        /* The Win32 desktop refresh can skip unchanged union bounds. Notify
+         * every process after publication even for an in-place rearrangement. */
+        NtUserPostMessage(HWND_BROADCAST, WM_WAYLAND_OUTPUT_CHANGE, 0, 0);
         return 0;
     case WM_WAYLAND_CONFIGURE:
         wayland_configure_window(hwnd);
+        return 0;
+    case WM_WAYLAND_OUTPUT_CHANGE:
+        wayland_window_update_output(hwnd);
         return 0;
     case WM_WAYLAND_NOTIFY_REORDER:
         NtUserNotifyWinEvent(EVENT_OBJECT_REORDER, NtUserGetDesktopWindow(), OBJID_CLIENT, 0);

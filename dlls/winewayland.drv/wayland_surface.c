@@ -1782,6 +1782,26 @@ static void wayland_surface_clear_outputs(struct wayland_surface *surface)
         wayland_output_release(entry->output);
         free(entry);
     }
+    wayland_surface_reset_presentation_output(surface);
+}
+
+/* Caller holds win_data_mutex. Placement is separate from output membership
+ * so a transient zero/multiple-output state does not switch presentation back
+ * to the original fullscreen preference. */
+void wayland_surface_reset_presentation_output(struct wayland_surface *surface)
+{
+    if (surface->presentation_output)
+        wayland_output_release(surface->presentation_output);
+    surface->presentation_output = NULL;
+}
+
+/* Reader callbacks only queue work. Win32 geometry is reconciled on its owner. */
+void wayland_surface_queue_output_update(struct wayland_surface *surface)
+{
+    if (surface->output_update_queued) return;
+    surface->output_update_queued = TRUE;
+    if (!NtUserPostMessage(surface->hwnd, WM_WAYLAND_OUTPUT_CHANGE, 0, 0))
+        surface->output_update_queued = FALSE;
 }
 
 /* Caller holds win_data_mutex. Each membership owns an output reference. */
@@ -1820,10 +1840,14 @@ static void wayland_surface_handle_output(void *private, struct wl_surface *wl_s
 
     if (!(data = wayland_win_data_get(private))) return;
     /* A retired direct-WSI proxy can outlive its HWND's current surface. */
-    if ((surface = data->wayland_surface) && surface->wl_surface == wl_surface &&
-        wayland_surface_update_output(surface, wl_output, entered))
-        TRACE("hwnd=%p wl_surface=%p output=%p entered=%u single_output=%p\n",
-              surface->hwnd, wl_surface, wl_output, entered, wayland_surface_get_output(surface));
+    if ((surface = data->wayland_surface) && surface->wl_surface == wl_surface && wl_output)
+    {
+        if (wayland_surface_update_output(surface, wl_output, entered))
+            TRACE("hwnd=%p wl_surface=%p output=%p entered=%u single_output=%p\n",
+                  surface->hwnd, wl_surface, wl_output, entered, wayland_surface_get_output(surface));
+        /* A repeated event also retries a previously failed message post. */
+        wayland_surface_queue_output_update(surface);
+    }
     wayland_win_data_release(data);
 }
 
@@ -3360,6 +3384,7 @@ BOOL wayland_surface_clear_role(struct wayland_surface *surface)
 
         surface->requested_output = NULL;
         surface->fullscreen_requested = FALSE;
+        wayland_surface_reset_presentation_output(surface);
         break;
 
     case WAYLAND_SURFACE_ROLE_LAYER:
@@ -7129,8 +7154,8 @@ BOOL wayland_client_surface_get_fullscreen_rect(struct wayland_client_surface *c
     {
         request = LIST_ENTRY(list_tail(&client->fullscreen_requests),
                              struct wayland_fullscreen_request, entry);
-        *rect = request->rect;
-        return TRUE;
+        if (request->invalid) return FALSE;
+        return wayland_output_get_layout_rect(request->output->wl_output, rect);
     }
     if (!client->fullscreen_active_owner) return FALSE;
 
@@ -7138,10 +7163,39 @@ BOOL wayland_client_surface_get_fullscreen_rect(struct wayland_client_surface *c
                         struct wayland_fullscreen_request, entry)
     {
         if (request->owner != client->fullscreen_active_owner) continue;
-        *rect = request->rect;
-        return TRUE;
+        if (request->invalid) return FALSE;
+        return wayland_output_get_layout_rect(request->output->wl_output, rect);
     }
     return FALSE;
+}
+
+BOOL wayland_client_surface_refresh_fullscreen_targets(struct wayland_client_surface *client,
+                                                       const struct wl_output *removed)
+{
+    struct wayland_fullscreen_request *request;
+    BOOL changed = FALSE, invalidate = FALSE;
+
+    if (!removed) return FALSE;
+    LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
+                        struct wayland_fullscreen_request, entry)
+    {
+        if (request->invalid) continue;
+        if (request->output->wl_output == removed)
+        {
+            request->invalid = TRUE;
+            changed = TRUE;
+            if (request->owner == client->fullscreen_active_owner)
+            {
+                client->fullscreen_active_owner = 0;
+                invalidate = TRUE;
+            }
+        }
+    }
+
+    /* A lost active target retires its swapchains once. Keep the request
+     * invalid until destruction, even if another output takes its old rect. */
+    if (invalidate) client_surface_invalidate_presentation(&client->client);
+    return changed;
 }
 
 BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surface *client,
@@ -7149,17 +7203,14 @@ BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surfa
 {
     struct wayland_fullscreen_request *request;
     struct wayland_output *output;
-    RECT target_rect;
     BOOL changed = FALSE, follows_window = FALSE;
-    UINT64 active_owner = client->fullscreen_active_owner;
 
     if (IsRectEmpty(window_rect)) return FALSE;
 
     LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
                         struct wayland_fullscreen_request, entry)
     {
-        if (request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW ||
-            request->owner == active_owner)
+        if (!request->invalid && request->target == VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW)
         {
             follows_window = TRUE;
             break;
@@ -7167,31 +7218,45 @@ BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surfa
     }
     if (!follows_window) return FALSE;
 
-    if (!(output = wayland_output_for_rect(window_rect, &target_rect, NULL)))
+    if (!(output = wayland_output_for_rect(window_rect, NULL, NULL)))
         return FALSE;
-    wayland_output_release(output);
 
     LIST_FOR_EACH_ENTRY(request, &client->fullscreen_requests,
                         struct wayland_fullscreen_request, entry)
     {
-        /* A fixed request selects the initial output. Once acquired, moving
-         * its Win32 window retargets host presentation without replacing the
-         * VkSurfaceKHR or its swapchain. */
-        if ((request->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW &&
-             request->owner != active_owner) ||
-            EqualRect(&request->rect, &target_rect))
+        /* An explicit Vulkan monitor remains fixed for the swapchain's
+         * lifetime. Only an implicit target follows an application move. */
+        if (request->invalid || request->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW ||
+            request->output == output)
             continue;
 
-        TRACE("fullscreen owner %s follows window %s: %s -> %s\n",
+        TRACE("fullscreen owner %s follows window %s: output %p -> %p\n",
               wine_dbgstr_longlong(request->owner), wine_dbgstr_rect(window_rect),
-              wine_dbgstr_rect(&request->rect), wine_dbgstr_rect(&target_rect));
-        request->rect = target_rect;
+              request->output->wl_output, output->wl_output);
+        wayland_output_add_ref(output);
+        wayland_output_release(request->output);
+        request->output = output;
         changed = TRUE;
     }
 
     /* Retargeting does not replace the client wl_surface or host VkSurfaceKHR.
      * Keep its swapchains valid while the normal state update applies it. */
+    wayland_output_release(output);
     return changed;
+}
+
+static void wayland_client_surface_clear_fullscreen_requests(struct wayland_client_surface *client)
+{
+    struct wayland_fullscreen_request *request, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE(request, next, &client->fullscreen_requests,
+                             struct wayland_fullscreen_request, entry)
+    {
+        list_remove(&request->entry);
+        wayland_output_release(request->output);
+        free(request);
+    }
+    client->fullscreen_active_owner = 0;
 }
 
 static void wayland_client_surface_reset_opaque_region(struct wayland_client_surface *surface)
@@ -7236,7 +7301,6 @@ static void wayland_surface_restore_gdi_shm_contents(struct wayland_surface *sur
 static void wayland_client_surface_destroy(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    struct wayland_fullscreen_request *request, *next;
     struct wl_callback *callback;
     struct wayland_win_data *data;
 
@@ -7273,12 +7337,7 @@ static void wayland_client_surface_destroy(struct client_surface *client)
         wl_surface_destroy(surface->direct_wl_surface);
     while (surface->retired_wl_surface_count)
         wayland_client_surface_remove_retired_wl_surface(surface, 0);
-    LIST_FOR_EACH_ENTRY_SAFE(request, next, &surface->fullscreen_requests,
-                             struct wayland_fullscreen_request, entry)
-    {
-        list_remove(&request->entry);
-        free(request);
-    }
+    wayland_client_surface_clear_fullscreen_requests(surface);
 
     wayland_win_data_unlock();
 }

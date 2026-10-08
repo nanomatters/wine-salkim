@@ -1,0 +1,166 @@
+/* Layout math from display.c. No window events or compositor are simulated. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+#include "winuser.h"
+#include "winternl.h"
+#include "ntuser.h"
+#include <wayland-util.h>
+
+#undef ERR
+#define ERR(...) ((void)0)
+struct wayland_output_mode { int width, height; };
+struct wayland_output_state
+{
+    const char *name;
+    int logical_x, logical_y, logical_w, logical_h;
+    struct wayland_output_mode *current_mode;
+};
+struct wayland_output { struct wl_list link; struct wayland_output_state current; };
+struct output_info { struct wayland_output_state *output; int x, y; BOOL is_primary; };
+static struct
+{
+    struct wl_array output_info_array;
+    BOOL output_layout_accepted;
+    struct wl_list output_list;
+    pthread_mutex_t output_mutex;
+} process_wayland = {.output_mutex = PTHREAD_MUTEX_INITIALIZER};
+static struct wayland_output outputs[2];
+static struct wayland_output_mode modes[2] = {{5120, 2160}, {3840, 1600}};
+static unsigned int checks;
+
+#define CHECK(value) do { \
+    ++checks; \
+    if (!(value)) { fprintf(stderr, "line %d: %s\n", __LINE__, #value); exit(1); } \
+} while (0)
+
+/* Only needed when running this test against the withdrawn shared-cache code.
+ * Layout construction itself must not depend on a subsequent window event. */
+ULONG_PTR WINAPI NtUserCallOneParam(ULONG_PTR value, ULONG code)
+{
+    (void)value;
+    (void)code;
+    return 0;
+}
+
+/* PRODUCTION_LAYOUT */
+
+static struct output_info *find_output(const char *name)
+{
+    struct output_info *info;
+    wl_array_for_each(info, &process_wayland.output_info_array)
+        if (!strcmp(info->output->name, name)) return info;
+    fprintf(stderr, "missing output %s\n", name);
+    exit(1);
+}
+
+static void check_output(const char *name, int x, int y, BOOL primary)
+{
+    struct output_info *info = find_output(name);
+    if (info->x != x || info->y != y || info->is_primary != primary)
+        fprintf(stderr, "%s: got (%d,%d) primary=%u, expected (%d,%d) primary=%u\n",
+                name, info->x, info->y, info->is_primary, x, y, primary);
+    CHECK(info->x == x && info->y == y && info->is_primary == primary);
+}
+
+static void reset(const char *primary)
+{
+    wl_array_release(&process_wayland.output_info_array);
+    wl_array_init(&process_wayland.output_info_array);
+    process_wayland.output_layout_accepted = FALSE;
+    wl_list_init(&process_wayland.output_list);
+    outputs[0].current = (struct wayland_output_state){"DP-3", 0, 0, 5120, 2160, &modes[0]};
+    outputs[1].current = (struct wayland_output_state){"DP-2", 5120, 334, 3840, 1600, &modes[1]};
+    if (primary) setenv("WAYLANDDRV_PRIMARY_MONITOR", primary, 1);
+    else unsetenv("WAYLANDDRV_PRIMARY_MONITOR");
+}
+
+static void announce(unsigned int index)
+{
+    wl_list_insert(process_wayland.output_list.prev, &outputs[index].link);
+    output_info_array_update();
+}
+
+static void test_startup_order(void)
+{
+    unsigned int reverse, delayed_geometry;
+    for (reverse = 0; reverse < 2; ++reverse)
+        for (delayed_geometry = 0; delayed_geometry < 2; ++delayed_geometry)
+        {
+            /* The small monitor may finish its initial output events first.
+             * It must not remain the origin after the requested primary arrives. */
+            reset("DP-3");
+            if (delayed_geometry) outputs[1].current.logical_x = outputs[1].current.logical_y = 0;
+            announce(reverse);
+            announce(!reverse);
+            outputs[1].current.logical_x = 5120;
+            outputs[1].current.logical_y = 334;
+            output_info_array_update();
+            check_output("DP-3", 0, 0, TRUE);
+            check_output("DP-2", 5120, 334, FALSE);
+            CHECK(!output_info_overlap(find_output("DP-3"), find_output("DP-2")));
+        }
+}
+
+static void test_hotplug(void)
+{
+    reset("DP-3");
+    announce(0);
+    announce(1);
+    wl_list_remove(&outputs[0].link);
+    outputs[1].current.logical_x = outputs[1].current.logical_y = 0;
+    output_info_array_update();
+    CHECK(process_wayland.output_info_array.size == sizeof(struct output_info));
+    check_output("DP-2", 0, 0, TRUE);
+    outputs[1].current.logical_x = 5120;
+    outputs[1].current.logical_y = 334;
+    announce(0);
+    check_output("DP-3", 0, 0, TRUE);
+    check_output("DP-2", 5120, 334, FALSE);
+}
+
+static void test_primary_and_rearrangement(void)
+{
+    reset("DP-2");
+    announce(0);
+    announce(1);
+    check_output("DP-2", 0, 0, TRUE);
+    check_output("DP-3", -5120, -334, FALSE);
+    outputs[1].current.logical_x = -3840;
+    outputs[1].current.logical_y = -100;
+    output_info_array_update();
+    check_output("DP-3", 3840, 100, FALSE);
+    check_output("DP-2", 0, 0, TRUE);
+    unsetenv("WAYLANDDRV_PRIMARY_MONITOR");
+    output_info_array_update();
+    check_output("DP-3", 0, 0, TRUE);
+    check_output("DP-2", -3840, -100, FALSE);
+    /* At 2x scale the logical monitors touch. Resolve the physical overlap
+     * and keep every consumer in the same primary-relative pixel space. */
+    reset(NULL);
+    outputs[0].current.logical_w = 2560;
+    outputs[0].current.logical_h = 1080;
+    outputs[1].current.logical_x = 2560;
+    outputs[1].current.logical_y = 0;
+    announce(1);
+    announce(0);
+    check_output("DP-3", 0, 0, TRUE);
+    check_output("DP-2", 5120, 0, FALSE);
+    CHECK(!output_info_overlap(find_output("DP-3"), find_output("DP-2")));
+}
+
+int main(void)
+{
+    test_startup_order();
+    test_hotplug();
+    test_primary_and_rearrangement();
+    wl_array_release(&process_wayland.output_info_array);
+    printf("%u monitor layout checks passed\n", checks);
+    return 0;
+}

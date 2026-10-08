@@ -1,0 +1,424 @@
+/* Standalone harness. The query and publication helpers are extracted verbatim. */
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+#include "winuser.h"
+#include "winternl.h"
+#include "wine/list.h"
+
+#define SetRect(r, l, t, rr, b) (*(r) = (RECT){(l), (t), (rr), (b)})
+struct ntuser_display_output { char name[MAX_PATH]; RECT rect; UINT state_flags; };
+struct ntuser_display_layout { UINT count; struct ntuser_display_output *outputs; };
+struct source
+{
+    struct list entry;
+    char path[MAX_PATH];
+    char name[MAX_PATH];
+    DEVMODEW physical, current;
+    UINT state_flags;
+    /* Fake registry storage. Production code only obtains this via NtQueryKey. */
+    char key_name[MAX_PATH];
+};
+struct device_manager_ctx
+{
+    UINT source_count;
+    HANDLE mutex;
+    BOOL devices_prepared;
+    char previous_primary_name[MAX_PATH];
+};
+struct gdi_device_manager { const char *(*get_primary_name)(void *); };
+struct user_driver { UINT (*pUpdateDisplayDevices)(const struct gdi_device_manager *, void *); };
+
+static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list sources = LIST_INIT(sources);
+static struct source local_sources[4], published[4];
+static UINT published_count;
+static UINT64 monitor_update_serial = 7;
+static int mutex_depth, closes, prepares, cache_reads, driver_calls, defaults;
+static int create_calls, waits;
+static NTSTATUS create_status, wait_status;
+static BOOL cache_available, cache_current;
+static HKEY config_key = (HKEY)0x10000;
+static struct source *opened_key;
+static UINT connector_opens, connector_queries;
+static NTSTATUS query_status;
+static BOOL open_fails;
+static const char *new_primary, *expected_previous;
+static UINT driver_status;
+static struct { struct { UINT SessionId; } *Peb; } fake_teb;
+static struct { UINT SessionId; } fake_peb;
+
+#undef NtCurrentTeb
+#define NtCurrentTeb() (&fake_teb)
+
+static UINT asciiz_to_unicode(WCHAR *dst, const char *src)
+{
+    UINT count = 0;
+    do { dst[count] = src[count]; } while (src[count++]);
+    return count * sizeof(WCHAR);
+}
+
+static NTSTATUS mock_create(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, BOOLEAN owner)
+{
+    ++create_calls;
+    if (create_status >= 0) *handle = (HANDLE)(UINT_PTR)create_calls;
+    return create_status;
+}
+static NTSTATUS mock_wait(HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout)
+{
+    assert(handle && !alertable && !timeout);
+    ++waits;
+    if (!wait_status || wait_status == STATUS_ABANDONED_WAIT_0) ++mutex_depth;
+    return wait_status;
+}
+static NTSTATUS mock_release(HANDLE handle, LONG *previous)
+{
+    assert(handle && mutex_depth > 0);
+    --mutex_depth;
+    return STATUS_SUCCESS;
+}
+static NTSTATUS mock_close(HANDLE handle)
+{
+    assert(handle);
+    if (handle == config_key) { assert(opened_key); opened_key = NULL; return STATUS_SUCCESS; }
+    ++closes;
+    return STATUS_SUCCESS;
+}
+#define NtCreateMutant mock_create
+#define NtWaitForSingleObject mock_wait
+#define NtReleaseMutant mock_release
+#define NtClose mock_close
+
+static HKEY reg_open_ascii_key(HKEY root, const char *path)
+{
+    UINT i;
+    assert(root == config_key && !opened_key);
+    ++connector_opens;
+    if (open_fails) return NULL;
+    for (i = 0; i < published_count; ++i)
+        if (!strcmp(path, published[i].path))
+        {
+            opened_key = &published[i];
+            return config_key;
+        }
+    return NULL;
+}
+
+static NTSTATUS mock_query_key(HANDLE key, KEY_INFORMATION_CLASS klass,
+                              void *buffer, ULONG capacity, ULONG *size)
+{
+    KEY_BASIC_INFORMATION *info = buffer;
+    UINT i, len;
+    assert(key == config_key && opened_key && klass == KeyBasicInformation);
+    ++connector_queries;
+    if (query_status) return query_status;
+    len = strlen(opened_key->key_name);
+    *size = offsetof(KEY_BASIC_INFORMATION, Name[len]);
+    if (capacity < *size) return STATUS_BUFFER_TOO_SMALL;
+    info->NameLength = len * sizeof(WCHAR);
+    for (i = 0; i < len; ++i) info->Name[i] = opened_key->key_name[i];
+    return STATUS_SUCCESS;
+}
+#define NtQueryKey mock_query_key
+
+static void fill_source(struct source *source, const char *name, LONG x, LONG y,
+                        UINT width, UINT height, UINT flags)
+{
+    memset(source, 0, sizeof(*source));
+    /* Real registry readers cache the Video alias, whose basename is 0000.
+     * The opened key resolves to Sources\\<name>. They are not interchangeable. */
+    assert(snprintf(source->path, sizeof(source->path), "Video\\{gpu-%s}\\0000", name) < sizeof(source->path));
+    strcpy(source->key_name, name);
+    source->physical.dmPosition.x = x;
+    source->physical.dmPosition.y = y;
+    source->physical.dmPelsWidth = width;
+    source->physical.dmPelsHeight = height;
+    source->current = source->physical;
+    source->state_flags = flags;
+    cache_current = FALSE;
+}
+
+static BOOL read_source_name(HKEY key, char name[MAX_PATH]);
+
+static BOOL update_display_cache_from_registry(UINT64 serial)
+{
+    HANDLE mutex;
+    assert(pthread_mutex_trylock(&display_lock) == EBUSY);
+    ++cache_reads;
+    assert(serial == monitor_update_serial);
+    if (!cache_available) return FALSE;
+    if (cache_current) return TRUE;
+    /* The real cache refresh takes the same recursive mutant. */
+    extern HANDLE test_acquire_cache_mutex(void);
+    mutex = test_acquire_cache_mutex();
+    if (!mutex) return FALSE;
+    list_init(&sources);
+    for (UINT i = 0; i < published_count; ++i)
+    {
+        HKEY key;
+        local_sources[i] = published[i];
+        if ((key = reg_open_ascii_key(config_key, local_sources[i].path)))
+        {
+            read_source_name(key, local_sources[i].name);
+            mock_close(key);
+        }
+        list_add_tail(&sources, &local_sources[i].entry);
+    }
+    cache_current = TRUE;
+    mock_release(mutex, NULL);
+    mock_close(mutex);
+    return TRUE;
+}
+
+static UINT64 get_monitor_update_serial(void) { return monitor_update_serial; }
+static void prepare_devices(void)
+{
+    assert(mutex_depth == 1);
+    ++prepares;
+    list_init(&sources);
+    cache_current = FALSE;
+}
+static NTSTATUS default_update_display_devices(struct device_manager_ctx *ctx);
+static BOOL is_virtual_desktop(void) { return FALSE; }
+static BOOL add_virtual_source(struct device_manager_ctx *ctx) { assert(0); return FALSE; }
+static UINT publish(const struct gdi_device_manager *manager, void *param);
+static const struct gdi_device_manager device_manager;
+static const struct user_driver driver = {publish};
+static const struct user_driver *user_driver = &driver;
+
+/* PRODUCTION_CACHE */
+
+HANDLE test_acquire_cache_mutex(void) { return get_display_device_init_mutex(); }
+static const struct gdi_device_manager device_manager = {get_primary_name};
+
+static UINT publish(const struct gdi_device_manager *manager, void *param)
+{
+    struct device_manager_ctx *ctx = param;
+    const char *previous = manager->get_primary_name(param);
+    ++driver_calls;
+    assert(mutex_depth == 1 && ctx->mutex);
+    assert((!previous && !expected_previous) ||
+           (previous && expected_previous && !strcmp(previous, expected_previous)));
+    if (driver_status) return driver_status;
+    prepare_display_devices(ctx);
+    prepare_display_devices(ctx);
+    /* Simulate the driver's primary-preservation decision and final publication. */
+    fill_source(&published[0], previous ? previous : new_primary, 0, 0, 3840, 1600,
+                DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE);
+    published_count = 1;
+    cache_available = TRUE;
+    assert((!get_primary_name(ctx) && !expected_previous) ||
+           !strcmp(get_primary_name(ctx), expected_previous));
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS default_update_display_devices(struct device_manager_ctx *ctx)
+{
+    ++defaults;
+    assert(ctx->mutex && mutex_depth == 1);
+    prepare_display_devices(ctx);
+    return STATUS_SUCCESS;
+}
+
+static void reset(void)
+{
+    assert(!mutex_depth);
+    memset(local_sources, 0, sizeof(local_sources));
+    memset(published, 0, sizeof(published));
+    list_init(&sources);
+    published_count = 0;
+    closes = prepares = cache_reads = driver_calls = defaults = create_calls = waits = 0;
+    create_status = wait_status = driver_status = STATUS_SUCCESS;
+    cache_available = cache_current = FALSE;
+    connector_opens = connector_queries = 0;
+    opened_key = NULL;
+    open_fails = FALSE;
+    query_status = STATUS_SUCCESS;
+    expected_previous = NULL;
+    new_primary = "DP-3";
+    fake_teb.Peb = (void *)&fake_peb;
+}
+
+static void finish_publication(struct device_manager_ctx *ctx)
+{
+    assert(ctx->mutex && mutex_depth == 1);
+    release_display_device_init_mutex(ctx->mutex);
+    ctx->mutex = NULL;
+    assert(!mutex_depth && closes == create_calls);
+}
+
+static UINT start_publication(struct device_manager_ctx *ctx)
+{
+    UINT status;
+
+    pthread_mutex_lock(&display_lock);
+    status = update_display_devices(ctx);
+    pthread_mutex_unlock(&display_lock);
+    return status;
+}
+
+static atomic_int query_started, query_done;
+static void *query_during_publication(void *param)
+{
+    atomic_store(&query_started, TRUE);
+    assert(get_display_layout(param));
+    atomic_store(&query_done, TRUE);
+    return NULL;
+}
+
+int main(void)
+{
+    struct ntuser_display_output entries[4], before[4];
+    struct ntuser_display_layout layout;
+    struct device_manager_ctx first = {0}, second = {0}, fallback = {0};
+    HANDLE mutex;
+    pthread_t thread;
+    UINT opens, queries, i;
+
+    reset();
+    assert(!get_display_layout(NULL));
+    layout = (struct ntuser_display_layout){ARRAY_SIZE(entries), entries};
+    assert(!get_display_layout(&layout) && !layout.count);
+    assert(cache_reads == 1 && !driver_calls && !prepares);
+
+    cache_available = TRUE;
+    published_count = 3;
+    fill_source(&published[0], "DP-2", -3840, 334, 3840, 1600, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP);
+    fill_source(&published[1], "DP-3", 0, 0, 5120, 2160,
+                DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE);
+    published[1].current.dmPelsWidth = 1920;
+    published[1].current.dmPelsHeight = 1080;
+    fill_source(&published[2], "DP-4", 5120, 0, 1920, 1080, 0);
+    memset(entries, 0x5a, sizeof(entries));
+    memcpy(before, entries, sizeof(entries));
+    layout = (struct ntuser_display_layout){1, entries};
+    assert(!get_display_layout(&layout) && layout.count == 2);
+    assert(!memcmp(entries, before, sizeof(entries)));
+    layout = (struct ntuser_display_layout){4, NULL};
+    assert(!get_display_layout(&layout) && layout.count == 2);
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(get_display_layout(&layout) && layout.count == 2);
+    assert(!strcmp(entries[0].name, "DP-2") && entries[0].rect.left == -3840);
+    assert(entries[0].rect.top == 334 && entries[0].rect.bottom == 1934);
+    assert(!strcmp(entries[1].name, "DP-3") && entries[1].rect.right == 5120);
+    assert(entries[1].rect.bottom == 2160);
+    assert(entries[1].state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+    assert(!driver_calls && !prepares && !mutex_depth && closes == create_calls);
+    /* Stable source names are read when loading the cache, not for each HWND. */
+    assert(connector_opens == 3 && connector_queries == 3);
+    opens = connector_opens;
+    queries = connector_queries;
+    for (i = 0; i < 1000; ++i)
+    {
+        layout = (struct ntuser_display_layout){4, entries};
+        assert(get_display_layout(&layout) && layout.count == 2);
+    }
+    assert(connector_opens == opens && connector_queries == queries);
+    /* Removal and in-place rearrangement come from the accepted physical map. */
+    cache_current = FALSE;
+    published_count = 1;
+    published[0].state_flags |= DISPLAY_DEVICE_PRIMARY_DEVICE;
+    published[0].physical.dmPosition.x = 0;
+    published[0].physical.dmPosition.y = 0;
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(get_display_layout(&layout) && layout.count == 1);
+    assert(!entries[0].rect.left && !entries[0].rect.top);
+    assert(!strcmp(entries[0].name, "DP-2"));
+    strcpy(published[0].key_name, "D\xc3\xa9-2");
+    cache_current = FALSE;
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(get_display_layout(&layout) && !strcmp(entries[0].name, "D\xc3\xa9-2"));
+    query_status = STATUS_ACCESS_DENIED;
+    cache_current = FALSE;
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(!get_display_layout(&layout) && !opened_key);
+    query_status = STATUS_SUCCESS;
+    open_fails = TRUE;
+    cache_current = FALSE;
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(!get_display_layout(&layout) && !opened_key);
+    open_fails = FALSE;
+    /* A query cannot observe a half-written publication or fall back locally. */
+    pthread_mutex_lock(&display_lock);
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(!pthread_create(&thread, NULL, query_during_publication, &layout));
+    while (!atomic_load(&query_started)) sched_yield();
+    assert(!atomic_load(&query_done));
+    fill_source(&published[0], "DP-2", 0, 0, 3840, 1600,
+                DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE);
+    pthread_mutex_unlock(&display_lock);
+    assert(!pthread_join(thread, NULL));
+    assert(atomic_load(&query_done) && layout.count == 1);
+    assert(!strcmp(entries[0].name, "DP-2") && entries[0].rect.right == 3840);
+    published_count = 0;
+    cache_current = FALSE;
+    layout = (struct ntuser_display_layout){4, entries};
+    assert(!get_display_layout(&layout) && !layout.count);
+
+    reset();
+    assert(!start_publication(&first));
+    assert(driver_calls == 1 && prepares == 1 && !get_primary_name(&first));
+    finish_publication(&first);
+    /* A second process with a different override reuses the first publication. */
+    new_primary = "DP-2";
+    expected_previous = "DP-3";
+    list_init(&sources);
+    assert(!start_publication(&second));
+    assert(prepares == 2 && !strcmp(get_primary_name(&second), "DP-3"));
+    assert(strstr(published[0].path, "DP-3"));
+    finish_publication(&second);
+
+    /* A pending Wayland replacement leaves the accepted registry and cache
+     * intact. It is not success and must not trigger the fallback publisher. */
+    driver_status = STATUS_PENDING;
+    second = (struct device_manager_ctx){0};
+    assert(start_publication(&second) == STATUS_PENDING);
+    assert(!second.devices_prepared && prepares == 2 && !defaults);
+    finish_publication(&second);
+    layout = (struct ntuser_display_layout){ARRAY_SIZE(entries), entries};
+    assert(get_display_layout(&layout) && layout.count == 1);
+    assert(!strcmp(entries[0].name, "DP-3") && entries[0].rect.right == 3840);
+
+    driver_status = STATUS_NOT_IMPLEMENTED;
+    assert(!start_publication(&fallback) && defaults == 1 && prepares == 3);
+    finish_publication(&fallback);
+
+    reset();
+    create_status = STATUS_OBJECT_NAME_EXISTS;
+    mutex = get_display_device_init_mutex();
+    assert(mutex && waits == 1 && mutex_depth == 1);
+    release_display_device_init_mutex(mutex);
+    assert(!mutex_depth && closes == 1);
+    cache_available = TRUE;
+    published_count = 1;
+    fill_source(&published[0], "DP-3", 0, 0, 5120, 2160,
+                DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE);
+    expected_previous = "DP-3";
+    first = (struct device_manager_ctx){0};
+    assert(!start_publication(&first));
+    finish_publication(&first);
+    wait_status = STATUS_ABANDONED_WAIT_0;
+    mutex = get_display_device_init_mutex();
+    assert(mutex && mutex_depth == 1);
+    release_display_device_init_mutex(mutex);
+    wait_status = STATUS_UNSUCCESSFUL;
+    assert(!get_display_device_init_mutex() && !mutex_depth && closes == create_calls);
+    first = (struct device_manager_ctx){0};
+    int old_driver_calls = driver_calls;
+    assert(start_publication(&first) == (UINT)STATUS_UNSUCCESSFUL);
+    assert(!first.mutex && driver_calls == old_driver_calls && !mutex_depth);
+    create_status = STATUS_ACCESS_DENIED;
+    assert(!get_display_device_init_mutex() && !mutex_depth);
+
+    puts("display-cache: query, physical geometry, atomic capacity and primary publication passed");
+    return 0;
+}

@@ -286,19 +286,15 @@ static struct wayland_fullscreen_request *find_fullscreen_request(
     return NULL;
 }
 
-static BOOL resolve_fullscreen_rect(
-        const struct vulkan_surface_fullscreen_info *info, RECT *rect)
+static struct wayland_output *resolve_fullscreen_output(
+        const struct vulkan_surface_fullscreen_info *info)
 {
-    struct wayland_output *output;
-
     if (!info || IsRectEmpty(&info->rect) ||
         (info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED &&
          info->target != VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW))
-        return FALSE;
+        return NULL;
 
-    if (!(output = wayland_output_for_rect(&info->rect, rect, NULL))) return FALSE;
-    wayland_output_release(output);
-    return TRUE;
+    return wayland_output_for_rect(&info->rect, NULL, NULL);
 }
 
 static VkBool32 wayland_vulkan_surface_fullscreen_supported(
@@ -307,17 +303,19 @@ static VkBool32 wayland_vulkan_surface_fullscreen_supported(
 {
     struct wayland_client_surface *client;
     struct wayland_win_data *data;
-    RECT output_rect;
+    struct wayland_output *output;
     BOOL valid;
 
-    if (!client_surface || !resolve_fullscreen_rect(info, &output_rect))
+    if (!client_surface || !(output = resolve_fullscreen_output(info)))
         return VK_FALSE;
 
     client = impl_from_client_surface(client_surface);
     wayland_win_data_lock();
     data = wayland_win_data_get_nolock(client_surface->hwnd);
-    valid = data && data->client_surface == client;
+    valid = data && data->client_surface == client &&
+            wayland_output_get_layout_rect(output->wl_output, NULL);
     wayland_win_data_unlock();
+    wayland_output_release(output);
     return valid;
 }
 
@@ -329,17 +327,19 @@ static VkResult wayland_vulkan_surface_fullscreen(
     struct wayland_client_surface *client = impl_from_client_surface(client_surface);
     struct wayland_fullscreen_request *request, *new_request = NULL, *latest;
     struct wayland_win_data *data;
-    RECT active_before, active_after, target_rect;
+    RECT active_before, active_after;
     BOOL had_active, has_active, refresh;
     VkResult res = VK_SUCCESS;
 
     if (action == VULKAN_SURFACE_FULLSCREEN_PREPARE)
     {
-        if (!resolve_fullscreen_rect(info, &target_rect))
-            return VK_ERROR_INITIALIZATION_FAILED;
         if (!(new_request = calloc(1, sizeof(*new_request)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (!(new_request->output = resolve_fullscreen_output(info)))
+        {
+            free(new_request);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         new_request->owner = owner;
-        new_request->rect = target_rect;
         new_request->target = info->target;
     }
 
@@ -361,6 +361,12 @@ static VkResult wayland_vulkan_surface_fullscreen(
             res = VK_ERROR_INITIALIZATION_FAILED;
             break;
         }
+        /* The output may disappear between resolution and the window lock. */
+        if (!wayland_output_get_layout_rect(new_request->output->wl_output, NULL))
+        {
+            res = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
         list_add_tail(&client->fullscreen_requests, &new_request->entry);
         new_request = NULL;
         break;
@@ -370,6 +376,11 @@ static VkResult wayland_vulkan_surface_fullscreen(
             !(request = find_fullscreen_request(client, owner)))
         {
             res = VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
+            break;
+        }
+        if (request->invalid)
+        {
+            res = VK_ERROR_INITIALIZATION_FAILED;
             break;
         }
         latest = LIST_ENTRY(list_tail(&client->fullscreen_requests),
@@ -395,6 +406,7 @@ static VkResult wayland_vulkan_surface_fullscreen(
         if ((request = find_fullscreen_request(client, owner)))
         {
             list_remove(&request->entry);
+            wayland_output_release(request->output);
             free(request);
         }
         if (client->fullscreen_active_owner == owner)
@@ -410,7 +422,11 @@ static VkResult wayland_vulkan_surface_fullscreen(
         wayland_win_data_refresh_fullscreen(data);
     wayland_win_data_unlock();
 
-    free(new_request);
+    if (new_request)
+    {
+        wayland_output_release(new_request->output);
+        free(new_request);
+    }
     return res;
 }
 

@@ -1,0 +1,78 @@
+/* Exercise the production source-name helper through real Wine registry links.
+ * Run only in a disposable test prefix. The test leaves its own keys there. */
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "winreg.h"
+#include "winternl.h"
+
+struct source { char path[MAX_PATH]; char name[MAX_PATH]; };
+static HKEY config_key = HKEY_CURRENT_USER;
+static unsigned int connector_opens;
+
+static HKEY reg_open_ascii_key(HKEY root, const char *path)
+{
+    HKEY key;
+    ++connector_opens;
+    return RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) ? NULL : key;
+}
+
+/* PRODUCTION_NAME */
+
+static BOOL load_source_name(struct source *source)
+{
+    HKEY key;
+    BOOL ret;
+    if (!(key = reg_open_ascii_key(config_key, source->path))) return FALSE;
+    ret = read_source_name(key, source->name);
+    RegCloseKey(key);
+    return ret;
+}
+
+#define CHECK(expr) do { if (!(expr)) { \
+    fprintf(stderr, "line %d: %s failed, error %lu\n", __LINE__, #expr, GetLastError()); \
+    return 1; } } while (0)
+
+int main(void)
+{
+    struct source direct = {0}, alias = {0}, missing = {0};
+    HKEY target, link, parent;
+    char name[MAX_PATH], path[MAX_PATH];
+    BYTE buffer[2048];
+    KEY_NAME_INFORMATION *info = (KEY_NAME_INFORMATION *)buffer;
+    DWORD size, i, opens;
+
+    snprintf(path, sizeof(path), "Software\\Wine\\MonitorLayoutTest-%lu", GetCurrentProcessId());
+    CHECK(!RegCreateKeyExA(config_key, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &parent, NULL));
+    RegCloseKey(parent);
+    snprintf(direct.path, sizeof(direct.path), "%s\\Sources\\DP-3", path);
+    CHECK(!RegCreateKeyExA(config_key, direct.path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &target, NULL));
+    CHECK(!NtQueryKey(target, KeyNameInformation, info, sizeof(buffer), &size));
+    snprintf(alias.path, sizeof(alias.path), "%s\\Video\\0000", path);
+    CHECK(!RegCreateKeyExA(config_key, alias.path, 0, NULL, REG_OPTION_CREATE_LINK,
+                           KEY_ALL_ACCESS, NULL, &link, NULL));
+    CHECK(!RegSetValueExW(link, L"SymbolicLinkValue", 0, REG_LINK, (BYTE *)info->Name, info->NameLength));
+    RegCloseKey(link);
+    RegCloseKey(target);
+
+    CHECK(load_source_name(&direct));
+    CHECK(load_source_name(&alias));
+    opens = connector_opens;
+    for (i = 0; i < 1000; ++i)
+    {
+        CHECK(get_source_name(&direct, name) && !strcmp(name, "DP-3"));
+        CHECK(get_source_name(&alias, name) && !strcmp(name, "DP-3"));
+    }
+    CHECK(connector_opens == opens);
+    CHECK(strcmp(name, strrchr(alias.path, '\\') + 1));
+    strcpy(missing.path, "Software\\Wine\\MissingMonitorLayoutSource");
+    CHECK(!load_source_name(&missing));
+    CHECK(!get_source_name(&missing, name) && !*name);
+    puts("PASS: direct key and Video alias resolve once to DP-3, repeated queries use cache, missing key is rejected");
+    return 0;
+}

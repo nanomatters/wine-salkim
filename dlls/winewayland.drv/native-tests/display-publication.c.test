@@ -1,0 +1,338 @@
+/* Extract the real lock, publication status dispatch, and release functions.
+ * Host GPU probing and registry transport are injected at their boundaries. */
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+#include "winuser.h"
+#include "winternl.h"
+#include "wine/list.h"
+
+#define WARN(...) (++warnings)
+#define ERR(...) (++errors)
+
+struct source
+{
+    struct list entry;
+    char name[MAX_PATH];
+    UINT state_flags;
+    RECT rect;
+};
+struct gpu_info { struct list entry; };
+struct device_manager_ctx
+{
+    struct list opengl_gpus, vulkan_gpus;
+    HANDLE mutex;
+    UINT gpu_count, source_count;
+    char previous_primary_name[MAX_PATH];
+};
+struct gdi_device_manager { UINT unused; };
+struct user_driver
+{
+    BOOL (*pHasWindowManager)(const char *);
+    UINT (*pUpdateDisplayDevices)(const struct gdi_device_manager *, void *);
+};
+
+static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list sources = LIST_INIT(sources), monitors = LIST_INIT(monitors);
+static struct { struct list entry; } virtual_monitor;
+static struct source cached_source, registry_source;
+static const struct gdi_device_manager device_manager;
+static UINT64 monitor_update_serial, shared_serial;
+static INT64 last_query_display_time, registry_timestamp;
+static UINT driver_status;
+static unsigned int warnings, errors, probes, live_gpu_infos, gpu_frees;
+static unsigned int mutex_depth, mutex_acquires, mutex_releases;
+static unsigned int cache_queries, registry_reads, driver_calls, commits;
+static unsigned int cleanups, prepares, defaults, virtual_sources, initializations;
+static BOOL cache_available, emulate_modeset, virtual_desktop;
+
+static void assert_display_locked(void)
+{
+    assert(pthread_mutex_trylock(&display_lock) == EBUSY);
+}
+
+static void assert_display_unlocked(void)
+{
+    assert(!pthread_mutex_trylock(&display_lock));
+    assert(!pthread_mutex_unlock(&display_lock));
+}
+
+static void install_cached_source(void)
+{
+    list_init(&sources);
+    cached_source = registry_source;
+    list_add_tail(&sources, &cached_source.entry);
+}
+
+static HANDLE get_display_device_init_mutex(void)
+{
+    assert_display_locked();
+    ++mutex_acquires;
+    ++mutex_depth;
+    return (HANDLE)(UINT_PTR)1;
+}
+
+static void release_display_device_init_mutex(HANDLE mutex)
+{
+    assert_display_locked();
+    assert(mutex == (HANDLE)(UINT_PTR)1 && mutex_depth);
+    --mutex_depth;
+    ++mutex_releases;
+}
+
+static BOOL update_display_cache_from_registry(UINT64 serial)
+{
+    HANDLE mutex;
+    assert_display_locked();
+    ++cache_queries;
+    if (!cache_available) return FALSE;
+    if (registry_timestamp <= last_query_display_time)
+    {
+        monitor_update_serial = serial;
+        return TRUE;
+    }
+    /* Model the real unchanged-timestamp cache invalidation and recursive
+     * publication mutant. STATUS_PENDING must still reach this reload. */
+    mutex = get_display_device_init_mutex();
+    ++registry_reads;
+    install_cached_source();
+    last_query_display_time = registry_timestamp;
+    monitor_update_serial = shared_serial;
+    release_display_device_init_mutex(mutex);
+    return TRUE;
+}
+
+static UINT64 get_monitor_update_serial(void)
+{
+    assert_display_locked();
+    return shared_serial;
+}
+
+static BOOL probe_gpu(struct list *infos)
+{
+    struct gpu_info *info;
+    assert_display_unlocked();
+    info = malloc(sizeof(*info));
+    assert(info);
+    list_add_tail(infos, &info->entry);
+    ++probes;
+    ++live_gpu_infos;
+    return TRUE;
+}
+
+static BOOL get_vulkan_gpus(struct list *infos) { return probe_gpu(infos); }
+static BOOL get_opengl_gpus(struct list *infos) { return probe_gpu(infos); }
+
+static void free_gpu_info(struct gpu_info *info)
+{
+    assert_display_locked();
+    assert(live_gpu_infos);
+    list_remove(&info->entry);
+    free(info);
+    --live_gpu_infos;
+    ++gpu_frees;
+}
+
+static void cleanup_devices(void)
+{
+    assert_display_locked();
+    assert(!mutex_depth);
+    ++cleanups;
+}
+
+static void prepare_publication(struct device_manager_ctx *ctx)
+{
+    assert_display_locked();
+    assert(mutex_depth == 1 && ctx->mutex);
+    ++prepares;
+    ctx->gpu_count = ctx->source_count = 1;
+    cache_available = TRUE;
+    registry_source.rect.right = 2560;
+    registry_source.rect.bottom = 1440;
+    ++registry_timestamp;
+    install_cached_source();
+}
+
+static UINT publish(const struct gdi_device_manager *manager, void *param)
+{
+    struct device_manager_ctx *ctx = param;
+    assert_display_locked();
+    assert(manager == &device_manager && ctx->mutex && mutex_depth == 1);
+    assert(!strcmp(ctx->previous_primary_name, cache_available ? "DP-1" : ""));
+    ++driver_calls;
+    if (driver_status) return driver_status;
+    prepare_publication(ctx);
+    return STATUS_SUCCESS;
+}
+
+static BOOL has_window_manager(const char *name)
+{
+    assert(!strcmp(name, "steamcompmgr"));
+    return FALSE;
+}
+
+static const struct user_driver driver = {has_window_manager, publish};
+static const struct user_driver *user_driver = &driver;
+static BOOL is_virtual_desktop(void) { return virtual_desktop; }
+
+static UINT add_virtual_source(struct device_manager_ctx *ctx)
+{
+    assert(ctx->source_count && ctx->mutex && mutex_depth == 1);
+    ++virtual_sources;
+    return STATUS_SUCCESS;
+}
+
+static UINT default_update_display_devices(struct device_manager_ctx *ctx)
+{
+    ++defaults;
+    prepare_publication(ctx);
+    return STATUS_SUCCESS;
+}
+
+static void commit_display_devices(struct device_manager_ctx *ctx)
+{
+    assert_display_locked();
+    assert(ctx->source_count && ctx->mutex && mutex_depth == 1);
+    ++commits;
+    ++shared_serial;
+    monitor_update_serial = shared_serial;
+}
+
+static void init_display_driver(void) { ++initializations; }
+static HANDLE NtUserGetProcessWindowStation(void) { return (HANDLE)(UINT_PTR)2; }
+
+static BOOL NtUserGetObjectInformation(HANDLE handle, INT index, void *buffer, DWORD size, DWORD *needed)
+{
+    assert_display_locked();
+    assert(handle == (HANDLE)(UINT_PTR)2 && index == UOI_NAME);
+    return FALSE;
+}
+
+static int mock_wcscmp(const WCHAR *a, const WCHAR *b)
+{
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a - *b;
+}
+#define wcscmp mock_wcscmp
+
+/* Service display branches are present in the extracted function. */
+static void clear_display_devices(void) { assert(!"unexpected service window station"); }
+static void set_winstation_monitors(BOOL increment) { assert(!"unexpected service window station"); }
+
+/* PRODUCTION_PUBLICATION */
+
+static void reset(BOOL accepted)
+{
+    assert_display_unlocked();
+    assert(!mutex_depth && !live_gpu_infos);
+    list_init(&sources);
+    memset(&registry_source, 0, sizeof(registry_source));
+    strcpy(registry_source.name, "DP-1");
+    registry_source.state_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
+    registry_source.rect = (RECT){0, 0, 1920, 1080};
+    monitor_update_serial = accepted ? 7 : 0;
+    shared_serial = 7;
+    registry_timestamp = 100;
+    last_query_display_time = accepted ? registry_timestamp : 0;
+    cache_available = accepted;
+    if (accepted) install_cached_source();
+    driver_status = STATUS_SUCCESS;
+    warnings = errors = probes = gpu_frees = 0;
+    mutex_acquires = mutex_releases = cache_queries = registry_reads = 0;
+    driver_calls = commits = cleanups = prepares = defaults = virtual_sources = initializations = 0;
+    emulate_modeset = TRUE;
+    virtual_desktop = FALSE;
+}
+
+static void check_cleanup(void)
+{
+    assert(!mutex_depth && !live_gpu_infos);
+    assert(mutex_acquires == mutex_releases);
+    assert(probes == gpu_frees);
+}
+
+int main(void)
+{
+    RECT previous;
+    unsigned int reads, queries;
+
+    reset(TRUE);
+    previous = cached_source.rect;
+    driver_status = STATUS_PENDING;
+    virtual_desktop = TRUE;
+    assert(lock_display_devices(TRUE));
+    assert_display_locked();
+    assert(driver_calls == 1 && probes == 2 && gpu_frees == 2);
+    assert(!commits && !defaults && !cleanups && !virtual_sources && !prepares);
+    assert(!warnings && !errors && cache_queries == 2 && registry_reads == 1);
+    assert(last_query_display_time == 100 && registry_timestamp == 100);
+    assert(monitor_update_serial == 7 && shared_serial == 7);
+    assert(!memcmp(&cached_source.rect, &previous, sizeof(previous)));
+    check_cleanup();
+    unlock_display_devices();
+    /* A subsequent ordinary serial/cache hit must not publish or probe. */
+    queries = cache_queries;
+    reads = registry_reads;
+    assert(lock_display_devices(FALSE));
+    assert_display_locked();
+    assert(driver_calls == 1 && probes == 2 && cache_queries == queries && registry_reads == reads);
+    assert(update_display_cache_from_registry(get_monitor_update_serial()));
+    assert(registry_reads == reads && monitor_update_serial == shared_serial);
+    unlock_display_devices();
+    assert_display_unlocked();
+
+    reset(FALSE);
+    driver_status = STATUS_PENDING;
+    assert(!lock_display_devices(TRUE));
+    assert_display_unlocked();
+    assert(driver_calls == 1 && cache_queries == 2 && errors == 1 && !warnings);
+    assert(list_empty(&sources) && !prepares && !commits && !cleanups && !defaults && !virtual_sources);
+    check_cleanup();
+    /* Existing output completion retries publication; startup can recover. */
+    driver_status = STATUS_SUCCESS;
+    assert(lock_display_devices(TRUE));
+    assert_display_locked();
+    assert(driver_calls == 2 && commits == 1 && prepares == 1 && cleanups == 1);
+    assert(cached_source.rect.right == 2560 && cached_source.rect.bottom == 1440);
+    assert(monitor_update_serial == 8 && shared_serial == 8 && registry_reads == 1);
+    check_cleanup();
+    unlock_display_devices();
+
+    reset(TRUE);
+    driver_status = STATUS_UNSUCCESSFUL;
+    assert(lock_display_devices(TRUE));
+    assert_display_locked();
+    assert(warnings == 1 && !errors && !commits && !prepares && !cleanups && !defaults);
+    assert(registry_reads == 1 && monitor_update_serial == 7);
+    check_cleanup();
+    unlock_display_devices();
+
+    reset(TRUE);
+    driver_status = STATUS_NOT_IMPLEMENTED;
+    assert(lock_display_devices(TRUE));
+    assert_display_locked();
+    assert(defaults == 1 && prepares == 1 && commits == 1 && cleanups == 1);
+    assert(!warnings && !errors && !virtual_sources);
+    check_cleanup();
+    unlock_display_devices();
+
+    reset(TRUE);
+    virtual_desktop = TRUE;
+    assert(lock_display_devices(TRUE));
+    assert_display_locked();
+    assert(virtual_sources == 1 && prepares == 1 && commits == 1 && !defaults);
+    check_cleanup();
+    unlock_display_devices();
+    assert_display_unlocked();
+
+    puts("display publication lock/status/cleanup tests passed");
+    return 0;
+}

@@ -1,4 +1,4 @@
-# DMA-BUF notification tests
+# Wayland driver native tests
 
 Run on Linux with a native C compiler:
 
@@ -33,6 +33,143 @@ A socket test exercises delivery and replies while reconfiguration is pending;
 it does not simulate a compositor or assert that a frame was displayed. These
 are transport/policy unit tests, not an end-to-end Wayland window-lifecycle or
 game performance test.
+
+## Monitor placement and fullscreen targets
+
+`make monitor-check BUILD_DIR=/path/to/build` runs seven suites that compile
+the production C functions with injected platform calls:
+
+- `display-cache.py` tests win32u's accepted physical layout query and publication
+  locking. Its cached sources use Video registry aliases such as `0000`, whose
+  opened keys resolve to connector names. It covers failed identity queries,
+  bootstrap, snapshot capacity and physical versus emulated modes.
+- `display-publication.py` tests win32u's publication and cache-refresh control
+  flow. A pending replacement must skip committing devices, release the
+  publication lock and GPU probe data, and reload the previous accepted display
+  snapshot. Startup without a snapshot still fails rather than inventing a
+  monitor. A later completed update publishes normally.
+- `display-notification.py` tests Wayland's opt-in asynchronous application
+  notification after publication. It compares attached connector identities,
+  placement, primary selection and current/physical modes rather than union
+  bounds. Identical events and enumeration-only changes do not notify again.
+  Removal, restoration, in-place rearrangement, mode changes, invalid identities,
+  allocation failures and source reference cleanup are covered. Existing
+  non-Wayland host and application-initiated mode change paths are unchanged.
+  Message transport and registry publication are injected calls, so this does
+  not replace a Wine window message integration test.
+- `monitor-layout.py` tests incremental startup announcements in both monitor
+  orders, delayed geometry, hotplug and mixed scaling. Startup coordinates
+  remain provisional until a complete desktop layout has been accepted.
+- `output-layout.py` tests primary selection and accepted layout reconciliation.
+  It covers missing and partial snapshots, monitor removal and re-enabling a
+  monitor while the previous coordinate map remains authoritative. Delayed
+  replacement modes defer publication before any device callback. Repeated
+  pending updates, startup, recovery, removal of a pending output and a ready
+  survivor with an unrelated pending output are covered.
+- `fullscreen-outputs.py` tests retained output identity, explicit versus
+  window-following targets, removal, presentation invalidation and reference
+  cleanup.
+- `monitor-outputs.py` tests enter/leave delivery, owner-thread reconciliation,
+  ambiguous memberships, virtual desktops, window positioning and separation
+  of fullscreen intent from compositor placement. It also runs the configure,
+  accepted geometry and acknowledgement chain in both configure/enter orders.
+  Repeated hotplug checks disable the initial output, restore it with a new
+  identity and remove the other output while presentation remains on the
+  survivor. They verify origin rebasing without a fresh enter event, unchanged
+  state updates preserving Win32u and inferred fullscreen, and real geometry,
+  style, hide or minimize changes leaving the preservation path.
+  The output-removal regression also runs the production toplevel visibility
+  decision while the old HWND is outside the surviving desktop. The replacement
+  fullscreen configure must be acknowledged before the survivor's enter arrives.
+  Explicit hiding, cloaking, minimize capabilities and fullscreen exit retain
+  their existing visibility behavior. The visibility test injects platform calls
+  and does not run native presentation or compositor frame callbacks.
+  Fullscreen preservation tests also exercise the production driver decision
+  before mode inference. They retain win32u's newly detected fullscreen state,
+  reject hide, minimize and style transitions, and consume the internal geometry
+  waiver before subsequent application position changes.
+  Application retargeting tests request A, accept compositor placement on B,
+  then request A again through the production window-position decisions.
+  They verify one renewed request, preservation through pending configures and
+  stale membership reconciliation, and no repeated requests from passive
+  updates. Size-only changes retain the chosen monitor, including Vulkan WINDOW
+  targets. Settled application moves on the requested and observed output do
+  not renew fullscreen. Unknown or ambiguous membership, pending configures,
+  unconfirmed fullscreen and an already deferred request retain renewal.
+  Moving to another output still sends one request. Virtual desktops, fixed
+  Vulkan targets and fullscreen style guards
+  retain their separate selection rules. These tests extract the target and
+  preservation blocks and supply mode-query results and Win32 calls with mocks.
+
+`WAYLANDDRV_PRIMARY_MONITOR` selects the primary when a Wine session first
+publishes its desktop. Processes joining that session reuse its shared Windows
+coordinate map rather than applying a conflicting local origin. A compositor
+move updates the window's observed monitor without turning the observation into
+a new fullscreen request. Wayland has no global window-position event, so
+windowed placement remains synthetic and enter/leave does not move or clamp
+windowed dialogs. Only settled fullscreen membership adjusts the Win32 origin.
+An explicit Vulkan monitor stays fixed. Configures change the accepted size
+before owner-thread output reconciliation changes the fullscreen origin.
+An application fullscreen move renews its monitor request even if the same
+monitor was requested before the compositor relocated the window. Its output
+identity survives configure processing. Passive reconciliation and resizing
+alone do not renew that request.
+Each new window synchronizes its process's layout before its initial Win32
+rectangle is interpreted. This query runs without the driver window lock.
+Connector names are resolved once when win32u loads each source, including
+registry aliases. Repeated layout reads use those cached names.
+Wayland explicitly requests asynchronous `WM_DISPLAYCHANGE` application
+notifications after an accepted attached topology or display mode changes.
+Repeated identical output events still refresh the desktop but do not emit
+another application broadcast. Other drivers retain their existing host-change
+notification policy.
+When the last initialized output disappears but a replacement has already been
+announced, Wine retains the published Win32 display snapshot until the output's
+initial mode arrives. The existing output events retry publication without a
+timer or blocking wait. Removed Wayland outputs are still released immediately.
+Ready surviving outputs and genuinely empty output lists keep their existing
+publication policy.
+
+`source-name.py` additionally tests the production connector-name helper through
+real registry links in a dedicated Wine prefix below its build directory:
+
+```sh
+python3 dlls/winewayland.drv/native-tests/source-name.py \
+    --build-dir "$HOME/tmp/wayland-monitor-tests/registry-link" \
+    --wine /path/to/wine
+```
+
+It requires a MinGW compiler and leaves its own test keys in that isolated
+prefix. It neither launches a game nor tests compositor window placement.
+
+The default compiler target is native. For the 32-bit and 64-bit reconciliation
+matrix, including sanitizers:
+
+```sh
+python3 dlls/winewayland.drv/native-tests/monitor-outputs.py \
+    --bits all --sanitizers --build-dir "$HOME/tmp/wayland-monitor-tests/monitor"
+```
+
+The other suites accept `--cc` and `--cflags` for a 32-bit or sanitized run.
+`check-driver-build.py` additionally compiles the live changed translation
+units with an existing Wine build's configuration, rather than its staged
+source copies. Add `--all` to compile all driver translation units and check
+consumers of the changed shared structures. `--win32u` includes the display
+cache translation unit:
+
+```sh
+python3 dlls/winewayland.drv/native-tests/check-driver-build.py \
+    --all --win32u \
+    --wine-build /opt/devel/wineland/build \
+    --output-dir "$HOME/tmp/wayland-monitor-tests/driver"
+```
+
+These are implementation-level regression tests. They do not prove actual
+compositor placement or game behaviour. Runtime checks should cover moving a
+window between unequal-resolution and mixed-scale outputs, fullscreen and
+virtual-desktop presentation, monitor rearrangement and unplugging a targeted
+output. Check `+waylanddrv` traces for the requested and observed output and
+compare the game's reported monitor after the owning thread applies placement.
 
 ## Event reader lifetime
 

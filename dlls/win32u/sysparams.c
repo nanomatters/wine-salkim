@@ -119,6 +119,7 @@ struct source
     LONG refcount;
     struct list entry;
     char path[MAX_PATH];
+    char name[MAX_PATH];
     unsigned int id;
     struct gpu *gpu;
     HKEY key;
@@ -400,6 +401,7 @@ static HANDLE get_display_device_init_mutex( void )
     OBJECT_ATTRIBUTES attr;
     char buffer[256];
     HANDLE mutex;
+    NTSTATUS status;
 
     snprintf( buffer, ARRAY_SIZE(buffer), "\\Sessions\\%u\\BaseNamedObjects\\display_device_init",
               NtCurrentTeb()->Peb->SessionId );
@@ -408,7 +410,11 @@ static HANDLE get_display_device_init_mutex( void )
 
     InitializeObjectAttributes( &attr, &name, OBJ_OPENIF, NULL, NULL );
     if (NtCreateMutant( &mutex, MUTEX_ALL_ACCESS, &attr, FALSE ) < 0) return 0;
-    NtWaitForSingleObject( mutex, FALSE, NULL );
+    if ((status = NtWaitForSingleObject( mutex, FALSE, NULL )) && status != STATUS_ABANDONED_WAIT_0)
+    {
+        NtClose( mutex );
+        return 0;
+    }
     return mutex;
 }
 
@@ -733,6 +739,29 @@ static unsigned int query_reg_subkey_value( HKEY hkey, const char *name, KEY_VAL
     return size;
 }
 
+static BOOL read_source_name( HKEY key, char name[MAX_PATH] )
+{
+    BYTE buffer[offsetof(KEY_BASIC_INFORMATION, Name[MAX_PATH])];
+    KEY_BASIC_INFORMATION *info = (KEY_BASIC_INFORMATION *)buffer;
+    DWORD size, i, count;
+    NTSTATUS status;
+
+    name[0] = 0;
+    /* The opened Video\\{guid}\\0000 alias resolves to Sources\\<connector>.
+     * Resolve that identity once while loading the source, not for each query. */
+    status = NtQueryKey( key, KeyBasicInformation, info, sizeof(buffer), &size );
+    if (status || info->NameLength % sizeof(WCHAR)) return FALSE;
+    count = info->NameLength / sizeof(WCHAR);
+    if (!count || count >= MAX_PATH) return FALSE;
+
+    /* reg_create_ascii_key() widens each byte, including signed char values. */
+    for (i = 0; i < count; ++i)
+        if (!info->Name[i] || (info->Name[i] > 0xff && info->Name[i] < 0xff80)) return FALSE;
+    for (i = 0; i < count; ++i) name[i] = info->Name[i];
+    name[count] = 0;
+    return TRUE;
+}
+
 static BOOL read_source_from_registry( unsigned int index, struct source *source, char *gpu_path )
 {
     char buffer[4096];
@@ -754,6 +783,7 @@ static BOOL read_source_from_registry( unsigned int index, struct source *source
     if (value->DataLength / sizeof(WCHAR) <= size) return FALSE;
     for (i = 0; i < value->DataLength / sizeof(WCHAR) - size; i++) source->path[i] = value_str[size + i];
     if (!(hkey = reg_open_ascii_key( config_key, source->path ))) return FALSE;
+    read_source_name( hkey, source->name );
 
     /* StateFlags */
     if (query_reg_ascii_value( hkey, "StateFlags", value, sizeof(buffer) ) && value->Type == REG_DWORD)
@@ -1125,6 +1155,8 @@ struct device_manager_ctx
     struct list vulkan_gpus;
     struct list opengl_gpus;
     BOOL has_primary;
+    BOOL devices_prepared;
+    char previous_primary_name[MAX_PATH];
     /* for the virtual desktop settings */
     BOOL is_primary;
     DEVMODEW primary;
@@ -1838,6 +1870,13 @@ static void free_gpu_info( struct gpu_info *info )
     free( info );
 }
 
+static void prepare_display_devices( struct device_manager_ctx *ctx )
+{
+    if (ctx->devices_prepared) return;
+    prepare_devices();
+    ctx->devices_prepared = TRUE;
+}
+
 static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *uuid, void *param )
 {
     struct device_manager_ctx *ctx = param;
@@ -1858,11 +1897,7 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
     if (!enum_key && !(enum_key = reg_create_ascii_key( NULL, enum_keyA, 0, NULL )))
         return;
 
-    if (!ctx->mutex)
-    {
-        ctx->mutex = get_display_device_init_mutex();
-        prepare_devices();
-    }
+    prepare_display_devices( ctx );
 
     if (!(gpu = calloc( 1, sizeof(*gpu) ))) return;
     gpu->refcount = 1;
@@ -2029,6 +2064,7 @@ static void add_source( const char *name, UINT state_flags, UINT dpi, void *para
         ctx->has_primary = TRUE;
     }
     source->dpi = dpi;
+    if (strlen(name) < sizeof(source->name)) strcpy( source->name, name );
 
     /* Wine specific config key where source settings will be held, symlinked with the logically indexed config key */
     snprintf( source->path, sizeof(source->path), "%s\\%s\\Video\\%s\\Sources\\%s", config_keyA,
@@ -2641,12 +2677,20 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     free( virtual_modes );
 }
 
+static const char *get_primary_name( void *param )
+{
+    struct device_manager_ctx *ctx = param;
+
+    return *ctx->previous_primary_name ? ctx->previous_primary_name : NULL;
+}
+
 static const struct gdi_device_manager device_manager =
 {
     add_gpu,
     add_source,
     add_monitor,
     add_modes,
+    get_primary_name,
 };
 
 static void free_gpu_infos( struct list *infos )
@@ -3105,7 +3149,7 @@ static BOOL update_display_cache_from_registry( UINT64 serial )
         return TRUE;
     }
 
-    mutex = get_display_device_init_mutex();
+    if (!(mutex = get_display_device_init_mutex())) return FALSE;
 
     clear_display_devices();
 
@@ -3277,6 +3321,8 @@ static BOOL add_virtual_source( struct device_manager_ctx *ctx )
     }
     source->gpu = gpu_acquire( gpu );
 
+    strcpy( source->name, "Virtual" );
+
     /* Wine specific config key where source settings will be held, symlinked with the logically indexed config key */
     snprintf( source->path, sizeof(source->path), "%s\\%s\\Video\\%s\\Sources\\%s", config_keyA,
               control_keyA + strlen( "\\Registry\\Machine" ), gpu->guid, "Virtual" );
@@ -3320,9 +3366,29 @@ static BOOL add_virtual_source( struct device_manager_ctx *ctx )
     return STATUS_SUCCESS;
 }
 
+static BOOL get_source_name( const struct source *source, char name[MAX_PATH] )
+{
+    strcpy( name, source->name );
+    return !!name[0];
+}
+
 static UINT update_display_devices( struct device_manager_ctx *ctx )
 {
+    struct source *source;
     UINT status;
+
+    /* Choose the previous primary under the existing publication lock, before
+     * add_gpu prepares a new device list. This also serializes first startup. */
+    if (!(ctx->mutex = get_display_device_init_mutex())) return STATUS_UNSUCCESSFUL;
+    if (update_display_cache_from_registry( monitor_update_serial ))
+    {
+        LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+        {
+            if (!(source->state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE)) continue;
+            get_source_name( source, ctx->previous_primary_name );
+            break;
+        }
+    }
 
     if (!(status = user_driver->pUpdateDisplayDevices( &device_manager, ctx )))
     {
@@ -3438,7 +3504,8 @@ static BOOL lock_display_devices( BOOL force )
     if (force)
     {
         if (!(status = update_display_devices( &ctx ))) commit_display_devices( &ctx );
-        else WARN( "Failed to update display devices, status %#x\n", status );
+        else if (status != STATUS_PENDING)
+            WARN( "Failed to update display devices, status %#x\n", status );
         release_display_manager_ctx( &ctx );
 
         ret = update_display_cache_from_registry( serial );
@@ -3460,6 +3527,45 @@ static BOOL lock_display_devices( BOOL force )
 static void unlock_display_devices(void)
 {
     pthread_mutex_unlock( &display_lock );
+}
+
+static BOOL get_display_layout( struct ntuser_display_layout *layout )
+{
+    struct ntuser_display_output *output;
+    struct source *source;
+    UINT capacity, count = 0;
+    BOOL ret = FALSE;
+
+    if (!layout) return FALSE;
+    capacity = layout->count;
+    layout->count = 0;
+    pthread_mutex_lock( &display_lock );
+
+    /* Read only an accepted layout. Unlike lock_display_devices(), a missing
+     * cache must not bootstrap a driver publication from inside this query. */
+    if (!update_display_cache_from_registry( get_monitor_update_serial() )) goto done;
+    LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+        if (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ++count;
+    layout->count = count;
+    if (!count || capacity < count || !layout->outputs) goto done;
+
+    output = layout->outputs;
+    LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+    {
+        const DEVMODEW *mode = &source->physical;
+
+        if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+        if (!get_source_name( source, output->name )) goto done;
+        SetRect( &output->rect, mode->dmPosition.x, mode->dmPosition.y,
+                 mode->dmPosition.x + mode->dmPelsWidth, mode->dmPosition.y + mode->dmPelsHeight );
+        output->state_flags = source->state_flags;
+        ++output;
+    }
+    ret = TRUE;
+
+done:
+    pthread_mutex_unlock( &display_lock );
+    return ret;
 }
 
 BOOL update_display_cache( BOOL force )
@@ -4929,24 +5035,115 @@ static BOOL get_primary_source_mode( DEVMODEW *mode )
     return ret;
 }
 
-static void display_mode_changed( BOOL broadcast )
+static BOOL display_modes_equal( const DEVMODEW *a, const DEVMODEW *b )
+{
+    const DWORD fields = DM_POSITION | DM_DISPLAYORIENTATION | DM_DISPLAYFIXEDOUTPUT |
+                         DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFLAGS |
+                         DM_DISPLAYFREQUENCY;
+    DWORD present = a->dmFields & fields;
+
+    if (present != (b->dmFields & fields)) return FALSE;
+    if ((present & DM_POSITION) && (a->dmPosition.x != b->dmPosition.x ||
+                                   a->dmPosition.y != b->dmPosition.y)) return FALSE;
+    if ((present & DM_DISPLAYORIENTATION) && a->dmDisplayOrientation != b->dmDisplayOrientation) return FALSE;
+    if ((present & DM_DISPLAYFIXEDOUTPUT) && a->dmDisplayFixedOutput != b->dmDisplayFixedOutput) return FALSE;
+    if ((present & DM_BITSPERPEL) && a->dmBitsPerPel != b->dmBitsPerPel) return FALSE;
+    if ((present & DM_PELSWIDTH) && a->dmPelsWidth != b->dmPelsWidth) return FALSE;
+    if ((present & DM_PELSHEIGHT) && a->dmPelsHeight != b->dmPelsHeight) return FALSE;
+    if ((present & DM_DISPLAYFLAGS) && a->dmDisplayFlags != b->dmDisplayFlags) return FALSE;
+    if ((present & DM_DISPLAYFREQUENCY) && a->dmDisplayFrequency != b->dmDisplayFrequency) return FALSE;
+    return TRUE;
+}
+
+/* display_lock must be held. Source objects are immutable after construction.
+ * Retaining them across cache replacement preserves the previous topology. */
+static BOOL display_sources_changed( struct source **previous, UINT count )
+{
+    struct source *source, *match;
+    UINT i, j, current_count = 0, matches;
+
+    LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+        if (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ++current_count;
+    if (count != current_count) return TRUE;
+
+    for (i = 0; i < count; ++i)
+    {
+        if (!previous[i]->name[0]) return TRUE;
+        for (j = 0; j < i; ++j)
+            if (!strcmp( previous[i]->name, previous[j]->name )) return TRUE;
+
+        match = NULL;
+        matches = 0;
+        LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+        {
+            if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            if (strcmp( previous[i]->name, source->name )) continue;
+            match = source;
+            ++matches;
+        }
+        if (matches != 1 || previous[i]->state_flags != match->state_flags ||
+            previous[i]->dpi != match->dpi || previous[i]->depth != match->depth ||
+            !display_modes_equal( &previous[i]->current, &match->current ) ||
+            !display_modes_equal( &previous[i]->physical, &match->physical )) return TRUE;
+    }
+    return FALSE;
+}
+
+static void display_mode_changed( BOOL broadcast, BOOL notify_apps )
 {
     DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
+    struct source **previous = NULL, *source;
+    UINT count = 0, i = 0;
+    BOOL snapshot_valid = FALSE, changed = TRUE, updated = FALSE;
+
+    if (notify_apps)
+    {
+        pthread_mutex_lock( &display_lock );
+        LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+            if (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ++count;
+        if (!count || (previous = malloc( count * sizeof(*previous) )))
+        {
+            LIST_FOR_EACH_ENTRY( source, &sources, struct source, entry )
+                if (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+                    previous[i++] = source_acquire( source );
+            snapshot_valid = TRUE;
+        }
+        pthread_mutex_unlock( &display_lock );
+    }
 
     if (!update_display_cache( TRUE ))
     {
         ERR( "Failed to update display cache after mode change.\n" );
-        return;
+        goto done;
     }
     if (!get_primary_source_mode( &current_mode ))
     {
         ERR( "Failed to get primary source current display settings.\n" );
-        return;
+        goto done;
     }
+    if (snapshot_valid)
+    {
+        pthread_mutex_lock( &display_lock );
+        changed = display_sources_changed( previous, count );
+        pthread_mutex_unlock( &display_lock );
+    }
+    updated = TRUE;
+
+done:
+    while (i) source_release( previous[--i] );
+    free( previous );
+    if (!updated) return;
 
     if (!broadcast)
+    {
         send_message( get_desktop_window(), WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
                       MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ) );
+        /* Wayland host notifications include topology changes whose desktop
+         * union bounds stayed the same. Repeated output events do not. */
+        if (notify_apps && changed)
+            send_notify_message( HWND_BROADCAST, WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
+                                 MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ), FALSE );
+    }
     else
     {
         /* broadcast to all the windows as well if an application changed the display settings */
@@ -5029,7 +5226,7 @@ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmo
         }
     }
 
-    display_mode_changed( TRUE );
+    display_mode_changed( TRUE, FALSE );
     return ret;
 }
 
@@ -8128,7 +8325,7 @@ ULONG_PTR WINAPI NtUserCallNoParam( ULONG code )
         return HandleToUlong( get_taskman_window() );
 
     case NtUserCallNoParam_DisplayModeChanged:
-        display_mode_changed( FALSE );
+        display_mode_changed( FALSE, FALSE );
         return TRUE;
 
     /* temporary exports */
@@ -8199,6 +8396,13 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
 
     case NtUserCallOneParam_UnregisterTouchWindow:
         return unregister_touch_window( (HWND)arg );
+
+    case NtUserCallOneParam_GetDisplayLayout:
+        return get_display_layout( (void *)arg );
+
+    case NtUserCallOneParam_DisplayModeChanged:
+        display_mode_changed( FALSE, !!arg );
+        return TRUE;
 
     /* temporary exports */
     case NtUserGetDeskPattern:

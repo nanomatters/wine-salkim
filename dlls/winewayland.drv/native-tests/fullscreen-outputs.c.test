@@ -1,0 +1,385 @@
+/* Production fullscreen ownership, retained output identity and topology tests. */
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "wine/list.h"
+
+typedef int BOOL;
+typedef int32_t LONG;
+typedef uint64_t UINT64;
+typedef uintptr_t HWND;
+typedef uint32_t VkBool32;
+typedef int32_t VkResult;
+typedef struct { int32_t left, top, right, bottom; } RECT;
+#define FALSE 0
+#define TRUE 1
+#define VK_FALSE 0
+#define VK_SUCCESS 0
+#define VK_ERROR_OUT_OF_HOST_MEMORY (-1)
+#define VK_ERROR_INITIALIZATION_FAILED (-3)
+#define VK_ERROR_SURFACE_LOST_KHR (-1000000000)
+#define VK_ERROR_OUT_OF_DATE_KHR (-1000001004)
+#define VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT (-1000255000)
+#define TRACE(...) do {} while (0)
+
+struct wl_output { unsigned int id; };
+struct wayland_output
+{
+    struct wl_output *wl_output;
+    RECT rect;
+    unsigned int ref;
+    BOOL registered;
+};
+
+/* PRODUCTION_TYPES */
+
+struct client_surface { HWND hwnd; int presentation_generation; };
+struct surface { struct client_surface *client; };
+struct swapchain
+{
+    struct surface *surface;
+    int presentation_generation, cloak_invalidated;
+    void *managed;
+};
+struct wayland_client_surface
+{
+    struct client_surface client;
+    struct list fullscreen_requests;
+    UINT64 fullscreen_active_owner;
+};
+struct wayland_win_data { struct wayland_client_surface *client_surface; };
+static struct wl_output proxies[3] = {{1}, {2}, {3}};
+static struct wayland_output outputs[3];
+static struct wayland_client_surface client;
+static struct wayland_win_data data;
+static unsigned int lock_depth, refreshes, fail_alloc, layout_queries;
+static struct wayland_output *remove_on_lock;
+
+static BOOL IsRectEmpty(const RECT *rect)
+{
+    return rect->left >= rect->right || rect->top >= rect->bottom;
+}
+static BOOL EqualRect(const RECT *a, const RECT *b)
+{
+    return a->left == b->left && a->top == b->top &&
+           a->right == b->right && a->bottom == b->bottom;
+}
+static void wayland_output_add_ref(struct wayland_output *output)
+{
+    assert(output && output->ref);
+    output->ref++;
+}
+static void wayland_output_release(struct wayland_output *output)
+{
+    assert(output && output->ref);
+    output->ref--;
+}
+static struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *result, void *scale)
+{
+    struct wayland_output *best = NULL;
+    int64_t best_area = 0;
+    unsigned int i;
+
+    (void)scale;
+    for (i = 0; i < 3; ++i)
+    {
+        struct wayland_output *output = &outputs[i];
+        int left, top, right, bottom;
+        int64_t area;
+        if (!output->registered) continue;
+        left = rect->left > output->rect.left ? rect->left : output->rect.left;
+        top = rect->top > output->rect.top ? rect->top : output->rect.top;
+        right = rect->right < output->rect.right ? rect->right : output->rect.right;
+        bottom = rect->bottom < output->rect.bottom ? rect->bottom : output->rect.bottom;
+        if (left >= right || top >= bottom) continue;
+        area = (int64_t)(right - left) * (bottom - top);
+        if (area > best_area) { best = output; best_area = area; }
+    }
+    if (best)
+    {
+        if (result) *result = best->rect;
+        wayland_output_add_ref(best);
+    }
+    return best;
+}
+static BOOL wayland_output_get_layout_rect(const struct wl_output *proxy, RECT *rect)
+{
+    unsigned int i;
+    ++layout_queries;
+    for (i = 0; i < 3; ++i)
+        if (outputs[i].registered && outputs[i].wl_output == proxy)
+        {
+            if (rect) *rect = outputs[i].rect;
+            return TRUE;
+        }
+    return FALSE;
+}
+static void remove_output(struct wayland_output *output)
+{
+    assert(output->registered);
+    output->registered = FALSE;
+    wayland_output_release(output);
+}
+static void wayland_win_data_lock(void)
+{
+    assert(!lock_depth);
+    lock_depth++;
+    if (remove_on_lock)
+    {
+        remove_output(remove_on_lock);
+        remove_on_lock = NULL;
+    }
+}
+static void wayland_win_data_unlock(void) { assert(lock_depth == 1); lock_depth--; }
+static struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd)
+{
+    assert(lock_depth == 1);
+    return hwnd == client.client.hwnd ? &data : NULL;
+}
+static struct wayland_client_surface *impl_from_client_surface(struct client_surface *surface)
+{
+    return LIST_ENTRY(surface, struct wayland_client_surface, client);
+}
+static void wayland_win_data_refresh_fullscreen(struct wayland_win_data *window)
+{
+    assert(lock_depth == 1 && window == &data);
+    refreshes++;
+}
+static void client_surface_invalidate_presentation(struct client_surface *surface)
+{
+    surface->presentation_generation++;
+}
+static BOOL NtUserIsWindowPresentationCloaked(HWND hwnd) { (void)hwnd; return FALSE; }
+static int InterlockedExchange(int *value, int replacement)
+{
+    int previous = *value;
+    *value = replacement;
+    return previous;
+}
+#define ReadAcquire(value) (*(value))
+static void *test_calloc(size_t count, size_t size)
+{
+    if (fail_alloc) { fail_alloc--; return NULL; }
+    return calloc(count, size);
+}
+#define calloc test_calloc
+
+/* PRODUCTION_HELPERS */
+/* PRODUCTION_VULKAN */
+/* PRODUCTION_INVALIDATION */
+
+static void setup(void)
+{
+    unsigned int i;
+    assert(!lock_depth && !remove_on_lock && !fail_alloc);
+    memset(&client, 0, sizeof(client));
+    client.client.hwnd = 1;
+    list_init(&client.fullscreen_requests);
+    data.client_surface = &client;
+    refreshes = layout_queries = 0;
+    for (i = 0; i < 3; ++i)
+    {
+        outputs[i].wl_output = &proxies[i];
+        outputs[i].ref = i < 2;
+        outputs[i].registered = i < 2;
+    }
+    outputs[0].rect = (RECT){0, 0, 1920, 1080};
+    outputs[1].rect = (RECT){1920, 0, 4480, 1440};
+    outputs[2].rect = outputs[1].rect;
+}
+static VkResult call(UINT64 owner, enum vulkan_surface_fullscreen_action action)
+{
+    return wayland_vulkan_surface_fullscreen(&client.client, owner, action, NULL);
+}
+static VkResult prepare(UINT64 owner, unsigned int output,
+                        enum vulkan_surface_fullscreen_target target)
+{
+    struct vulkan_surface_fullscreen_info info = {outputs[output].rect, target};
+    return wayland_vulkan_surface_fullscreen(&client.client, owner,
+                                            VULKAN_SURFACE_FULLSCREEN_PREPARE, &info);
+}
+static BOOL refresh(const struct wl_output *removed)
+{
+    BOOL changed;
+    wayland_win_data_lock();
+    changed = wayland_client_surface_refresh_fullscreen_targets(&client, removed);
+    wayland_win_data_unlock();
+    return changed;
+}
+static BOOL move(unsigned int output)
+{
+    BOOL changed;
+    wayland_win_data_lock();
+    changed = wayland_client_surface_update_fullscreen_target(&client, &outputs[output].rect);
+    wayland_win_data_unlock();
+    return changed;
+}
+static void finish(void)
+{
+    unsigned int i;
+    wayland_win_data_lock();
+    wayland_client_surface_clear_fullscreen_requests(&client);
+    wayland_win_data_unlock();
+    assert(list_empty(&client.fullscreen_requests) && !client.fullscreen_active_owner);
+    for (i = 0; i < 3; ++i) assert(outputs[i].ref == (unsigned int)outputs[i].registered);
+}
+
+static void test_fixed_identity(void)
+{
+    struct wayland_fullscreen_request *request;
+    unsigned int queries;
+    RECT rect;
+    setup();
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_SUCCESS);
+    assert(call(1, VULKAN_SURFACE_FULLSCREEN_ACQUIRE) == VK_SUCCESS);
+    request = find_fullscreen_request(&client, 1);
+    assert(request->output == &outputs[0] && outputs[0].ref == 2);
+    assert(!move(1) && request->output == &outputs[0]);
+    outputs[0].rect = (RECT){-1920, 240, 0, 1320};
+    outputs[1].rect = (RECT){0, 0, 2560, 1440};
+    /* Layout updates are visible immediately, without a cache refresh. */
+    assert(wayland_client_surface_get_fullscreen_rect(&client, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+    assert(wayland_client_surface_get_fullscreen_rect(&client, FALSE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+    outputs[0].rect = (RECT){-3840, -200, 0, 1960};
+    assert(wayland_client_surface_get_fullscreen_rect(&client, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect) && outputs[0].ref == 2);
+    queries = layout_queries;
+    assert(!refresh(NULL) && layout_queries == queries);
+    assert(!move(1) && !client.client.presentation_generation);
+    assert(call(1, VULKAN_SURFACE_FULLSCREEN_CLEAR) == VK_SUCCESS);
+    assert(outputs[0].ref == 1 && !client.fullscreen_active_owner);
+    finish();
+}
+
+static void test_missing_layout_is_not_removal(void)
+{
+    struct wayland_fullscreen_request *request;
+    unsigned int queries;
+    RECT rect;
+    setup();
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_SUCCESS);
+    assert(call(1, VULKAN_SURFACE_FULLSCREEN_ACQUIRE) == VK_SUCCESS);
+    request = find_fullscreen_request(&client, 1);
+    /* Model an incomplete coordinate map without a registry removal event. */
+    outputs[0].registered = FALSE;
+    assert(!wayland_client_surface_get_fullscreen_rect(&client, TRUE, &rect));
+    queries = layout_queries;
+    assert(!refresh(NULL) && layout_queries == queries);
+    assert(!request->invalid && client.fullscreen_active_owner == 1);
+    assert(!client.client.presentation_generation && outputs[0].ref == 2);
+    outputs[0].registered = TRUE;
+    assert(wayland_client_surface_get_fullscreen_rect(&client, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+    finish();
+}
+
+static void test_window_follows(void)
+{
+    struct wayland_fullscreen_request *following, *fixed;
+    setup();
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW) == VK_SUCCESS);
+    assert(prepare(2, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_SUCCESS);
+    assert(call(2, VULKAN_SURFACE_FULLSCREEN_ACQUIRE) == VK_SUCCESS);
+    following = find_fullscreen_request(&client, 1);
+    fixed = find_fullscreen_request(&client, 2);
+    assert(move(1));
+    assert(following->output == &outputs[1] && fixed->output == &outputs[0]);
+    assert(outputs[0].ref == 2 && outputs[1].ref == 2);
+    assert(!move(1) && !client.client.presentation_generation);
+    /* The same rectangle does not make a replacement connector the old output. */
+    remove_output(&outputs[1]);
+    outputs[2].registered = TRUE;
+    outputs[2].ref = 1;
+    assert(move(2) && following->output == &outputs[2]);
+    assert(!outputs[1].ref && outputs[2].ref == 2);
+    finish();
+}
+
+static void test_removed_target(void)
+{
+    struct wayland_fullscreen_request *active, *pending;
+    struct surface wrapper_surface = {&client.client};
+    struct swapchain swapchain = { .surface = &wrapper_surface };
+    RECT rect;
+    setup();
+    assert(!swapchain_is_out_of_date(&swapchain));
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_SUCCESS);
+    assert(call(1, VULKAN_SURFACE_FULLSCREEN_ACQUIRE) == VK_SUCCESS);
+    assert(prepare(2, 1, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_SUCCESS);
+    active = find_fullscreen_request(&client, 1);
+    pending = find_fullscreen_request(&client, 2);
+    remove_output(&outputs[1]);
+    assert(refresh(&proxies[1]));
+    assert(pending->invalid && !active->invalid && !client.client.presentation_generation);
+    assert(!swapchain_is_out_of_date(&swapchain));
+    assert(wayland_client_surface_get_fullscreen_rect(&client, TRUE, &rect));
+    assert(!wayland_client_surface_get_fullscreen_rect(&client, FALSE, &rect));
+    assert(call(2, VULKAN_SURFACE_FULLSCREEN_ACQUIRE) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(call(2, VULKAN_SURFACE_FULLSCREEN_CLEAR) == VK_SUCCESS);
+    assert(!outputs[1].ref);
+    remove_output(&outputs[0]);
+    assert(!wayland_client_surface_get_fullscreen_rect(&client, TRUE, &rect));
+    assert(!client.client.presentation_generation);
+    assert(refresh(&proxies[0]));
+    assert(active->invalid && !client.fullscreen_active_owner);
+    assert(client.client.presentation_generation == 1);
+    assert(swapchain_is_out_of_date(&swapchain));
+    assert(!refresh(&proxies[0]) && client.client.presentation_generation == 1);
+    outputs[2].registered = TRUE;
+    outputs[2].ref = 1;
+    outputs[2].rect = outputs[0].rect;
+    assert(!refresh(NULL) && !move(2));
+    assert(swapchain_is_out_of_date(&swapchain));
+    assert(call(1, VULKAN_SURFACE_FULLSCREEN_ACQUIRE) == VK_ERROR_INITIALIZATION_FAILED);
+    finish();
+}
+
+static void test_hook_failures(void)
+{
+    struct vulkan_surface_fullscreen_info info;
+    setup();
+    info = (struct vulkan_surface_fullscreen_info){outputs[0].rect,
+                                                 VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED};
+    assert(wayland_vulkan_surface_fullscreen_supported(&client.client, &info));
+    assert(outputs[0].ref == 1);
+    fail_alloc = 1;
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_ERROR_OUT_OF_HOST_MEMORY);
+    assert(outputs[0].ref == 1);
+    data.client_surface = NULL;
+    assert(!wayland_vulkan_surface_fullscreen_supported(&client.client, &info));
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_ERROR_SURFACE_LOST_KHR);
+    assert(outputs[0].ref == 1);
+    data.client_surface = &client;
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_SUCCESS);
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(outputs[0].ref == 2);
+    info.target = (enum vulkan_surface_fullscreen_target)99;
+    assert(!wayland_vulkan_surface_fullscreen_supported(&client.client, &info));
+    assert(wayland_vulkan_surface_fullscreen(&client.client, 3,
+            VULKAN_SURFACE_FULLSCREEN_PREPARE, &info) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(call(3, VULKAN_SURFACE_FULLSCREEN_PREPARE) == VK_ERROR_INITIALIZATION_FAILED);
+    finish();
+
+    setup();
+    remove_on_lock = &outputs[0];
+    assert(prepare(1, 0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED) == VK_ERROR_INITIALIZATION_FAILED);
+    assert(!outputs[0].ref && list_empty(&client.fullscreen_requests));
+    finish();
+}
+
+int main(void)
+{
+    test_fixed_identity();
+    test_missing_layout_is_not_removal();
+    test_window_follows();
+    test_removed_target();
+    test_hook_failures();
+    puts("fullscreen output identity: fixed/window targets, topology, ownership and cleanup passed");
+    return 0;
+}

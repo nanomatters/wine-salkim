@@ -1,0 +1,2043 @@
+/* Actual output-membership and window reconciliation bodies with platform mocks.
+ * These tests do not start a compositor or establish a physical window position. */
+#include <assert.h>
+#include <math.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wayland-util.h>
+#include "wine/list.h"
+
+typedef int BOOL;
+typedef unsigned int UINT, DWORD;
+typedef int INT;
+typedef uint64_t UINT64;
+typedef void *HWND;
+typedef struct { int left, top, right, bottom; } RECT;
+typedef struct { int cx, cy; } SIZE;
+struct window_rects { RECT window, client, visible; };
+#define TRUE 1
+#define FALSE 0
+static void test_trace(const char *format, ...) { (void)format; }
+static const char *wine_dbgstr_rect(const RECT *rect) { (void)rect; return "rect"; }
+static const char *debugstr_window_rects(const struct window_rects *rects) { (void)rects; return "rects"; }
+static const char *wine_dbgstr_longlong(uint64_t value) { (void)value; return "owner"; }
+#define TRACE test_trace
+#define TRACE_(channel) TRACE
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#define WS_MINIMIZE 0x20000000u
+#define WS_VISIBLE 0x10000000u
+#define WS_POPUP 0x80000000u
+#define WS_MAXIMIZE 0x01000000u
+#define WS_CAPTION 0x00c00000u
+#define WS_THICKFRAME 0x00040000u
+#define WS_OVERLAPPEDWINDOW 0x00cf0000u
+#define WM_WAYLAND_OUTPUT_CHANGE 0x9010u
+#define SWP_NOSIZE 0x1u
+#define SWP_NOZORDER 0x4u
+#define SWP_NOACTIVATE 0x10u
+#define SWP_NOOWNERZORDER 0x200u
+#define SWP_NOSENDCHANGING 0x400u
+#define SWP_NOMOVE 0x2u
+#define SWP_FRAMECHANGED 0x20u
+#define SWP_HIDEWINDOW 0x80u
+#define WINE_SWP_FULLSCREEN 0x80000000u
+#define GWL_STYLE (-16)
+#define SC_MAXIMIZE 0xf030u
+#define SC_RESTORE 0xf120u
+#define WM_ENTERSIZEMOVE 0x231u
+#define WM_EXITSIZEMOVE 0x232u
+#define WM_WINE_WINDOW_STATE_CHANGED 0x9011u
+#define WAYLAND_SURFACE_ROLE_TOPLEVEL 1
+#define WAYLAND_SURFACE_ROLE_POPUP 3
+#define WAYLAND_SURFACE_WM_CAPS_MINIMIZE 0x10u
+#define VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED 0
+#define VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW 1
+
+enum wayland_surface_config_state
+{
+    WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED = 1,
+    WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN = 2,
+    WAYLAND_SURFACE_CONFIG_STATE_TILED = 4,
+    WAYLAND_SURFACE_CONFIG_STATE_RESIZING = 8,
+    WAYLAND_SURFACE_CONFIG_STATE_SUSPENDED = 16
+};
+struct wayland_window_config
+{
+    RECT rect, window_rect, client_rect, shm_source;
+    unsigned int state;
+    BOOL minimized, resizeable, managed, preserve_fullscreen_size;
+    SIZE virtual_size;
+};
+struct wayland_surface_config { RECT rect; unsigned int serial, state, decor, caps; BOOL processed; };
+
+struct wl_output { int identity; };
+struct wl_surface { int identity; };
+struct wayland_output
+{
+    struct wl_output *wl_output;
+    RECT rect;
+    int references;
+    BOOL alive;
+};
+struct wayland_surface_output { struct wl_list link; struct wayland_output *output; };
+struct wayland_surface
+{
+    HWND hwnd;
+    struct wl_surface *wl_surface;
+    struct wl_list output_list;
+    struct wayland_output *presentation_output;
+    BOOL output_update_queued;
+    int role;
+    const struct wl_output *requested_output;
+    BOOL fullscreen_requested;
+    void *xdg_toplevel;
+    void *xdg_surface;
+    BOOL resizing;
+    struct wayland_window_config window, comitted;
+    struct wayland_surface_config current, processing, queued;
+    RECT toplevel_size_limits;
+};
+struct client_surface { unsigned int invalidations; };
+struct wayland_fullscreen_request
+{
+    struct list entry;
+    UINT64 owner;
+    unsigned int target;
+    struct wayland_output *output;
+    BOOL invalid;
+};
+struct wayland_client_surface
+{
+    struct client_surface client;
+    struct list fullscreen_requests;
+    UINT64 fullscreen_active_owner;
+};
+struct wayland_win_data
+{
+    HWND hwnd;
+    struct wayland_surface *wayland_surface;
+    struct wayland_client_surface *client_surface;
+    struct window_rects rects;
+    DWORD style, exstyle;
+    BOOL virtual_desktop, is_fullscreen, has_present_rect, visible;
+    BOOL application_fullscreen, updating_output;
+    BOOL explicitly_hidden;
+    RECT application_fullscreen_rect;
+    struct wayland_output *application_fullscreen_output;
+    unsigned int configure_state_serial;
+    HWND subsurface_parent;
+    BOOL client_rect_in_toplevel_valid, restore_rect_valid, managed;
+    RECT client_rect_in_toplevel, restore_rect, present_rect;
+};
+
+static struct wl_output proxies[] = {{1}, {2}, {3}};
+static struct wl_surface proxy = {1}, retired_proxy = {2};
+static struct wayland_output outputs[3];
+static struct wayland_surface surface;
+static struct wayland_win_data window;
+static struct wayland_client_surface client;
+static struct wayland_fullscreen_request request;
+static unsigned int posts, raw_positions, position_changes, size_changes, refreshes, exposes;
+static unsigned int fullscreen_sets, fullscreen_unsets, commits;
+static struct wl_output *last_fullscreen_output;
+static unsigned int shared_layout_syncs;
+static int lock_depth;
+static int output_lock_depth;
+static BOOL require_shared_sync;
+static unsigned int prior_shared_layout_syncs;
+static BOOL in_reader, post_fail, disappear_on_move;
+static BOOL shared_layout_ready, layout_available[3];
+static BOOL window_data_missing, create_fails;
+static RECT last_position;
+static BOOL configure_rawpos, configure_expected_guard;
+static BOOL check_mapping_visibility, presentation_cloaked;
+static void (*rawpos_observer)(void);
+static void (*contents_observer)(void);
+static void (*position_callback)(const struct window_rects *rects, UINT flags);
+static unsigned int acknowledgements, last_acknowledged;
+static struct { pthread_mutex_t output_mutex; } process_wayland = { PTHREAD_MUTEX_INITIALIZER };
+
+static int __attribute__((unused)) monitor_mutex_lock(pthread_mutex_t *mutex)
+{
+    assert(mutex == &process_wayland.output_mutex && !lock_depth && !output_lock_depth);
+    output_lock_depth = 1;
+    return pthread_mutex_lock(mutex);
+}
+static int __attribute__((unused)) monitor_mutex_unlock(pthread_mutex_t *mutex)
+{
+    assert(mutex == &process_wayland.output_mutex && !lock_depth && output_lock_depth == 1);
+    output_lock_depth = 0;
+    return pthread_mutex_unlock(mutex);
+}
+#define pthread_mutex_lock monitor_mutex_lock
+#define pthread_mutex_unlock monitor_mutex_unlock
+static BOOL output_info_array_sync_shared_layout(void)
+{
+    assert(!lock_depth && !output_lock_depth && !in_reader);
+    ++shared_layout_syncs;
+    return shared_layout_ready;
+}
+
+static BOOL EqualRect(const RECT *a, const RECT *b) { return !memcmp(a, b, sizeof(*a)); }
+static BOOL IsRectEmpty(const RECT *rect)
+{
+    return rect->right <= rect->left || rect->bottom <= rect->top;
+}
+static void SetRect(RECT *rect, int left, int top, int right, int bottom)
+{
+    *rect = (RECT){left, top, right, bottom};
+}
+static void OffsetRect(RECT *rect, int x, int y)
+{
+    rect->left += x; rect->right += x;
+    rect->top += y; rect->bottom += y;
+}
+static struct wayland_output *find_output(const struct wl_output *output)
+{
+    unsigned int i;
+    for (i = 0; i < 3; ++i) if (outputs[i].wl_output == output) return &outputs[i];
+    return NULL;
+}
+static struct wayland_output *wayland_output_get(struct wl_output *output)
+{
+    struct wayland_output *found = find_output(output);
+    if (!found || !found->alive) return NULL;
+    ++found->references;
+    return found;
+}
+static void wayland_output_release(struct wayland_output *output)
+{
+    assert(output && output->references > 1);
+    --output->references;
+}
+static void wayland_output_add_ref(struct wayland_output *output)
+{
+    assert(output && output->references);
+    ++output->references;
+}
+static BOOL wayland_output_get_layout_rect(const struct wl_output *output, RECT *rect)
+{
+    struct wayland_output *found = find_output(output);
+    if (!found || !found->alive || !layout_available[found - outputs]) return FALSE;
+    if (rect) *rect = found->rect;
+    return TRUE;
+}
+static BOOL wayland_output_get_primary_rect(RECT *rect)
+{
+    return wayland_output_get_layout_rect(&proxies[0], rect);
+}
+static struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *output_rect,
+                                                     void *unused)
+{
+    struct wayland_output *best = NULL;
+    int best_area = 0;
+    unsigned int i;
+    (void)unused;
+    for (i = 0; i < 3; ++i)
+    {
+        const RECT *target = &outputs[i].rect;
+        int width = max(0, min(rect->right, target->right) - max(rect->left, target->left));
+        int height = max(0, min(rect->bottom, target->bottom) - max(rect->top, target->top));
+        if (outputs[i].alive && width * height > best_area)
+        {
+            best = &outputs[i];
+            best_area = width * height;
+        }
+    }
+    if (!best) return NULL;
+    ++best->references;
+    if (output_rect) *output_rect = best->rect;
+    return best;
+}
+static BOOL wayland_output_layout_intersects_rect(const RECT *rect)
+{
+    struct wayland_output *output = wayland_output_for_rect(rect, NULL, NULL);
+    if (!output) return FALSE;
+    wayland_output_release(output);
+    return TRUE;
+}
+static BOOL NtUserIsWindowPresentationCloaked(HWND hwnd)
+{
+    assert(hwnd == window.hwnd);
+    return presentation_cloaked;
+}
+static struct wayland_win_data *wayland_win_data_get(HWND hwnd)
+{
+    assert(!lock_depth && !output_lock_depth);
+    if (require_shared_sync) assert(shared_layout_syncs > prior_shared_layout_syncs);
+    if (hwnd != window.hwnd || !window.hwnd || window_data_missing) return NULL;
+    ++lock_depth;
+    return &window;
+}
+static struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd)
+{
+    assert(lock_depth == 1);
+    return hwnd == window.hwnd ? &window : NULL;
+}
+static void wayland_win_data_release(struct wayland_win_data *data)
+{
+    assert(data == &window && lock_depth == 1);
+    --lock_depth;
+}
+static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct window_rects *rects)
+{
+    assert(hwnd == window.hwnd && rects == &window.rects);
+    assert(window_data_missing && !lock_depth && shared_layout_syncs == 1);
+    if (create_fails) return NULL;
+    window_data_missing = FALSE;
+    return wayland_win_data_get(hwnd);
+}
+static void wayland_win_data_update_restore_rect(struct wayland_win_data *data, DWORD style,
+                                                 const struct window_rects *rects)
+{
+    assert(data == &window && style == window.style && rects == &window.rects && lock_depth == 1);
+}
+static BOOL wayland_surface_is_toplevel(struct wayland_surface *value)
+{
+    return value->role == WAYLAND_SURFACE_ROLE_TOPLEVEL;
+}
+static BOOL NtUserPostMessage(HWND hwnd, UINT message, uintptr_t wparam, intptr_t lparam)
+{
+    assert(hwnd == surface.hwnd && message == WM_WAYLAND_OUTPUT_CHANGE);
+    assert(!wparam && !lparam);
+    ++posts;
+    return !post_fail;
+}
+static void client_surface_invalidate_presentation(struct client_surface *value)
+{
+    ++value->invalidations;
+}
+static void wayland_surface_update_toplevel_parent(struct wayland_surface *value) { (void)value; }
+static void wayland_surface_shortcut_control(struct wayland_surface *value, BOOL enabled)
+{
+    (void)value; (void)enabled;
+}
+static void xdg_toplevel_unset_maximized(void *value) { (void)value; }
+static void xdg_toplevel_set_maximized(void *value) { (void)value; }
+static void xdg_toplevel_unset_fullscreen(void *value) { (void)value; ++fullscreen_unsets; }
+static void xdg_toplevel_set_fullscreen(void *value, struct wl_output *output)
+{
+    (void)value;
+    assert(!output || find_output(output));
+    last_fullscreen_output = output;
+    ++fullscreen_sets;
+}
+static void xdg_toplevel_set_min_size(void *value, int width, int height)
+{
+    (void)value; assert(!width && !height);
+}
+static void xdg_toplevel_set_max_size(void *value, int width, int height)
+{
+    (void)value; assert(!width && !height);
+}
+static void wayland_surface_mark_pending_commit(struct wayland_surface *value)
+{
+    assert(value == &surface);
+    ++commits;
+}
+static void xdg_surface_ack_configure(void *value, unsigned int serial)
+{
+    assert(value == surface.xdg_surface && serial);
+    ++acknowledgements;
+    last_acknowledged = serial;
+}
+static void wayland_surface_reconfigure_geometry(struct wayland_surface *value, RECT rect)
+{
+    assert(value == &surface);
+    assert(EqualRect(&rect, &surface.window.rect));
+}
+static void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data)
+{
+    assert(data == &window && lock_depth == 1 && !in_reader);
+    ++refreshes;
+}
+static DWORD NtUserGetWindowLongW(HWND hwnd, int index)
+{
+    assert(hwnd == window.hwnd && index == GWL_STYLE);
+    return window.style;
+}
+static void NtUserSetWindowLong(HWND hwnd, int index, DWORD style, BOOL ansi)
+{
+    assert(hwnd == window.hwnd && index == GWL_STYLE && !ansi);
+    window.style = style;
+}
+static void send_message(HWND hwnd, unsigned int message, uintptr_t wparam, intptr_t lparam)
+{
+    assert(hwnd == window.hwnd && !lock_depth && !wparam && !lparam);
+    assert(message == WM_ENTERSIZEMOVE || message == WM_EXITSIZEMOVE);
+}
+static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
+                                               UINT command, const RECT *rect)
+{
+    assert(data == &window && lock_depth == 1);
+    assert(command == SC_MAXIMIZE || command == SC_RESTORE);
+    (void)rect;
+}
+static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+{
+    assert(data == &window && lock_depth == 1);
+    surface.processing.processed = TRUE;
+}
+static void ensure_window_surface_contents(HWND hwnd, void *region)
+{
+    assert(!lock_depth && !in_reader && !region);
+    assert(hwnd == surface.hwnd);
+    ++exposes;
+    if (contents_observer) contents_observer();
+}
+static void NtUserSetRawWindowPos(HWND hwnd, RECT rect, UINT flags, BOOL internal)
+{
+    RECT old = window.rects.window;
+    struct window_rects next = window.rects;
+    int dx, dy;
+    assert(!lock_depth && !in_reader && !internal);
+    assert(hwnd == window.hwnd);
+    if (configure_rawpos)
+    {
+        assert(window.updating_output == configure_expected_guard);
+        assert(flags & SWP_NOACTIVATE);
+        if (rawpos_observer) rawpos_observer();
+    }
+    else
+    {
+        assert(window.updating_output);
+        assert(flags == (SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER |
+                         SWP_NOOWNERZORDER | SWP_NOSENDCHANGING));
+        assert(rect.right - rect.left == old.right - old.left);
+        assert(rect.bottom - rect.top == old.bottom - old.top);
+    }
+    if (flags & SWP_NOSIZE)
+    {
+        rect.right = rect.left + old.right - old.left;
+        rect.bottom = rect.top + old.bottom - old.top;
+    }
+    if (flags & SWP_NOMOVE)
+        OffsetRect(&rect, old.left - rect.left, old.top - rect.top);
+    dx = rect.left - old.left;
+    dy = rect.top - old.top;
+    last_position = rect;
+    ++raw_positions;
+    if (rect.left != old.left || rect.top != old.top) ++position_changes;
+    if (rect.right - rect.left != old.right - old.left ||
+        rect.bottom - rect.top != old.bottom - old.top) ++size_changes;
+    next.window = rect;
+    OffsetRect(&next.client, dx, dy);
+    next.client.right += (rect.right - rect.left) - (old.right - old.left);
+    next.client.bottom += (rect.bottom - rect.top) - (old.bottom - old.top);
+    if (EqualRect(&next.visible, &old)) next.visible = rect;
+    else OffsetRect(&next.visible, dx, dy);
+    if (position_callback) position_callback(&next, flags);
+    else window.rects = next;
+    if (disappear_on_move) window.hwnd = NULL;
+}
+void wayland_surface_reset_presentation_output(struct wayland_surface *value);
+
+/* MONITOR_PRODUCTION_FUNCTIONS */
+
+/* Run the visibility decision extracted from create_wayland_surface. This
+ * mocks an unowned root toplevel, not its Wayland requests or frame callbacks. */
+static BOOL root_toplevel_visible(void)
+{
+    struct wayland_win_data *data = &window;
+    struct wayland_surface *surface = data->wayland_surface;
+    struct wayland_surface *owner_surface = NULL, *toplevel_surface = NULL;
+    BOOL subsurface_window = FALSE, use_layer_shell = FALSE;
+    BOOL keep_toplevel_mapped, fullscreen_target_active, first_show_minimized;
+    DWORD style = data->style;
+    BOOL visible = !data->explicitly_hidden && (style & WS_VISIBLE);
+
+    /* MONITOR_PRODUCTION_VISIBILITY */
+    return visible;
+}
+
+struct fullscreen_decision
+{
+    BOOL fullscreen, preserve, application, updating_output;
+    RECT application_rect;
+};
+
+/* Extract the actual driver decision before application-mode inference. A
+ * caller-supplied WINE_SWP_FULLSCREEN is the win32u decision, not a mock guess. */
+static struct fullscreen_decision windowpos_fullscreen_decision(const struct window_rects *new_rects,
+                                                               DWORD style, UINT swp_flags)
+{
+    struct wayland_win_data *data;
+    HWND hwnd = window.hwnd;
+    BOOL fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL preserve_fullscreen = FALSE, application_fullscreen = FALSE, updating_output = FALSE;
+    RECT application_fullscreen_rect = {0};
+
+    /* MONITOR_PRODUCTION_FULLSCREEN_DECISION */
+    return (struct fullscreen_decision){!!fullscreen, preserve_fullscreen,
+                                       application_fullscreen, updating_output, application_fullscreen_rect};
+}
+
+/* Run the production WindowPosChanged decision blocks with a supplied mode
+ * query result. The mock omits mode enumeration and unrelated window roles. */
+static struct fullscreen_decision apply_window_position(const struct window_rects *new_rects,
+                                                       DWORD style, UINT swp_flags, BOOL inferred)
+{
+    struct fullscreen_decision decision = windowpos_fullscreen_decision(new_rects, style, swp_flags);
+    BOOL preserve_fullscreen = decision.preserve, updating_output = decision.updating_output;
+    BOOL update_fullscreen_target = FALSE;
+    BOOL application_fullscreen = decision.application, fullscreen = decision.fullscreen;
+    BOOL visible = (style & WS_VISIBLE) && !(swp_flags & SWP_HIDEWINDOW);
+    BOOL has_present_rect;
+    RECT application_fullscreen_rect = decision.application_rect;
+    struct wayland_win_data *data;
+
+    if (!preserve_fullscreen && inferred)
+    {
+        struct wayland_output *output = wayland_output_for_rect(&new_rects->client,
+                                                               &application_fullscreen_rect, NULL);
+        assert(output);
+        wayland_output_release(output);
+        application_fullscreen = fullscreen = TRUE;
+    }
+    has_present_rect = fullscreen && window.has_present_rect;
+    data = wayland_win_data_get(window.hwnd);
+    assert(data);
+    /* MONITOR_PRODUCTION_FULLSCREEN_TARGET */
+    data->rects = *new_rects;
+    data->style = style;
+    data->visible = visible;
+    data->is_fullscreen = fullscreen;
+    data->application_fullscreen = application_fullscreen;
+    data->application_fullscreen_rect = application_fullscreen_rect;
+    /* MONITOR_PRODUCTION_CLIENT_TARGET */
+    wayland_win_data_release(data);
+    return decision;
+}
+
+static void apply_driver_position(const struct window_rects *rects, UINT flags)
+{
+    BOOL was_fullscreen = window.is_fullscreen;
+    struct fullscreen_decision decision = apply_window_position(rects, window.style, flags, FALSE);
+    assert(decision.preserve == was_fullscreen);
+    assert(decision.updating_output);
+    assert(!window.updating_output);
+}
+
+static void init(void)
+{
+    unsigned int i;
+    memset(&surface, 0, sizeof(surface));
+    memset(&window, 0, sizeof(window));
+    memset(&client, 0, sizeof(client));
+    memset(&request, 0, sizeof(request));
+    for (i = 0; i < 3; ++i)
+    {
+        outputs[i].wl_output = &proxies[i];
+        outputs[i].references = 1;
+        outputs[i].alive = TRUE;
+        layout_available[i] = TRUE;
+    }
+    outputs[0].rect = (RECT){0, 0, 3840, 2160};
+    outputs[1].rect = (RECT){-2560, -720, 0, 720};
+    outputs[2].rect = (RECT){3840, 200, 5760, 1280};
+    wl_list_init(&surface.output_list);
+    list_init(&client.fullscreen_requests);
+    window.hwnd = surface.hwnd = (HWND)(uintptr_t)0x1234;
+    surface.wl_surface = &proxy;
+    surface.role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+    window.wayland_surface = &surface;
+    window.visible = TRUE;
+    window.style = WS_OVERLAPPEDWINDOW;
+    window.rects.client = (RECT){100, 100, 900, 700};
+    window.rects.window = (RECT){92, 70, 908, 708};
+    window.rects.visible = window.rects.window;
+    posts = raw_positions = position_changes = size_changes = refreshes = exposes = 0;
+    fullscreen_sets = fullscreen_unsets = commits = 0;
+    last_fullscreen_output = NULL;
+    shared_layout_syncs = prior_shared_layout_syncs = 0;
+    output_lock_depth = 0;
+    require_shared_sync = FALSE;
+    lock_depth = 0;
+    in_reader = post_fail = disappear_on_move = FALSE;
+    shared_layout_ready = TRUE;
+    last_position = (RECT){0};
+    configure_rawpos = configure_expected_guard = FALSE;
+    check_mapping_visibility = presentation_cloaked = FALSE;
+    rawpos_observer = NULL;
+    contents_observer = NULL;
+    position_callback = NULL;
+    acknowledgements = last_acknowledged = 0;
+}
+static void cleanup(void)
+{
+    unsigned int i;
+    wayland_surface_clear_outputs(&surface);
+    if (window.application_fullscreen_output)
+        wayland_output_release(window.application_fullscreen_output);
+    if (!list_empty(&client.fullscreen_requests))
+    {
+        list_remove(&request.entry);
+        wayland_output_release(request.output);
+    }
+    for (i = 0; i < 3; ++i) assert(outputs[i].references == 1);
+    assert(!lock_depth && !surface.presentation_output);
+}
+static void event(struct wl_surface *value, struct wl_output *output, BOOL enter)
+{
+    unsigned int positions = raw_positions, refreshed = refreshes;
+    in_reader = TRUE;
+    wayland_surface_handle_output(window.hwnd, value, output, enter);
+    in_reader = FALSE;
+    assert(raw_positions == positions && refreshes == refreshed && !lock_depth);
+}
+static void dispatch(void)
+{
+    BOOL was_configure = configure_rawpos;
+    assert(surface.output_update_queued);
+    prior_shared_layout_syncs = shared_layout_syncs;
+    require_shared_sync = TRUE;
+    configure_rawpos = FALSE;
+    wayland_window_update_output(window.hwnd);
+    configure_rawpos = was_configure;
+    require_shared_sync = FALSE;
+    assert(shared_layout_syncs == prior_shared_layout_syncs + 1 && !output_lock_depth);
+    assert(!surface.output_update_queued && !lock_depth);
+}
+static void add_request(unsigned int output, unsigned int target)
+{
+    window.client_surface = &client;
+    request.output = wayland_output_get(&proxies[output]);
+    request.owner = client.fullscreen_active_owner = 7;
+    request.target = target;
+    list_add_tail(&client.fullscreen_requests, &request.entry);
+}
+
+static void test_membership_events(void)
+{
+    init();
+    event(&retired_proxy, &proxies[0], TRUE);
+    event(&proxy, NULL, TRUE);
+    assert(!posts && wl_list_empty(&surface.output_list));
+    event(&proxy, &proxies[0], TRUE);
+    event(&proxy, &proxies[0], TRUE);
+    event(&proxy, &proxies[1], TRUE);
+    assert(posts == 1 && !wayland_surface_get_output(&surface));
+    event(&proxy, &proxies[0], FALSE);
+    assert(posts == 1 && wayland_surface_get_output(&surface) == &proxies[1]);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !raw_positions);
+    assert(EqualRect(&window.rects.client, &(RECT){100, 100, 900, 700}));
+    assert(window.rects.client.right - window.rects.client.left == 800);
+    assert(window.rects.client.bottom - window.rects.client.top == 600);
+    cleanup();
+
+    init();
+    post_fail = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    assert(posts == 1 && !surface.output_update_queued);
+    post_fail = FALSE;
+    event(&proxy, &proxies[1], TRUE);
+    wayland_surface_queue_output_update(&surface);
+    assert(posts == 2 && surface.output_update_queued);
+    dispatch();
+    assert(!raw_positions);
+    cleanup();
+}
+
+static void test_ambiguous_and_zero(void)
+{
+    RECT rect;
+    init();
+    window.style = WS_POPUP;
+    window.is_fullscreen = TRUE;
+    window.application_fullscreen = TRUE;
+    window.application_fullscreen_rect = outputs[0].rect;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+    assert(surface.presentation_output == &outputs[1] && posts == 1);
+    event(&proxy, &proxies[2], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && raw_positions == 1);
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+    event(&proxy, &proxies[1], FALSE);
+    event(&proxy, &proxies[2], FALSE);
+    dispatch();
+    assert(!wayland_surface_get_output(&surface));
+    assert(surface.presentation_output == &outputs[1] && raw_positions == 1);
+    cleanup();
+}
+
+static void test_windowed_geometry_is_not_inferred(void)
+{
+    struct window_rects before;
+    init();
+    window.rects.client = (RECT){3800, 2100, 4600, 2700};
+    window.rects.window = window.rects.visible = (RECT){3792, 2070, 4608, 2708};
+    before = window.rects;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !raw_positions);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    cleanup();
+
+    init();
+    window.rects.window = window.rects.client = window.rects.visible = (RECT){0, 0, 5040, 2160};
+    before = window.rects;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !raw_positions);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    cleanup();
+}
+
+static void test_owner_output_noop_and_topology_change(void)
+{
+    struct window_rects before;
+
+    init();
+    before = window.rects;
+    event(&proxy, &proxies[0], TRUE);
+    dispatch();
+    assert(!raw_positions && !memcmp(&before, &window.rects, sizeof(before)));
+    assert(surface.presentation_output == &outputs[0] && outputs[0].references == 3);
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(!raw_positions && !memcmp(&before, &window.rects, sizeof(before)));
+    assert(outputs[0].references == 3 && outputs[1].references == 1 && outputs[2].references == 1);
+    cleanup();
+
+    init();
+    window.rects.client = (RECT){10000, 9000, 10800, 9600};
+    window.rects.window = window.rects.visible = (RECT){9992, 8970, 10808, 9608};
+    before = window.rects;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(!raw_positions && surface.presentation_output == &outputs[1]);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    assert(outputs[1].references == 3 && outputs[0].references == 1 && outputs[2].references == 1);
+    cleanup();
+
+    init();
+    window.is_fullscreen = TRUE;
+    window.style = WS_POPUP;
+    window.updating_output = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(raw_positions == 1 && window.updating_output);
+    assert(surface.presentation_output == &outputs[1]);
+    cleanup();
+}
+
+static void test_virtual_and_fixed(void)
+{
+    struct window_rects before;
+    RECT rect;
+    init();
+    window.virtual_desktop = window.is_fullscreen = TRUE;
+    window.style = WS_POPUP;
+    surface.fullscreen_requested = TRUE;
+    surface.requested_output = &proxies[0];
+    before = window.rects;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(!raw_positions && !memcmp(&before, &window.rects, sizeof(before)));
+    assert(surface.requested_output == &proxies[0] && surface.fullscreen_requested);
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+    cleanup();
+
+    /* The Win32 virtual desktop intentionally has no matching physical
+     * shared layout. Observation still updates presentation, never geometry. */
+    init();
+    window.virtual_desktop = window.is_fullscreen = TRUE;
+    window.style = WS_POPUP;
+    window.rects.window = window.rects.client = window.rects.visible = (RECT){0, 0, 2304, 1296};
+    surface.fullscreen_requested = TRUE;
+    surface.requested_output = &proxies[0];
+    before = window.rects;
+    shared_layout_ready = FALSE;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1]);
+    assert(!raw_positions && !position_changes && !size_changes);
+    assert(!memcmp(&before, &window.rects, sizeof(before)));
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+    assert(surface.requested_output == &proxies[0] && surface.fullscreen_requested);
+    cleanup();
+
+    init();
+    add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED);
+    before = window.rects;
+    assert(wayland_win_data_has_fixed_output(&window, TRUE));
+    assert(wayland_win_data_has_fixed_output(&window, FALSE));
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(!raw_positions && !memcmp(&before, &window.rects, sizeof(before)));
+    assert(surface.presentation_output == &outputs[1]);
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+    client.fullscreen_active_owner = 999;
+    assert(!wayland_win_data_has_fixed_output(&window, TRUE));
+    assert(wayland_win_data_has_fixed_output(&window, FALSE));
+    cleanup();
+
+    init();
+    add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW);
+    assert(!wayland_win_data_has_fixed_output(&window, TRUE));
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(raw_positions == 1 && window.rects.client.left == -2560);
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+    cleanup();
+}
+
+static void test_pending_fullscreen_size(void)
+{
+    const unsigned int targets[] = {VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED,
+                                    VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW};
+    unsigned int i;
+    RECT rect;
+
+    for (i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i)
+    {
+        init();
+        window.is_fullscreen = TRUE;
+        window.style = WS_POPUP;
+        window.rects.client = (RECT){0, 0, 1920, 1080};
+        window.rects.window = window.rects.visible = window.rects.client;
+        add_request(1, targets[i]);
+        client.fullscreen_active_owner = 0;
+        event(&proxy, &proxies[1], TRUE);
+        dispatch();
+
+        /* PREPARE needs the requested output extent before a request becomes
+         * active. Ordinary active presentation still uses the client size. */
+        assert(wayland_win_data_get_presentation_rect(&window, FALSE, &rect));
+        assert(EqualRect(&rect, &outputs[1].rect));
+        assert(wayland_win_data_get_presentation_rect(&window, TRUE, &rect));
+        assert(rect.left == outputs[1].rect.left && rect.top == outputs[1].rect.top);
+        assert(rect.right - rect.left == 1920 && rect.bottom - rect.top == 1080);
+        cleanup();
+    }
+}
+
+static void test_hidden_roles_and_lifetime(void)
+{
+    init();
+    surface.role = WAYLAND_SURFACE_ROLE_POPUP;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(!surface.presentation_output && !raw_positions && !refreshes && !exposes);
+    surface.role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+    window.visible = FALSE;
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(!surface.presentation_output && !raw_positions);
+    window.visible = TRUE;
+    window.style |= WS_MINIMIZE;
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(!surface.presentation_output && !raw_positions);
+    window.style &= ~WS_MINIMIZE;
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !raw_positions);
+    wayland_surface_reset_presentation_output(&surface);
+    assert(!surface.presentation_output && wayland_surface_get_output(&surface) == &proxies[1]);
+    cleanup();
+
+    init();
+    window.is_fullscreen = TRUE;
+    window.style = WS_POPUP;
+    disappear_on_move = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(raw_positions == 1 && !refreshes && !window.hwnd);
+    cleanup();
+}
+
+static void test_layout_refresh_and_removal(void)
+{
+    RECT rect, requested_before;
+    init();
+    add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED);
+    window.application_fullscreen = TRUE;
+    window.application_fullscreen_output = wayland_output_get(&proxies[0]);
+    window.application_fullscreen_rect = outputs[0].rect;
+    surface.fullscreen_requested = TRUE;
+    surface.requested_output = &proxies[0];
+    event(&proxy, &proxies[0], TRUE);
+    dispatch();
+    requested_before = window.application_fullscreen_rect;
+    outputs[0].rect = (RECT){-3840, 600, 0, 2760};
+    wayland_win_data_refresh_output_targets(&window, NULL);
+    assert(EqualRect(&window.application_fullscreen_rect, &requested_before));
+    assert(wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect) && !client.client.invalidations);
+    outputs[0].alive = FALSE;
+    wayland_win_data_refresh_output_targets(&window, &proxies[0]);
+    assert(!surface.presentation_output && !surface.requested_output && !surface.fullscreen_requested);
+    assert(window.application_fullscreen && !window.application_fullscreen_output);
+    assert(request.invalid && !client.fullscreen_active_owner && client.client.invalidations == 1);
+    wayland_win_data_refresh_output_targets(&window, &proxies[0]);
+    assert(client.client.invalidations == 1);
+    assert(!wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &rect));
+    assert(!wayland_win_data_has_fixed_output(&window, FALSE));
+    cleanup();
+
+    init();
+    outputs[1].alive = FALSE;
+    event(&proxy, &proxies[1], TRUE);
+    assert(posts == 1 && wl_list_empty(&surface.output_list));
+    dispatch();
+    assert(!surface.presentation_output && !raw_positions);
+    cleanup();
+}
+
+static void test_requested_output_does_not_follow_observation(void)
+{
+    init();
+    window.style = WS_POPUP;
+    window.is_fullscreen = window.application_fullscreen = TRUE;
+    window.application_fullscreen_rect = outputs[0].rect;
+    window.application_fullscreen_output = wayland_output_get(&proxies[0]);
+    surface.window.state = surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.window.rect = outputs[0].rect;
+    surface.requested_output = &proxies[0];
+    surface.fullscreen_requested = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1]);
+    surface.window.rect = outputs[1].rect;
+    /* MONITOR_TOPLEVEL_CALL */;
+    /* MONITOR_TOPLEVEL_CALL */;
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+    assert(surface.requested_output == &proxies[0] && surface.fullscreen_requested);
+    window.application_fullscreen_rect = outputs[2].rect;
+    wayland_output_release(window.application_fullscreen_output);
+    window.application_fullscreen_output = wayland_output_get(&proxies[2]);
+    /* MONITOR_TOPLEVEL_CALL */;
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    assert(surface.requested_output == &proxies[2]);
+    cleanup();
+
+    init();
+    window.style = WS_POPUP;
+    window.is_fullscreen = TRUE;
+    surface.window.state = surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.window.rect = outputs[0].rect;
+    surface.requested_output = &proxies[0];
+    surface.fullscreen_requested = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    surface.window.rect = outputs[1].rect;
+    /* MONITOR_TOPLEVEL_CALL */;
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+    assert(surface.requested_output == &proxies[0]);
+    cleanup();
+}
+
+static void observe_configure_rawpos(void)
+{
+    RECT requested;
+    struct wayland_win_data *data = wayland_win_data_get(window.hwnd);
+
+    /* This callback sees the same guard WindowPosChanged consumes. The test
+     * does not replace the full Wine window-positioning implementation. */
+    assert(data && data->updating_output);
+    assert(!surface.presentation_output);
+    assert(wayland_win_data_get_requested_fullscreen_rect(data, TRUE, &requested));
+    assert(EqualRect(&requested, &outputs[0].rect));
+    wayland_win_data_release(data);
+}
+
+static void setup_fullscreen_configure(int width, int height)
+{
+    window.style = WS_POPUP;
+    window.is_fullscreen = window.application_fullscreen = TRUE;
+    window.application_fullscreen_rect = outputs[0].rect;
+    window.application_fullscreen_output = wayland_output_get(&proxies[0]);
+    window.rects.window = window.rects.client = window.rects.visible = outputs[0].rect;
+    surface.window.state = surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.window.rect = outputs[0].rect;
+    surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.queued.serial = 1;
+    surface.queued.rect = (RECT){0, 0, width, height};
+    surface.xdg_surface = &proxy;
+    surface.requested_output = &proxies[0];
+    surface.fullscreen_requested = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    configure_rawpos = TRUE;
+}
+
+static void test_real_configure_output_guard(void)
+{
+    struct window_rects before;
+    RECT rect;
+
+    init();
+    setup_fullscreen_configure(2560, 1440);
+    configure_expected_guard = TRUE;
+    rawpos_observer = observe_configure_rawpos;
+    wayland_configure_window(window.hwnd);
+    assert(raw_positions == 1 && !window.updating_output);
+    assert(!position_changes && size_changes == 1);
+    assert(EqualRect(&window.rects.client, &(RECT){0, 0, 2560, 1440}));
+    assert(EqualRect(&window.application_fullscreen_rect, &outputs[0].rect));
+    assert(!surface.presentation_output && surface.output_update_queued);
+    assert(surface.requested_output == &proxies[0] && surface.processing.processed);
+    dispatch();
+    assert(EqualRect(&window.rects.client, &outputs[1].rect) && position_changes == 1);
+    cleanup();
+
+    init();
+    setup_fullscreen_configure(2560, 1440);
+    window.has_present_rect = TRUE;
+    configure_expected_guard = TRUE;
+    rawpos_observer = observe_configure_rawpos;
+    window.updating_output = TRUE;
+    wayland_configure_window(window.hwnd);
+    assert(window.updating_output);
+    assert(window.rects.client.left == 0 && window.rects.client.top == 0);
+    assert(window.rects.client.right - window.rects.client.left == 3840);
+    assert(window.rects.client.bottom - window.rects.client.top == 2160);
+    assert(!position_changes && !size_changes);
+    dispatch();
+    assert(window.updating_output && window.rects.client.left == -2560 && window.rects.client.top == -720);
+    cleanup();
+
+    init();
+    setup_fullscreen_configure(0, 0);
+    configure_expected_guard = TRUE;
+    rawpos_observer = observe_configure_rawpos;
+    wayland_configure_window(window.hwnd);
+    assert(window.rects.client.left == 0 && window.rects.client.top == 0);
+    assert(window.rects.client.right - window.rects.client.left == 3840);
+    assert(window.rects.client.bottom - window.rects.client.top == 2160);
+    assert(!position_changes && !size_changes && !surface.presentation_output);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1]);
+    cleanup();
+
+    init();
+    setup_fullscreen_configure(2560, 1440);
+    window.virtual_desktop = TRUE;
+    window.application_fullscreen = FALSE;
+    window.rects.window = window.rects.client = window.rects.visible = (RECT){0, 0, 2304, 1296};
+    before = window.rects;
+    configure_expected_guard = TRUE;
+    wayland_configure_window(window.hwnd);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    assert(!window.updating_output && !surface.presentation_output);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !position_changes && !size_changes);
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+    cleanup();
+
+    init();
+    setup_fullscreen_configure(2560, 1440);
+    add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED);
+    before = window.rects;
+    configure_expected_guard = TRUE;
+    wayland_configure_window(window.hwnd);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    assert(!window.updating_output && !surface.presentation_output);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !position_changes && !size_changes);
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+    cleanup();
+}
+
+static BOOL contents_reconfigured;
+
+static void reconfigure_accepted_contents(void)
+{
+    struct wayland_win_data *data = wayland_win_data_get(window.hwnd);
+
+    assert(data);
+    /* Production cannot update the window config when an attempted unmap
+     * defers the role change until an in-flight present returns. */
+    if (check_mapping_visibility && !root_toplevel_visible())
+    {
+        contents_reconfigured = FALSE;
+        wayland_win_data_release(data);
+        return;
+    }
+    wayland_win_data_get_config(data, &surface.window);
+    contents_reconfigured = wayland_surface_reconfigure_xdg(&surface, surface.window.rect);
+    wayland_win_data_release(data);
+}
+
+static void setup_configure_sequence(void)
+{
+    init();
+    outputs[0].rect = (RECT){0, 0, 1920, 1080};
+    outputs[1].rect = (RECT){1920, -360, 4480, 1080};
+    window.style = WS_POPUP;
+    window.is_fullscreen = window.application_fullscreen = TRUE;
+    window.application_fullscreen_rect = outputs[0].rect;
+    window.application_fullscreen_output = wayland_output_get(&proxies[0]);
+    window.rects.window = window.rects.client = window.rects.visible = outputs[0].rect;
+    surface.current.serial = 1;
+    surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.current.rect = (RECT){0, 0, 1920, 1080};
+    surface.xdg_surface = &proxy;
+    surface.requested_output = &proxies[0];
+    surface.fullscreen_requested = TRUE;
+    event(&proxy, &proxies[0], TRUE);
+    dispatch();
+    reconfigure_accepted_contents();
+    assert(contents_reconfigured && !acknowledgements);
+    configure_rawpos = TRUE;
+    configure_expected_guard = TRUE;
+    contents_observer = reconfigure_accepted_contents;
+}
+
+static void accept_configure(int width, int height, unsigned int serial)
+{
+    unsigned int previous_acks = acknowledgements;
+    surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.queued.serial = serial;
+    surface.queued.rect = (RECT){0, 0, width, height};
+    contents_reconfigured = FALSE;
+    wayland_configure_window(window.hwnd);
+    assert(contents_reconfigured);
+    assert(acknowledgements == previous_acks + 1 && last_acknowledged == serial);
+    assert(surface.current.serial == serial && !surface.processing.serial);
+    assert(!window.updating_output);
+}
+
+static void configure_size(int width, int height)
+{
+    accept_configure(width, height, 2);
+    assert(surface.requested_output == &proxies[0]);
+    assert(EqualRect(&window.application_fullscreen_rect, &outputs[0].rect));
+}
+
+static void test_configure_membership_order(void)
+{
+    RECT accepted;
+
+    /* Configure accepts only the new extent before surface.enter. No old or
+     * requested output is used to manufacture a position. */
+    setup_configure_sequence();
+    configure_size(2560, 1440);
+    assert(surface.presentation_output == &outputs[0]);
+    assert(EqualRect(&surface.window.rect, &(RECT){0, 0, 2560, 1440}));
+    assert(!position_changes && size_changes == 1);
+    assert(!surface.window.preserve_fullscreen_size);
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(EqualRect(&window.rects.client, &outputs[1].rect));
+    assert(EqualRect(&surface.window.rect, &outputs[1].rect));
+    assert(acknowledgements == 1);
+    cleanup();
+
+    /* An enter with an already queued configure cannot move at the old extent.
+     * Resize is acknowledged first, then owner reconciliation sets the origin. */
+    setup_configure_sequence();
+    surface.queued.serial = 2;
+    surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.queued.rect = (RECT){0, 0, 2560, 1440};
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    accepted = outputs[0].rect;
+    assert(EqualRect(&window.rects.client, &accepted));
+    assert(!position_changes && !size_changes && !acknowledgements);
+    configure_size(2560, 1440);
+    assert(!position_changes && size_changes == 1);
+    dispatch();
+    assert(EqualRect(&surface.window.rect, &outputs[1].rect));
+    assert(EqualRect(&window.rects.client, &outputs[1].rect));
+    cleanup();
+
+    /* Zero compositor hints retain the accepted application dimensions. */
+    setup_configure_sequence();
+    configure_size(0, 0);
+    assert(EqualRect(&surface.window.rect, &outputs[0].rect));
+    cleanup();
+
+    /* Virtual desktop and explicit rendering modes remain fixed-size. */
+    setup_configure_sequence();
+    window.virtual_desktop = TRUE;
+    window.application_fullscreen = FALSE;
+    window.rects.window = window.rects.client = window.rects.visible = (RECT){0, 0, 2304, 1296};
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    configure_expected_guard = TRUE;
+    configure_size(2560, 1440);
+    assert(EqualRect(&window.rects.client, &(RECT){0, 0, 2304, 1296}));
+    assert(EqualRect(&surface.window.rect, &outputs[1].rect));
+    assert(surface.window.preserve_fullscreen_size);
+    assert(surface.window.virtual_size.cx == 2304 && surface.window.virtual_size.cy == 1296);
+    cleanup();
+
+    setup_configure_sequence();
+    window.has_present_rect = TRUE;
+    window.present_rect = outputs[0].rect;
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    configure_size(2560, 1440);
+    assert(EqualRect(&window.rects.client, &(RECT){1920, -360, 3840, 720}));
+    assert(EqualRect(&surface.window.rect, &outputs[1].rect));
+    assert(surface.window.preserve_fullscreen_size);
+    cleanup();
+
+    setup_configure_sequence();
+    add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED);
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    configure_expected_guard = TRUE;
+    configure_size(2560, 1440);
+    assert(EqualRect(&window.rects.client, &outputs[0].rect));
+    assert(EqualRect(&surface.window.rect, &outputs[0].rect));
+    assert(surface.window.preserve_fullscreen_size);
+    cleanup();
+}
+
+static void test_rejected_layout_does_not_change_placement(void)
+{
+    struct window_rects before;
+    RECT requested_before;
+
+    /* Busy publication: no initial observation is committed or positioned. */
+    init();
+    window.style = WS_POPUP;
+    window.is_fullscreen = TRUE;
+    before = window.rects;
+    event(&proxy, &proxies[1], TRUE);
+    shared_layout_ready = FALSE;
+    dispatch();
+    assert(!surface.presentation_output && !raw_positions && !refreshes && !exposes);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    shared_layout_ready = TRUE;
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && position_changes == 1 && !size_changes);
+    cleanup();
+
+    /* An incomplete map must not discard previously accepted identity/intent. */
+    setup_configure_sequence();
+    before = window.rects;
+    requested_before = window.application_fullscreen_rect;
+    shared_layout_ready = FALSE;
+    layout_available[0] = FALSE;
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[0] && !position_changes && !size_changes);
+    assert(window.application_fullscreen_output == &outputs[0] && window.application_fullscreen);
+    assert(EqualRect(&window.application_fullscreen_rect, &requested_before));
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    shared_layout_ready = layout_available[0] = TRUE;
+    cleanup();
+}
+
+static void test_ambiguous_configure_does_not_move(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < 2; ++i)
+    {
+        setup_configure_sequence();
+        if (!i) event(&proxy, &proxies[0], FALSE);
+        else event(&proxy, &proxies[1], TRUE);
+        dispatch();
+        assert(!wayland_surface_get_output(&surface) && surface.presentation_output == &outputs[0]);
+        configure_size(2560, 1440);
+        assert(!position_changes && size_changes == 1);
+        assert(EqualRect(&window.rects.client, &(RECT){0, 0, 2560, 1440}));
+        dispatch();
+        assert(!position_changes && surface.presentation_output == &outputs[0]);
+        cleanup();
+    }
+}
+
+static void test_unprocessed_configure_defers_position(void)
+{
+    struct window_rects before;
+    setup_configure_sequence();
+    before = window.rects;
+    surface.processing.serial = window.configure_state_serial = 2;
+    surface.processing.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.processing.rect = (RECT){0, 0, 2560, 1440};
+    surface.processing.processed = FALSE;
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !position_changes && !size_changes);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    contents_reconfigured = FALSE;
+    wayland_configure_window(window.hwnd);
+    assert(contents_reconfigured && acknowledgements == 1 && last_acknowledged == 2);
+    assert(!surface.processing.serial && !position_changes && size_changes == 1);
+    dispatch();
+    assert(position_changes == 1 && EqualRect(&window.rects.client, &outputs[1].rect));
+    cleanup();
+}
+
+static void test_fullscreen_mapping_guards(void)
+{
+    unsigned int i;
+
+    init();
+    window.style = WS_VISIBLE | WS_POPUP;
+    window.rects.window = window.rects.client = window.rects.visible =
+        (RECT){10000, 10000, 13840, 11600};
+    assert(!root_toplevel_visible());
+    assert(!should_keep_toplevel_mapped(NULL, window.style, FALSE));
+    surface.processing.state = surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    assert(!root_toplevel_visible()); /* Incomplete pending events have no serial. */
+    surface.processing.state = surface.queued.state = 0;
+
+    /* A mapped fullscreen configure cannot be validated against stale Win32
+     * coordinates. Each acknowledged or queued snapshot can own the map. */
+    for (i = 0; i < 3; ++i)
+    {
+        struct wayland_surface_config *config = i == 0 ? &surface.current :
+                                                i == 1 ? &surface.processing : &surface.queued;
+        config->serial = 1;
+        config->state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+        assert(root_toplevel_visible());
+        window.explicitly_hidden = TRUE;
+        assert(!root_toplevel_visible());
+        window.explicitly_hidden = FALSE;
+        presentation_cloaked = TRUE;
+        assert(!root_toplevel_visible());
+        presentation_cloaked = FALSE;
+        surface.role = WAYLAND_SURFACE_ROLE_POPUP;
+        assert(!should_keep_toplevel_mapped(&surface, window.style, FALSE));
+        surface.role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+        window.style |= WS_MINIMIZE;
+        surface.current.caps = 1; /* Advertised caps without minimize. */
+        assert(!root_toplevel_visible());
+        surface.current.caps |= WAYLAND_SURFACE_WM_CAPS_MINIMIZE;
+        assert(root_toplevel_visible());
+        surface.current.caps = 0; /* Older compositor without caps. */
+        assert(root_toplevel_visible());
+        window.style &= ~WS_MINIMIZE;
+        memset(config, 0, sizeof(*config));
+        assert(!root_toplevel_visible());
+    }
+
+    /* Keep an exit configure reachable until it supersedes the acknowledged
+     * fullscreen state. This is not a permanent fullscreen visibility latch. */
+    surface.current.serial = 1;
+    surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.queued.serial = 2;
+    assert(root_toplevel_visible());
+    surface.processing = surface.queued;
+    memset(&surface.queued, 0, sizeof(surface.queued));
+    assert(root_toplevel_visible());
+    surface.current = surface.processing;
+    memset(&surface.processing, 0, sizeof(surface.processing));
+    assert(!root_toplevel_visible());
+    cleanup();
+}
+
+static void test_removed_output_configure_before_enter(BOOL inferred)
+{
+    init();
+    outputs[0].rect = (RECT){0, 0, 5120, 2160};
+    outputs[1].rect = (RECT){5120, 334, 8960, 1934};
+    outputs[2].alive = FALSE;
+    window.style = WS_VISIBLE | WS_POPUP;
+    window.is_fullscreen = TRUE;
+    window.application_fullscreen = inferred;
+    if (inferred) window.application_fullscreen_output = wayland_output_get(&proxies[1]);
+    window.application_fullscreen_rect = outputs[1].rect;
+    window.rects.window = window.rects.client = window.rects.visible = outputs[1].rect;
+    surface.current.serial = 1;
+    surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.current.rect = (RECT){0, 0, 3840, 1600};
+    surface.xdg_surface = &proxy;
+    surface.requested_output = &proxies[1];
+    surface.fullscreen_requested = TRUE;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    reconfigure_accepted_contents();
+    assert(contents_reconfigured);
+    check_mapping_visibility = TRUE;
+    configure_rawpos = configure_expected_guard = TRUE;
+    contents_observer = reconfigure_accepted_contents;
+
+    /* Observed crash sequence: the old output disappears, then configure
+     * precedes the survivor's enter. The old origin is exactly outside it. */
+    outputs[1].alive = FALSE;
+    event(&proxy, &proxies[1], FALSE);
+    wayland_win_data_refresh_output_targets(&window, &proxies[1]);
+    dispatch();
+    assert(!surface.presentation_output && !surface.requested_output && !surface.fullscreen_requested);
+    assert(!wayland_surface_get_output(&surface));
+    assert(!wayland_output_layout_intersects_rect(&window.rects.window));
+    assert(root_toplevel_visible());
+    accept_configure(5120, 2160, 2);
+    assert(size_changes == 1 && !position_changes);
+    assert(EqualRect(&window.rects.client, &(RECT){5120, 334, 10240, 2494}));
+    assert(surface.current.serial == 2 && root_toplevel_visible());
+    assert(!surface.window.preserve_fullscreen_size);
+    dispatch();
+    assert(!surface.presentation_output && !position_changes);
+
+    /* Only actual compositor membership supplies the new origin. */
+    event(&proxy, &proxies[0], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[0]);
+    assert(EqualRect(&window.rects.client, &outputs[0].rect));
+    assert(position_changes == 1 && size_changes == 1 && acknowledgements == 1);
+    cleanup();
+}
+
+static void test_monitor_disable_and_reenable(BOOL inferred)
+{
+    init();
+    outputs[0].rect = (RECT){0, 0, 5120, 2160};
+    outputs[1].rect = (RECT){5120, 334, 8960, 1934};
+    window.style = WS_POPUP;
+    window.is_fullscreen = TRUE;
+    window.application_fullscreen = inferred;
+    if (inferred) window.application_fullscreen_output = wayland_output_get(&proxies[0]);
+    window.application_fullscreen_rect = outputs[0].rect;
+    window.rects.window = window.rects.client = window.rects.visible = outputs[0].rect;
+    surface.current.serial = 1;
+    surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.current.rect = (RECT){0, 0, 5120, 2160};
+    surface.xdg_surface = &proxy;
+    surface.requested_output = &proxies[0];
+    surface.fullscreen_requested = TRUE;
+    event(&proxy, &proxies[0], TRUE);
+    dispatch();
+    reconfigure_accepted_contents();
+    configure_rawpos = configure_expected_guard = TRUE;
+    contents_observer = reconfigure_accepted_contents;
+
+    outputs[0].alive = FALSE;
+    outputs[1].rect = (RECT){0, 0, 3840, 1600};
+    event(&proxy, &proxies[0], FALSE);
+    wayland_win_data_refresh_output_targets(&window, &proxies[0]);
+    assert(!surface.presentation_output && !window.application_fullscreen_output);
+    surface.queued.serial = 2;
+    surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.queued.rect = (RECT){0, 0, 3840, 1600};
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(!position_changes && !size_changes);
+    assert(EqualRect(&window.rects.client, &(RECT){0, 0, 5120, 2160}));
+    accept_configure(3840, 1600, 2);
+    assert(!position_changes && size_changes == 1);
+    dispatch();
+    assert(EqualRect(&window.rects.client, &outputs[1].rect));
+    assert(surface.presentation_output == &outputs[1] && !position_changes);
+
+    /* The game has selected the surviving output. KWin may move it back to
+     * the re-enabled monitor without changing this application request. */
+    window.application_fullscreen = inferred;
+    window.application_fullscreen_rect = outputs[1].rect;
+    if (inferred) window.application_fullscreen_output = wayland_output_get(&proxies[1]);
+    surface.requested_output = &proxies[1];
+    surface.fullscreen_requested = TRUE;
+
+    /* Re-enabled monitor has a new output identity and a negative origin. */
+    outputs[2].rect = (RECT){-5120, -334, 0, 1826};
+    surface.queued.serial = 3;
+    surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.queued.rect = (RECT){0, 0, 5120, 2160};
+    event(&proxy, &proxies[1], FALSE);
+    event(&proxy, &proxies[2], TRUE);
+    dispatch();
+    assert(!position_changes && size_changes == 1);
+    accept_configure(5120, 2160, 3);
+    assert(!position_changes && size_changes == 2);
+    assert(EqualRect(&window.rects.client, &(RECT){0, 0, 5120, 2160}));
+    dispatch();
+    assert(position_changes == 1 && EqualRect(&window.rects.client, &outputs[2].rect));
+    assert(surface.presentation_output == &outputs[2]);
+    assert(acknowledgements == 2 && last_acknowledged == 3);
+
+    /* Removing the original request now rebases the same entered output.
+     * There is no new enter event to repair lost fullscreen intent. */
+    outputs[1].alive = FALSE;
+    wayland_win_data_refresh_output_targets(&window, &proxies[1]);
+    assert(window.application_fullscreen == inferred && !window.application_fullscreen_output);
+    assert(surface.presentation_output == &outputs[2]);
+    assert(!surface.requested_output && !surface.fullscreen_requested);
+    shared_layout_ready = FALSE;
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(window.application_fullscreen == inferred && window.is_fullscreen);
+    /* Win32u can stop setting WINE_SWP_FULLSCREEN on this unchanged HWND
+     * because its origin is outside the newly published desktop. */
+    assert(wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    assert(EqualRect(&window.rects.client, &outputs[2].rect));
+    shared_layout_ready = TRUE;
+    outputs[2].rect = (RECT){0, 0, 5120, 2160};
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(position_changes == 2 && size_changes == 2);
+    assert(EqualRect(&window.rects.client, &outputs[2].rect));
+    assert(window.application_fullscreen == inferred && window.is_fullscreen);
+    assert(!window.application_fullscreen_output && !window.updating_output);
+    cleanup();
+}
+
+static void test_windowed_dialog_survives_topology_rearrangement(void)
+{
+    struct window_rects before;
+
+    init();
+    outputs[0].rect = (RECT){0, 0, 5120, 2160};
+    outputs[1].rect = (RECT){5120, 334, 8960, 1934};
+    window.rects.client = (RECT){6905, 1063, 7175, 1230};
+    window.rects.window = window.rects.visible = (RECT){6902, 1034, 7178, 1233};
+    before = window.rects;
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1] && !raw_positions);
+
+    /* This is the dialog geometry from the failing disable/re-enable log.
+     * Its compositor placement does not authorize either synthetic move. */
+    outputs[0].rect = (RECT){-5120, -334, 0, 1826};
+    outputs[1].rect = (RECT){0, 0, 3840, 1600};
+    wayland_surface_queue_output_update(&surface);
+    dispatch();
+    assert(!raw_positions && !memcmp(&window.rects, &before, sizeof(before)));
+
+    surface.xdg_surface = &proxy;
+    surface.queued.serial = 1;
+    surface.queued.rect = (RECT){0, 0, 270, 167};
+    configure_rawpos = TRUE;
+    configure_expected_guard = FALSE;
+    wayland_configure_window(window.hwnd);
+    assert(!position_changes && !size_changes);
+    assert(!surface.output_update_queued);
+    assert(!memcmp(&window.rects, &before, sizeof(before)));
+    cleanup();
+}
+
+static void test_noop_fullscreen_preserves_identity(void)
+{
+    struct window_rects changed;
+    RECT rect;
+
+    setup_configure_sequence();
+    event(&proxy, &proxies[0], FALSE);
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1]);
+    assert(window.application_fullscreen_output == &outputs[0]);
+
+    /* A state refresh must not replace request A with observed output B.
+     * This remains true while publication is busy and after rebasing B. */
+    shared_layout_ready = FALSE;
+    assert(wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    shared_layout_ready = TRUE;
+    outputs[1].rect = (RECT){0, 0, 2560, 1440};
+    assert(wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    assert(wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[0].rect));
+
+    /* Removing A preserves intent but makes the old cached rectangle unusable
+     * as an output claim. B remains the presentation target. */
+    outputs[0].alive = FALSE;
+    wayland_win_data_refresh_output_targets(&window, &proxies[0]);
+    assert(window.application_fullscreen && !window.application_fullscreen_output);
+    assert(wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    assert(!wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &rect));
+    assert(wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(EqualRect(&rect, &outputs[1].rect));
+
+    /* There is no permission to substitute the old rectangle if all observed
+     * membership disappears either. Later enter will reconcile placement. */
+    event(&proxy, &proxies[1], FALSE);
+    wayland_surface_reset_presentation_output(&surface);
+    assert(!wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &rect));
+    assert(!wayland_win_data_get_fullscreen_rect(&window, TRUE, &rect));
+    assert(wayland_win_data_is_fullscreen(&window));
+
+    changed = window.rects;
+    ++changed.client.right;
+    assert(!wayland_win_data_preserves_fullscreen(&window, &changed, window.style, 0));
+    assert(!wayland_win_data_retargets_fullscreen(&window, &changed, window.style, 0, &rect));
+    changed = window.rects;
+    ++changed.window.left;
+    assert(!wayland_win_data_preserves_fullscreen(&window, &changed, window.style, 0));
+    assert(!wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style | WS_CAPTION, 0));
+    assert(!wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, SWP_HIDEWINDOW));
+    window.style |= WS_MINIMIZE;
+    assert(!wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    window.style &= ~WS_MINIMIZE;
+    window.application_fullscreen = FALSE;
+    assert(wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    window.is_fullscreen = FALSE;
+    assert(!wayland_win_data_preserves_fullscreen(&window, &window.rects, window.style, 0));
+    window.updating_output = TRUE;
+    assert(!wayland_win_data_preserves_fullscreen(&window, &changed, WS_OVERLAPPEDWINDOW, 0));
+    window.updating_output = FALSE;
+    cleanup();
+}
+
+static void test_fullscreen_preservation_scope(void)
+{
+    struct window_rects changed;
+    struct fullscreen_decision result;
+
+    init();
+    window.style = WS_VISIBLE | WS_POPUP;
+    changed = window.rects;
+    changed.window.right += 100;
+    changed.client.right += 100;
+
+    /* A compositor resize may enter fullscreen from a windowed popup. The
+     * old FALSE state must not override win32u's new fullscreen detection. */
+    window.updating_output = TRUE;
+    result = windowpos_fullscreen_decision(&changed, window.style, WINE_SWP_FULLSCREEN);
+    assert(result.fullscreen && !result.preserve && !result.application);
+    assert(!window.updating_output);
+
+    window.is_fullscreen = window.application_fullscreen = TRUE;
+    window.application_fullscreen_rect = outputs[0].rect;
+    window.updating_output = TRUE;
+    result = windowpos_fullscreen_decision(&changed, window.style, 0);
+    assert(result.fullscreen && result.preserve && result.application);
+    assert(EqualRect(&result.application_rect, &outputs[0].rect));
+    assert(!window.updating_output);
+
+    /* The first driver callback consumes the geometry waiver. Changes from
+     * subsequent WM_WINDOWPOSCHANGED/WM_SIZE handlers are ordinary app changes. */
+    window.rects = changed;
+    ++changed.window.right;
+    ++changed.client.right;
+    result = windowpos_fullscreen_decision(&changed, window.style, 0);
+    assert(!result.preserve && !result.fullscreen);
+
+    window.updating_output = TRUE;
+    result = windowpos_fullscreen_decision(&changed, window.style | WS_MINIMIZE, 0);
+    assert(!result.preserve && !result.fullscreen && !window.updating_output);
+    window.updating_output = TRUE;
+    result = windowpos_fullscreen_decision(&changed, window.style, SWP_HIDEWINDOW);
+    assert(!result.preserve && !result.fullscreen && !window.updating_output);
+    window.updating_output = TRUE;
+    result = windowpos_fullscreen_decision(&changed, WS_VISIBLE | WS_OVERLAPPEDWINDOW, 0);
+    assert(!result.preserve && !result.fullscreen && !window.updating_output);
+    window.updating_output = TRUE;
+    result = windowpos_fullscreen_decision(&changed, window.style | WS_THICKFRAME, 0);
+    assert(!result.preserve && !result.fullscreen && !window.updating_output);
+    cleanup();
+}
+
+static void update_fullscreen_state(void)
+{
+    wayland_win_data_get_config(&window, &surface.window);
+    /* MONITOR_TOPLEVEL_CALL */;
+}
+
+static void setup_relocated_fullscreen_state(BOOL inferred, BOOL window_target, BOOL win32_fullscreen)
+{
+    init();
+    window.style = WS_VISIBLE | WS_POPUP;
+    window.is_fullscreen = win32_fullscreen;
+    window.application_fullscreen = inferred;
+    window.application_fullscreen_rect = outputs[0].rect;
+    window.application_fullscreen_output = wayland_output_get(&proxies[0]);
+    window.rects.window = window.rects.client = window.rects.visible = outputs[0].rect;
+    surface.window.state = surface.current.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    surface.requested_output = &proxies[0];
+    surface.fullscreen_requested = TRUE;
+    if (window_target) add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW);
+    position_callback = apply_driver_position;
+
+    /* The compositor chooses B. Its geometry update enters the same extracted
+     * WindowPosChanged code as the subsequent application move. */
+    event(&proxy, &proxies[1], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[1]);
+    assert(window.rects.client.left == outputs[1].rect.left);
+    assert(window.application_fullscreen_output == (win32_fullscreen ? &outputs[0] : NULL));
+    update_fullscreen_state();
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+}
+
+static void setup_relocated_fullscreen(BOOL inferred, BOOL window_target)
+{
+    setup_relocated_fullscreen_state(inferred, window_target, TRUE);
+}
+
+static void setup_settled_fullscreen(BOOL window_target)
+{
+    setup_relocated_fullscreen(FALSE, window_target);
+    event(&proxy, &proxies[1], FALSE);
+    event(&proxy, &proxies[0], TRUE);
+    dispatch();
+    assert(surface.presentation_output == &outputs[0]);
+    assert(wayland_surface_get_output(&surface) == &proxies[0]);
+    assert(EqualRect(&window.rects.client, &outputs[0].rect));
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+}
+
+static void test_settled_fullscreen_move(BOOL window_target)
+{
+    struct window_rects changed;
+    struct fullscreen_decision decision;
+
+    setup_settled_fullscreen(window_target);
+    /* Both application positions cover A, so win32u still considers this
+     * oversized popup fullscreen. Its observed output and request remain A. */
+    changed.window = changed.client = changed.visible = (RECT){-8, -8, 3848, 2168};
+    decision = apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(!decision.preserve && !decision.updating_output);
+    assert(surface.fullscreen_requested && surface.requested_output == &proxies[0]);
+    assert(!surface.presentation_output);
+    assert(wayland_surface_get_output(&surface) == &proxies[0]);
+    assert(window.application_fullscreen_output == &outputs[0]);
+    if (window_target) assert(request.output == &outputs[0]);
+    update_fullscreen_state();
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+
+    OffsetRect(&changed.window, 4, 4);
+    OffsetRect(&changed.client, 4, 4);
+    OffsetRect(&changed.visible, 4, 4);
+    apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(surface.fullscreen_requested && window.application_fullscreen_output == &outputs[0]);
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+
+    /* Keeping the old request valid must not hide a genuinely different
+     * application target: the state update compares A against the new B. */
+    changed.window = changed.client = changed.visible = outputs[1].rect;
+    apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(surface.fullscreen_requested && surface.requested_output == &proxies[0]);
+    assert(window.application_fullscreen_output == &outputs[1]);
+    if (window_target) assert(request.output == &outputs[1]);
+    update_fullscreen_state();
+    update_fullscreen_state();
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    assert(last_fullscreen_output == &proxies[1]);
+    assert(surface.fullscreen_requested && surface.requested_output == &proxies[1]);
+    cleanup();
+}
+
+static void test_settled_fullscreen_renew_guards(void)
+{
+    struct window_rects changed;
+    unsigned int i;
+
+    for (i = 0; i < 8; ++i)
+    {
+        setup_settled_fullscreen(FALSE);
+        switch (i)
+        {
+        case 0: /* A cached presentation output does not prove membership. */
+            event(&proxy, &proxies[0], FALSE);
+            break;
+        case 1: /* Multiple memberships do not identify a settled output. */
+            event(&proxy, &proxies[1], TRUE);
+            break;
+        case 2:
+            surface.queued.serial = 12;
+            surface.queued.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+            break;
+        case 3:
+            surface.processing.serial = 13;
+            surface.processing.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+            break;
+        case 4: /* The compositor has declined the requested fullscreen state. */
+            surface.current.state = 0;
+            break;
+        case 5: /* A compositor-selected request has no explicit output. */
+            surface.requested_output = NULL;
+            break;
+        case 6: /* Two unknown outputs must not compare as settled. */
+            surface.requested_output = NULL;
+            event(&proxy, &proxies[0], FALSE);
+            break;
+        case 7: /* An already deferred request must stay invalidated. */
+            surface.fullscreen_requested = FALSE;
+            break;
+        }
+        changed.window = changed.client = changed.visible = (RECT){-8, -8, 3848, 2168};
+        apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+        assert(!surface.fullscreen_requested);
+        assert(window.application_fullscreen_output == &outputs[0]);
+        update_fullscreen_state();
+        if (i == 3)
+        {
+            assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+            assert(!surface.fullscreen_requested && surface.processing.processed);
+            surface.current = surface.processing;
+            memset(&surface.processing, 0, sizeof(surface.processing));
+            update_fullscreen_state();
+        }
+        update_fullscreen_state();
+        assert(fullscreen_sets == 1 && fullscreen_unsets == (i == 4 ? 0 : 1) && commits == 1);
+        assert(last_fullscreen_output == &proxies[0]);
+        assert(surface.fullscreen_requested && surface.requested_output == &proxies[0]);
+        cleanup();
+    }
+}
+
+static void test_native_window_request_retarget(BOOL pending)
+{
+    struct window_rects changed;
+    unsigned int i;
+
+    setup_relocated_fullscreen_state(FALSE, TRUE, FALSE);
+    assert(!window.is_fullscreen && !window.application_fullscreen);
+    assert(request.target == VULKAN_SURFACE_FULLSCREEN_TARGET_WINDOW);
+    changed.window = changed.client = changed.visible = outputs[0].rect;
+    if (pending)
+    {
+        surface.processing.serial = 11;
+        surface.processing.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    }
+    apply_window_position(&changed, window.style, 0, FALSE);
+    assert(!window.is_fullscreen && !window.application_fullscreen);
+    assert(!surface.fullscreen_requested);
+    assert(request.output == &outputs[0]);
+    update_fullscreen_state();
+    if (pending)
+    {
+        assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+        wayland_surface_queue_output_update(&surface);
+        dispatch();
+        assert(request.output == &outputs[0]);
+        assert(!surface.fullscreen_requested);
+        surface.current = surface.processing;
+        memset(&surface.processing, 0, sizeof(surface.processing));
+        update_fullscreen_state();
+    }
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    assert(last_fullscreen_output == &proxies[0]);
+    for (i = 0; i < 3; ++i)
+    {
+        wayland_surface_queue_output_update(&surface);
+        dispatch();
+        update_fullscreen_state();
+    }
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    cleanup();
+}
+
+static void test_application_repeats_requested_output(BOOL inferred, BOOL window_target, BOOL pending)
+{
+    struct window_rects changed;
+    struct fullscreen_decision decision;
+    RECT target;
+    unsigned int i;
+
+    setup_relocated_fullscreen(inferred, window_target);
+    changed.window = changed.client = changed.visible = outputs[0].rect;
+    if (pending)
+    {
+        surface.processing.serial = 9;
+        surface.processing.state = WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN;
+    }
+    decision = apply_window_position(&changed, window.style,
+                                    inferred ? 0 : WINE_SWP_FULLSCREEN, inferred);
+    assert(!decision.preserve && !decision.updating_output);
+    assert(!surface.fullscreen_requested);
+    assert(!surface.presentation_output);
+    assert(window.application_fullscreen_output == &outputs[0]);
+    assert(wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &target));
+    assert(EqualRect(&target, &outputs[0].rect));
+    update_fullscreen_state();
+    if (pending)
+    {
+        assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+        assert(!surface.fullscreen_requested && surface.processing.processed);
+        /* Old membership can be reconciled before the pending configure is
+         * promoted. That must not erase the deferred application request. */
+        wayland_surface_queue_output_update(&surface);
+        dispatch();
+        assert(window.application_fullscreen_output == &outputs[0]);
+        assert(wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &target));
+        assert(EqualRect(&target, &outputs[0].rect));
+        assert(!surface.fullscreen_requested);
+        {
+            /* Resizing at observed B while A is deferred must not turn B
+             * into new monitor intent merely because its rectangle changed. */
+            changed = window.rects;
+            ++changed.window.right;
+            ++changed.client.right;
+            ++changed.visible.right;
+            apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+            assert(window.application_fullscreen_output == &outputs[0]);
+            assert(wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &target));
+            assert(EqualRect(&target, &outputs[0].rect));
+            assert(!surface.fullscreen_requested);
+        }
+        surface.current = surface.processing;
+        memset(&surface.processing, 0, sizeof(surface.processing));
+        update_fullscreen_state();
+    }
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    assert(last_fullscreen_output == &proxies[0]);
+    assert(surface.fullscreen_requested && surface.requested_output == &proxies[0]);
+    for (i = 0; i < 3; ++i)
+    {
+        /* A compositor may continue presenting on B after this request. The
+         * observation itself must never create a repeated request loop. */
+        wayland_surface_queue_output_update(&surface);
+        dispatch();
+        update_fullscreen_state();
+    }
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    cleanup();
+}
+
+static void test_application_retarget_guards(void)
+{
+    struct window_rects changed;
+    struct fullscreen_decision decision;
+    RECT target;
+    unsigned int i;
+
+    setup_relocated_fullscreen(FALSE, FALSE);
+    changed = window.rects;
+    decision = apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(decision.preserve && surface.fullscreen_requested);
+    ++changed.window.right;
+    ++changed.client.right;
+    ++changed.visible.right;
+    decision = apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(!decision.preserve && surface.fullscreen_requested);
+    assert(window.application_fullscreen_output == &outputs[0]);
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+    cleanup();
+
+    setup_relocated_fullscreen(TRUE, FALSE);
+    changed.window = changed.client = changed.visible = outputs[2].rect;
+    apply_window_position(&changed, window.style, 0, TRUE);
+    update_fullscreen_state();
+    assert(fullscreen_sets == 1 && fullscreen_unsets == 1 && commits == 1);
+    assert(surface.requested_output == &proxies[2]);
+    cleanup();
+
+    setup_relocated_fullscreen(FALSE, FALSE);
+    add_request(0, VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED);
+    changed.window = changed.client = changed.visible = outputs[0].rect;
+    apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(surface.fullscreen_requested && request.output == &outputs[0]);
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+    cleanup();
+
+    setup_relocated_fullscreen(FALSE, FALSE);
+    window.virtual_desktop = TRUE;
+    changed.window = changed.client = changed.visible = outputs[0].rect;
+    apply_window_position(&changed, window.style, WINE_SWP_FULLSCREEN, FALSE);
+    assert(surface.fullscreen_requested);
+    update_fullscreen_state();
+    assert(!fullscreen_sets && !fullscreen_unsets && !commits);
+    cleanup();
+
+    for (i = 0; i < 3; ++i)
+    {
+        DWORD style;
+        UINT flags = WINE_SWP_FULLSCREEN;
+        setup_relocated_fullscreen(FALSE, FALSE);
+        style = window.style;
+        if (i == 0) style |= WS_MINIMIZE;
+        if (i == 1) style &= ~WS_VISIBLE;
+        if (i == 2) flags |= SWP_HIDEWINDOW;
+        changed.window = changed.client = changed.visible = outputs[0].rect;
+        apply_window_position(&changed, style, flags, FALSE);
+        assert(surface.fullscreen_requested);
+        cleanup();
+    }
+
+    setup_relocated_fullscreen(FALSE, FALSE);
+    changed.window = changed.client = changed.visible = (RECT){100, 100, 900, 700};
+    apply_window_position(&changed, WS_VISIBLE | WS_OVERLAPPEDWINDOW, 0, FALSE);
+    assert(surface.fullscreen_requested && !window.is_fullscreen);
+    update_fullscreen_state();
+    assert(!fullscreen_sets && fullscreen_unsets == 1 && commits == 1);
+    cleanup();
+
+    for (i = 0; i < 2; ++i)
+    {
+        setup_relocated_fullscreen(FALSE, FALSE);
+        changed.window = changed.client = changed.visible = outputs[0].rect;
+        apply_window_position(&changed, WS_VISIBLE | WS_OVERLAPPEDWINDOW |
+                              (i ? WS_MAXIMIZE : WS_POPUP), WINE_SWP_FULLSCREEN, FALSE);
+        assert(surface.fullscreen_requested);
+        assert(!wayland_win_data_get_requested_fullscreen_rect(&window, TRUE, &target));
+        cleanup();
+    }
+}
+
+static void test_sync_before_window_creation(void)
+{
+    init();
+    window_data_missing = TRUE;
+    assert(WAYLAND_WindowPosChanging(window.hwnd, 0, FALSE, &window.rects));
+    assert(!window_data_missing && shared_layout_syncs == 1 && !lock_depth);
+    assert(WAYLAND_WindowPosChanging(window.hwnd, 0, FALSE, &window.rects));
+    assert(shared_layout_syncs == 1 && !lock_depth);
+    cleanup();
+
+    init();
+    window_data_missing = TRUE;
+    create_fails = TRUE;
+    assert(!WAYLAND_WindowPosChanging(window.hwnd, 0, FALSE, &window.rects));
+    assert(shared_layout_syncs == 1 && !lock_depth);
+    create_fails = window_data_missing = FALSE;
+    cleanup();
+}
+
+int main(void)
+{
+    test_settled_fullscreen_move(FALSE);
+    test_settled_fullscreen_move(TRUE);
+    test_settled_fullscreen_renew_guards();
+    test_native_window_request_retarget(FALSE);
+    test_native_window_request_retarget(TRUE);
+    test_application_repeats_requested_output(TRUE, FALSE, FALSE);
+    test_application_repeats_requested_output(FALSE, FALSE, FALSE);
+    test_application_repeats_requested_output(FALSE, TRUE, FALSE);
+    test_application_repeats_requested_output(TRUE, FALSE, TRUE);
+    test_application_repeats_requested_output(FALSE, FALSE, TRUE);
+    test_application_repeats_requested_output(FALSE, TRUE, TRUE);
+    test_application_retarget_guards();
+    test_sync_before_window_creation();
+    test_fullscreen_preservation_scope();
+    test_membership_events();
+    test_ambiguous_and_zero();
+    test_windowed_geometry_is_not_inferred();
+    test_owner_output_noop_and_topology_change();
+    test_virtual_and_fixed();
+    test_pending_fullscreen_size();
+    test_hidden_roles_and_lifetime();
+    test_layout_refresh_and_removal();
+    test_requested_output_does_not_follow_observation();
+    test_real_configure_output_guard();
+    test_configure_membership_order();
+    test_rejected_layout_does_not_change_placement();
+    test_ambiguous_configure_does_not_move();
+    test_unprocessed_configure_defers_position();
+    test_removed_output_configure_before_enter(TRUE);
+    test_removed_output_configure_before_enter(FALSE);
+    test_fullscreen_mapping_guards();
+    test_monitor_disable_and_reenable(TRUE);
+    test_monitor_disable_and_reenable(FALSE);
+    test_noop_fullscreen_preserves_identity();
+    test_windowed_dialog_survives_topology_rearrangement();
+    puts("PASS: production monitor events, accepted layout, configure/enter ordering, late-enter visibility, disable/re-enable, application retargeting, deferred WINDOW requests, ownership, cleanup");
+    return 0;
+}

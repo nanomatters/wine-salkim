@@ -96,6 +96,7 @@ enum wayland_window_message
     WM_WAYLAND_NOTIFY_REORDER,
     WM_WAYLAND_CLIPBOARD_SELECTION,
     WM_WAYLAND_CLIPBOARD_EXPORT,
+    WM_WAYLAND_OUTPUT_CHANGE,
 };
 
 #define WAYLAND_ACTIVATION_TOKEN_MAGIC 0x54434158 /* XACT */
@@ -375,6 +376,7 @@ struct wayland
     struct wayland_data_device data_device;
     struct wl_list output_list;
     struct wl_array output_info_array;
+    BOOL output_layout_accepted;
     /* Protects the output_list, output_info_array, and the wayland_output.current states. */
     pthread_mutex_t output_mutex;
     LONG input_serial;
@@ -572,8 +574,9 @@ struct wayland_fullscreen_request
 {
     struct list entry;
     UINT64 owner;
-    RECT rect;
     enum vulkan_surface_fullscreen_target target;
+    struct wayland_output *output;
+    BOOL invalid;
 };
 
 struct wayland_client_surface
@@ -653,6 +656,9 @@ struct wayland_surface
     struct wl_surface *wl_surface;
     /* Output membership belongs to this proxy, independently of its role. */
     struct wl_list output_list;
+    /* Last unambiguous output accepted by the window thread. Owns a ref. */
+    struct wayland_output *presentation_output;
+    BOOL output_update_queued;
     LONG pending_commit;
     struct wp_viewport *wp_viewport;
     struct wp_viewport *configured_wp_viewport;
@@ -674,7 +680,7 @@ struct wayland_surface
             struct xdg_toplevel *xdg_toplevel;
             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
             struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1;
-            /* Fullscreen requested by Wine and not rejected by the compositor. */
+            /* Last fullscreen preference sent to the compositor, not placement. */
             const struct wl_output *requested_output;
             BOOL fullscreen_requested;
         };
@@ -771,6 +777,7 @@ BOOL wayland_output_get_layout_rect(const struct wl_output *wl_output, RECT *rec
 BOOL wayland_output_get_primary_rect(RECT *rect);
 BOOL wayland_output_layout_intersects_rect(const RECT *rect);
 void output_info_array_update(void);
+BOOL output_info_array_sync_shared_layout(void);
 BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);
 BOOL wayland_output_get_edid_hdr_info(const unsigned char *edid, UINT edid_len,
                                       UINT *max_luminance);
@@ -796,6 +803,8 @@ void wayland_surface_destroy(struct wayland_surface *surface);
 struct wl_output *wayland_surface_get_output(struct wayland_surface *surface);
 BOOL wayland_surface_update_output(struct wayland_surface *surface,
                                     struct wl_output *wl_output, BOOL entered);
+void wayland_surface_queue_output_update(struct wayland_surface *surface);
+void wayland_surface_reset_presentation_output(struct wayland_surface *surface);
 BOOL wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor,
                                    HWND owner, LPCWSTR title);
 BOOL wayland_surface_make_subsurface(struct wayland_surface *surface,
@@ -897,6 +906,8 @@ BOOL wayland_client_surface_get_fullscreen_rect(struct wayland_client_surface *c
                                                 BOOL active, RECT *rect);
 BOOL wayland_client_surface_update_fullscreen_target(struct wayland_client_surface *client,
                                                      const RECT *window_rect);
+BOOL wayland_client_surface_refresh_fullscreen_targets(struct wayland_client_surface *client,
+                                                       const struct wl_output *removed);
 void wayland_surface_ensure_contents(struct wayland_surface *surface,
                                      struct wayland_client_surface *client);
 void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
@@ -1001,6 +1012,9 @@ struct wayland_win_data
     RECT present_rect;
     BOOL application_fullscreen;
     RECT application_fullscreen_rect;
+    /* Win32 output intent, including fullscreen supplied by win32u. */
+    struct wayland_output *application_fullscreen_output;
+    BOOL updating_output;
     BOOL managed;
     BOOL frameless;
     RECT restore_rect;
@@ -1049,6 +1063,7 @@ void wayland_surface_unmonitor_fd(int fd);
 void wayland_surface_dispatch_dmabuf(HWND hwnd, UINT32 serial);
 void wayland_window_init(void);
 void wayland_window_remove_output(struct wl_output *output);
+void wayland_window_update_outputs(void);
 
 /**********************************************************************
  *          Wayland Keyboard
