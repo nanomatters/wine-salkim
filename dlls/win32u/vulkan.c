@@ -54,6 +54,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 WINE_DECLARE_DEBUG_CHANNEL(dmabuf);
+WINE_DECLARE_DEBUG_CHANNEL(vulkan_present);
 
 static PFN_vkGetDeviceProcAddr p_vkGetDeviceProcAddr;
 static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
@@ -5742,6 +5743,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         goto failed_locked;
 
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
+    TRACE_(vulkan_present)( "created swapchain %p, host %s, mode %u, format %u, colorspace %u -> %u, Wine description %u\n",
+                           swapchain, wine_dbgstr_longlong(host_swapchain), create_info_host.presentMode,
+                           create_info_host.imageFormat, create_info->imageColorSpace,
+                           create_info_host.imageColorSpace, swapchain->uses_color_description );
     swapchain->surface = surface;
     swapchain->host_surface = surface->active_host;
     swapchain->presentation_generation = get_swapchain_presentation_generation(
@@ -5958,7 +5963,9 @@ static VkResult swapchain_acquire_next_image( struct vulkan_device *device, stru
 {
     BOOL poll_surface = swapchain->surface->client->funcs->needs_acquire_revalidation;
     BOOL infinite = info->timeout == UINT64_MAX;
+    BOOL trace = TRACE_ON(vulkan_present);
     uint64_t remaining = info->timeout, start = 0;
+    uint64_t acquire_start;
     VkAcquireNextImageInfoKHR slice_info = *info;
     VkResult res;
 
@@ -5967,12 +5974,18 @@ static VkResult swapchain_acquire_next_image( struct vulkan_device *device, stru
     for (;;)
     {
         slice_info.timeout = poll_surface ? min( remaining, WINE_VK_PRESENT_WAIT_SLICE_NS ) : remaining;
+        if (trace) acquire_start = managed_monotonic_time_ns();
         if (acquire2)
             res = device->p_vkAcquireNextImage2KHR( device->host.device, &slice_info, image_index );
         else
             res = device->p_vkAcquireNextImageKHR( device->host.device, slice_info.swapchain,
                                                    slice_info.timeout, slice_info.semaphore,
                                                    slice_info.fence, image_index );
+        if (trace)
+            TRACE_(vulkan_present)( "acquire attempt swapchain %p, timeout %s, result %d, image %u, host %.3f ms\n",
+                                   swapchain, wine_dbgstr_longlong(slice_info.timeout), res,
+                                   res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR ? *image_index : UINT32_MAX,
+                                   (managed_monotonic_time_ns() - acquire_start) / 1000000.0 );
         if (res != VK_TIMEOUT || !poll_surface) return res;
 
         /* No image or semaphore signal was acquired on timeout. Check for
@@ -6470,6 +6483,14 @@ static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapcha
         if (!swapchain || swapchain_is_out_of_date( swapchain )) continue;
         /* HDR metadata does not define the Windows swapchain encoding. */
         if (swapchain->managed) continue;
+        TRACE_(vulkan_present)( "forward metadata swapchain %p, red %.9g,%.9g, green %.9g,%.9g, blue %.9g,%.9g, white %.9g,%.9g, "
+                               "min %.9g, max %.9g, MaxCLL %.9g, MaxFALL %.9g\n",
+                               swapchain, metadata[i].displayPrimaryRed.x, metadata[i].displayPrimaryRed.y,
+                               metadata[i].displayPrimaryGreen.x, metadata[i].displayPrimaryGreen.y,
+                               metadata[i].displayPrimaryBlue.x, metadata[i].displayPrimaryBlue.y,
+                               metadata[i].whitePoint.x, metadata[i].whitePoint.y,
+                               metadata[i].minLuminance, metadata[i].maxLuminance,
+                               metadata[i].maxContentLightLevel, metadata[i].maxFrameAverageLightLevel );
         host_swapchains[host_count] = swapchain->obj.host.swapchain;
         host_metadata[host_count] = metadata[i];
         host_count++;
@@ -7464,7 +7485,25 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     /* Host present consumes waits for host swapchains. */
     if (host_count)
     {
+        BOOL trace = TRACE_ON(vulkan_present);
+        uint64_t present_start, present_duration;
         VkResult host_res;
+
+        if (trace)
+        {
+            const VkSwapchainPresentModeInfoKHR *mode_info =
+                win32u_vk_find_struct( client_present_info, SWAPCHAIN_PRESENT_MODE_INFO_KHR );
+
+            for (uint32_t i = 0; i < host_count; i++)
+            {
+                uint32_t idx = host_indices[i];
+                TRACE_(vulkan_present)( "present queue %p, swapchain %p, image %u\n",
+                                       queue, present_swapchains[idx], host_info.pImageIndices[i] );
+                if (mode_info && idx < mode_info->swapchainCount)
+                    TRACE_(vulkan_present)( "swapchain %p, requested mode %u\n",
+                                           present_swapchains[idx], mode_info->pPresentModes[idx] );
+            }
+        }
 
         if (!explicit_submit)
         {
@@ -7475,8 +7514,13 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             presentation_feedbacks[i] = client_surface_prepare_presentation_feedback(
                     present_swapchains[host_indices[i]]->surface->client );
         vulkan_queue_lock( queue );
+        if (trace) present_start = managed_monotonic_time_ns();
         host_res = device->p_vkQueuePresentKHR( queue->host.queue, &host_info );
+        if (trace) present_duration = managed_monotonic_time_ns() - present_start;
         vulkan_queue_unlock( queue );
+        if (trace)
+            TRACE_(vulkan_present)( "present queue %p, count %u, result %d, host %.3f ms\n",
+                                   queue, host_count, host_res, present_duration / 1000000.0 );
         if (present_result_was_enqueued( host_res ))
             present_waits_submitted = TRUE;
         else if (explicit_submit && host_res != VK_ERROR_DEVICE_LOST)
