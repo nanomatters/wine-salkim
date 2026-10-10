@@ -102,9 +102,10 @@ static BOOL CALLBACK enum_instances( const DIDEVICEINSTANCEW *instance, void *co
     if (type == DI8DEVTYPE_MOUSE) return DIENUM_CONTINUE;
     if (type == DI8DEVTYPE_KEYBOARD) return DIENUM_CONTINUE;
 
-    instances[index++] = *instance;
     if (index >= ARRAY_SIZE(instances)) return DIENUM_STOP;
+    instances[index++] = *instance;
     *(ULONG *)context = index;
+    if (index >= ARRAY_SIZE(instances)) return DIENUM_STOP;
     return DIENUM_CONTINUE;
 }
 

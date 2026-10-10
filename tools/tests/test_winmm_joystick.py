@@ -293,6 +293,35 @@ int main(void)
 }
 """)
 
+    def test_enumeration_capacity(self):
+        source = SOURCE.read_text()
+        helper = source[source.index("static BOOL CALLBACK enum_instances("):
+                        source.index("static BOOL WINAPI joystick_load_once(")]
+        self.run_native(helper, r"""
+int main(void)
+{
+    ULONG count = 0;
+    unsigned int i;
+    DIDEVICEINSTANCEW value = instance(1);
+    value.dwDevType = DI8DEVTYPE_MOUSE;
+    assert(enum_instances(&value, &count) == DIENUM_CONTINUE && !count);
+    value.dwDevType = DI8DEVTYPE_KEYBOARD;
+    assert(enum_instances(&value, &count) == DIENUM_CONTINUE && !count);
+    for (i = 0; i < 32; ++i)
+    {
+        value = instance(i + 1);
+        BOOL result = enum_instances(&value, &count);
+        if (i < ARRAY_SIZE(instances) - 1) assert(result == DIENUM_CONTINUE);
+        else assert(result == DIENUM_STOP);
+        assert(count == (i < ARRAY_SIZE(instances) ? i + 1 : ARRAY_SIZE(instances)));
+    }
+    assert(count == ARRAY_SIZE(instances));
+    for (i = 0; i < ARRAY_SIZE(instances); ++i)
+        assert(instances[i].guidInstance == i + 1);
+    return 0;
+}
+""")
+
 
 if __name__ == "__main__":
     unittest.main()
