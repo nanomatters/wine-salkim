@@ -45,7 +45,7 @@ struct joystick
 static struct joystick joysticks[16];
 static DIDEVICEINSTANCEW instances[16];
 static int dinput;
-static unsigned int failure_stage, created, released, events, closed, killed;
+static unsigned int failure_stage, created, released, events, closed, killed, acquires;
 static HWND last_killed_window;
 static UINT last_killed_timer;
 
@@ -123,6 +123,8 @@ static HRESULT set_data_format(IDirectInputDevice8W *device)
 static HRESULT IDirectInputDevice8_Acquire(IDirectInputDevice8W *device)
 {
     assert(device);
+    ++acquires;
+    if (!failure_stage && SUCCEEDED(device->acquire_result)) device->state_result = 0;
     return failure_stage == 6 ? -1 : device->acquire_result;
 }
 
@@ -212,6 +214,80 @@ int main(void)
     i = created;
     add_joystick(&first);
     assert(created == i);
+    cleanup();
+    return 0;
+}
+""")
+
+    def test_reconnect_and_capture_cleanup(self):
+        source = SOURCE.read_text()
+        helper = source[source.index("static void update_connected_state("):
+                        source.index("static void find_joysticks(")]
+        self.run_native(helper, r"""
+int main(void)
+{
+    DIDEVICEINSTANCEW value = instance(1), replacement = instance(99);
+    unsigned int i, stage, before, acquire_count;
+    IDirectInputDevice8W *old_device;
+    HANDLE old_event;
+
+    add_joystick(&value);
+    old_device = joysticks[0].device;
+    old_event = joysticks[0].event;
+    joysticks[0].capture = (HWND)(uintptr_t)123;
+    joysticks[0].timer = 456;
+    joysticks[0].device->state_result = DIERR_INPUTLOST;
+    joysticks[0].device->acquire_result = -1;
+    acquire_count = acquires;
+    update_connected_state();
+    assert(acquires == acquire_count + 1);
+    assert(joysticks[0].disconnected && !killed);
+    add_joystick(&value);
+    assert(joysticks[0].device == old_device && joysticks[0].event == old_event);
+    joysticks[0].device->acquire_result = 0;
+    update_connected_state();
+    assert(!joysticks[0].disconnected && !killed);
+    assert(joysticks[0].capture == (HWND)(uintptr_t)123 && joysticks[0].timer == 456);
+
+    joysticks[0].device->state_result = DIERR_NOTACQUIRED;
+    update_connected_state();
+    assert(!joysticks[0].disconnected);
+    assert(joysticks[0].device == old_device && joysticks[0].event == old_event);
+
+    joysticks[0].device->state_result = -100;
+    update_connected_state();
+    assert(killed == 1 && last_killed_window == (HWND)(uintptr_t)123 && last_killed_timer == 456);
+    assert(!joysticks[0].device && !joysticks[0].event && !joysticks[0].capture && !joysticks[0].timer);
+    cleanup();
+
+    for (i = 0; i < ARRAY_SIZE(joysticks); ++i)
+    {
+        value = instance(i + 1);
+        add_joystick(&value);
+    }
+    old_device = joysticks[0].device;
+    old_event = joysticks[0].event;
+    joysticks[0].disconnected = TRUE;
+    joysticks[0].capture = (HWND)(uintptr_t)234;
+    joysticks[0].timer = 567;
+    joysticks[0].threshold = 42;
+    for (stage = 1; stage <= 6; ++stage)
+    {
+        failure_stage = stage;
+        before = killed;
+        add_joystick(&replacement);
+        assert(joysticks[0].device == old_device && joysticks[0].event == old_event);
+        assert(joysticks[0].instance.guidInstance == 1 && joysticks[0].disconnected);
+        assert(joysticks[0].capture == (HWND)(uintptr_t)234 && joysticks[0].timer == 567);
+        assert(joysticks[0].threshold == 42 && killed == before);
+        assert(created - released == ARRAY_SIZE(joysticks));
+        assert(events - closed == ARRAY_SIZE(joysticks));
+    }
+    failure_stage = 0;
+    add_joystick(&replacement);
+    assert(joysticks[0].device->id == 99 && !joysticks[0].disconnected);
+    assert(!joysticks[0].capture && !joysticks[0].timer);
+    assert(killed == 2 && last_killed_window == (HWND)(uintptr_t)234 && last_killed_timer == 567);
     cleanup();
     return 0;
 }
