@@ -68,6 +68,10 @@ static DWORD (WINAPI *pConvertLengthToIpv4Mask)(ULONG,ULONG*);
 static DWORD (WINAPI *pParseNetworkString)(const WCHAR*,DWORD,NET_ADDRESS_INFO*,USHORT*,BYTE*);
 static DWORD (WINAPI *pNotifyUnicastIpAddressChange)(ADDRESS_FAMILY, PUNICAST_IPADDRESS_CHANGE_CALLBACK,
                                                 PVOID, BOOLEAN, HANDLE *);
+static DWORD (WINAPI *pNotifyIpInterfaceChange)(ADDRESS_FAMILY, PIPINTERFACE_CHANGE_CALLBACK,
+                                              PVOID, BOOLEAN, HANDLE *);
+static DWORD (WINAPI *pNotifyRouteChange2)(ADDRESS_FAMILY, PIPFORWARD_CHANGE_CALLBACK,
+                                        PVOID, BOOLEAN, HANDLE *);
 static DWORD (WINAPI *pCancelMibChangeNotify2)(HANDLE);
 static DWORD (WINAPI *pGetIpInterfaceEntry)(MIB_IPINTERFACE_ROW*);
 static DWORD (WINAPI *pGetIpInterfaceTable)(ADDRESS_FAMILY family, MIB_IPINTERFACE_TABLE **table);
@@ -91,6 +95,8 @@ static void loadIPHlpApi(void)
     pConvertLengthToIpv4Mask = (void *)GetProcAddress(hLibrary, "ConvertLengthToIpv4Mask");
     pParseNetworkString = (void *)GetProcAddress(hLibrary, "ParseNetworkString");
     pNotifyUnicastIpAddressChange = (void *)GetProcAddress(hLibrary, "NotifyUnicastIpAddressChange");
+    pNotifyIpInterfaceChange = (void *)GetProcAddress(hLibrary, "NotifyIpInterfaceChange");
+    pNotifyRouteChange2 = (void *)GetProcAddress(hLibrary, "NotifyRouteChange2");
     pCancelMibChangeNotify2 = (void *)GetProcAddress(hLibrary, "CancelMibChangeNotify2");
     pGetIpInterfaceTable = (void *)GetProcAddress(hLibrary, "GetIpInterfaceTable");
     pGetIpInterfaceEntry = (void *)GetProcAddress(hLibrary, "GetIpInterfaceEntry");
@@ -3527,12 +3533,137 @@ static void test_NotifyUnicastIpAddressChange(void)
     callback_called = FALSE;
     ret = pNotifyUnicastIpAddressChange(AF_INET, test_ipaddtess_change_callback,
             &callback_called, TRUE, &handle);
+    if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_CALL_NOT_IMPLEMENTED)
+    {
+        win_skip("Unicast address notifications are not supported, error %lu.\n", ret);
+        return;
+    }
     ok(ret == NO_ERROR, "Unexpected ret %#lx.\n", ret);
+    if (ret) return;
     ok(callback_called, "Callback was not called.\n");
 
     ret = pCancelMibChangeNotify2(handle);
     ok(ret == NO_ERROR, "Unexpected ret %#lx.\n", ret);
     ok(!CloseHandle(handle), "CloseHandle() succeeded.\n");
+}
+
+struct notification_test
+{
+    HANDLE event;
+    LONG initial;
+    ADDRESS_FAMILY family;
+};
+
+static void check_notification( struct notification_test *test, const void *row,
+                                ADDRESS_FAMILY family, MIB_NOTIFICATION_TYPE type )
+{
+    if (type == MibInitialNotification)
+    {
+        ok( !row, "Unexpected initial notification row %p.\n", row );
+        InterlockedIncrement( &test->initial );
+        SetEvent( test->event );
+    }
+    else
+    {
+        ok( type == MibAddInstance || type == MibDeleteInstance || type == MibParameterNotification,
+            "Unexpected notification type %u.\n", type );
+        ok( !!row, "Missing changed row.\n" );
+        ok( test->family == AF_UNSPEC || test->family == family,
+            "Expected family %u, got %u.\n", test->family, family );
+    }
+}
+
+static void WINAPI interface_notification( void *context, MIB_IPINTERFACE_ROW *row, MIB_NOTIFICATION_TYPE type )
+{
+    check_notification( context, row, row ? row->Family : AF_UNSPEC, type );
+}
+
+static void WINAPI address_notification( void *context, MIB_UNICASTIPADDRESS_ROW *row, MIB_NOTIFICATION_TYPE type )
+{
+    check_notification( context, row, row ? row->Address.si_family : AF_UNSPEC, type );
+}
+
+static void WINAPI route_notification( void *context, MIB_IPFORWARD_ROW2 *row, MIB_NOTIFICATION_TYPE type )
+{
+    check_notification( context, row, row ? row->DestinationPrefix.Prefix.si_family : AF_UNSPEC, type );
+}
+
+static DWORD register_test_notification( unsigned int type, ADDRESS_FAMILY family, struct notification_test *test,
+                                         BOOLEAN initial, HANDLE *handle )
+{
+    switch (type)
+    {
+    case 0: return pNotifyIpInterfaceChange( family, interface_notification, test, initial, handle );
+    case 1: return pNotifyUnicastIpAddressChange( family, address_notification, test, initial, handle );
+    default: return pNotifyRouteChange2( family, route_notification, test, initial, handle );
+    }
+}
+
+static void test_mib_notifications(void)
+{
+    static const ADDRESS_FAMILY families[] = { AF_INET, AF_INET6, AF_UNSPEC };
+    struct notification_test test;
+    HANDLE handle, second;
+    unsigned int type, i;
+    DWORD ret;
+
+    if (!pNotifyIpInterfaceChange || !pNotifyUnicastIpAddressChange || !pNotifyRouteChange2 || !pCancelMibChangeNotify2)
+    {
+        win_skip( "MIB notification functions not available.\n" );
+        return;
+    }
+    ret = pCancelMibChangeNotify2( NULL );
+    ok( ret == ERROR_INVALID_PARAMETER, "Unexpected ret %lu.\n", ret );
+    test.event = CreateEventW( NULL, TRUE, FALSE, NULL );
+
+    for (type = 0; type < 3; ++type)
+    {
+        winetest_push_context( "notification type %u", type );
+        handle = (HANDLE)0xdeadbeef;
+        ret = register_test_notification( type, AF_UNIX, &test, FALSE, &handle );
+        ok( ret == ERROR_INVALID_PARAMETER, "Unexpected ret %lu.\n", ret );
+        ok( !handle, "Unexpected handle %p.\n", handle );
+        for (i = 0; i < ARRAY_SIZE(families); ++i)
+        {
+            winetest_push_context( "family %u", families[i] );
+            test.family = families[i];
+            test.initial = 0;
+            ResetEvent( test.event );
+            handle = NULL;
+            ret = register_test_notification( type, families[i], &test, TRUE, &handle );
+            if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_CALL_NOT_IMPLEMENTED)
+                win_skip( "Notifications are not supported, error %lu.\n", ret );
+            else
+                ok( !ret, "Unexpected ret %lu.\n", ret );
+            if (!ret)
+            {
+                ok( !!handle, "Missing notification handle.\n" );
+                ret = WaitForSingleObject( test.event, 3000 );
+                ok( ret == WAIT_OBJECT_0, "Initial callback wait returned %lu.\n", ret );
+                ok( test.initial == 1, "Got %ld initial callbacks.\n", test.initial );
+
+                /* Two registrations are independent, including cancellation. */
+                second = NULL;
+                ret = register_test_notification( type, families[i], &test, FALSE, &second );
+                if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_CALL_NOT_IMPLEMENTED)
+                    win_skip( "Notifications are not supported, error %lu.\n", ret );
+                else
+                    ok( !ret, "Unexpected ret %lu.\n", ret );
+                ok( !second || second != handle, "Identical handles %p.\n", handle );
+                ret = pCancelMibChangeNotify2( handle );
+                ok( !ret, "Unexpected cancel result %lu.\n", ret );
+                if (second)
+                {
+                    ret = pCancelMibChangeNotify2( second );
+                    ok( !ret, "Unexpected second cancel result %lu.\n", ret );
+                }
+                ok( test.initial == 1, "Unexpected extra initial callback, got %ld.\n", test.initial );
+            }
+            winetest_pop_context();
+        }
+        winetest_pop_context();
+    }
+    CloseHandle( test.event );
 }
 
 static void test_ConvertGuidToString( void )
@@ -4192,6 +4323,7 @@ START_TEST(iphlpapi)
     test_GetUdp6Table();
     test_ParseNetworkString();
     test_NotifyUnicastIpAddressChange();
+    test_mib_notifications();
     test_ConvertGuidToString();
     test_compartments();
     test_GetIpInterface();

@@ -4,4 +4,5 @@ IMPORTS   = advapi32 dnsapi nsi uuid ws2_32
 
 SOURCES = \
 	iphlpapi_main.c \
+	notification.c \
 	version.rc

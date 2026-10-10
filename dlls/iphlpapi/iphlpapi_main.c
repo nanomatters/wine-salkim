@@ -143,16 +143,6 @@ BOOL WINAPI CancelIPChangeNotify(LPOVERLAPPED overlapped)
 
 
 /******************************************************************
- *    CancelMibChangeNotify2 (IPHLPAPI.@)
- */
-DWORD WINAPI CancelMibChangeNotify2(HANDLE handle)
-{
-    FIXME("(handle %p): stub\n", handle);
-    return NO_ERROR;
-}
-
-
-/******************************************************************
  *    CreateIpForwardEntry (IPHLPAPI.@)
  *
  * Create a route in the local computer's IP table.
@@ -3962,31 +3952,6 @@ DWORD WINAPI NotifyAddrChange(PHANDLE Handle, LPOVERLAPPED overlapped)
 
 
 /******************************************************************
- *    NotifyIpInterfaceChange (IPHLPAPI.@)
- */
-DWORD WINAPI NotifyIpInterfaceChange(ADDRESS_FAMILY family, PIPINTERFACE_CHANGE_CALLBACK callback,
-                                     PVOID context, BOOLEAN init_notify, PHANDLE handle)
-{
-    FIXME("(family %d, callback %p, context %p, init_notify %d, handle %p): stub\n",
-          family, callback, context, init_notify, handle);
-    if (handle) *handle = NULL;
-    return NO_ERROR;
-}
-
-/******************************************************************
- *    NotifyRouteChange2 (IPHLPAPI.@)
- */
-DWORD WINAPI NotifyRouteChange2(ADDRESS_FAMILY family, PIPFORWARD_CHANGE_CALLBACK callback, VOID* context,
-                                BOOLEAN init_notify, HANDLE* handle)
-{
-    FIXME("(family %d, callback %p, context %p, init_notify %d, handle %p): stub\n",
-        family, callback, context, init_notify, handle);
-    if (handle) *handle = NULL;
-    return NO_ERROR;
-}
-
-
-/******************************************************************
  *    NotifyRouteChange (IPHLPAPI.@)
  *
  * Notify caller whenever the ip routing table is changed.
@@ -4008,22 +3973,6 @@ DWORD WINAPI NotifyRouteChange(PHANDLE Handle, LPOVERLAPPED overlapped)
   return ERROR_NOT_SUPPORTED;
 }
 
-
-/******************************************************************
- *    NotifyUnicastIpAddressChange (IPHLPAPI.@)
- */
-DWORD WINAPI NotifyUnicastIpAddressChange(ADDRESS_FAMILY family, PUNICAST_IPADDRESS_CHANGE_CALLBACK callback,
-                                          PVOID context, BOOLEAN init_notify, PHANDLE handle)
-{
-    FIXME("(family %d, callback %p, context %p, init_notify %d, handle %p): semi-stub\n",
-          family, callback, context, init_notify, handle);
-    if (handle) *handle = NULL;
-
-    if (init_notify)
-        callback(context, NULL, MibInitialNotification);
-
-    return NO_ERROR;
-}
 
 /******************************************************************
  *    SendARP (IPHLPAPI.@)
@@ -4696,6 +4645,7 @@ DWORD WINAPI GetIpInterfaceTable( ADDRESS_FAMILY family, MIB_IPINTERFACE_TABLE *
         if (err)
         {
             HeapFree( GetProcessHeap(), 0, *table );
+            *table = NULL;
             return err;
         }
         total_count += count;
@@ -4703,6 +4653,7 @@ DWORD WINAPI GetIpInterfaceTable( ADDRESS_FAMILY family, MIB_IPINTERFACE_TABLE *
         if (!new_alloc)
         {
             HeapFree( GetProcessHeap(), 0, *table );
+            *table = NULL;
             NsiFreeTable( keys, rw, dyn, NULL );
             return ERROR_NOT_ENOUGH_MEMORY;
         }
