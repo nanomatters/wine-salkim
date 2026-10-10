@@ -57,3 +57,5 @@ uses real GStreamer video buffers to check padding replication. It requires
 the native `gstreamer-video-1.0` and `gstreamer-audio-1.0` development packages
 and the configured Wine build's `config.h`. `make check` runs both native tests.
 No game or video decoder plugin is needed.
+Coverage includes partial-pixel row padding, invalid strides, planar formats and
+nonzero aperture offsets, including subsampled planes with odd top padding.

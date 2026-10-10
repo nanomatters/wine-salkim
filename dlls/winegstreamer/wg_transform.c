@@ -1273,7 +1273,8 @@ enum fill_action
 static void fill_frame_padded_bits(GstBuffer *buffer, const GstVideoAlignment *align, const GstVideoInfo *info,
         enum fill_action action)
 {
-    guint i, j, plane, padded_height, width, height, stride, pixel_stride, padding_bottom = align->padding_bottom;
+    guint i, j, plane, padded_height, width, height, left, padding_bottom = align->padding_bottom;
+    gint stride, pixel_stride;
     GstVideoFrame frame;
 
     if (!padding_bottom) action &= ~FILL_BOTTOM;
@@ -1291,24 +1292,33 @@ static void fill_frame_padded_bits(GstBuffer *buffer, const GstVideoAlignment *a
         gst_video_format_info_component(frame.info.finfo, plane, comp);
         height = GST_VIDEO_FRAME_COMP_HEIGHT(&frame, comp[0]);
         stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, plane);
+        pixel_stride = GST_VIDEO_FRAME_COMP_PSTRIDE(&frame, comp[0]);
+        width = GST_VIDEO_FRAME_COMP_WIDTH(&frame, comp[0]);
+        left = GST_VIDEO_FORMAT_INFO_SCALE_WIDTH(frame.info.finfo, comp[0], align->padding_left);
+        if (!height || !width || stride <= 0 || pixel_stride <= 0 || left > stride / pixel_stride
+                || width > stride / pixel_stride - left)
+            continue;
+        width *= pixel_stride;
+        left *= pixel_stride;
 
         if (action & FILL_RIGHT)
         {
             guint8 *data = GST_VIDEO_FRAME_PLANE_DATA(&frame, plane);
-            pixel_stride = GST_VIDEO_FRAME_COMP_PSTRIDE(&frame, plane);
-            width = GST_VIDEO_FRAME_COMP_WIDTH(&frame, comp[0]) * pixel_stride;
             data += width;
             for (i = 0; i < height; i++)
-                for (j = 0; j < stride - width; j += pixel_stride)
-                    memcpy(data + i * stride + j, data + i * stride - pixel_stride, pixel_stride);
+                for (j = 0; j < stride - left - width; j += pixel_stride)
+                    memcpy(data + i * stride + j, data + i * stride - pixel_stride,
+                            min(pixel_stride, stride - left - width - j));
         }
 
         if (action & FILL_BOTTOM)
         {
             guint8 *data = GST_VIDEO_FRAME_PLANE_DATA(&frame, plane);
-            padded_height = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT(frame.info.finfo, comp[0], info->height + padding_bottom);
-            data += height * stride;
-            for (i = 0; i < padded_height - height; i++) memcpy(data + i * stride, data - stride, stride);
+            padded_height = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT(frame.info.finfo, comp[0],
+                    align->padding_top + info->height + padding_bottom);
+            padded_height -= GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT(frame.info.finfo, comp[0], align->padding_top);
+            data += height * stride - left;
+            for (i = height; i < padded_height; i++) memcpy(data + (i - height) * stride, data - stride, stride);
         }
     }
 
