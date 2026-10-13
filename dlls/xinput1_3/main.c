@@ -57,8 +57,10 @@ struct xinput_controller
     XINPUT_VIBRATION vibration;
     HANDLE device;
     WCHAR device_path[MAX_PATH];
+    WCHAR interface_path[MAX_PATH * 2];
     HANDLE read_event;
     BOOL enabled;
+    BOOL enumerated;
 
     struct
     {
@@ -97,6 +99,223 @@ static HMODULE xinput_instance;
 static HANDLE start_event;
 static HANDLE update_event;
 static HANDLE steam_overlay_event;
+
+enum discovery_result
+{
+    DISCOVERY_COMPLETE,
+    DISCOVERY_PENDING,
+    DISCOVERY_FULL,
+};
+
+struct discovery_watch
+{
+    HKEY root, key;
+    const WCHAR *path;
+    HANDLE event;
+    BOOL failed;
+};
+
+static WCHAR app_override_path[MAX_PATH + 64];
+static struct discovery_watch discovery_watches[] =
+{
+    {HKEY_LOCAL_MACHINE},
+    {HKEY_CURRENT_USER},
+    {HKEY_LOCAL_MACHINE, NULL,
+        L"System\\CurrentControlSet\\Control\\DeviceClasses\\{6c53d5fd-6480-440f-b618-476750c5e1a6}"},
+    {HKEY_CURRENT_USER, NULL, L"Software\\Wine\\DirectInput\\Joysticks"},
+    {HKEY_CURRENT_USER, NULL, app_override_path},
+};
+
+struct pending_controller
+{
+    struct pending_controller *next;
+    BOOL enumerated;
+    WCHAR path[MAX_PATH];
+    WCHAR interface_path[MAX_PATH * 2];
+};
+
+static struct pending_controller *pending_controllers;
+static BOOL discovery_dirty = TRUE;
+static ULONGLONG discovery_retry_time;
+static LONG discovery_error;
+
+static BOOL set_pending_controller(const WCHAR *path, BOOL pending);
+static void set_controller_interface_path(const WCHAR *path, const WCHAR *interface_path);
+
+static BOOL get_app_override_path(WCHAR *path, unsigned int size)
+{
+    WCHAR local[MAX_PATH], *buffer = local, *name, *tmp;
+    DWORD len, capacity = ARRAY_SIZE(local);
+    BOOL ret = FALSE;
+
+    for (;;)
+    {
+        if (!(len = GetModuleFileNameW(NULL, buffer, capacity))) goto done;
+        if (len < capacity) break;
+        if (capacity == 32768)
+        {
+            SetLastError(ERROR_FILENAME_EXCED_RANGE);
+            goto done;
+        }
+        capacity = min(capacity * 2, 32768);
+        if (buffer != local) free(buffer);
+        if (!(buffer = malloc(capacity * sizeof(WCHAR))))
+        {
+            SetLastError(ERROR_OUTOFMEMORY);
+            goto done;
+        }
+    }
+    name = buffer;
+    if ((tmp = wcsrchr(name, '/'))) name = tmp + 1;
+    if ((tmp = wcsrchr(name, '\\'))) name = tmp + 1;
+    ret = swprintf(path, size, L"Software\\Wine\\AppDefaults\\%s\\DirectInput\\Joysticks", name) >= 0;
+    if (!ret) SetLastError(ERROR_INSUFFICIENT_BUFFER);
+done:
+    if (buffer != local) free(buffer);
+    if (!ret && size) *path = 0;
+    return ret;
+}
+
+/* Root name watches cover deletion of a watched key and creation of missing
+ * keys. Separate, narrow value watches avoid invalidation on unrelated writes. */
+static BOOL arm_discovery_watch(unsigned int index)
+{
+    struct discovery_watch *watch = discovery_watches + index;
+    DWORD filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC;
+    LONG ret;
+
+    if (watch->key) RegCloseKey(watch->key);
+    watch->key = NULL;
+    if (!watch->event && !(watch->event = CreateEventW(NULL, TRUE, FALSE, NULL)))
+        ret = GetLastError();
+    else if (index == 4 && !*app_override_path &&
+             !get_app_override_path(app_override_path, ARRAY_SIZE(app_override_path)))
+        ret = GetLastError() ? GetLastError() : ERROR_GEN_FAILURE;
+    else if (index < 2)
+    {
+        /* An empty RegOpenKeyEx on a predefined key returns that shared
+         * pseudo-handle. RegCreateKeyEx opens the existing root with a private
+         * handle, so another XInput DLL cannot consume this notification. */
+        ret = RegCreateKeyExW(watch->root, L"", 0, NULL, 0, KEY_READ | KEY_NOTIFY,
+                              NULL, &watch->key, NULL);
+    }
+    else
+    {
+        filter |= REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY;
+        ret = *watch->path ? RegOpenKeyExW(watch->root, watch->path, 0, KEY_READ | KEY_NOTIFY, &watch->key)
+                          : ERROR_FILE_NOT_FOUND;
+        if (ret == ERROR_FILE_NOT_FOUND || ret == ERROR_PATH_NOT_FOUND)
+        {
+            ResetEvent(watch->event);
+            watch->failed = FALSE;
+            return TRUE;
+        }
+    }
+
+    if (!ret) ret = RegNotifyChangeKeyValue(watch->key, TRUE, filter, watch->event, TRUE);
+    if (ret)
+    {
+        if (!watch->failed) WARN("Failed to watch controller registry changes, error %lu\n", ret);
+        if (watch->key) RegCloseKey(watch->key);
+        watch->key = NULL;
+        if (watch->event) ResetEvent(watch->event);
+    }
+    watch->failed = !!ret;
+    return !ret;
+}
+
+static void init_discovery_watches(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(discovery_watches); ++i) arm_discovery_watch(i);
+}
+
+/* A root notification can concern an unrelated key. Keep the narrow watch,
+ * including any pending value notification, when its key object is unchanged. */
+static BOOL refresh_discovery_watch(unsigned int index)
+{
+    struct discovery_watch *watch = discovery_watches + index;
+    HKEY key = NULL;
+    LONG ret;
+    BOOL unchanged = FALSE;
+
+    ret = *watch->path ? RegOpenKeyExW(watch->root, watch->path, 0, KEY_READ | KEY_NOTIFY, &key)
+                      : ERROR_INVALID_PARAMETER;
+    if (!watch->failed && watch->event)
+    {
+        if (!ret && watch->key) unchanged = !NtCompareObjects(key, watch->key);
+        else if (ret == ERROR_FILE_NOT_FOUND || ret == ERROR_PATH_NOT_FOUND) unchanged = !watch->key;
+    }
+    if (key) RegCloseKey(key);
+    if (unchanged) return FALSE;
+
+    arm_discovery_watch(index);
+    return TRUE;
+}
+
+static BOOL check_discovery_watches(void)
+{
+    HANDLE events[ARRAY_SIZE(discovery_watches)];
+    unsigned int indices[ARRAY_SIZE(discovery_watches)], i, count;
+    DWORD ret, processed = 0;
+    BOOL complete = TRUE;
+
+    for (;;)
+    {
+        for (i = count = 0; i < ARRAY_SIZE(discovery_watches); ++i)
+        {
+            if ((processed & (1u << i)) || !discovery_watches[i].event) continue;
+            events[count] = discovery_watches[i].event;
+            indices[count++] = i;
+        }
+        if (!count) break;
+        ret = WaitForMultipleObjects(count, events, FALSE, 0);
+        if (ret >= count)
+        {
+            if (ret == WAIT_FAILED) complete = FALSE;
+            break;
+        }
+        i = indices[ret];
+        processed |= 1u << i;
+        arm_discovery_watch(i);
+        if (i < 2)
+        {
+            HKEY root = discovery_watches[i].root;
+
+            /* Rearm the root first so a replacement during these checks
+             * remains visible to the next refresh. */
+            for (i = 2; i < ARRAY_SIZE(discovery_watches); ++i)
+                if (discovery_watches[i].root == root && refresh_discovery_watch(i)) discovery_dirty = TRUE;
+        }
+        else discovery_dirty = TRUE;
+    }
+    if (!complete) discovery_dirty = TRUE;
+    for (i = 0; i < ARRAY_SIZE(discovery_watches); ++i)
+        if (!discovery_watches[i].event || discovery_watches[i].failed) complete = FALSE;
+    return complete;
+}
+
+static void destroy_discovery_watches(void)
+{
+    struct pending_controller *pending;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(discovery_watches); ++i)
+    {
+        if (discovery_watches[i].key) RegCloseKey(discovery_watches[i].key);
+        if (discovery_watches[i].event) CloseHandle(discovery_watches[i].event);
+        discovery_watches[i].key = NULL;
+        discovery_watches[i].event = NULL;
+        discovery_watches[i].failed = TRUE;
+    }
+    while ((pending = pending_controllers))
+    {
+        pending_controllers = pending->next;
+        free(pending);
+    }
+    discovery_dirty = TRUE;
+}
 
 static SRWLOCK state_lock = SRWLOCK_INIT;
 static XINPUT_STATE current_state[XUSER_MAX_COUNT];
@@ -327,12 +546,15 @@ static void controller_destroy(struct xinput_controller *controller, BOOL alread
 
         CloseHandle(controller->device);
         controller->device = NULL;
+        controller->interface_path[0] = 0;
 
         free(controller->hid.input_report_buf);
         free(controller->hid.output_report_buf);
         free(controller->hid.feature_report_buf);
         HidD_FreePreparsedData(controller->hid.preparsed);
         memset(&controller->hid, 0, sizeof(controller->hid));
+        discovery_dirty = TRUE;
+        SetEvent(update_event);
     }
 }
 
@@ -392,88 +614,133 @@ failed:
     return FALSE;
 }
 
-static void get_registry_keys(HKEY *defkey, HKEY *appkey)
+static LONG read_device_override(const WCHAR *path, const WCHAR *name, BOOL *disabled)
 {
-    WCHAR buffer[MAX_PATH + 26], *name = buffer, *tmp;
-    DWORD len;
-    HKEY hkey;
+    WCHAR local[MAX_PATH + 1], *buffer = local;
+    DWORD size = sizeof(local) - sizeof(WCHAR), type;
+    HKEY key;
+    LONG ret;
 
-    *appkey = 0;
-    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\DirectInput\\Joysticks", defkey))
-        *defkey = 0;
-
-    if (!(len = GetModuleFileNameW(0, buffer, MAX_PATH)) || len >= MAX_PATH)
-        return;
-
-    if (!RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\AppDefaults", &hkey))
+    if ((ret = RegOpenKeyW(HKEY_CURRENT_USER, path, &key))) return ret;
+    ret = RegQueryValueExW(key, name, NULL, &type, (BYTE *)buffer, &size);
+    if ((!ret || ret == ERROR_MORE_DATA) && (type != REG_SZ || size % sizeof(WCHAR))) ret = ERROR_INVALID_DATA;
+    if (ret == ERROR_MORE_DATA)
     {
-        if ((tmp = wcsrchr(name, '/'))) name = tmp + 1;
-        if ((tmp = wcsrchr(name, '\\'))) name = tmp + 1;
-        wcscat(name, L"\\DirectInput\\Joysticks");
-        if (RegOpenKeyW(hkey, name, appkey)) *appkey = 0;
-        RegCloseKey(hkey);
+        SIZE_T allocation_size = (SIZE_T)size + sizeof(WCHAR);
+
+        if (allocation_size < size || !(buffer = malloc(allocation_size)))
+            ret = ERROR_NOT_ENOUGH_MEMORY;
+        else ret = RegQueryValueExW(key, name, NULL, &type, (BYTE *)buffer, &size);
     }
+    if (!ret)
+    {
+        if (type != REG_SZ || size % sizeof(WCHAR)) ret = ERROR_INVALID_DATA;
+        else
+        {
+            buffer[size / sizeof(WCHAR)] = 0;
+            *disabled = !wcscmp(buffer, L"override") || !wcscmp(buffer, L"disabled");
+        }
+    }
+    if (buffer != local) free(buffer);
+    RegCloseKey(key);
+    return ret;
 }
 
-static BOOL device_is_overridden(HANDLE device)
+static BOOL device_is_overridden(HANDLE device, BOOL *disabled)
 {
-    WCHAR name[MAX_PATH], buffer[MAX_PATH];
-    DWORD size = sizeof(buffer);
-    BOOL disable = FALSE;
-    HKEY defkey, appkey;
+    WCHAR name[MAX_PATH];
+    LONG ret;
 
-    if (!HidD_GetProductString(device, name, MAX_PATH)) return FALSE;
-
-    get_registry_keys(&defkey, &appkey);
-    if (!defkey && !appkey) return FALSE;
-    if ((appkey && !RegQueryValueExW(appkey, name, 0, NULL, (LPBYTE)buffer, &size)) ||
-        (defkey && !RegQueryValueExW(defkey, name, 0, NULL, (LPBYTE)buffer, &size)))
+    *disabled = FALSE;
+    if (!HidD_GetProductString(device, name, sizeof(name)))
     {
-        if ((disable = !wcscmp(buffer, L"override") || !wcscmp(buffer, L"disabled")))
-            TRACE("Disabling gamepad '%s' based on registry key.\n", debugstr_w(name));
+        /* A driver without product strings has no named override. Other
+         * failures can be temporary and must remain retryable. */
+        return GetLastError() == ERROR_NOT_SUPPORTED || GetLastError() == ERROR_INVALID_FUNCTION;
     }
+    name[ARRAY_SIZE(name) - 1] = 0;
 
-    if (appkey) RegCloseKey(appkey);
-    if (defkey) RegCloseKey(defkey);
-    return disable;
+    if (!*app_override_path && !get_app_override_path(app_override_path, ARRAY_SIZE(app_override_path))) return FALSE;
+    ret = read_device_override(app_override_path, name, disabled);
+    /* Only known missing or invalid values permit fallback. A failed read
+     * cannot establish that the application has no higher-priority setting. */
+    if (ret == ERROR_FILE_NOT_FOUND || ret == ERROR_PATH_NOT_FOUND || ret == ERROR_INVALID_DATA)
+        ret = read_device_override(L"Software\\Wine\\DirectInput\\Joysticks", name, disabled);
+    if (ret == ERROR_FILE_NOT_FOUND || ret == ERROR_PATH_NOT_FOUND || ret == ERROR_INVALID_DATA) return TRUE;
+    if (!ret && *disabled) TRACE("Disabling gamepad '%s' based on registry key.\n", debugstr_w(name));
+    return !ret;
 }
 
 /* open a device with the given path at the given index, xinput_cs must be held */
-static BOOL open_device_at_index(const WCHAR *device_path, int index)
+static enum discovery_result open_device_at_index(const WCHAR *device_path, int index)
 {
-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
     PHIDP_PREPARSED_DATA preparsed;
     HIDP_CAPS caps;
     NTSTATUS status;
     HANDLE device;
+    BOOL disabled = FALSE, complete = TRUE;
+    enum discovery_result result = DISCOVERY_PENDING;
+    WCHAR displaced_path[MAX_PATH], displaced_interface_path[MAX_PATH * 2];
+    unsigned int spare;
 
     device = CreateFileW(device_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                          NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
-    if (device == INVALID_HANDLE_VALUE) return TRUE;
+    if (device == INVALID_HANDLE_VALUE) return DISCOVERY_PENDING;
 
     preparsed = NULL;
     if (!HidD_GetPreparsedData(device, &preparsed))
         WARN("ignoring HID device, HidD_GetPreparsedData failed with error %lu\n", GetLastError());
     else if ((status = HidP_GetCaps(preparsed, &caps)) != HIDP_STATUS_SUCCESS)
+    {
         WARN("ignoring HID device, HidP_GetCaps returned %#lx\n", status);
+        if (status == HIDP_STATUS_INVALID_PREPARSED_DATA) result = DISCOVERY_COMPLETE;
+    }
     else if (caps.UsagePage != HID_USAGE_PAGE_GENERIC)
+    {
         WARN("ignoring HID device, unsupported usage page %04x\n", caps.UsagePage);
+        result = DISCOVERY_COMPLETE;
+    }
     else if (caps.Usage != HID_USAGE_GENERIC_GAMEPAD && caps.Usage != HID_USAGE_GENERIC_JOYSTICK &&
              caps.Usage != HID_USAGE_GENERIC_MULTI_AXIS_CONTROLLER)
+    {
         WARN("ignoring HID device, unsupported usage %04x:%04x\n", caps.UsagePage, caps.Usage);
-    else if (device_is_overridden(device))
-        WARN("ignoring HID device, overridden for dinput or disabled\n");
-    else if (!controller_init(&controllers[index], preparsed, &caps, device, device_path))
-        WARN("ignoring HID device, failed to initialize\n");
+        result = DISCOVERY_COMPLETE;
+    }
     else
     {
-        TRACE("opened device %s at index %u\n", debugstr_w(device_path), index);
-        return TRUE;
+        complete = device_is_overridden(device, &disabled);
+        if (disabled) result = complete ? DISCOVERY_COMPLETE : DISCOVERY_PENDING;
+        else
+        {
+            /* Validate a preferred Steam slot's replacement before moving
+             * its current pad. Ignored or unpublished devices cannot evict it. */
+            if (controllers[index].device)
+            {
+                if (!complete) goto done;
+                for (spare = 0; spare < XUSER_MAX_COUNT; ++spare)
+                    if (!controllers[spare].device) break;
+                lstrcpynW(displaced_path, controllers[index].device_path, ARRAY_SIZE(displaced_path));
+                lstrcpynW(displaced_interface_path, controllers[index].interface_path, ARRAY_SIZE(displaced_interface_path));
+                controller_destroy(controllers + index, FALSE);
+                if (spare < XUSER_MAX_COUNT && open_device_at_index(displaced_path, spare) == DISCOVERY_PENDING)
+                    if (!set_pending_controller(displaced_path, TRUE)) discovery_dirty = TRUE;
+                set_controller_interface_path(displaced_path, displaced_interface_path);
+            }
+            if (!controller_init(&controllers[index], preparsed, &caps, device, device_path))
+                WARN("ignoring HID device, failed to initialize\n");
+            else
+            {
+                controllers[index].enumerated = TRUE;
+                TRACE("opened device %s at index %u\n", debugstr_w(device_path), index);
+                return complete ? DISCOVERY_COMPLETE : DISCOVERY_PENDING;
+            }
+        }
     }
 
+done:
     CloseHandle(device);
     HidD_FreePreparsedData(preparsed);
-    return TRUE;
+    return result;
 }
 
 static BOOL find_opened_device(const WCHAR *device_path, int *slot)
@@ -496,8 +763,6 @@ static BOOL find_opened_device(const WCHAR *device_path, int *slot)
          swscanf(device_path, L"\\\\?\\HID#VID_28DE&PID_11FF&XI_%02u#", &i) == 1) &&
         i < XUSER_MAX_COUNT && *slot != i)
     {
-        controller_destroy(&controllers[i], FALSE);
-        if (*slot != XUSER_MAX_COUNT) open_device_at_index(controllers[i].device_path, *slot);
         *slot = i;
     }
 
@@ -505,51 +770,280 @@ static BOOL find_opened_device(const WCHAR *device_path, int *slot)
 }
 
 /* try opening a new controller device from the given path, xinput_cs must be held */
-static BOOL try_add_device(const WCHAR *device_path)
+static enum discovery_result try_add_device(const WCHAR *device_path)
 {
-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
-    int i;
-
-    if (find_opened_device(device_path, &i)) return TRUE; /* already opened */
-    if (i == XUSER_MAX_COUNT) return FALSE; /* no more slots */
-    return open_device_at_index(device_path, i);
-}
-
-/* try closing an open controller device with the given path, xinput_cs must be held */
-static void try_remove_device(const WCHAR *device_path)
-{
+    BOOL disabled, complete;
     int i;
 
     if (find_opened_device(device_path, &i))
-        controller_destroy(&controllers[i], FALSE);
+    {
+        controllers[i].enumerated = TRUE;
+        complete = device_is_overridden(controllers[i].device, &disabled);
+        if (complete && disabled) controller_destroy(controllers + i, FALSE);
+        return complete ? DISCOVERY_COMPLETE : DISCOVERY_PENDING;
+    }
+    if (i == XUSER_MAX_COUNT) return DISCOVERY_FULL;
+    return open_device_at_index(device_path, i);
 }
 
+/* Failed opens can race interface publication. Retain their paths so an
+ * immediate query can retry without rebuilding the entire interface list. */
+static BOOL set_pending_controller(const WCHAR *path, BOOL pending)
+{
+    struct pending_controller **entry = &pending_controllers, *controller;
+
+    while (*entry && wcsicmp((*entry)->path, path)) entry = &(*entry)->next;
+    if (!pending)
+    {
+        if ((controller = *entry))
+        {
+            *entry = controller->next;
+            free(controller);
+        }
+        return TRUE;
+    }
+    if (!*entry)
+    {
+        if (!(controller = malloc(sizeof(*controller)))) return FALSE;
+        controller->next = NULL;
+        controller->interface_path[0] = 0;
+        lstrcpynW(controller->path, path, ARRAY_SIZE(controller->path));
+        *entry = controller;
+    }
+    (*entry)->enumerated = TRUE;
+    return TRUE;
+}
+
+static void set_controller_interface_path(const WCHAR *path, const WCHAR *interface_path)
+{
+    struct pending_controller *pending;
+    unsigned int i;
+
+    for (i = 0; i < XUSER_MAX_COUNT; ++i)
+        if (controllers[i].device && !wcsicmp(controllers[i].device_path, path))
+            lstrcpynW(controllers[i].interface_path, interface_path, ARRAY_SIZE(controllers[i].interface_path));
+    for (pending = pending_controllers; pending; pending = pending->next)
+        if (!wcsicmp(pending->path, path) && pending->interface_path != interface_path)
+            lstrcpynW(pending->interface_path, interface_path, ARRAY_SIZE(pending->interface_path));
+}
+
+static BOOL registry_key_missing(LONG ret)
+{
+    return ret == ERROR_FILE_NOT_FOUND || ret == ERROR_PATH_NOT_FOUND || ret == ERROR_KEY_DELETED;
+}
+
+/* Missing or malformed metadata cannot improve without a registry change.
+ * Transport, access and allocation errors, in contrast, remain retryable. */
+static BOOL registry_data_incomplete(LONG ret)
+{
+    return registry_key_missing(ret) || ret == ERROR_INVALID_DATA ||
+           ret == ERROR_UNSUPPORTED_TYPE || ret == ERROR_MORE_DATA;
+}
+
+enum interface_status
+{
+    INTERFACE_PRESENT,
+    INTERFACE_REMOVED,
+    INTERFACE_INCOMPLETE,
+    INTERFACE_RETRY,
+};
+
+/* Resolve an unseen device independently of the rest of the enumeration.
+ * An unrelated failure must not hide its removal. Conversely, incomplete
+ * publication of its own metadata must not disconnect a working handle. */
+static enum interface_status get_controller_interface_status(HKEY class_key, const WCHAR *interface_path,
+                                                            const WCHAR *device_path)
+{
+    WCHAR path[MAX_PATH] = {0};
+    HKEY key;
+    DWORD size, linked;
+    LONG ret;
+
+    ret = RegOpenKeyExW(class_key, interface_path, 0, KEY_READ, &key);
+    if (registry_key_missing(ret)) return INTERFACE_REMOVED;
+    if (ret) return INTERFACE_RETRY;
+    size = sizeof(linked);
+    ret = RegGetValueW(key, L"Control", L"Linked", RRF_RT_REG_DWORD, NULL, &linked, &size);
+    if (!ret && size != sizeof(linked)) ret = ERROR_INVALID_DATA;
+    if (registry_key_missing(ret) || (!ret && !linked))
+    {
+        RegCloseKey(key);
+        return INTERFACE_REMOVED;
+    }
+    if (!ret)
+    {
+        size = sizeof(path);
+        ret = RegGetValueW(key, NULL, L"SymbolicLink", RRF_RT_REG_SZ, NULL, path, &size);
+        if (!ret && (!*path || size % sizeof(WCHAR))) ret = ERROR_INVALID_DATA;
+    }
+    RegCloseKey(key);
+    if (ret) return registry_data_incomplete(ret) ? INTERFACE_INCOMPLETE : INTERFACE_RETRY;
+    return wcsicmp(path, device_path) ? INTERFACE_REMOVED : INTERFACE_PRESENT;
+}
+
+/* SetupAPI can silently omit interfaces after internal errors. Read Wine's
+ * interface source directly so transient failures remain distinguishable
+ * from an empty list and static, incomplete registrations. */
+static BOOL enumerate_controller_interfaces(HKEY class_key)
+{
+    WCHAR name[MAX_PATH], reference[MAX_PATH], path[MAX_PATH], interface_path[MAX_PATH * 2];
+    DWORD index = 0, reference_index, size, linked;
+    HKEY device_key, reference_key;
+    LONG ret, reference_ret;
+    BOOL complete = TRUE;
+
+    for (;;)
+    {
+        size = ARRAY_SIZE(name);
+        ret = RegEnumKeyExW(class_key, index++, name, &size, NULL, NULL, NULL, NULL);
+        if (ret == ERROR_MORE_DATA) continue;
+        if (ret) break;
+        if ((ret = RegOpenKeyExW(class_key, name, 0, KEY_READ, &device_key)))
+        {
+            if (!registry_key_missing(ret)) complete = FALSE;
+            continue;
+        }
+        size = 0;
+        ret = RegGetValueW(device_key, NULL, L"DeviceInstance", RRF_RT_REG_SZ, NULL, NULL, &size);
+        if (ret || !size || size % sizeof(WCHAR))
+        {
+            if (ret && !registry_data_incomplete(ret)) complete = FALSE;
+            RegCloseKey(device_key);
+            continue;
+        }
+        reference_index = 0;
+        for (;;)
+        {
+            size = ARRAY_SIZE(reference);
+            reference_ret = RegEnumKeyExW(device_key, reference_index++, reference, &size, NULL, NULL, NULL, NULL);
+            if (reference_ret == ERROR_MORE_DATA) continue;
+            if (reference_ret) break;
+            if (*reference != '#') continue;
+            if ((reference_ret = RegOpenKeyExW(device_key, reference, 0, KEY_READ, &reference_key)))
+            {
+                if (!registry_key_missing(reference_ret)) complete = FALSE;
+                continue;
+            }
+            size = sizeof(linked);
+            reference_ret = RegGetValueW(reference_key, L"Control", L"Linked", RRF_RT_REG_DWORD,
+                                         NULL, &linked, &size);
+            if (!reference_ret && size != sizeof(linked)) reference_ret = ERROR_INVALID_DATA;
+            if (!reference_ret && linked)
+            {
+                size = sizeof(path);
+                *path = 0;
+                reference_ret = RegGetValueW(reference_key, NULL, L"SymbolicLink", RRF_RT_REG_SZ,
+                                             NULL, path, &size);
+                if (reference_ret)
+                {
+                    if (!registry_data_incomplete(reference_ret)) complete = FALSE;
+                }
+                else if (*path && !(size % sizeof(WCHAR)))
+                {
+                    if (!set_pending_controller(path, try_add_device(path) == DISCOVERY_PENDING)) complete = FALSE;
+                    swprintf(interface_path, ARRAY_SIZE(interface_path), L"%s\\%s", name, reference);
+                    set_controller_interface_path(path, interface_path);
+                }
+            }
+            else if (reference_ret && !registry_data_incomplete(reference_ret))
+                complete = FALSE;
+            RegCloseKey(reference_key);
+        }
+        if (reference_ret != ERROR_NO_MORE_ITEMS) complete = FALSE;
+        RegCloseKey(device_key);
+    }
+    if (ret != ERROR_NO_MORE_ITEMS) complete = FALSE;
+    return complete;
+}
+
+static void enumerate_controllers(void)
+{
+    HKEY class_key = NULL;
+    LONG ret;
+    BOOL complete;
+    enum interface_status status;
+    struct pending_controller **entry, *pending;
+    unsigned int i;
+
+    TRACE("Refreshing controller interfaces\n");
+    discovery_dirty = FALSE;
+    for (i = 0; i < XUSER_MAX_COUNT; ++i) controllers[i].enumerated = FALSE;
+    for (pending = pending_controllers; pending; pending = pending->next) pending->enumerated = FALSE;
+    ret = RegOpenKeyExW(HKEY_LOCAL_MACHINE, discovery_watches[2].path, 0, KEY_READ, &class_key);
+    if (!ret) complete = enumerate_controller_interfaces(class_key);
+    else if (registry_key_missing(ret)) complete = TRUE;
+    else
+    {
+        if (discovery_error != ret) WARN("Failed to enumerate controller interfaces, error %lu\n", ret);
+        complete = FALSE;
+    }
+    discovery_error = registry_key_missing(ret) ? 0 : ret;
+
+    for (i = 0; i < XUSER_MAX_COUNT; ++i)
+    {
+        if (!controllers[i].device || controllers[i].enumerated) continue;
+        status = complete ? INTERFACE_REMOVED : INTERFACE_RETRY;
+        if (class_key && *controllers[i].interface_path)
+            status = get_controller_interface_status(class_key, controllers[i].interface_path,
+                                                     controllers[i].device_path);
+        if (status == INTERFACE_REMOVED) controller_destroy(controllers + i, FALSE);
+        else if (status == INTERFACE_RETRY) complete = FALSE;
+    }
+    for (entry = &pending_controllers; (pending = *entry);)
+    {
+        status = complete ? INTERFACE_REMOVED : INTERFACE_RETRY;
+        if (pending->enumerated) status = INTERFACE_PRESENT;
+        else if (class_key && *pending->interface_path)
+            status = get_controller_interface_status(class_key, pending->interface_path, pending->path);
+        if (status == INTERFACE_REMOVED || status == INTERFACE_INCOMPLETE)
+        {
+            *entry = pending->next;
+            free(pending);
+        }
+        else entry = &pending->next;
+        if (status == INTERFACE_RETRY) complete = FALSE;
+    }
+    if (class_key) RegCloseKey(class_key);
+    /* A slot freed after enumeration may admit an already-present fifth pad. */
+    if (!complete) discovery_dirty = TRUE;
+}
+
+/* xinput_cs must be held. Only actual changes require a full scan. Pending
+ * devices remain immediately retryable even before the arrival message runs. */
 static void update_controller_list(void)
 {
-    char buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + MAX_PATH * sizeof(WCHAR)];
-    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
-    GUID guid = GUID_DEVINTERFACE_WINEXINPUT;
-    HDEVINFO set;
-    DWORD idx;
+    struct pending_controller **entry, *pending;
+    ULONGLONG now = GetTickCount64();
+    BOOL monitored;
+    unsigned int i;
 
-    EnterCriticalSection(&xinput_cs);
-
-    set = SetupDiGetClassDevsW(&guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
-    detail->cbSize = sizeof(*detail);
-
-    idx = 0;
-    while (SetupDiEnumDeviceInterfaces(set, NULL, &guid, idx++, &iface))
+    monitored = check_discovery_watches();
+    if (!monitored && (!discovery_retry_time || now >= discovery_retry_time))
     {
-        if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, sizeof(buffer), NULL, NULL))
-            continue;
-        if (!try_add_device(detail->DevicePath))
-            break;
+        for (i = 0; i < ARRAY_SIZE(discovery_watches); ++i) arm_discovery_watch(i);
+        monitored = check_discovery_watches();
     }
+    if (!monitored) discovery_dirty = TRUE;
+    if (discovery_dirty) enumerate_controllers();
+    if (discovery_dirty && monitored) enumerate_controllers();
 
-    SetupDiDestroyDeviceInfoList(set);
+    for (entry = &pending_controllers; (pending = *entry);)
+    {
+        enum discovery_result result = try_add_device(pending->path);
 
-    LeaveCriticalSection(&xinput_cs);
+        set_controller_interface_path(pending->path, pending->interface_path);
+        if (result == DISCOVERY_PENDING) entry = &pending->next;
+        else
+        {
+            *entry = pending->next;
+            free(pending);
+        }
+    }
+    if (!monitored || discovery_dirty || pending_controllers)
+    {
+        if (!discovery_retry_time || now >= discovery_retry_time) discovery_retry_time = now + 2000;
+    }
+    else discovery_retry_time = 0;
 }
 
 static LONG sign_extend(ULONG value, const HIDP_VALUE_CAPS *caps)
@@ -578,9 +1072,10 @@ static void read_controller_state(struct xinput_controller *controller)
     ULONG i, button_length, value;
     BOOL ret;
 
-    if (!GetOverlappedResult(controller->device, &controller->hid.read_ovl, &read_len, TRUE))
+    /* An API query may have replaced this slot after the worker's wait. */
+    if (!GetOverlappedResult(controller->device, &controller->hid.read_ovl, &read_len, FALSE))
     {
-        if (GetLastError() == ERROR_OPERATION_ABORTED) return;
+        if (GetLastError() == ERROR_OPERATION_ABORTED || GetLastError() == ERROR_IO_INCOMPLETE) return;
         if (GetLastError() == ERROR_ACCESS_DENIED || GetLastError() == ERROR_INVALID_HANDLE ||
             GetLastError() == ERROR_DEVICE_NOT_CONNECTED)
         {
@@ -673,14 +1168,42 @@ static void read_controller_state(struct xinput_controller *controller)
 
 static LRESULT CALLBACK xinput_devnotify_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
+    const DEV_BROADCAST_DEVICEINTERFACE_W *iface = (void *)lparam;
+    HIDD_ATTRIBUTES attributes = {.Size = sizeof(attributes)};
+    DWORD error;
+    unsigned int i;
+
     if (msg == WM_DEVICECHANGE)
     {
-        DEV_BROADCAST_DEVICEINTERFACE_W *iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)lparam;
-
-        EnterCriticalSection(&xinput_cs);
-        if (wparam == DBT_DEVICEARRIVAL) try_add_device(iface->dbcc_name);
-        if (wparam == DBT_DEVICEREMOVECOMPLETE) try_remove_device(iface->dbcc_name);
-        LeaveCriticalSection(&xinput_cs);
+        if (wparam == DBT_DEVICEARRIVAL || wparam == DBT_DEVICEREMOVECOMPLETE)
+        {
+            EnterCriticalSection(&xinput_cs);
+            /* With input disabled there may be no read to notice unplugging.
+             * A removal for a reused path is authoritative only if the cached
+             * handle is dead. A late message must not retire a live replacement. */
+            if (wparam == DBT_DEVICEREMOVECOMPLETE && iface &&
+                iface->dbcc_devicetype == DBT_DEVTYP_DEVICEINTERFACE &&
+                IsEqualGUID(&iface->dbcc_classguid, &GUID_DEVINTERFACE_WINEXINPUT))
+            {
+                for (i = 0; i < XUSER_MAX_COUNT; ++i)
+                {
+                    if (!controllers[i].device || wcsicmp(controllers[i].device_path, iface->dbcc_name)) continue;
+                    if (HidD_GetAttributes(controllers[i].device, &attributes)) continue;
+                    error = GetLastError();
+                    /* HID removal's STATUS_DELETE_PENDING / STATUS_FILE_DELETED
+                     * both map to ERROR_ACCESS_DENIED in Wine. */
+                    if (error == ERROR_DEVICE_NOT_CONNECTED || error == ERROR_INVALID_HANDLE ||
+                        error == ERROR_ACCESS_DENIED || error == ERROR_NO_SUCH_DEVICE ||
+                        error == ERROR_DEVICE_REMOVED)
+                        controller_destroy(controllers + i, FALSE);
+                }
+            }
+            /* Reconcile current interfaces rather than replaying a stale
+             * removal message against a replacement with the same path. */
+            discovery_dirty = TRUE;
+            update_controller_list();
+            LeaveCriticalSection(&xinput_cs);
+        }
     }
 
     return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -688,9 +1211,10 @@ static LRESULT CALLBACK xinput_devnotify_wndproc(HWND hwnd, UINT msg, WPARAM wpa
 
 static DWORD WINAPI hid_update_thread_proc(void *param)
 {
-    struct xinput_controller *devices[XUSER_MAX_COUNT + 1];
-    HANDLE events[XUSER_MAX_COUNT + 1];
-    DWORD i, count = 1, ret = WAIT_TIMEOUT;
+    struct xinput_controller *devices[XUSER_MAX_COUNT];
+    HANDLE events[XUSER_MAX_COUNT + 1 + ARRAY_SIZE(discovery_watches)];
+    DWORD i, count = 0, read_count = 0, ret = WAIT_TIMEOUT, timeout;
+    ULONGLONG now;
     DEV_BROADCAST_DEVICEINTERFACE_W filter =
     {
         .dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE_W),
@@ -715,16 +1239,21 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
                            HWND_MESSAGE, NULL, NULL, NULL);
     notif = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
 
+    EnterCriticalSection(&xinput_cs);
+    init_discovery_watches();
     update_controller_list();
+    LeaveCriticalSection(&xinput_cs);
     SetEvent(start_event);
 
     do
     {
         if (ret == count) while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
-        if (ret == WAIT_TIMEOUT) update_controller_list();
-
         EnterCriticalSection(&xinput_cs);
-        if (ret < count - 1 && devices[ret]->device) read_controller_state(devices[ret]);
+        if (ret < read_count && devices[ret]->device) read_controller_state(devices[ret]);
+        /* Ready HID reports must not starve a registry change or retry. */
+        if (!check_discovery_watches()) discovery_dirty = TRUE;
+        if (ret >= read_count || discovery_dirty ||
+            (discovery_retry_time && GetTickCount64() >= discovery_retry_time)) update_controller_list();
         for (count = 0, i = 0; i < XUSER_MAX_COUNT; ++i)
         {
             if (controllers[i].device && controllers[i].enabled)
@@ -734,10 +1263,16 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
                 count++;
             }
         }
+        read_count = count;
         events[count++] = update_event;
+        for (i = 0; i < ARRAY_SIZE(discovery_watches); ++i)
+            if (discovery_watches[i].event) events[count++] = discovery_watches[i].event;
+        now = GetTickCount64();
+        timeout = discovery_retry_time ? min(discovery_retry_time > now ? discovery_retry_time - now : 0, 2000)
+                                       : INFINITE;
         LeaveCriticalSection(&xinput_cs);
     }
-    while ((ret = MsgWaitForMultipleObjectsEx(count, events, 2000, QS_ALLINPUT, MWMO_ALERTABLE)) <= count ||
+    while ((ret = MsgWaitForMultipleObjectsEx(count, events, timeout, QS_ALLINPUT, MWMO_ALERTABLE)) <= count ||
             ret == WAIT_TIMEOUT);
 
     ERR("wait failed in the update thread, ret %lu, error %lu\n", ret, GetLastError());
@@ -745,6 +1280,9 @@ static DWORD WINAPI hid_update_thread_proc(void *param)
     UnregisterDeviceNotification(notif);
     DestroyWindow(hwnd);
     UnregisterClassW(cls.lpszClassName, xinput_instance);
+    EnterCriticalSection(&xinput_cs);
+    destroy_discovery_watches();
+    LeaveCriticalSection(&xinput_cs);
 
     FreeLibraryAndExitThread(xinput_instance, ret);
 }
@@ -850,7 +1388,6 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
 static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
 {
     DWORD ret;
-    const char *sgi;
 
     if (!state) return ERROR_BAD_ARGUMENTS;
 
@@ -860,9 +1397,6 @@ static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
 
     ret = get_current_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
     if (ret == ERROR_SUCCESS) goto done;
-    sgi = getenv("SteamGameId");
-    if (sgi && !strcmp(sgi, "298110")) goto done;
-
     EnterCriticalSection(&xinput_cs);
     update_controller_list();
     ret = get_current_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;

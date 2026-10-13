@@ -35,6 +35,8 @@
 #include "unknwn.h"
 #include "winstring.h"
 #include "cfgmgr32.h"
+#include "setupapi.h"
+#include "xinput.h"
 
 #include "wine/hid.h"
 
@@ -1612,10 +1614,376 @@ next:
     CloseHandle( controller_removed.event );
 }
 
+static const GUID xinput_interface_class =
+    {0x6c53d5fd, 0x6480, 0x440f, {0xb6, 0x18, 0x47, 0x67, 0x50, 0xc5, 0xe1, 0xa6}};
+
+static DWORD (WINAPI *xinput_get_state)( DWORD, XINPUT_STATE * );
+static DWORD (WINAPI *xinput_get_capabilities)( DWORD, DWORD, XINPUT_CAPABILITIES * );
+static DWORD (WINAPI *xinput_set_state)( DWORD, XINPUT_VIBRATION * );
+static void (WINAPI *xinput_enable)( BOOL );
+
+static HKEY create_xinput_interface( HDEVINFO set, SP_DEVINFO_DATA *device, WCHAR *path,
+                                     SP_DEVICE_INTERFACE_DATA *iface, BOOL *created )
+{
+    WCHAR buffer[MAX_PATH * 2], key_path[MAX_PATH * 3], *name;
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (void *)buffer;
+    DWORD linked = 1;
+    HKEY key, control;
+    LSTATUS status;
+    BOOL ret;
+
+    ret = SetupDiCreateDeviceInterfaceW( set, device, &xinput_interface_class, NULL, 0, iface );
+    ok( ret, "SetupDiCreateDeviceInterfaceW failed, error %lu\n", GetLastError() );
+    if (!ret) return NULL;
+    *created = TRUE;
+
+    detail->cbSize = sizeof(*detail);
+    ret = SetupDiGetDeviceInterfaceDetailW( set, iface, detail, sizeof(buffer), NULL, NULL );
+    ok( ret, "SetupDiGetDeviceInterfaceDetailW failed, error %lu\n", GetLastError() );
+    if (!ret) return NULL;
+    wcscpy( path, detail->DevicePath );
+
+    swprintf( key_path, ARRAY_SIZE(key_path), L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+              L"{6c53d5fd-6480-440f-b618-476750c5e1a6}\\%s", detail->DevicePath );
+    name = key_path + wcslen(key_path) - wcslen(detail->DevicePath);
+    name[0] = name[1] = name[3] = '#';
+    wcscat( key_path, L"\\#" );
+
+    status = RegOpenKeyExW( HKEY_LOCAL_MACHINE, key_path, 0, KEY_ALL_ACCESS, &key );
+    ok( !status, "RegOpenKeyExW %s returned %ld\n", debugstr_w(key_path), status );
+    if (status) return NULL;
+
+    status = RegCreateKeyExW( key, L"Control", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &control, NULL );
+    ok( !status, "RegCreateKeyExW returned %ld\n", status );
+    if (!status)
+    {
+        status = RegSetValueExW( control, L"Linked", 0, REG_DWORD, (const BYTE *)&linked, sizeof(linked) );
+        ok( !status, "RegSetValueExW returned %ld\n", status );
+        RegCloseKey( control );
+    }
+    return key;
+}
+
+static HANDLE create_xinput_link( const WCHAR *path, const WCHAR *hid_path )
+{
+    NTSTATUS (WINAPI *open_link)( HANDLE *, ACCESS_MASK, OBJECT_ATTRIBUTES * );
+    NTSTATUS (WINAPI *query_link)( HANDLE, UNICODE_STRING *, ULONG * );
+    NTSTATUS (WINAPI *create_link)( HANDLE *, ACCESS_MASK, OBJECT_ATTRIBUTES *, UNICODE_STRING * );
+    WCHAR source[MAX_PATH], target_buffer[MAX_PATH], destination[MAX_PATH];
+    UNICODE_STRING name, target;
+    OBJECT_ATTRIBUTES attr;
+    HANDLE source_link, link;
+    NTSTATUS status;
+    HMODULE ntdll;
+
+    ntdll = GetModuleHandleW( L"ntdll.dll" );
+    open_link = (void *)GetProcAddress( ntdll, "NtOpenSymbolicLinkObject" );
+    query_link = (void *)GetProcAddress( ntdll, "NtQuerySymbolicLinkObject" );
+    create_link = (void *)GetProcAddress( ntdll, "NtCreateSymbolicLinkObject" );
+
+    swprintf( source, ARRAY_SIZE(source), L"\\??\\%s", hid_path + 4 );
+    name.Buffer = source;
+    name.Length = wcslen(source) * sizeof(WCHAR);
+    name.MaximumLength = sizeof(source);
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+    status = open_link( &source_link, SYMBOLIC_LINK_QUERY, &attr );
+    ok( !status, "NtOpenSymbolicLinkObject returned %#lx\n", status );
+    if (status) return NULL;
+    target.Buffer = target_buffer;
+    target.Length = 0;
+    target.MaximumLength = sizeof(target_buffer);
+    status = query_link( source_link, &target, NULL );
+    ok( !status, "NtQuerySymbolicLinkObject returned %#lx\n", status );
+    CloseHandle( source_link );
+    if (status) return NULL;
+
+    swprintf( destination, ARRAY_SIZE(destination), L"\\??\\%s", path + 4 );
+    name.Buffer = destination;
+    name.Length = wcslen(destination) * sizeof(WCHAR);
+    name.MaximumLength = sizeof(destination);
+    status = create_link( &link, SYMBOLIC_LINK_ALL_ACCESS, &attr, &target );
+    ok( !status, "NtCreateSymbolicLinkObject returned %#lx\n", status );
+    return status ? NULL : link;
+}
+
+static void test_xinput_discovery(void)
+{
+#include "psh_hid_macros.h"
+    static const unsigned char report_desc[] =
+    {
+        USAGE_PAGE(1, HID_USAGE_PAGE_GENERIC),
+        USAGE(1, HID_USAGE_GENERIC_GAMEPAD),
+        COLLECTION(1, Application),
+            USAGE_PAGE(1, HID_USAGE_PAGE_BUTTON),
+            USAGE_MINIMUM(1, 1),
+            USAGE_MAXIMUM(1, 16),
+            LOGICAL_MINIMUM(1, 0),
+            LOGICAL_MAXIMUM(1, 1),
+            REPORT_SIZE(1, 1),
+            REPORT_COUNT(1, 16),
+            INPUT(1, Data|Var|Abs),
+            USAGE_PAGE(1, HID_USAGE_PAGE_GENERIC),
+            USAGE(1, HID_USAGE_GENERIC_X),
+            USAGE(1, HID_USAGE_GENERIC_Y),
+            USAGE(1, HID_USAGE_GENERIC_RX),
+            USAGE(1, HID_USAGE_GENERIC_RY),
+            LOGICAL_MINIMUM(2, -32768),
+            LOGICAL_MAXIMUM(2, 32767),
+            REPORT_SIZE(1, 16),
+            REPORT_COUNT(1, 4),
+            INPUT(1, Data|Var|Abs),
+            USAGE(1, HID_USAGE_GENERIC_Z),
+            USAGE(1, HID_USAGE_GENERIC_RZ),
+            LOGICAL_MINIMUM(1, 0),
+            LOGICAL_MAXIMUM(2, 255),
+            REPORT_SIZE(1, 8),
+            REPORT_COUNT(1, 2),
+            INPUT(1, Data|Var|Abs),
+        END_COLLECTION,
+    };
+#include "pop_hid_macros.h"
+    struct hid_device_desc desc[2] =
+    {
+        {
+            .caps = {.InputReportByteLength = 13},
+            .attributes = default_attributes,
+            .product_str = L"Wine XInput discovery fixture",
+            .serial_str = L"xinput_discovery_0",
+        },
+    };
+    SP_DEVICE_INTERFACE_DATA hid_iface = {sizeof(hid_iface)}, iface[2] = {{sizeof(*iface)}, {sizeof(*iface)}};
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail;
+    SP_DEVINFO_DATA device[2] = {{sizeof(*device)}, {sizeof(*device)}};
+    WCHAR buffer[MAX_PATH * 2], hid_path[2][MAX_PATH], path[2][MAX_PATH];
+    WCHAR override_path[MAX_PATH * 2], malformed_path[MAX_PATH * 2], module[MAX_PATH], *filename;
+    XINPUT_VIBRATION vibration = {0};
+    XINPUT_CAPABILITIES caps;
+    HANDLE links[2] = {0};
+    HKEY override_key = NULL, malformed_key, iface_keys[2] = {0};
+    BYTE *saved_override = NULL;
+    XINPUT_STATE state;
+    DWORD index, result, disposition, saved_size = 0, saved_type;
+    HDEVINFO set = INVALID_HANDLE_VALUE;
+    HMODULE xinput;
+    BOOL ret, started = FALSE, override_modified = FALSE;
+    BOOL iface_created[2] = {0};
+    BOOL malformed_created = FALSE, input_disabled = FALSE;
+    LSTATUS status;
+
+    if (strcmp( winetest_platform, "wine" ))
+    {
+        win_skip( "XInput discovery tests require Wine's interface registry source\n" );
+        return;
+    }
+    xinput = LoadLibraryW( L"xinput1_3.dll" );
+    ok( !!xinput, "LoadLibraryW failed, error %lu\n", GetLastError() );
+    if (!xinput) return;
+    xinput_get_state = (void *)GetProcAddress( xinput, "XInputGetState" );
+    xinput_get_capabilities = (void *)GetProcAddress( xinput, "XInputGetCapabilities" );
+    xinput_set_state = (void *)GetProcAddress( xinput, "XInputSetState" );
+    xinput_enable = (void *)GetProcAddress( xinput, "XInputEnable" );
+
+    for (index = 0; index < XUSER_MAX_COUNT; ++index)
+        if (xinput_get_state( index, &state ) != ERROR_DEVICE_NOT_CONNECTED) break;
+    if (index != XUSER_MAX_COUNT)
+    {
+        skip( "XInput discovery requires no connected physical controllers\n" );
+        goto done;
+    }
+
+    desc[0].report_descriptor_len = sizeof(report_desc);
+    memcpy( desc[0].report_descriptor_buf, report_desc, sizeof(report_desc) );
+    desc[1] = desc[0];
+    desc[1].attributes.ProductID++;
+    wcscpy( desc[1].serial_str, L"xinput_discovery_1" );
+    if (!(started = hid_device_start( desc, ARRAY_SIZE(desc) ))) goto done;
+
+    set = SetupDiGetClassDevsW( &GUID_DEVINTERFACE_HID, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT );
+    for (index = 0; index < ARRAY_SIZE(desc); ++index)
+    {
+        swprintf( hid_path[index], ARRAY_SIZE(*hid_path), L"\\\\?\\hid#vid_%04x&pid_%04x",
+                  desc[index].attributes.VendorID, desc[index].attributes.ProductID );
+        ret = find_hid_device_path( hid_path[index] );
+        ok( ret, "Could not find synthetic HID device\n" );
+        if (!ret) goto done;
+        ret = SetupDiOpenDeviceInterfaceW( set, hid_path[index], 0, &hid_iface );
+        ok( ret, "SetupDiOpenDeviceInterfaceW failed, error %lu\n", GetLastError() );
+        detail = (void *)buffer;
+        detail->cbSize = sizeof(*detail);
+        ret = SetupDiGetDeviceInterfaceDetailW( set, &hid_iface, detail, sizeof(buffer), NULL, &device[index] );
+        ok( ret, "SetupDiGetDeviceInterfaceDetailW failed, error %lu\n", GetLastError() );
+        if (!ret) goto done;
+    }
+
+    GetModuleFileNameW( NULL, module, ARRAY_SIZE(module) );
+    filename = wcsrchr( module, '\\' );
+    if (!filename) filename = module;
+    else filename++;
+    swprintf( override_path, ARRAY_SIZE(override_path), L"Software\\Wine\\AppDefaults\\%s\\DirectInput\\Joysticks", filename );
+    status = RegCreateKeyExW( HKEY_CURRENT_USER, override_path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &override_key, &disposition );
+    ok( !status, "RegCreateKeyExW returned %ld\n", status );
+    if (status) goto done;
+    status = RegQueryValueExW( override_key, desc[0].product_str, NULL, &saved_type, NULL, &saved_size );
+    ok( !status || status == ERROR_FILE_NOT_FOUND, "RegQueryValueExW returned %ld\n", status );
+    if (!status)
+    {
+        saved_override = malloc( max(saved_size, 1) );
+        ok( !!saved_override, "Failed to save previous override\n" );
+        if (!saved_override) goto done;
+        status = RegQueryValueExW( override_key, desc[0].product_str, NULL, &saved_type, saved_override, &saved_size );
+        ok( !status, "RegQueryValueExW returned %ld\n", status );
+        if (status) goto done;
+    }
+    if (status && status != ERROR_FILE_NOT_FOUND) goto done;
+    status = RegSetValueExW( override_key, desc[0].product_str, 0, REG_SZ, (const BYTE *)L"disabled", sizeof(L"disabled") );
+    ok( !status, "RegSetValueExW returned %ld\n", status );
+    if (status) goto done;
+    override_modified = TRUE;
+
+    iface_keys[0] = create_xinput_interface( set, &device[0], path[0], &iface[0], &iface_created[0] );
+    if (!iface_keys[0]) goto done;
+    links[0] = create_xinput_link( path[0], hid_path[0] );
+    if (!links[0]) goto done;
+
+    result = xinput_get_state( 0, &state );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Disabled controller returned %lu\n", result );
+    result = xinput_get_capabilities( 0, 0, &caps );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Disabled capabilities returned %lu\n", result );
+    result = xinput_set_state( 0, &vibration );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Disabled vibration returned %lu\n", result );
+
+    status = RegDeleteValueW( override_key, desc[0].product_str );
+    ok( !status, "RegDeleteValueW returned %ld\n", status );
+    result = xinput_get_state( 0, &state );
+    ok( result == ERROR_SUCCESS, "Immediate query after removing override returned %lu\n", result );
+
+    /* A published interface is not necessarily openable yet. Retry that path
+     * even if making it usable does not send another registry notification. */
+    iface_keys[1] = create_xinput_interface( set, &device[1], path[1], &iface[1], &iface_created[1] );
+    if (!iface_keys[1]) goto done;
+    result = xinput_get_state( 1, &state );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Unusable interface returned %lu\n", result );
+    links[1] = create_xinput_link( path[1], hid_path[1] );
+    if (!links[1]) goto done;
+    result = xinput_get_state( 1, &state );
+    ok( result == ERROR_SUCCESS, "Immediate query after path became usable returned %lu\n", result );
+    result = xinput_get_capabilities( 1, 0, &caps );
+    ok( result == ERROR_SUCCESS, "Capabilities after discovery returned %lu\n", result );
+    result = xinput_set_state( 1, &vibration );
+    ok( result == ERROR_SUCCESS, "Vibration after discovery returned %lu\n", result );
+
+    /* An incomplete, unrelated registration must not prevent removal of a
+     * known interface. Disable reads so they cannot mask stale discovery. */
+    swprintf( malformed_path, ARRAY_SIZE(malformed_path), L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+              L"{6c53d5fd-6480-440f-b618-476750c5e1a6}\\##?#xinput-discovery-incomplete-%lu", GetCurrentProcessId() );
+    status = RegCreateKeyExW( HKEY_LOCAL_MACHINE, malformed_path, 0, NULL, 0, KEY_ALL_ACCESS,
+                              NULL, &malformed_key, &result );
+    ok( !status, "RegCreateKeyExW returned %ld\n", status );
+    if (status) goto done;
+    malformed_created = result == REG_CREATED_NEW_KEY;
+    RegCloseKey( malformed_key );
+    xinput_enable( FALSE );
+    input_disabled = TRUE;
+    ret = SetupDiRemoveDeviceInterface( set, &iface[0] );
+    ok( ret, "SetupDiRemoveDeviceInterface failed, error %lu\n", GetLastError() );
+    if (ret) iface_created[0] = FALSE;
+    RegCloseKey( iface_keys[0] );
+    iface_keys[0] = NULL;
+    /* The connected-state fast path remains asynchronous. An empty-slot
+     * query must reconcile the change before returning. */
+    result = xinput_get_state( XUSER_MAX_COUNT - 1, &state );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Empty-slot query returned %lu\n", result );
+    result = xinput_get_state( 0, &state );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Removed interface returned %lu\n", result );
+    result = xinput_get_state( 1, &state );
+    ok( result == ERROR_SUCCESS, "Remaining interface returned %lu\n", result );
+    xinput_enable( TRUE );
+    input_disabled = FALSE;
+    if (malformed_created)
+    {
+        status = RegDeleteKeyW( HKEY_LOCAL_MACHINE, malformed_path );
+        ok( !status, "RegDeleteKeyW returned %ld\n", status );
+        if (!status) malformed_created = FALSE;
+    }
+
+    status = RegSetValueExW( override_key, desc[0].product_str, 0, REG_SZ, (const BYTE *)L"disabled", sizeof(L"disabled") );
+    ok( !status, "RegSetValueExW returned %ld\n", status );
+    result = xinput_get_state( XUSER_MAX_COUNT - 1, &state );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Empty-slot query returned %lu\n", result );
+    result = xinput_get_state( 1, &state );
+    ok( result == ERROR_DEVICE_NOT_CONNECTED, "Newly disabled interface returned %lu\n", result );
+    status = RegDeleteValueW( override_key, desc[0].product_str );
+    ok( !status, "RegDeleteValueW returned %ld\n", status );
+    result = xinput_get_capabilities( 0, 0, &caps );
+    ok( result == ERROR_SUCCESS, "Immediate capabilities after removing override returned %lu\n", result );
+
+    if (disposition == REG_CREATED_NEW_KEY)
+    {
+        status = RegDeleteKeyW( HKEY_CURRENT_USER, override_path );
+        ok( !status, "RegDeleteKeyW returned %ld\n", status );
+        result = xinput_get_state( XUSER_MAX_COUNT - 1, &state );
+        ok( result == ERROR_DEVICE_NOT_CONNECTED, "Query after deleting override key returned %lu\n", result );
+        RegCloseKey( override_key );
+        override_key = NULL;
+        status = RegCreateKeyExW( HKEY_CURRENT_USER, override_path, 0, NULL, 0,
+                                  KEY_ALL_ACCESS, NULL, &override_key, NULL );
+        ok( !status, "RegCreateKeyExW returned %ld\n", status );
+        if (status) goto done;
+        status = RegSetValueExW( override_key, desc[0].product_str, 0, REG_SZ,
+                                 (const BYTE *)L"disabled", sizeof(L"disabled") );
+        ok( !status, "RegSetValueExW returned %ld\n", status );
+        result = xinput_get_state( XUSER_MAX_COUNT - 1, &state );
+        ok( result == ERROR_DEVICE_NOT_CONNECTED, "Empty-slot query returned %lu\n", result );
+        result = xinput_get_state( 0, &state );
+        ok( result == ERROR_DEVICE_NOT_CONNECTED, "Recreated disabled override returned %lu\n", result );
+        status = RegDeleteValueW( override_key, desc[0].product_str );
+        ok( !status, "RegDeleteValueW returned %ld\n", status );
+        result = xinput_set_state( 0, &vibration );
+        ok( result == ERROR_SUCCESS, "Immediate vibration after removing override returned %lu\n", result );
+    }
+
+done:
+    if (input_disabled) xinput_enable( TRUE );
+    if (malformed_created)
+    {
+        status = RegDeleteKeyW( HKEY_LOCAL_MACHINE, malformed_path );
+        ok( !status, "RegDeleteKeyW returned %ld\n", status );
+    }
+    for (index = 0; index < ARRAY_SIZE(iface_keys); ++index)
+    {
+        if (iface_keys[index]) RegCloseKey( iface_keys[index] );
+        if (iface_created[index])
+        {
+            ret = SetupDiRemoveDeviceInterface( set, &iface[index] );
+            ok( ret, "SetupDiRemoveDeviceInterface failed, error %lu\n", GetLastError() );
+        }
+        if (links[index]) CloseHandle( links[index] );
+    }
+    if (override_key)
+    {
+        if (override_modified)
+        {
+            if (saved_override)
+                status = RegSetValueExW( override_key, desc[0].product_str, 0, saved_type, saved_override, saved_size );
+            else
+                status = RegDeleteValueW( override_key, desc[0].product_str );
+            ok( !status || status == ERROR_FILE_NOT_FOUND, "Restoring override returned %ld\n", status );
+        }
+        RegCloseKey( override_key );
+        if (disposition == REG_CREATED_NEW_KEY) RegDeleteKeyW( HKEY_CURRENT_USER, override_path );
+    }
+    free( saved_override );
+    if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList( set );
+    if (started) hid_device_stop( desc, ARRAY_SIZE(desc) );
+    FreeLibrary( xinput );
+}
+
 START_TEST( hotplug )
 {
     dinput_test_init();
     if (!bus_device_start()) goto done;
+
+    test_xinput_discovery();
 
     if (test_input_lost( 0x500 ))
     {
