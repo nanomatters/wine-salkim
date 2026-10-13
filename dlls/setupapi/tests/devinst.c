@@ -2074,6 +2074,405 @@ static void test_device_iface(void)
     ok(ret, "Failed to destroy device list, error %#lx.\n", GetLastError());
 }
 
+static BOOL cleanup_device_interface_alias_tests(void)
+{
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    WCHAR instance_id[MAX_DEVICE_ID_LEN];
+    DWORD i, error;
+    HDEVINFO set;
+    BOOL ret;
+
+    /* Recover the test fixtures left by an interrupted run, including devices
+     * that had not yet been registered. */
+    set = SetupDiGetClassDevsW(&guid, L"ROOT", NULL, 0);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to enumerate test devices, error %#lx.\n", GetLastError());
+    if (set == INVALID_HANDLE_VALUE) return FALSE;
+
+    for (i = 0; SetupDiEnumDeviceInfo(set, i, &device); ++i)
+    {
+        ret = SetupDiGetDeviceInstanceIdW(set, &device, instance_id, ARRAY_SIZE(instance_id), NULL);
+        ok(ret, "Failed to get test device id, error %#lx.\n", GetLastError());
+        if (!ret) goto done;
+        if (wcsicmp(instance_id, L"ROOT\\WINE_ALIAS_TEST\\0000")
+                && wcsicmp(instance_id, L"ROOT\\WINE_ALIAS_TEST\\0001")
+                && wcsicmp(instance_id, L"ROOT\\WINE_ALIAS_ACTIVE_TEST\\0000"))
+            continue;
+        ret = SetupDiRemoveDevice(set, &device);
+        ok(ret, "Failed to remove leftover %s, error %#lx.\n", wine_dbgstr_w(instance_id), GetLastError());
+        if (!ret) goto done;
+    }
+    error = GetLastError();
+    ret = error == ERROR_NO_MORE_ITEMS;
+    ok(ret, "Failed to enumerate test devices, error %#lx.\n", error);
+done:
+    SetupDiDestroyDeviceInfoList(set);
+    return ret;
+}
+
+static void test_device_interface_alias_active(void)
+{
+    static const struct
+    {
+        GUID class;
+        WCHAR class_string[39];
+        BOOL synthetic_audio;
+    }
+    classes[] =
+    {
+        {{0xe6327cad, 0xdcec, 0x4949, {0xae,0x8a,0x99,0x1e,0x97,0x6a,0x79,0xd2}},
+                L"{e6327cad-dcec-4949-ae8a-991e976a79d2}", TRUE},
+        {{0x2eef81be, 0x33fa, 0x4800, {0x96,0x70,0x1c,0xd4,0x74,0x97,0x2c,0x3f}},
+                L"{2eef81be-33fa-4800-9670-1cd474972c3f}", TRUE},
+        {{0x6994ad04, 0x93ef, 0x11d0, {0xa3,0xcc,0x00,0xa0,0xc9,0x22,0x31,0x96}},
+                L"{6994ad04-93ef-11d0-a3cc-00a0c9223196}", TRUE},
+        {{0xdeadf00d, 0x3f65, 0x11db, {0xb7,0x04,0x00,0x11,0x95,0x5c,0x2b,0xdb}},
+                L"{deadf00d-3f65-11db-b704-0011955c2bdb}", FALSE},
+    };
+    static const WCHAR instance_id[] = L"ROOT\\WINE_ALIAS_ACTIVE_TEST\\0000";
+    SP_DEVICE_INTERFACE_DATA source = {sizeof(source)}, target = {sizeof(target)};
+    SP_DEVICE_INTERFACE_DATA alias = {sizeof(alias)}, imported = {sizeof(imported)};
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    WCHAR path[256], symlink[256], value[256];
+    DWORD size, value_size, linked, expected_flags;
+    HDEVINFO set, enum_set;
+    HKEY key, control_key;
+    unsigned int i;
+    LONG error;
+    int state;
+    BOOL ret;
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        skip("Synthetic audio interface state is Wine-specific.\n");
+        return;
+    }
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create list, error %#lx.\n", GetLastError());
+    if (set == INVALID_HANDLE_VALUE) return;
+    ret = SetupDiCreateDeviceInfoW(set, instance_id, &guid, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    if (!ret) goto done;
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid, L"active", 0, &source);
+    ok(ret, "Failed to create source interface, error %#lx.\n", GetLastError());
+    if (!ret) goto remove_device;
+
+    for (i = 0; i < ARRAY_SIZE(classes); ++i)
+    {
+        winetest_push_context("class %u", i);
+        ret = SetupDiCreateDeviceInterfaceW(set, &device, &classes[i].class, L"active", 0, &target);
+        ok(ret, "Failed to create target interface, error %#lx.\n", GetLastError());
+        if (!ret) goto next_class;
+        expected_flags = classes[i].synthetic_audio ? SPINT_ACTIVE : 0;
+        ok(target.Flags == expected_flags, "Created flags %#lx, expected %#lx.\n", target.Flags, expected_flags);
+        ret = SetupDiGetDeviceInterfaceAlias(set, &source, &classes[i].class, &alias);
+        ok(ret, "Failed to find cached alias, error %#lx.\n", GetLastError());
+        ok(alias.Flags == expected_flags, "Cached flags %#lx, expected %#lx.\n", alias.Flags, expected_flags);
+        ok(alias.Reserved == target.Reserved, "Lookup did not reuse the cached interface.\n");
+
+        swprintf(path, ARRAY_SIZE(path), L"System\\CurrentControlSet\\Control\\DeviceClasses\\%ls\\"
+                L"##?#ROOT#WINE_ALIAS_ACTIVE_TEST#0000#%ls\\#active",
+                classes[i].class_string, classes[i].class_string);
+        error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &key);
+        ok(!error, "Failed to open interface key, error %#lx.\n", error);
+        if (error) goto next_class;
+        size = sizeof(symlink);
+        error = RegQueryValueExW(key, L"SymbolicLink", NULL, NULL, (BYTE *)symlink, &size);
+        ok(!error, "Failed to read symbolic link, error %#lx.\n", error);
+        if (error) goto close_key;
+
+        for (state = -1; state <= 1; ++state)
+        {
+            winetest_push_context("Linked %d", state);
+            if (state >= 0)
+            {
+                linked = state;
+                error = RegCreateKeyW(key, L"Control", &control_key);
+                ok(!error, "Failed to create Control, error %#lx.\n", error);
+                if (error) goto next_state;
+                error = RegSetValueExW(control_key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+                ok(!error, "Failed to set Linked, error %#lx.\n", error);
+                RegCloseKey(control_key);
+                if (error) goto next_state;
+            }
+
+            /* Only enumerate the source class, leaving the target's state untouched. */
+            enum_set = SetupDiGetClassDevsW(&iface_guid, instance_id, NULL, DIGCF_DEVICEINTERFACE);
+            ok(enum_set != INVALID_HANDLE_VALUE, "Failed to enumerate source, error %#lx.\n", GetLastError());
+            if (enum_set == INVALID_HANDLE_VALUE) goto next_state;
+            ret = SetupDiEnumDeviceInterfaces(enum_set, NULL, &iface_guid, 0, &imported);
+            ok(ret, "Failed to get source interface, error %#lx.\n", GetLastError());
+            if (ret)
+            {
+                ret = SetupDiGetDeviceInterfaceAlias(enum_set, &imported, &classes[i].class, &alias);
+                ok(ret, "Failed to import alias, error %#lx.\n", GetLastError());
+                expected_flags = classes[i].synthetic_audio || state > 0 ? SPINT_ACTIVE : 0;
+                ok(alias.Flags == expected_flags, "Imported flags %#lx, expected %#lx.\n", alias.Flags, expected_flags);
+                target = alias;
+                ret = SetupDiGetDeviceInterfaceAlias(enum_set, &imported, &classes[i].class, &alias);
+                ok(ret, "Failed to find imported cached alias, error %#lx.\n", GetLastError());
+                ok(alias.Reserved == target.Reserved && alias.Flags == target.Flags,
+                        "Repeated lookup changed the imported interface.\n");
+            }
+            SetupDiDestroyDeviceInfoList(enum_set);
+
+            error = RegOpenKeyExW(key, L"Control", 0, KEY_READ, &control_key);
+            if (state < 0)
+            {
+                ok(error == ERROR_FILE_NOT_FOUND, "Lookup created Control, error %#lx.\n", error);
+                if (!error) RegCloseKey(control_key);
+            }
+            else
+            {
+                ok(!error, "Failed to reopen Control, error %#lx.\n", error);
+                if (!error)
+                {
+                    value_size = sizeof(linked);
+                    error = RegQueryValueExW(control_key, L"Linked", NULL, NULL, (BYTE *)&linked, &value_size);
+                    ok(!error && value_size == sizeof(linked) && linked == state,
+                            "Lookup changed Linked to %lu, error %#lx.\n", linked, error);
+                    RegCloseKey(control_key);
+                }
+            }
+            value_size = sizeof(value);
+            error = RegQueryValueExW(key, L"SymbolicLink", NULL, NULL, (BYTE *)value, &value_size);
+            ok(!error && value_size == size && !memcmp(value, symlink, size), "Lookup changed SymbolicLink.\n");
+next_state:
+            winetest_pop_context();
+        }
+
+        enum_set = SetupDiGetClassDevsW(&classes[i].class, instance_id, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        ok(enum_set != INVALID_HANDLE_VALUE, "Failed to enumerate target, error %#lx.\n", GetLastError());
+        if (enum_set != INVALID_HANDLE_VALUE)
+        {
+            ret = SetupDiEnumDeviceInterfaces(enum_set, NULL, &classes[i].class, 0, &imported);
+            ok(ret, "Failed to get target interface, error %#lx.\n", GetLastError());
+            ok(imported.Flags == SPINT_ACTIVE, "Enumerated flags %#lx.\n", imported.Flags);
+            SetupDiDestroyDeviceInfoList(enum_set);
+        }
+        ret = SetupDiGetDeviceInterfaceAlias(set, &source, &classes[i].class, &alias);
+        ok(ret, "Failed to find alias after enumeration, error %#lx.\n", GetLastError());
+        if (classes[i].synthetic_audio)
+            ok(alias.Flags == SPINT_ACTIVE, "Enumeration changed the cached audio flags to %#lx.\n", alias.Flags);
+close_key:
+        RegCloseKey(key);
+next_class:
+        winetest_pop_context();
+    }
+
+remove_device:
+    ret = SetupDiRemoveDevice(set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+done:
+    SetupDiDestroyDeviceInfoList(set);
+}
+
+static void test_device_interface_alias(void)
+{
+    static const WCHAR instance_id[] = L"ROOT\\WINE_ALIAS_TEST\\0000";
+    static const WCHAR other_instance_id[] = L"ROOT\\WINE_ALIAS_TEST\\0001";
+    static const WCHAR alias_key_path[] = L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+            L"{deadf00d-3f65-11db-b704-0011955c2bdb}\\"
+            L"##?#ROOT#WINE_ALIAS_TEST#0000#{deadf00d-3f65-11db-b704-0011955c2bdb}\\#SHARED";
+    BYTE buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + 256 * sizeof(WCHAR)];
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
+    SP_DEVICE_INTERFACE_DATA source = {sizeof(source)}, named_source = {sizeof(named_source)};
+    SP_DEVICE_INTERFACE_DATA alias = {sizeof(alias)}, expected = {sizeof(expected)}, invalid = {0};
+    SP_DEVICE_INTERFACE_DATA enumerated_source = {sizeof(enumerated_source)};
+    SP_DEVINFO_DATA device = {sizeof(device)}, other_device = {sizeof(other_device)};
+    HDEVINFO set, other_set, enum_set;
+    WCHAR expected_path[256], symlink[256], raw_symlink[256];
+    DWORD size, raw_size;
+    HKEY alias_key = NULL, parameters_key;
+    LONG error;
+    BOOL ret;
+
+    if (!cleanup_device_interface_alias_tests()) return;
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "Failed to create device list, error %#lx.\n", GetLastError());
+    if (set == INVALID_HANDLE_VALUE) return;
+
+    ret = SetupDiCreateDeviceInfoW(set, instance_id, &guid, NULL, NULL, 0, &device);
+    ok(ret, "Failed to create device, error %#lx.\n", GetLastError());
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register device, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInfoW(set, other_instance_id, &guid, NULL, NULL, 0, &other_device);
+    ok(ret, "Failed to create other device, error %#lx.\n", GetLastError());
+    ret = SetupDiRegisterDeviceInfo(set, &other_device, 0, NULL, NULL, NULL);
+    ok(ret, "Failed to register other device, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid, NULL, 0, &source);
+    ok(ret, "Failed to create source interface, error %#lx.\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(NULL, &source, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(INVALID_HANDLE_VALUE, &source, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, NULL, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &invalid, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    invalid.cbSize = sizeof(invalid);
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &invalid, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    invalid.Reserved = 1;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &invalid, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, NULL, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, &iface_guid, &alias);
+    ok(!ret && GetLastError() == ERROR_NO_SUCH_DEVICE_INTERFACE, "Got ret %d, error %#lx.\n", ret, GetLastError());
+
+    other_set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(other_set != INVALID_HANDLE_VALUE, "Failed to create other list, error %#lx.\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(other_set, &source, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetupDiDestroyDeviceInfoList(other_set);
+
+    /* Neither a matching reference on another device nor another reference on
+     * this device is an alias of the source interface. */
+    ret = SetupDiCreateDeviceInterfaceW(set, &other_device, &iface_guid2, NULL, 0, NULL);
+    ok(ret, "Failed to create other device interface, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid2, L"other", 0, NULL);
+    ok(ret, "Failed to create other reference, error %#lx.\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_NO_SUCH_DEVICE_INTERFACE, "Got ret %d, error %#lx.\n", ret, GetLastError());
+
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid2, L"", 0, &expected);
+    ok(ret, "Failed to create default alias, error %#lx.\n", GetLastError());
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, &iface_guid2, &alias);
+    ok(ret, "Failed to find default alias, error %#lx.\n", GetLastError());
+    ok(IsEqualGUID(&alias.InterfaceClassGuid, &iface_guid2), "Got class %s.\n",
+            wine_dbgstr_guid(&alias.InterfaceClassGuid));
+    ok(alias.Flags == expected.Flags, "Got flags %#lx, expected %#lx.\n", alias.Flags, expected.Flags);
+    ok(alias.Reserved == expected.Reserved, "Got interface %#Ix, expected %#Ix.\n", alias.Reserved, expected.Reserved);
+
+    invalid.cbSize = 0;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, &iface_guid2, &invalid);
+    ok(!ret && GetLastError() == ERROR_INVALID_USER_BUFFER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, &iface_guid2, NULL);
+    ok(!ret && GetLastError() == ERROR_INVALID_USER_BUFFER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid, L"shared", 0, &named_source);
+    ok(ret, "Failed to create named source, error %#lx.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid2, L"SHARED", 0, &expected);
+    ok(ret, "Failed to create named alias, error %#lx.\n", GetLastError());
+    ret = SetupDiGetDeviceInterfaceAlias(set, &named_source, &iface_guid2, &alias);
+    ok(ret, "Failed to find named alias, error %#lx.\n", GetLastError());
+    ok(alias.Reserved == expected.Reserved, "Got interface %#Ix, expected %#Ix.\n", alias.Reserved, expected.Reserved);
+    detail->cbSize = sizeof(*detail);
+    ret = SetupDiGetDeviceInterfaceDetailW(set, &alias, detail, sizeof(buffer), NULL, NULL);
+    ok(ret, "Failed to get alias path, error %#lx.\n", GetLastError());
+    lstrcpyW(expected_path, detail->DevicePath);
+
+    /* The input and output structures may be the same buffer. */
+    alias = named_source;
+    ret = SetupDiGetDeviceInterfaceAlias(set, &alias, &iface_guid2, &alias);
+    ok(ret, "Failed to find alias in place, error %#lx.\n", GetLastError());
+    ret = SetupDiGetDeviceInterfaceAlias(set, &alias, &iface_guid, &alias);
+    ok(ret, "Failed to find reverse alias, error %#lx.\n", GetLastError());
+    ok(alias.Reserved == named_source.Reserved, "Got interface %#Ix, expected %#Ix.\n",
+            alias.Reserved, named_source.Reserved);
+
+    enum_set = SetupDiGetClassDevsW(&iface_guid, instance_id, NULL, DIGCF_DEVICEINTERFACE);
+    ok(enum_set != INVALID_HANDLE_VALUE, "Failed to enumerate source class, error %#lx.\n", GetLastError());
+    ret = SetupDiEnumDeviceInterfaces(enum_set, NULL, &iface_guid, 1, &enumerated_source);
+    ok(ret, "Failed to enumerate named source, error %#lx.\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiEnumDeviceInterfaces(enum_set, NULL, &iface_guid2, 0, &alias);
+    ok(!ret && GetLastError() == ERROR_NO_MORE_ITEMS, "Got ret %d, error %#lx.\n", ret, GetLastError());
+
+    error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, alias_key_path, 0, KEY_ALL_ACCESS, &alias_key);
+    ok(!error, "Failed to open alias registry key, error %#lx.\n", error);
+    if (!error)
+    {
+        size = sizeof(symlink);
+        error = RegQueryValueExW(alias_key, L"SymbolicLink", NULL, NULL, (BYTE *)symlink, &size);
+        ok(!error, "Failed to read symbolic link, error %#lx.\n", error);
+        if (!error && size >= sizeof(WCHAR) && size <= sizeof(symlink))
+        {
+            /* Exercise a REG_SZ whose stored data does not include a terminator. */
+            size -= sizeof(WCHAR);
+            symlink[size / sizeof(WCHAR)] = '!';
+            error = RegSetValueExW(alias_key, L"SymbolicLink", 0, REG_SZ, (BYTE *)symlink, size - 1);
+            ok(!error, "Failed to write malformed symbolic link, error %#lx.\n", error);
+            SetLastError(0xdeadbeef);
+            ret = SetupDiGetDeviceInterfaceAlias(enum_set, &enumerated_source, &iface_guid2, &alias);
+            ok(!ret && GetLastError() == ERROR_INVALID_DATA, "Got ret %d, error %#lx.\n", ret, GetLastError());
+            error = RegSetValueExW(alias_key, L"SymbolicLink", 0, REG_SZ, (BYTE *)symlink, size);
+            ok(!error, "Failed to write unterminated symbolic link, error %#lx.\n", error);
+        }
+    }
+
+    /* Even an invalid output buffer must leave the discovered alias in the set. */
+    invalid.cbSize = 0;
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(enum_set, &enumerated_source, &iface_guid2, &invalid);
+    ok(!ret && GetLastError() == ERROR_INVALID_USER_BUFFER, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    alias.cbSize = sizeof(alias);
+    ret = SetupDiEnumDeviceInterfaces(enum_set, NULL, &iface_guid2, 0, &alias);
+    ok(ret, "Alias class was not added to the set, error %#lx.\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiEnumDeviceInterfaces(enum_set, NULL, &iface_guid2, 1, &alias);
+    ok(!ret && GetLastError() == ERROR_NO_MORE_ITEMS, "Got ret %d, error %#lx.\n", ret, GetLastError());
+    alias.cbSize = sizeof(alias);
+    ret = SetupDiGetDeviceInterfaceAlias(enum_set, &enumerated_source, &iface_guid2, &alias);
+    ok(ret, "Failed to find imported alias, error %#lx.\n", GetLastError());
+    ret = SetupDiGetDeviceInterfaceDetailW(enum_set, &alias, detail, sizeof(buffer), NULL, NULL);
+    ok(ret, "Failed to get imported alias path, error %#lx.\n", GetLastError());
+    ok(!wcsicmp(detail->DevicePath, expected_path), "Got alias path %s, expected %s.\n",
+            wine_dbgstr_w(detail->DevicePath), wine_dbgstr_w(expected_path));
+    parameters_key = SetupDiCreateDeviceInterfaceRegKeyW(enum_set, &alias, 0, KEY_ALL_ACCESS, NULL, NULL);
+    ok(parameters_key != INVALID_HANDLE_VALUE, "Failed to create imported alias parameters, error %#lx.\n", GetLastError());
+    if (parameters_key != INVALID_HANDLE_VALUE) RegCloseKey(parameters_key);
+    ret = SetupDiDeleteDeviceInterfaceRegKey(enum_set, &alias, 0);
+    ok(ret, "Failed to delete imported alias parameters, error %#lx.\n", GetLastError());
+    if (!error)
+    {
+        raw_size = sizeof(raw_symlink);
+        error = RegQueryValueExW(alias_key, L"SymbolicLink", NULL, NULL, (BYTE *)raw_symlink, &raw_size);
+        ok(!error, "Failed to read imported symbolic link, error %#lx.\n", error);
+        ok(raw_size == size, "Lookup changed registry size from %lu to %lu.\n", size, raw_size);
+        ok(!error && raw_size == size && !memcmp(raw_symlink, symlink, size), "Lookup changed registry data.\n");
+    }
+    if (alias_key) RegCloseKey(alias_key);
+    SetupDiDestroyDeviceInfoList(enum_set);
+
+    ret = SetupDiRemoveDeviceInterface(set, &expected);
+    ok(ret, "Failed to remove alias, error %#lx.\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &named_source, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_NO_SUCH_DEVICE_INTERFACE, "Got ret %d, error %#lx.\n", ret, GetLastError());
+
+    ret = SetupDiRemoveDeviceInterface(set, &source);
+    ok(ret, "Failed to remove source, error %#lx.\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = SetupDiGetDeviceInterfaceAlias(set, &source, &iface_guid2, &alias);
+    ok(!ret && GetLastError() == ERROR_NO_SUCH_DEVICE_INTERFACE, "Got ret %d, error %#lx.\n", ret, GetLastError());
+
+    ret = SetupDiRemoveDevice(set, &other_device);
+    ok(ret, "Failed to remove other device, error %#lx.\n", GetLastError());
+    ret = SetupDiRemoveDevice(set, &device);
+    ok(ret, "Failed to remove device, error %#lx.\n", GetLastError());
+    SetupDiDestroyDeviceInfoList(set);
+
+    test_device_interface_alias_active();
+}
+
 static void test_device_iface_detail(void)
 {
     static const char path[] = "\\\\?\\root#legacy_bogus#0000#{6a55b5a4-3f65-11db-b704-0011955c2bdb}";
@@ -5583,6 +5982,7 @@ START_TEST(devinst)
     test_open_device_info();
     test_register_device_info();
     test_device_iface();
+    test_device_interface_alias();
     test_device_iface_detail();
     test_device_key();
     test_register_device_iface();

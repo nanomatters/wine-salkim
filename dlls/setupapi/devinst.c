@@ -416,6 +416,24 @@ static BOOL is_linked(HKEY key)
     return ret;
 }
 
+DEFINE_GUID(DEVINTERFACE_AUDIO_RENDER, 0xe6327cad,0xdcec,0x4949,0xae,0x8a,0x99,0x1e,0x97,0x6a,0x79,0xd2);
+DEFINE_GUID(DEVINTERFACE_AUDIO_CAPTURE, 0x2eef81be,0x33fa,0x4800,0x96,0x70,0x1c,0xd4,0x74,0x97,0x2c,0x3f);
+DEFINE_GUID(AM_KSCATEGORY_AUDIO, 0x6994ad04,0x93ef,0x11d0,0xa3,0xcc,0x00,0xa0,0xc9,0x22,0x31,0x96);
+
+static BOOL is_synthetic_audio_interface(const GUID *class)
+{
+    /* These interfaces are supplied by mmdevapi rather than a PnP driver. */
+    return IsEqualGUID(class, &DEVINTERFACE_AUDIO_RENDER)
+            || IsEqualGUID(class, &DEVINTERFACE_AUDIO_CAPTURE)
+            || IsEqualGUID(class, &AM_KSCATEGORY_AUDIO);
+}
+
+static BOOL is_device_interface_active(const GUID *class, HKEY key)
+{
+    /* Match enumeration without requiring it to have written Linked first. */
+    return is_synthetic_audio_interface(class) || is_linked(key);
+}
+
 static struct device_iface *SETUPDI_CreateDeviceInterface(struct device *device,
         const GUID *class, const WCHAR *refstr)
 {
@@ -484,7 +502,7 @@ static struct device_iface *SETUPDI_CreateDeviceInterface(struct device *device,
     RegSetValueExW(key, L"SymbolicLink", 0, REG_SZ, (BYTE *)iface->symlink,
         lstrlenW(iface->symlink) * sizeof(WCHAR));
 
-    if (is_linked(key))
+    if (is_device_interface_active(class, key))
         iface->flags |= SPINT_ACTIVE;
 
     free(path);
@@ -2067,27 +2085,13 @@ end:
     return ret;
 }
 
-DEFINE_GUID(DEVINTERFACE_AUDIO_RENDER, 0xe6327cad,0xdcec,0x4949,0xae,0x8a,0x99,0x1e,0x97,0x6a,0x79,0xd2);
-DEFINE_GUID(DEVINTERFACE_AUDIO_CAPTURE, 0x2eef81be,0x33fa,0x4800,0x96,0x70,0x1c,0xd4,0x74,0x97,0x2c,0x3f);
-DEFINE_GUID(AM_KSCATEGORY_AUDIO, 0x6994ad04,0x93ef,0x11d0,0xa3,0xcc,0x00,0xa0,0xc9,0x22,0x31,0x96);
-
 static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
     const GUID *guid, DWORD flags)
 {
+    BOOL synthetic_audio = is_synthetic_audio_interface(guid);
     DWORD i, len;
     WCHAR subKeyName[MAX_PATH];
     LONG l = ERROR_SUCCESS;
-
-    /* Fake entries instead of a real driver. See mmdevapi/devenum.c */
-    const GUID *SKIP_PRESENT_CHECK[] = {&DEVINTERFACE_AUDIO_RENDER, &DEVINTERFACE_AUDIO_CAPTURE, &AM_KSCATEGORY_AUDIO, NULL};
-    bool skip_present_check = false;
-
-    for (i = 0; SKIP_PRESENT_CHECK[i] ; i++)
-        if (IsEqualGUID(SKIP_PRESENT_CHECK[i], guid))
-        {
-            skip_present_check = true;
-            break;
-        }
 
     for (i = 0; !l; i++)
     {
@@ -2107,9 +2111,9 @@ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
                     WCHAR symbolicLink[MAX_PATH];
                     DWORD dataType;
 
-                    if (!(flags & DIGCF_PRESENT) || is_linked(subKey) || skip_present_check)
+                    if (!(flags & DIGCF_PRESENT) || is_device_interface_active(guid, subKey))
                     {
-                        if (skip_present_check)
+                        if (synthetic_audio)
                         {
                             DWORD linked = 1;
                             HKEY control_key;
@@ -2919,6 +2923,147 @@ BOOL WINAPI SetupDiDestroyDeviceInfoList(HDEVINFO devinfo)
     free(set);
 
     SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static struct device_iface *load_device_interface_alias(struct device *device, const GUID *class,
+        const WCHAR *refstr)
+{
+    struct device_iface *iface;
+    WCHAR *path = NULL, *symlink = NULL;
+    DWORD size = 0;
+    LONG error;
+
+    if (!(iface = calloc(1, sizeof(*iface))))
+    {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return NULL;
+    }
+    iface->device = device;
+    iface->class = *class;
+    if (refstr && !(iface->refstr = wcsdup(refstr)))
+        goto out_of_memory;
+    if (!(iface->symlink = SETUPDI_CreateSymbolicLinkPath(device->instanceId, class, refstr)))
+        goto out_of_memory;
+    if (!(path = get_iface_key_path(iface)))
+        goto out_of_memory;
+    error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, MAXIMUM_ALLOWED, &iface->class_key);
+    free(path);
+    path = NULL;
+    if (error) goto failed;
+    if (!(path = get_refstr_key_path(iface)))
+        goto out_of_memory;
+    error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, MAXIMUM_ALLOWED, &iface->refstr_key);
+    free(path);
+    path = NULL;
+    if (error) goto failed;
+
+    error = RegGetValueW(iface->refstr_key, NULL, L"SymbolicLink", RRF_RT_REG_SZ, NULL, NULL, &size);
+    if (error) goto failed;
+    if (size % sizeof(WCHAR) || size > MAXDWORD - sizeof(WCHAR))
+    {
+        error = ERROR_INVALID_DATA;
+        goto failed;
+    }
+    /* RegGetValueW may need to terminate an unterminated registry string. */
+    size += sizeof(WCHAR);
+    if (!(symlink = malloc(size))) goto out_of_memory;
+    error = RegGetValueW(iface->refstr_key, NULL, L"SymbolicLink", RRF_RT_REG_SZ, NULL, symlink, &size);
+    if (error) goto failed;
+    if (size % sizeof(WCHAR))
+    {
+        error = ERROR_INVALID_DATA;
+        goto failed;
+    }
+    if (!size || !*symlink)
+    {
+        error = ERROR_NO_SUCH_DEVICE_INTERFACE;
+        goto failed;
+    }
+    free(iface->symlink);
+    iface->symlink = symlink;
+    if (is_device_interface_active(class, iface->refstr_key)) iface->flags |= SPINT_ACTIVE;
+    list_add_tail(&device->interfaces, &iface->entry);
+    return iface;
+
+out_of_memory:
+    error = ERROR_OUTOFMEMORY;
+failed:
+    RegCloseKey(iface->refstr_key);
+    RegCloseKey(iface->class_key);
+    free(iface->refstr);
+    free(iface->symlink);
+    free(symlink);
+    free(iface);
+    free(path);
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+        error = ERROR_NO_SUCH_DEVICE_INTERFACE;
+    SetLastError(error);
+    return NULL;
+}
+
+/***********************************************************************
+ *              SetupDiGetDeviceInterfaceAlias (SETUPAPI.@)
+ */
+BOOL WINAPI SetupDiGetDeviceInterfaceAlias(HDEVINFO devinfo, SP_DEVICE_INTERFACE_DATA *iface_data,
+        const GUID *class, SP_DEVICE_INTERFACE_DATA *alias_data)
+{
+    struct device_iface *iface = NULL, *candidate;
+    struct DeviceInfoSet *set;
+    struct device *device;
+
+    TRACE("devinfo %p, iface_data %p, class %s, alias_data %p.\n",
+            devinfo, iface_data, debugstr_guid(class), alias_data);
+
+    if (!(set = get_device_set(devinfo)))
+        return FALSE;
+    if (!iface_data || iface_data->cbSize != sizeof(*iface_data) || !class)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    /* Reserved identifies an interface in this set, not an arbitrary pointer. */
+    LIST_FOR_EACH_ENTRY(device, &set->devices, struct device, entry)
+    {
+        LIST_FOR_EACH_ENTRY(candidate, &device->interfaces, struct device_iface, entry)
+        {
+            if ((ULONG_PTR)candidate == iface_data->Reserved)
+            {
+                iface = candidate;
+                break;
+            }
+        }
+        if (iface) break;
+    }
+    if (!iface)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (device->removed || (iface->flags & SPINT_REMOVED) || IsEqualGUID(&iface->class, class))
+    {
+        SetLastError(ERROR_NO_SUCH_DEVICE_INTERFACE);
+        return FALSE;
+    }
+
+    LIST_FOR_EACH_ENTRY(candidate, &device->interfaces, struct device_iface, entry)
+    {
+        if (!(candidate->flags & SPINT_REMOVED) && IsEqualGUID(&candidate->class, class)
+                && !wcsicmp(candidate->refstr ? candidate->refstr : L"", iface->refstr ? iface->refstr : L""))
+            goto found;
+    }
+
+    /* Import only the registered alias, including when the output is invalid. */
+    if (!(candidate = load_device_interface_alias(device, class, iface->refstr)))
+        return FALSE;
+found:
+    if (!alias_data || alias_data->cbSize != sizeof(*alias_data))
+    {
+        SetLastError(ERROR_INVALID_USER_BUFFER);
+        return FALSE;
+    }
+    copy_device_iface_data(alias_data, candidate);
     return TRUE;
 }
 
