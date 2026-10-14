@@ -1308,6 +1308,7 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
     const struct opengl_funcs *funcs = &display_funcs;
     const struct egl_platform *egl = &display_egl;
     EGLint err, egl_attribs[16], *attribs_end = egl_attribs;
+    EGLint major = 0, flags = 0, *minor = NULL, *profile = NULL;
 
     TRACE( "format %d, share %p, attribs %p\n", format, share, attribs );
 
@@ -1323,12 +1324,14 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
         switch (attribs[0])
         {
         case WGL_CONTEXT_MAJOR_VERSION_ARB:
+            major = attribs[1];
             name = EGL_CONTEXT_MAJOR_VERSION_KHR;
             break;
         case WGL_CONTEXT_MINOR_VERSION_ARB:
             name = EGL_CONTEXT_MINOR_VERSION_KHR;
             break;
         case WGL_CONTEXT_FLAGS_ARB:
+            flags = attribs[1];
             name = EGL_CONTEXT_FLAGS_KHR;
             break;
         case WGL_CONTEXT_OPENGL_NO_ERROR_ARB:
@@ -1357,6 +1360,8 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
             assert( dst - egl_attribs <= ARRAY_SIZE(egl_attribs) - 3 );
             dst[0] = name;
             dst[1] = attribs[1];
+            if (name == EGL_CONTEXT_MINOR_VERSION_KHR) minor = &dst[1];
+            if (name == EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR) profile = &dst[1];
             if (dst == attribs_end) attribs_end += 2;
         }
     }
@@ -1370,9 +1375,29 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
      *    > purposes except eglCreateContext.
      */
     funcs->p_eglBindAPI( EGL_OPENGL_API );
+    if (major == 3 && minor && *minor == 1 && !flags &&
+        (!profile || *profile == EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR))
+    {
+        /* Some applications expect deprecated features in unflagged 3.1 contexts. EGL profiles start at 3.2. */
+        *minor = 2;
+        if (!profile)
+        {
+            assert( attribs_end - egl_attribs <= ARRAY_SIZE(egl_attribs) - 3 );
+            attribs_end[0] = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
+            attribs_end[1] = EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR;
+            attribs_end[2] = EGL_NONE;
+        }
+        *context = funcs->p_eglCreateContext( egl->display, EGL_NO_CONFIG_KHR, share, egl_attribs );
+        err = funcs->p_eglGetError();
+        if (*context || (err != EGL_BAD_MATCH && err != EGL_BAD_ATTRIBUTE)) goto done;
+        *minor = 1;
+        *attribs_end = EGL_NONE;
+    }
     *context = funcs->p_eglCreateContext( egl->display, EGL_NO_CONFIG_KHR, share, attribs ? egl_attribs : NULL );
+    err = funcs->p_eglGetError();
 
-    if ((err = funcs->p_eglGetError()) != EGL_SUCCESS || !*context)
+done:
+    if (err != EGL_SUCCESS || !*context)
     {
         WARN( "Context creation failed (error %#x).\n", err );
         return FALSE;

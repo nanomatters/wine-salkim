@@ -2438,8 +2438,8 @@ static void test_opengl3(HDC hdc)
             {
                 extensions = (const char *)glGetString(GL_EXTENSIONS);
                 error = glGetError();
-                todo_wine ok(error == GL_NO_ERROR, "glGetString(GL_EXTENSIONS) returned error %#x.\n", error);
-                todo_wine ok(extensions && gl_extension_supported(extensions, "GL_ARB_compatibility"),
+                ok(error == GL_NO_ERROR, "glGetString(GL_EXTENSIONS) returned error %#x.\n", error);
+                ok(extensions && gl_extension_supported(extensions, "GL_ARB_compatibility"),
                         "Missing GL_ARB_compatibility.\n");
 
                 ret = wglMakeCurrent(old_dc, old_ctx);
