@@ -1,0 +1,22 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "waveform.h"
+
+static void test_unregister_before_cleanup(void)
+{
+    endpoint_count[eRender] = endpoint_count[eCapture] = 1;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(registered_client == &g_notif && live_locks == 2);
+    require_unregistered_during_cleanup = TRUE;
+    WINMM_DeleteWaveform();
+    assert(unregisters == 1 && releases == 1 && !registered_client);
+    assert(!live_locks && deleted_locks == 2);
+}
+
+int main(void)
+{
+    run_test(test_unregister_before_cleanup, "unregister before cleanup");
+    return 0;
+}

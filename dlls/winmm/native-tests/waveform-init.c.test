@@ -1,0 +1,106 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "waveform.h"
+
+static void test_empty_inventory(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < 8; ++i)
+    {
+        assert(!waveOutGetNumDevs());
+        assert(!waveInGetNumDevs());
+        assert(!mixerGetNumDevs());
+    }
+    assert(creates == 1 && registers == 1);
+    assert(endpoint_queries[eRender] == 1 && endpoint_queries[eCapture] == 1);
+    assert(com_inits == 1 && com_uninits == 1);
+    assert(registered_client == &g_notif && g_devenum == &mock_enumerator);
+    assert(!releases && !unregisters);
+    WINMM_DeleteWaveform();
+    assert(releases == 1 && unregisters == 1 && !registered_client);
+    assert(!allocated && !live_locks);
+}
+
+static void *query_thread(void *arg)
+{
+    assert(!waveOutGetNumDevs());
+    assert(!waveInGetNumDevs());
+    return NULL;
+}
+
+static void test_concurrent_inventory(void)
+{
+    pthread_t threads[16];
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(threads); ++i)
+        assert(!pthread_create(&threads[i], NULL, query_thread, NULL));
+    for (i = 0; i < ARRAY_SIZE(threads); ++i)
+        assert(!pthread_join(threads[i], NULL));
+    assert(creates == 1 && registers == 1);
+    assert(endpoint_queries[eRender] == 1 && endpoint_queries[eCapture] == 1);
+    WINMM_DeleteWaveform();
+    assert(releases == 1 && unregisters == 1);
+}
+
+static void test_create_retry(void)
+{
+    create_result = E_FAIL;
+    assert(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(creates == 1 && !registers && !releases && !g_devenum);
+    create_result = S_OK;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(creates == 2 && registers == 1 && !releases);
+    WINMM_DeleteWaveform();
+    assert(releases == 1 && unregisters == 1);
+}
+
+static void test_register_retry(void)
+{
+    register_result = E_FAIL;
+    assert(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(creates == 1 && registers == 1 && releases == 1 && !g_devenum);
+    assert(!registered_client);
+    register_result = S_OK;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(creates == 2 && registers == 2 && releases == 1);
+    WINMM_DeleteWaveform();
+    assert(releases == 2 && unregisters == 2);
+}
+
+static void test_render_retry(void)
+{
+    endpoint_result[eRender] = E_FAIL;
+    assert(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(!g_devenum && !registered_client && releases == 1 && unregisters == 1);
+    assert(!endpoint_queries[eCapture]);
+    endpoint_result[eRender] = S_OK;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(creates == 2 && registers == 2);
+    WINMM_DeleteWaveform();
+    assert(releases == 2 && unregisters == 2 && !allocated);
+}
+
+static void test_changed_com_apartment(void)
+{
+    com_result = RPC_E_CHANGED_MODE;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(com_inits == 1 && !com_uninits);
+    WINMM_DeleteWaveform();
+    assert(releases == 1 && unregisters == 1);
+}
+
+int main(void)
+{
+    assert(sizeof(WCHAR) == 2 && sizeof(wchar_t) == 2);
+    run_test(test_empty_inventory, "empty inventory");
+    run_test(test_concurrent_inventory, "concurrent inventory");
+    run_test(test_create_retry, "creation retry");
+    run_test(test_register_retry, "registration retry");
+    run_test(test_render_retry, "render enumeration retry");
+    run_test(test_changed_com_apartment, "existing COM apartment");
+    return 0;
+}

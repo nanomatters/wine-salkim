@@ -198,6 +198,9 @@ void WINMM_DeleteWaveform(void)
 {
     UINT i, j;
 
+    if (g_devenum)
+        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(g_devenum, &g_notif);
+
     if(g_devices_thread)
         CloseHandle(g_devices_thread);
 
@@ -238,7 +241,6 @@ void WINMM_DeleteWaveform(void)
     }
 
     if (g_devenum){
-        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(g_devenum, &g_notif);
         IMMDeviceEnumerator_Release(g_devenum);
     }
 
