@@ -1591,9 +1591,8 @@ static NTSTATUS lnxev_device_create(struct udev_device *dev, int fd, const char 
     if (!desc.product[0]) ntdll_umbstowcs(info.name, strlen(info.name) + 1, desc.product, ARRAY_SIZE(desc.product));
     if (!desc.serialnumber[0]) ntdll_umbstowcs(info.uniq, strlen(info.uniq) + 1, desc.serialnumber, ARRAY_SIZE(desc.serialnumber));
 
-    /* CW-Bug-Id: #23185 Emulate Steam Input native hooks for native SDL:
-     * keep version fixed as 0 so we can hardcode it in ntdll rawinput pipe redirection
-     */
+    /* CW-Bug-Id: #23185 Emulate Steam Input native hooks for native SDL.
+     * Keep the existing version value for native-hook compatibility. */
     if (desc.interface != -1) desc.version = 0;
 
     if (!(impl = hid_device_create(&lnxev_device_vtbl, sizeof(struct lnxev_device))))

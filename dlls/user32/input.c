@@ -28,6 +28,7 @@
 #include "dbt.h"
 #include "wine/debug.h"
 #include "wine/plugplay.h"
+#include "wine/steam_input.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 WINE_DECLARE_DEBUG_CHANNEL(keyboard);
@@ -547,7 +548,7 @@ static BOOL steam_input_get_vid_pid( UINT slot, UINT16 *vid, UINT16 *pid )
 /* CW-Bug-Id: #23185 Emulate Steam Input native hooks for native SDL */
 static BOOL steam_input_devnotify(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header, BOOL ansi)
 {
-    char buffer[offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name[MAX_PATH])];
+    char buffer[offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name[MAX_PATH + 32])];
     DEV_BROADCAST_DEVICEINTERFACE_W *copyW = (DEV_BROADCAST_DEVICEINTERFACE_W *)buffer;
 
     if (flags & 0x8000)
@@ -556,34 +557,27 @@ static BOOL steam_input_devnotify(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR 
         {
         case DBT_DEVTYP_DEVICEINTERFACE:
         {
-            static const WCHAR steam_input_idW[] = L"\\\\?\\HID#VID_28DE&PID_11FF&IG_";
             const DEV_BROADCAST_DEVICEINTERFACE_W *ifaceW = (const DEV_BROADCAST_DEVICEINTERFACE_W *)header;
+            UINT length, size, slot, instance_len;
+            const WCHAR *instance;
+            UINT16 vid, pid;
 
-            if (!wcsnicmp( ifaceW->dbcc_name, steam_input_idW, 29 ))
+            if (header->dbch_size < offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name)) break;
+            length = (header->dbch_size - offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name)) / sizeof(WCHAR);
+            if (wine_steam_input_get_instance( ifaceW->dbcc_name, length, FALSE, &instance, &instance_len, &slot ))
             {
-                UINT size, slot;
-                const WCHAR *tmpW;
-                UINT16 vid, pid;
-
-                copyW->dbcc_devicetype = ifaceW->dbcc_devicetype;
-                copyW->dbcc_reserved = ifaceW->dbcc_reserved;
-                copyW->dbcc_classguid = ifaceW->dbcc_classguid;
-
-                if (swscanf( ifaceW->dbcc_name + 29, L"%02u", &slot ) != 1) slot = 0;
                 if (!steam_input_get_vid_pid( slot, &vid, &pid ))
                 {
                     vid = 0x045e;
                     pid = 0x028e;
                 }
 
-                size = swprintf( copyW->dbcc_name, MAX_PATH, L"\\\\.\\pipe\\HID#VID_045E&PID_028E&IG_00#%04X&%04X", vid, pid );
-                if ((tmpW = wcschr( ifaceW->dbcc_name + 29, '&' )))
-                {
-                    do copyW->dbcc_name[size++] = *tmpW++;
-                    while (*tmpW != '&' && size < MAX_PATH);
-                }
-                size += swprintf( copyW->dbcc_name + size, MAX_PATH - size, L"#%d#%u", slot, (UINT)GetCurrentProcessId() );
-
+                size = wine_steam_input_format_token( copyW->dbcc_name, MAX_PATH + 32, FALSE, vid, pid,
+                                                       instance, instance_len, slot, GetCurrentProcessId() );
+                if (!size) break;
+                copyW->dbcc_devicetype = ifaceW->dbcc_devicetype;
+                copyW->dbcc_reserved = ifaceW->dbcc_reserved;
+                copyW->dbcc_classguid = ifaceW->dbcc_classguid;
                 copyW->dbcc_size = offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name[size + 1]);
                 header = (DEV_BROADCAST_HDR *)copyW;
             }

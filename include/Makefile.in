@@ -992,6 +992,7 @@ SOURCES = \
 	wine/schrpc.idl \
 	wine/server.h \
 	wine/server_protocol.h \
+	wine/steam_input.h \
 	wine/strmbase.h \
 	wine/svcctl.idl \
 	wine/test.h \

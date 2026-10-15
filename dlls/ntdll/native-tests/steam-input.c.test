@@ -1,0 +1,320 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include <assert.h>
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+typedef uint16_t WCHAR, UINT16, USHORT;
+typedef unsigned int UINT;
+typedef int BOOL;
+typedef uint32_t DWORD;
+typedef int32_t HRESULT;
+typedef void *HANDLE;
+typedef WCHAR *HSTRING;
+typedef struct { uint32_t data[4]; } GUID;
+typedef struct { DWORD dbch_size, dbch_devicetype, dbch_reserved; } DEV_BROADCAST_HDR;
+typedef struct
+{
+    DWORD dbcc_size, dbcc_devicetype, dbcc_reserved;
+    GUID dbcc_classguid;
+    WCHAR dbcc_name[1];
+} DEV_BROADCAST_DEVICEINTERFACE_W;
+typedef struct { USHORT Length, MaximumLength; WCHAR *Buffer; } UNICODE_STRING;
+typedef struct { void *RootDirectory; UNICODE_STRING *ObjectName; } OBJECT_ATTRIBUTES;
+
+#define TRUE 1
+#define FALSE 0
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define TRACE(...) ((void)0)
+#define MAX_PATH 260
+#define DBT_DEVTYP_DEVICEINTERFACE 5
+#define S_OK 0
+#define E_FAIL ((HRESULT)0x80004005)
+#define E_NOTIMPL ((HRESULT)0x80004001)
+#define wcslen test_wcslen
+
+static BOOL lookup_succeeds = TRUE, allocation_fails;
+static UINT requested_slot;
+static unsigned char notified[2048];
+static UINT callbacks;
+
+static UINT length(const WCHAR *string)
+{
+    const WCHAR *end = string;
+    while (*end) ++end;
+    return end - string;
+}
+
+static UINT test_wcslen(const WCHAR *string) { return length(string); }
+
+static int wcsnicmp(const WCHAR *a, const WCHAR *b, UINT count)
+{
+    while (count--)
+    {
+        WCHAR x = *a++, y = *b++;
+        if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
+        if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
+        if (x != y) return x - y;
+        if (!x) return 0;
+    }
+    return 0;
+}
+
+static BOOL steam_input_get_vid_pid(UINT slot, UINT16 *vid, UINT16 *pid)
+{
+    requested_slot = slot;
+    *vid = 0x054c;
+    *pid = 0x0ce6;
+    return lookup_succeeds;
+}
+
+static UINT GetCurrentProcessId(void) { return 12345; }
+
+static UINT devnotify_window_callbackW(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header)
+{
+    assert(handle == (void *)1 && !(flags & ~0x8000u));
+    assert(header->dbch_size <= sizeof(notified));
+    memcpy(notified, header, header->dbch_size);
+    ++callbacks;
+    return 1;
+}
+
+static UINT devnotify_window_callbackA(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header)
+{
+    devnotify_window_callbackW(handle, flags, header);
+    return 2;
+}
+
+static HRESULT WindowsCreateString(const WCHAR *string, UINT count, HSTRING *out)
+{
+    *out = malloc((count + 1) * sizeof(WCHAR));
+    assert(*out);
+    memcpy(*out, string, count * sizeof(WCHAR));
+    (*out)[count] = 0;
+    return S_OK;
+}
+
+#include "wine/steam_input.h"
+
+static void *test_malloc(size_t size)
+{
+    return allocation_fails ? NULL : malloc(size);
+}
+
+#define malloc test_malloc
+/* PRODUCTION_HELPERS */
+#undef malloc
+
+static void roundtrip(const WCHAR *path, UINT slot)
+{
+    static const WCHAR prefix[] = L"\\\\.\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&";
+    WCHAR buffer[1024], expected[1024], xinput[1024];
+    unsigned char notification[2048];
+    DEV_BROADCAST_DEVICEINTERFACE_W *event = (void *)notification, *received = (void *)notified;
+    UNICODE_STRING input, output = {0};
+    OBJECT_ATTRIBUTES attr = {.ObjectName = &input};
+    const WCHAR *result, *instance;
+    HSTRING nrid;
+    char suffix[32];
+    UINT instance_len, suffix_len;
+    UINT count = length(path), i;
+
+    result = get_steam_input_path(path, buffer, ARRAY_SIZE(buffer));
+    assert(result == buffer && requested_slot == slot);
+    assert(!wcsnicmp(buffer, prefix, length(prefix)));
+    assert(wine_steam_input_get_instance(path, count, FALSE, &instance, &instance_len, &requested_slot));
+    suffix_len = snprintf(suffix, sizeof(suffix), "#%u#12345", slot);
+    for (i = 0; i <= suffix_len; ++i)
+        assert(buffer[length(prefix) + instance_len + i] == (unsigned char)suffix[i]);
+    assert(get_steam_input_path(path, expected, length(buffer)) == path);
+    assert(get_steam_input_path(path, expected, length(buffer) + 1) == expected);
+
+    event->dbcc_size = offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name[count + 1]);
+    event->dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    event->dbcc_reserved = 17;
+    memset(&event->dbcc_classguid, 0x5a, sizeof(GUID));
+    memcpy(event->dbcc_name, path, (count + 1) * sizeof(WCHAR));
+    assert(steam_input_devnotify((void *)1, 0x8000, (void *)event, FALSE) == 1);
+    assert(received->dbcc_size == offsetof(DEV_BROADCAST_DEVICEINTERFACE_W,
+                                          dbcc_name[length(buffer) + 1]));
+    assert(!memcmp(received->dbcc_name, buffer, (length(buffer) + 1) * sizeof(WCHAR)));
+    assert(received->dbcc_reserved == 17 && !memcmp(&received->dbcc_classguid, &event->dbcc_classguid, sizeof(GUID)));
+    assert(steam_input_devnotify((void *)1, 0x8000, (void *)event, TRUE) == 2);
+    assert(!memcmp(received->dbcc_name, buffer, (length(buffer) + 1) * sizeof(WCHAR)));
+    assert(steam_input_devnotify((void *)1, 0, (void *)event, FALSE) == 1);
+    assert(!memcmp(received, event, event->dbcc_size));
+
+    memcpy(xinput, path, (count + 1) * sizeof(WCHAR));
+    xinput[26] = 'X';
+    xinput[27] = 'I';
+    assert(steam_input_non_roamable_id(xinput, &nrid) == S_OK);
+    assert(!wcsnicmp(nrid, L"{wgi/nrid/:steam-054C&0CE6&", length(L"{wgi/nrid/:steam-054C&0CE6&")));
+    assert(!memcmp(nrid + length(L"{wgi/nrid/:steam-054C&0CE6&"), instance, instance_len * sizeof(WCHAR)));
+    assert(nrid[length(nrid) - 1] == '}');
+    free(nrid);
+
+    /* Win32 DOS-device conversion changes only the first four characters. */
+    buffer[0] = '\\';
+    buffer[1] = '?';
+    buffer[2] = '?';
+    input.Length = length(buffer) * sizeof(WCHAR);
+    input.MaximumLength = input.Length;
+    input.Buffer = buffer;
+    assert(replace_steam_input_path(&attr, &output));
+    assert(attr.ObjectName == &output && output.Buffer[output.Length / sizeof(WCHAR)] == 0);
+    assert(output.MaximumLength == output.Length + sizeof(WCHAR));
+    memcpy(expected, path, (count + 1) * sizeof(WCHAR));
+    expected[0] = '\\';
+    expected[1] = '?';
+    expected[2] = '?';
+    assert(output.Length == count * sizeof(WCHAR));
+    assert(!wcsnicmp(output.Buffer, expected, count));
+    free(output.Buffer);
+
+    /* A counted name need not have a terminating WCHAR in its allocation. */
+    input.Buffer = malloc(input.Length);
+    assert(input.Buffer);
+    memcpy(input.Buffer, buffer, input.Length);
+    attr.ObjectName = &input;
+    attr.RootDirectory = (void *)1;
+    assert(replace_steam_input_path(&attr, &output));
+    assert(!wcsnicmp(output.Buffer, expected, count));
+    free(output.Buffer);
+    free(input.Buffer);
+
+    /* Every truncated name is rejected, including truncation at a guard page. */
+    for (i = 0; i < length(buffer); ++i)
+    {
+        size_t page = sysconf(_SC_PAGESIZE);
+        char *guard = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert(guard != MAP_FAILED && !mprotect(guard + page, page, PROT_NONE));
+        input.Length = input.MaximumLength = i * sizeof(WCHAR);
+        input.Buffer = (WCHAR *)(guard + page - input.Length);
+        memcpy(input.Buffer, buffer, input.Length);
+        attr.ObjectName = &input;
+        /* A prefix ending inside the PID is itself a valid counted name. */
+        if (replace_steam_input_path(&attr, &output)) free(output.Buffer);
+        munmap(guard, 2 * page);
+    }
+}
+
+static void invalid(const WCHAR *name)
+{
+    UNICODE_STRING input = {length(name) * sizeof(WCHAR), length(name) * sizeof(WCHAR), (WCHAR *)name};
+    UNICODE_STRING output = {0};
+    OBJECT_ATTRIBUTES attr = {.RootDirectory = (void *)1, .ObjectName = &input};
+
+    assert(!replace_steam_input_path(&attr, &output));
+    assert(attr.ObjectName == &input && !output.Buffer && !output.Length);
+}
+
+static void test_shared_parser(const WCHAR *path)
+{
+    static const WCHAR *const malformed[] =
+    {
+        L"", L"\\\\?\\HID#VID_28DE&PID_11FF&IG_#instance#guid",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_0##guid",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_0#path/instance#guid",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_0#path\\instance#guid",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&XI_0#instance#guid",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_4294967296#instance#guid",
+        L"\\\\?\\HID#VID_0000&PID_11FF&IG_0#instance#guid",
+    };
+    const WCHAR *instance;
+    WCHAR buffer[8];
+    UINT instance_len, slot, count;
+
+    assert(!wine_steam_input_get_instance(NULL, 0, FALSE, &instance, &instance_len, &slot));
+    for (count = 0; count < ARRAY_SIZE(malformed); ++count)
+        assert(!wine_steam_input_get_instance(malformed[count], length(malformed[count]), FALSE,
+                                             &instance, &instance_len, &slot));
+    assert(!wine_steam_input_get_instance(path, length(path), TRUE, &instance, &instance_len, &slot));
+    for (count = 0; count <= length(path); ++count)
+    {
+        size_t page = sysconf(_SC_PAGESIZE);
+        char *guard = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        WCHAR *name;
+        assert(guard != MAP_FAILED && !mprotect(guard + page, page, PROT_NONE));
+        name = (WCHAR *)(guard + page - count * sizeof(WCHAR));
+        memcpy(name, path, count * sizeof(WCHAR));
+        if (wine_steam_input_get_instance(name, count, FALSE, &instance, &instance_len, &slot))
+        {
+            assert(slot == 0 && instance_len && instance >= name && instance + instance_len < name + count);
+        }
+        munmap(guard, 2 * page);
+    }
+    buffer[0] = 0xffff;
+    assert(!wine_steam_input_format_token(buffer, 0, FALSE, 1, 2, path, 1, 0, 1));
+    assert(!wine_steam_input_format_token(buffer, ARRAY_SIZE(buffer), FALSE, 1, 2, path, UINT_MAX, 0, 1));
+    assert(buffer[0] == 0xffff);
+}
+
+int main(void)
+{
+    static const WCHAR *const paths[] =
+    {
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_00#0&SERIAL&0&0&1#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_03#1&0123abcd&0&7#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+        L"\\\\?\\HID#VID_28DE&PID_11FF&IG_10#1&fedcba98&0&12#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+        L"\\\\?\\hid#vid_28de&pid_11ff&ig_00#\x03a9\x00e9&instance#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+    };
+    static const WCHAR *const malformed[] =
+    {
+        L"", L"pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&instance#0#12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00X054C&0CE6&instance#0#12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054Z&0CE6&instance#0#12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C!0CE6&instance#0#12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&#0#12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&instance##12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&instance#4294967296#12345",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&instance#0#",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&instance#0#12345#extra",
+        L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&path\\instance#0#12345",
+    };
+    WCHAR buffer[1024];
+    const WCHAR *result;
+    UNICODE_STRING input = {0}, output = {0};
+    OBJECT_ATTRIBUTES attr = {.ObjectName = &input};
+    UINT i;
+
+    for (i = 0; i < ARRAY_SIZE(paths); ++i) roundtrip(paths[i], i == 1 ? 3 : i == 2 ? 10 : 0);
+    test_shared_parser(paths[0]);
+    for (i = 0; i < ARRAY_SIZE(malformed); ++i) invalid(malformed[i]);
+    invalid(L"\\??\\pipe\\HID#VID_045E&PID_028E&IG_00#054C&0CE6&instance#x#12345");
+
+    lookup_succeeds = FALSE;
+    result = get_steam_input_path(paths[0], buffer, ARRAY_SIZE(buffer));
+    assert(result == buffer && !wcsnicmp(buffer + length(L"\\\\.\\pipe\\HID#VID_045E&PID_028E&IG_00#"),
+                                      L"045E&028E&", 10));
+    lookup_succeeds = TRUE;
+    assert(get_steam_input_path(L"\\\\?\\HID#VID_0000&PID_0000", buffer, ARRAY_SIZE(buffer)) != buffer);
+    assert(get_steam_input_path(L"\\\\?\\HID#VID_28DE&PID_11FF&IG_00#instance", buffer, ARRAY_SIZE(buffer)) != buffer);
+    assert(get_steam_input_path(L"\\\\?\\HID#VID_28DE&PID_11FF&IG_4294967296#x#guid", buffer, ARRAY_SIZE(buffer)) != buffer);
+
+    get_steam_input_path(paths[0], buffer, ARRAY_SIZE(buffer));
+    buffer[0] = '\\'; buffer[1] = '?'; buffer[2] = '?';
+    input.Buffer = buffer;
+    input.Length = input.MaximumLength = length(buffer) * sizeof(WCHAR);
+    allocation_fails = TRUE;
+    assert(!replace_steam_input_path(&attr, &output) && !output.Buffer && attr.ObjectName == &input);
+    allocation_fails = FALSE;
+    --input.Length;
+    assert(!replace_steam_input_path(&attr, &output));
+    input.Length += 3;
+    assert(!replace_steam_input_path(&attr, &output));
+    input.Buffer = NULL;
+    assert(!replace_steam_input_path(&attr, &output));
+    attr.ObjectName = NULL;
+    assert(!replace_steam_input_path(&attr, &output));
+    puts("PASS: Steam Input paths preserve complete instance IDs and counted-name bounds");
+    return 0;
+}

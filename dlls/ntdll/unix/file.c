@@ -3169,51 +3169,75 @@ static BOOL replace_steam_input_path( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *r
     static const WCHAR hid_prefixW[] =
     {
         '\\','?','?','\\','h','i','d','#','v','i','d','_','2','8','d','e',
-        '&','p','i','d','_','1','1','f','f','&','i','g','_','0'
-    };
-    static const WCHAR hid_midW[] =
-    {
-        '#','0',
+        '&','p','i','d','_','1','1','f','f','&','i','g','_',
     };
     static const WCHAR hid_tailW[] =
     {
-        '&','0','&','0','&','1','#','{','4','d','1','e','5','5','b','2','-','f','1','6','f','-',
+        '#','{','4','d','1','e','5','5','b','2','-','f','1','6','f','-',
         '1','1','c','f','-','8','8','c','b','-','0','0','1','1','1','1','0','0','0','0','3','0','}'
     };
     UNICODE_STRING *path = attr->ObjectName;
-    const WCHAR *slot = NULL, *slot_end = NULL, *serial, *serial_end = NULL;
-    UINT len = 0;
+    const WCHAR *p, *end, *instance, *instance_end, *slot, *slot_end;
+    WCHAR *buffer;
+    UINT len, i, j, value = 0;
 
-    if (!path || !path->Buffer || path->Length <= sizeof(pipe_prefixW)) return FALSE;
+    if (!path || !path->Buffer || path->Length % sizeof(WCHAR) || path->Length > path->MaximumLength ||
+        path->Length <= sizeof(pipe_prefixW)) return FALSE;
     if (wcsnicmp( path->Buffer, pipe_prefixW, ARRAY_SIZE(pipe_prefixW) )) return FALSE;
 
-    serial = path->Buffer + path->Length / sizeof(WCHAR);
-    while (serial > path->Buffer && *serial != '&')
+    p = path->Buffer + ARRAY_SIZE(pipe_prefixW);
+    end = path->Buffer + path->Length / sizeof(WCHAR);
+    if (*p++ != '#' || end - p < 10) return FALSE;
+    for (i = 0; i < 2; ++i)
     {
-        if (*serial == '#')
+        for (j = 0; j < 4; ++j, ++p)
         {
-            slot_end = serial_end;
-            serial_end = serial;
-            slot = serial_end + 1;
+            if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f') &&
+                !(*p >= 'A' && *p <= 'F')) return FALSE;
         }
-        serial--;
+        if (*p++ != '&') return FALSE;
     }
-    if (serial == path->Buffer || *serial != '&' || !slot_end || !serial_end) return FALSE;
 
-    redir->Length = sizeof(hid_prefixW) + sizeof(hid_midW) + sizeof(hid_tailW);
-    redir->Length += (serial_end - serial + slot_end - slot) * sizeof(WCHAR);
-    redir->MaximumLength = redir->Length + sizeof(WCHAR);
-    if (!(redir->Buffer = malloc( redir->MaximumLength ))) return FALSE;
+    /* Carry the actual instance ID instead of assuming winebus's old layout. */
+    instance = p;
+    while (p != end && *p != '#')
+    {
+        if (!*p || *p == '\\' || *p == '/') return FALSE;
+        ++p;
+    }
+    if (p == instance || p == end) return FALSE;
+    instance_end = p++;
+    slot = p;
+    while (p != end && *p >= '0' && *p <= '9')
+    {
+        if (value > (UINT_MAX - (*p - '0')) / 10) return FALSE;
+        value = value * 10 + *p++ - '0';
+    }
+    if (p == slot || p == end || *p++ != '#') return FALSE;
+    slot_end = p - 1;
+    if (p == end) return FALSE;
+    while (p != end)
+        if (*p < '0' || *p++ > '9') return FALSE;
 
-    memcpy( redir->Buffer, hid_prefixW, sizeof(hid_prefixW) );
-    len += ARRAY_SIZE(hid_prefixW);
-    memcpy( redir->Buffer + len, slot, (slot_end - slot) * sizeof(WCHAR) );
+    len = ARRAY_SIZE(hid_prefixW) + (slot_end - slot) + (slot_end - slot == 1) + 1 +
+          (instance_end - instance) + ARRAY_SIZE(hid_tailW);
+    if (len > USHRT_MAX / sizeof(WCHAR) - 1 || !(buffer = malloc( (len + 1) * sizeof(WCHAR) )))
+        return FALSE;
+
+    memcpy( buffer, hid_prefixW, sizeof(hid_prefixW) );
+    len = ARRAY_SIZE(hid_prefixW);
+    if (slot_end - slot == 1) buffer[len++] = '0';
+    memcpy( buffer + len, slot, (slot_end - slot) * sizeof(WCHAR) );
     len += slot_end - slot;
-    memcpy( redir->Buffer + len, hid_midW, sizeof(hid_midW) );
-    len += ARRAY_SIZE(hid_midW);
-    memcpy( redir->Buffer + len, serial, (serial_end - serial) * sizeof(WCHAR) );
-    len += serial_end - serial;
-    memcpy( redir->Buffer + len, hid_tailW, sizeof(hid_tailW) );
+    buffer[len++] = '#';
+    memcpy( buffer + len, instance, (instance_end - instance) * sizeof(WCHAR) );
+    len += instance_end - instance;
+    memcpy( buffer + len, hid_tailW, sizeof(hid_tailW) );
+    len += ARRAY_SIZE(hid_tailW);
+    buffer[len] = 0;
+    redir->Length = len * sizeof(WCHAR);
+    redir->MaximumLength = (len + 1) * sizeof(WCHAR);
+    redir->Buffer = buffer;
 
     TRACE( "HACK: %s -> %s\n", debugstr_us(attr->ObjectName), debugstr_us(redir) );
     attr->ObjectName = redir;
