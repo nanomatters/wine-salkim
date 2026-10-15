@@ -676,6 +676,8 @@ static HRESULT update_mapping(WINMM_MMDevice ***map, UINT count,
     WINMM_MMDevice *prev;
     UINT i;
 
+    if (!count || !default_id) return S_FALSE;
+
     prev = (*map)[0];
     for(i = 0; i < count; ++i){
         WINMM_MMDevice *tmp;

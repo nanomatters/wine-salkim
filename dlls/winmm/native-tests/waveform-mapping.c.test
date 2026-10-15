@@ -1,0 +1,46 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "waveform.h"
+
+static void test_empty_flow(void)
+{
+    WINMM_MMDevice **map = NULL;
+
+    assert(update_mapping(&map, 0, L"endpoint") == S_FALSE);
+    assert(!map);
+    assert(notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"endpoint") == S_OK);
+    assert(notif_OnDefaultDeviceChanged(&g_notif, eCapture, eConsole, L"endpoint") == S_OK);
+    assert(!g_out_map && !g_in_map);
+}
+
+static void test_null_default(void)
+{
+    WINMM_MMDevice endpoint = {.dev_id = L"endpoint"};
+    WINMM_MMDevice *items[] = {&endpoint};
+    WINMM_MMDevice **map = items;
+
+    assert(update_mapping(&map, 1, NULL) == S_FALSE);
+    assert(map == items && map[0] == &endpoint);
+}
+
+static void test_default_remap(void)
+{
+    WINMM_MMDevice endpoints[] = {{.dev_id = L"first"}, {.dev_id = L"second"}};
+    WINMM_MMDevice *items[] = {&endpoints[0], &endpoints[1]};
+    WINMM_MMDevice **map = items;
+
+    assert(update_mapping(&map, 2, L"second") == S_OK);
+    assert(map[0] == &endpoints[1] && map[1] == &endpoints[0]);
+    assert(update_mapping(&map, 2, L"first") == S_OK);
+    assert(map[0] == &endpoints[0] && map[1] == &endpoints[1]);
+}
+
+int main(void)
+{
+    run_test(test_empty_flow, "empty flow mapping");
+    run_test(test_null_default, "absent default mapping");
+    run_test(test_default_remap, "default remapping");
+    return 0;
+}

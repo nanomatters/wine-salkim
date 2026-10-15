@@ -13,7 +13,7 @@ override LDFLAGS += -Wl,--gc-sections
 LDLIBS += -pthread
 
 .PHONY: all check
-all: $(BUILD_DIR)/waveform-init $(BUILD_DIR)/waveform-lifetime
+all: $(BUILD_DIR)/waveform-init $(BUILD_DIR)/waveform-lifetime $(BUILD_DIR)/waveform-mapping
 
 $(BUILD_DIR)/waveform-%: waveform-%.c.test waveform.h $(WAVEFORM_SOURCE) Makefile
 	mkdir -p $(BUILD_DIR)
@@ -22,3 +22,4 @@ $(BUILD_DIR)/waveform-%: waveform-%.c.test waveform.h $(WAVEFORM_SOURCE) Makefil
 check: all
 	$(BUILD_DIR)/waveform-init
 	$(BUILD_DIR)/waveform-lifetime
+	$(BUILD_DIR)/waveform-mapping
