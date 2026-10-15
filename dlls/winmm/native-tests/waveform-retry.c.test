@@ -1,0 +1,41 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "waveform.h"
+
+static void test_capture_failure_rollback(void)
+{
+    endpoint_count[eRender] = 1;
+    endpoint_result[eCapture] = E_FAIL;
+    require_unregistered_during_cleanup = TRUE;
+    assert(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(!registered_client && !g_devenum && releases == 1 && unregisters == 1);
+    assert(!allocated && !live_locks);
+    assert(!g_out_mmdevices && !g_out_map && !g_outmmdevices_count);
+    endpoint_result[eCapture] = S_OK;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(creates == 2 && registers == 2 && releases == 1);
+    assert(g_outmmdevices_count == 1 && live_locks == 1);
+    WINMM_DeleteWaveform();
+    assert(!live_locks && releases == 2 && unregisters == 2);
+}
+
+static void test_empty_render_capture_failure(void)
+{
+    endpoint_result[eCapture] = E_FAIL;
+    assert(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    assert(!g_outmmdevices_count && !g_out_mmdevices && !g_out_map);
+    assert(!registered_client && !g_devenum && !allocated && !live_locks);
+    endpoint_result[eCapture] = S_OK;
+    assert(InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    WINMM_DeleteWaveform();
+    assert(releases == 2 && unregisters == 2 && !allocated && !live_locks);
+}
+
+int main(void)
+{
+    run_test(test_capture_failure_rollback, "capture failure rollback");
+    run_test(test_empty_render_capture_failure, "empty render capture failure");
+    return 0;
+}

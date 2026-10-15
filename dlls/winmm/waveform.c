@@ -844,7 +844,9 @@ static IMMNotificationClient g_notif = { &g_notif_vtbl };
 
 static BOOL WINAPI WINMM_InitMMDevices(INIT_ONCE *once, void *param, void **context)
 {
+    BOOL render_initialized = FALSE;
     HRESULT hr, init_hr;
+    UINT i;
 
     init_hr = CoInitialize(NULL);
 
@@ -864,6 +866,7 @@ static BOOL WINAPI WINMM_InitMMDevices(INIT_ONCE *once, void *param, void **cont
         g_inmmdevices_count = 0;
         goto exit;
     }
+    render_initialized = TRUE;
 
     hr = WINMM_EnumDevices(&g_in_mmdevices, &g_in_map, &g_inmmdevices_count,
             eCapture, g_devenum);
@@ -877,6 +880,25 @@ exit:
         IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(g_devenum, &g_notif);
         IMMDeviceEnumerator_Release(g_devenum);
         g_devenum = NULL;
+    }
+    if (FAILED(hr) && render_initialized)
+    {
+        for (i = 0; i < g_outmmdevices_count; ++i)
+        {
+            WINMM_MMDevice *device = &g_out_mmdevices[i];
+
+            CoTaskMemFree(device->dev_id);
+            if (device->lock.DebugInfo)
+            {
+                device->lock.DebugInfo->Spare[0] = 0;
+                DeleteCriticalSection(&device->lock);
+            }
+        }
+        free(g_out_mmdevices);
+        free(g_out_map);
+        g_out_mmdevices = NULL;
+        g_out_map = NULL;
+        g_outmmdevices_count = 0;
     }
     if(SUCCEEDED(init_hr))
         CoUninitialize();
