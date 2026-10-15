@@ -825,6 +825,35 @@ static void test_device_interface_properties( UNICODE_STRING *name )
     ok( val == DEVPROP_TRUE, "got val %d\n", val );
 }
 
+static void test_enumerator_name_buffer(DEVICE_OBJECT *device, const WCHAR *name)
+{
+    WCHAR buffer[16];
+    ULONG size = (wcslen(name) + 1) * sizeof(WCHAR), req_size = 0;
+    NTSTATUS status;
+    unsigned int i;
+
+    status = IoGetDeviceProperty(device, DevicePropertyEnumeratorName, 0, NULL, &req_size);
+    ok(status == STATUS_BUFFER_TOO_SMALL, "Unexpected status %#lx.\n", status);
+    ok(req_size == size, "Expected size %lu, got %lu.\n", size, req_size);
+
+    memset(buffer, 0xcc, sizeof(buffer));
+    req_size = 0;
+    status = IoGetDeviceProperty(device, DevicePropertyEnumeratorName, size - sizeof(WCHAR), buffer, &req_size);
+    ok(status == STATUS_BUFFER_TOO_SMALL, "Unexpected status %#lx.\n", status);
+    ok(req_size == size, "Expected size %lu, got %lu.\n", size, req_size);
+    for (i = 0; i < ARRAY_SIZE(buffer); ++i)
+        ok(buffer[i] == 0xcccc, "Short buffer modified at %u: %#x.\n", i, buffer[i]);
+
+    req_size = 0;
+    status = IoGetDeviceProperty(device, DevicePropertyEnumeratorName, size, buffer, &req_size);
+    ok(status == STATUS_SUCCESS, "Unexpected status %#lx.\n", status);
+    ok(req_size == size, "Expected size %lu, got %lu.\n", size, req_size);
+    if (status == STATUS_SUCCESS)
+        ok(!kmemcmp(buffer, name, size), "Unexpected enumerator name or terminator.\n");
+    for (i = size / sizeof(WCHAR); i < ARRAY_SIZE(buffer); ++i)
+        ok(buffer[i] == 0xcccc, "Buffer overwritten at %u: %#x.\n", i, buffer[i]);
+}
+
 static void test_enumerator_name(void)
 {
     static const WCHAR root[] = L"ROOT";
@@ -844,6 +873,8 @@ static void test_enumerator_name(void)
     ok(req_size == sizeof(root), "unexpected size %lu\n", req_size);
     if (status == STATUS_SUCCESS)
         ok(!wcscmp(root, buffer), "unexpected property value '%ls'\n", buffer);
+
+    test_enumerator_name_buffer(bus_pdo, root);
 }
 
 static void test_child_enumerator_name(DEVICE_OBJECT *device)
@@ -860,6 +891,8 @@ static void test_child_enumerator_name(DEVICE_OBJECT *device)
     ok(req_size == sizeof(wine), "unexpected size %lu\n", req_size);
     if (status == STATUS_SUCCESS)
         ok(!wcscmp(wine, buffer), "unexpected property value '%ls'\n", buffer);
+
+    test_enumerator_name_buffer(device, wine);
 }
 
 static void test_device_registry_key(void)

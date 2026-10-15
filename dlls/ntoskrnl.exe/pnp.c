@@ -992,7 +992,7 @@ NTSTATUS WINAPI IoGetDeviceProperty( DEVICE_OBJECT *device, DEVICE_REGISTRY_PROP
             if (length >= *needed)
             {
                 memcpy( buffer, device_instance_id, *needed - sizeof(WCHAR) );
-                ((WCHAR *)buffer)[((ptr - device_instance_id) + 1)] = 0;
+                ((WCHAR *)buffer)[ptr - device_instance_id] = 0;
             }
             else
                 status = STATUS_BUFFER_TOO_SMALL;
