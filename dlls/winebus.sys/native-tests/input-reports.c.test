@@ -1,0 +1,334 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "wine/list.h"
+
+typedef unsigned char BYTE;
+typedef unsigned long ULONG, DWORD;
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+#define STATUS_SUCCESS 0
+#define IO_NO_INCREMENT 0
+#define HIDRAW_FIXUP_DUALSHOCK_BT 1
+#define HIDRAW_FIXUP_DUALSENSE_BT 2
+#define TRACE_ON(channel) 0
+#define TRACE(...) trace(__VA_ARGS__)
+#define WARN(...) trace(__VA_ARGS__)
+
+struct device_extension;
+typedef struct { struct device_extension *DeviceExtension; } DEVICE_OBJECT;
+typedef struct
+{
+    void *UserBuffer;
+    struct { long Status; uintptr_t Information; } IoStatus;
+    unsigned int completed;
+} IRP;
+struct hid_report
+{
+    struct list entry;
+    ULONG length;
+    BYTE buffer[1];
+};
+enum device_state { DEVICE_STATE_STOPPED, DEVICE_STATE_STARTED, DEVICE_STATE_REMOVED };
+struct device_extension
+{
+    unsigned int cs;
+    DEVICE_OBJECT *device;
+    enum device_state state;
+    struct { struct { BYTE ReportID; } ReportIDs[1]; } collection_desc;
+    struct hid_report *last_reports[256];
+    struct list reports;
+    IRP *pending_read;
+    unsigned int report_fixups;
+    uint64_t unix_device;
+};
+
+static unsigned int allocations, live_allocations, completions;
+static BOOL allocation_fails;
+
+static void trace(const char *format, ...)
+{
+    (void)format;
+}
+
+static void RtlEnterCriticalSection(unsigned int *lock)
+{
+    assert(!*lock);
+    ++*lock;
+}
+
+static void RtlLeaveCriticalSection(unsigned int *lock)
+{
+    assert(*lock == 1);
+    --*lock;
+}
+
+static void *GetProcessHeap(void) { return NULL; }
+
+static void *RtlAllocateHeap(void *heap, unsigned int flags, size_t size)
+{
+    void *result;
+    (void)heap;
+    (void)flags;
+    ++allocations;
+    if (allocation_fails) return NULL;
+    result = malloc(size);
+    assert(result);
+    ++live_allocations;
+    return result;
+}
+
+static void RtlFreeHeap(void *heap, unsigned int flags, void *memory)
+{
+    (void)heap;
+    (void)flags;
+    assert(memory && live_allocations);
+    --live_allocations;
+    free(memory);
+}
+
+static IRP *pop_pending_read(struct device_extension *ext)
+{
+    IRP *result = ext->pending_read;
+    assert(ext->cs == 1);
+    ext->pending_read = NULL;
+    return result;
+}
+
+static void IoCompleteRequest(IRP *irp, unsigned int boost)
+{
+    (void)boost;
+    ++irp->completed;
+    ++completions;
+}
+
+/* PRODUCTION_HELPERS */
+
+static void init_device(struct device_extension *ext, DEVICE_OBJECT *device, BYTE id, ULONG length)
+{
+    struct hid_report *cached;
+
+    assert(!live_allocations);
+    allocations = completions = 0;
+    allocation_fails = FALSE;
+    memset(ext, 0, sizeof(*ext));
+    device->DeviceExtension = ext;
+    ext->device = device;
+    ext->state = DEVICE_STATE_STARTED;
+    ext->collection_desc.ReportIDs[0].ReportID = id;
+    list_init(&ext->reports);
+    cached = malloc(offsetof(struct hid_report, buffer[length]));
+    assert(cached);
+    cached->length = length;
+    memset(cached->buffer, 0xa5, length);
+    ext->last_reports[id] = cached;
+}
+
+static void finish_device(struct device_extension *ext)
+{
+    struct list *entry;
+    unsigned int i;
+
+    assert(!ext->cs);
+    while ((entry = list_head(&ext->reports)))
+    {
+        struct hid_report *report = LIST_ENTRY(entry, struct hid_report, entry);
+        list_remove(entry);
+        RtlFreeHeap(NULL, 0, report);
+    }
+    for (i = 0; i < 256; ++i) free(ext->last_reports[i]);
+    assert(!live_allocations);
+}
+
+static struct hid_report *only_report(struct device_extension *ext)
+{
+    struct list *head = list_head(&ext->reports);
+    assert(head && head->next == &ext->reports);
+    return LIST_ENTRY(head, struct hid_report, entry);
+}
+
+static void test_length(BOOL numbered, ULONG received, ULONG declared)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    struct hid_report *report;
+    BYTE bytes[32];
+    ULONG length = received < declared ? received : declared, i;
+    BYTE id = numbered ? 7 : 0;
+
+    init_device(&ext, &device, id, declared);
+    for (i = 0; i < sizeof(bytes); ++i) bytes[i] = i + 7;
+    process_hid_report(&device, bytes, received);
+    assert(!ext.cs && allocations == 1 && live_allocations == 1);
+    report = only_report(&ext);
+    assert(report->length == length && !memcmp(report->buffer, bytes, length));
+    assert(!memcmp(ext.last_reports[id]->buffer, bytes, length));
+    for (i = length; i < declared; ++i) assert(ext.last_reports[id]->buffer[i] == 0xa5);
+    finish_device(&ext);
+}
+
+static void exact(void) { test_length(TRUE, 8, 8); }
+static void oversized(void) { test_length(TRUE, 32, 8); }
+static void unnumbered(void) { test_length(FALSE, 32, 8); }
+static void short_report(void) { test_length(TRUE, 1, 8); }
+
+static void empty(void)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    BYTE *bytes = malloc(1);
+
+    assert(bytes);
+    init_device(&ext, &device, 7, 8);
+    process_hid_report(&device, bytes + 1, 0);
+    process_hid_report(&device, NULL, 0);
+    assert(!allocations && !ext.cs && list_empty(&ext.reports));
+    finish_device(&ext);
+    free(bytes);
+}
+
+static void rejected(enum device_state state, BYTE id)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    BYTE bytes[8] = {id};
+
+    init_device(&ext, &device, 7, 8);
+    ext.state = state;
+    process_hid_report(&device, bytes, sizeof(bytes));
+    assert(!allocations && !live_allocations && !ext.cs && list_empty(&ext.reports));
+    assert(ext.last_reports[7]->buffer[0] == 0xa5);
+    finish_device(&ext);
+}
+
+static void stopped(void) { rejected(DEVICE_STATE_STOPPED, 7); }
+static void removed(void) { rejected(DEVICE_STATE_REMOVED, 7); }
+static void unexpected(void) { rejected(DEVICE_STATE_STARTED, 9); }
+
+static void no_memory(void)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    BYTE bytes[8] = {7};
+
+    init_device(&ext, &device, 7, 8);
+    allocation_fails = TRUE;
+    process_hid_report(&device, bytes, sizeof(bytes));
+    assert(allocations == 1 && !live_allocations && !ext.cs && list_empty(&ext.reports));
+    assert(ext.last_reports[7]->buffer[0] == 0xa5);
+    finish_device(&ext);
+}
+
+static void fifo(void)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    BYTE first[8] = {7, 1}, second[8] = {7, 2}, result[8];
+    IRP irp = {.UserBuffer = result};
+
+    init_device(&ext, &device, 7, 8);
+    process_hid_report(&device, first, sizeof(first));
+    process_hid_report(&device, second, sizeof(second));
+    assert(live_allocations == 2 && !completions);
+    assert(deliver_next_report(&ext, &irp));
+    assert(irp.IoStatus.Status == STATUS_SUCCESS && irp.IoStatus.Information == 8);
+    assert(!memcmp(result, first, sizeof(result)) && live_allocations == 1);
+    assert(deliver_next_report(&ext, &irp));
+    assert(!memcmp(result, second, sizeof(result)) && !live_allocations);
+    assert(!deliver_next_report(&ext, &irp));
+    finish_device(&ext);
+}
+
+static void pending(void)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    BYTE bytes[32] = {7, 0x66}, result[8];
+    IRP irp = {.UserBuffer = result};
+
+    init_device(&ext, &device, 7, sizeof(result));
+    ext.pending_read = &irp;
+    process_hid_report(&device, bytes, sizeof(bytes));
+    assert(!memcmp(result, bytes, sizeof(result)));
+    assert(irp.IoStatus.Status == STATUS_SUCCESS && irp.IoStatus.Information == sizeof(result));
+    assert(irp.completed == 1 && completions == 1 && !ext.pending_read);
+    assert(!live_allocations && list_empty(&ext.reports));
+    finish_device(&ext);
+}
+
+static void bluetooth(unsigned int fixup, BYTE id, ULONG received, ULONG declared, BOOL translated)
+{
+    struct device_extension ext;
+    DEVICE_OBJECT device;
+    struct hid_report *report;
+    BYTE bytes[100], expected[10];
+    ULONG length = received < declared ? received : declared, i;
+
+    init_device(&ext, &device, id, declared);
+    ext.report_fixups = fixup;
+    for (i = 0; i < sizeof(bytes); ++i) bytes[i] = i;
+    bytes[0] = id;
+    process_hid_report(&device, bytes, received);
+    report = only_report(&ext);
+    assert(!memcmp(ext.last_reports[id]->buffer, bytes, length));
+    if (translated)
+    {
+        if (id == 0x11)
+        {
+            const BYTE value[] = {1, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+            memcpy(expected, value, sizeof(expected));
+        }
+        else
+        {
+            const BYTE value[] = {1, 2, 3, 4, 5, 9, 10, 11, 6, 7};
+            memcpy(expected, value, sizeof(expected));
+        }
+        assert(report->length == sizeof(expected));
+        assert(!memcmp(report->buffer, expected, sizeof(expected)));
+    }
+    else assert(report->length == length && !memcmp(report->buffer, bytes, length));
+    finish_device(&ext);
+}
+
+static void dualshock(void) { bluetooth(HIDRAW_FIXUP_DUALSHOCK_BT, 0x11, 78, 78, TRUE); }
+static void dualsense(void) { bluetooth(HIDRAW_FIXUP_DUALSENSE_BT, 0x31, 100, 78, TRUE); }
+static void short_bt(void) { bluetooth(HIDRAW_FIXUP_DUALSENSE_BT, 0x31, 11, 78, FALSE); }
+static void declared_short_bt(void) { bluetooth(HIDRAW_FIXUP_DUALSENSE_BT, 0x31, 100, 11, FALSE); }
+static void disabled_fixup(void) { bluetooth(0, 0x31, 78, 78, FALSE); }
+
+int main(int argc, char **argv)
+{
+    static const struct { const char *name; void (*run)(void); } cases[] =
+    {
+        {"exact", exact}, {"oversized", oversized}, {"unnumbered", unnumbered},
+        {"short", short_report}, {"empty", empty}, {"stopped", stopped},
+        {"removed", removed}, {"unexpected", unexpected}, {"no-memory", no_memory},
+        {"fifo", fifo}, {"pending", pending}, {"dualshock", dualshock},
+        {"dualsense", dualsense}, {"short-bt", short_bt},
+        {"declared-short-bt", declared_short_bt}, {"disabled-fixup", disabled_fixup},
+    };
+    unsigned int i, j, count = 0;
+
+    for (i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
+    {
+        if (argc > 1)
+        {
+            for (j = 1; j < (unsigned int)argc; ++j) if (!strcmp(argv[j], cases[i].name)) break;
+            if (j == (unsigned int)argc) continue;
+        }
+        cases[i].run();
+        printf("ok %s\n", cases[i].name);
+        ++count;
+    }
+    assert(count && (argc == 1 || count == (unsigned int)argc - 1));
+    printf("%u input report cases passed\n", count);
+    return 0;
+}

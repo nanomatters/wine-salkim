@@ -706,6 +706,8 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
     ULONG size;
     IRP *irp;
 
+    if (!report_len) return;
+
     TRACE("device %p report_buf %p (%#x), report_len %#lx\n", device, report_buf, *report_buf, report_len);
 
     RtlEnterCriticalSection(&ext->cs);
