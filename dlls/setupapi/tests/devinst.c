@@ -5790,6 +5790,145 @@ static void test_driver_store(struct testsign_context *ctx)
     ok(ret, "Failed to destroy device list.\n");
 }
 
+static void test_present_interface_preserves_device(void)
+{
+    static const WCHAR instance[] = L"ROOT\\WINE_PRESENT_INTERFACE_TEST\\0000";
+    static const WCHAR phantom_instance[] = L"ROOT\\WINE_PRESENT_INTERFACE_TEST\\0001";
+    static const WCHAR instance_key[] = L"System\\CurrentControlSet\\Enum\\ROOT\\WINE_PRESENT_INTERFACE_TEST\\0000";
+    static const WCHAR phantom_key[] = L"System\\CurrentControlSet\\Enum\\ROOT\\WINE_PRESENT_INTERFACE_TEST\\0001";
+    static const WCHAR class_key[] = L"System\\CurrentControlSet\\Control\\Class\\{6a55b5a4-3f65-11db-b704-0011955c2bdb}";
+    static const WCHAR link_key[] = L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+            L"{deadbeef-3f65-11db-b704-0011955c2bdb}\\"
+            L"##?#ROOT#WINE_PRESENT_INTERFACE_TEST#0000#{deadbeef-3f65-11db-b704-0011955c2bdb}\\#\\Control";
+    static const WCHAR phantom_iface_key[] = L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+            L"{deadbeef-3f65-11db-b704-0011955c2bdb}\\"
+            L"##?#ROOT#WINE_PRESENT_INTERFACE_TEST#0001#{deadbeef-3f65-11db-b704-0011955c2bdb}";
+    SP_DEVINFO_DATA device = {sizeof(device)}, phantom = {sizeof(phantom)}, found = {sizeof(found)};
+    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
+    HDEVINFO set, present_set, caller_set;
+    DWORD disposition, linked, value, size;
+    HKEY key, control;
+    unsigned int i;
+    BOOL ret;
+    LONG status;
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        skip("Registry-backed interface presence is Wine-specific.\n");
+        return;
+    }
+
+    set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(set != INVALID_HANDLE_VALUE, "CreateDeviceInfoList failed: %lu.\n", GetLastError());
+    if (set == INVALID_HANDLE_VALUE) return;
+    ret = SetupDiCreateDeviceInfoW(set, instance, &guid, NULL, NULL, 0, &device);
+    ok(ret, "CreateDeviceInfo failed: %lu.\n", GetLastError());
+    if (!ret) goto done;
+    ret = SetupDiRegisterDeviceInfo(set, &device, 0, NULL, NULL, NULL);
+    ok(ret, "RegisterDeviceInfo failed: %lu.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &device, &iface_guid, NULL, 0, &iface);
+    ok(ret, "CreateDeviceInterface failed: %lu.\n", GetLastError());
+
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, class_key, 0, NULL, 0, KEY_ALL_ACCESS,
+            NULL, &key, &disposition);
+    ok(!status, "Create class key failed: %lu.\n", status);
+    if (status) goto remove_device;
+    RegCloseKey(key);
+    key = SetupDiCreateDevRegKeyW(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, NULL, NULL);
+    ok(key != INVALID_HANDLE_VALUE, "Create driver key failed: %lu.\n", GetLastError());
+    if (key == INVALID_HANDLE_VALUE) goto remove_class;
+    value = 0x12345678;
+    status = RegSetValueExW(key, L"WinePresentTest", 0, REG_DWORD, (BYTE *)&value, sizeof(value));
+    ok(!status, "Set driver value failed: %lu.\n", status);
+    RegCloseKey(key);
+
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, link_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &control, NULL);
+    ok(!status, "Create interface control failed: %lu.\n", status);
+    if (status) goto remove_class;
+    linked = 0;
+    status = RegSetValueExW(control, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+    ok(!status, "Set initial Linked failed: %lu.\n", status);
+    caller_set = SetupDiCreateDeviceInfoList(&guid, NULL);
+    ok(caller_set != INVALID_HANDLE_VALUE, "Create caller device set failed: %lu.\n", GetLastError());
+    if (caller_set != INVALID_HANDLE_VALUE)
+    {
+        ret = SetupDiOpenDeviceInfoW(caller_set, instance, NULL, 0, &found);
+        ok(ret, "Open caller device failed: %lu.\n", GetLastError());
+        present_set = SetupDiGetClassDevsExW(&iface_guid, instance, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+                caller_set, NULL, NULL);
+        ok(present_set == caller_set, "Expected the caller's device set.\n");
+        ret = SetupDiEnumDeviceInfo(caller_set, 0, &found);
+        ok(ret, "Enumeration discarded an existing registered device.\n");
+        SetupDiDestroyDeviceInfoList(caller_set);
+    }
+
+    ret = SetupDiCreateDeviceInfoW(set, phantom_instance, &guid, NULL, NULL, 0, &phantom);
+    ok(ret, "Create phantom device failed: %lu.\n", GetLastError());
+    /* Supply an inactive interface without adding it to the caller's set. */
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, phantom_iface_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+    ok(!status, "Create phantom interface key failed: %lu.\n", status);
+    if (!status)
+    {
+        status = RegSetValueExW(key, L"DeviceInstance", 0, REG_SZ, (const BYTE *)phantom_instance, sizeof(phantom_instance));
+        ok(!status, "Set phantom interface instance failed: %lu.\n", status);
+        RegCloseKey(key);
+    }
+    present_set = SetupDiGetClassDevsExW(&iface_guid, phantom_instance, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+            set, NULL, NULL);
+    ok(present_set == set, "Expected the caller's device set.\n");
+    ret = SetupDiEnumDeviceInfo(set, 1, &found);
+    ok(ret && found.Reserved == phantom.Reserved, "Enumeration discarded an existing phantom device.\n");
+    status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, phantom_key, 0, KEY_READ, &key);
+    ok(!status, "Enumeration deleted the caller's phantom instance, error %lu.\n", status);
+    if (!status) RegCloseKey(key);
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, phantom_iface_key);
+
+    for (i = 0; i < 4; ++i)
+    {
+        linked = i % 2;
+        winetest_push_context("Linked %lu, pass %u", linked, i);
+        status = RegSetValueExW(control, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+        ok(!status, "Set Linked failed: %lu.\n", status);
+        present_set = SetupDiGetClassDevsW(&iface_guid, instance, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        ok(present_set != INVALID_HANDLE_VALUE, "GetClassDevs failed: %lu.\n", GetLastError());
+        if (present_set != INVALID_HANDLE_VALUE)
+        {
+            ret = SetupDiEnumDeviceInfo(present_set, 0, &found);
+            ok(ret == linked, "Device presence is %u, expected %lu.\n", ret, linked);
+            ret = SetupDiEnumDeviceInterfaces(present_set, NULL, &iface_guid, 0, &iface);
+            ok(ret == linked, "Interface presence is %u, expected %lu.\n", ret, linked);
+            SetupDiDestroyDeviceInfoList(present_set);
+        }
+        status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, instance_key, 0, KEY_READ, &key);
+        ok(!status, "Enumeration deleted the device instance, error %lu.\n", status);
+        if (!status) RegCloseKey(key);
+        key = SetupDiOpenDevRegKey(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_READ);
+        ok(key != INVALID_HANDLE_VALUE, "Enumeration deleted the driver key, error %lu.\n", GetLastError());
+        if (key != INVALID_HANDLE_VALUE)
+        {
+            size = sizeof(value);
+            value = 0;
+            status = RegQueryValueExW(key, L"WinePresentTest", NULL, NULL, (BYTE *)&value, &size);
+            ok(!status && value == 0x12345678, "Driver value changed to %#lx, error %lu.\n", value, status);
+            RegCloseKey(key);
+        }
+        size = sizeof(value);
+        value = ~linked;
+        status = RegQueryValueExW(control, L"Linked", NULL, NULL, (BYTE *)&value, &size);
+        ok(!status && value == linked, "Interface state changed to %lu, error %lu.\n", value, status);
+        winetest_pop_context();
+    }
+    RegCloseKey(control);
+remove_class:
+    SetupDiRemoveDevice(set, &device);
+    if (disposition == REG_CREATED_NEW_KEY) RegDeleteKeyW(HKEY_LOCAL_MACHINE, class_key);
+    goto done;
+remove_device:
+    SetupDiRemoveDevice(set, &device);
+done:
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 static void check_winehid_presence_(unsigned int line, BOOL present)
 {
     SP_DEVINFO_DATA found = {sizeof(found)};
@@ -6090,6 +6229,7 @@ START_TEST(devinst)
     test_get_class_devs();
     test_SetupDiOpenDeviceInterface();
     test_device_enum();
+    test_present_interface_preserves_device();
     test_winehid_device_presence();
 
     if (!testsign_create_cert(&ctx))

@@ -941,7 +941,7 @@ static void delete_device(struct device *device)
 
 /* Create a new device, or return a device already in the set. */
 static struct device *create_device(struct DeviceInfoSet *set,
-    const GUID *class, const WCHAR *instanceid, BOOL phantom)
+    const GUID *class, const WCHAR *instanceid, BOOL phantom, BOOL *created)
 {
     const DWORD one = 1;
     struct device *device;
@@ -952,6 +952,7 @@ static struct device *create_device(struct DeviceInfoSet *set,
     TRACE("%p, %s, %s, %d\n", set, debugstr_guid(class),
         debugstr_w(instanceid), phantom);
 
+    if (created) *created = FALSE;
     LIST_FOR_EACH_ENTRY(device, &set->devices, struct device, entry)
     {
         if (!wcsicmp(instanceid, device->instanceId))
@@ -999,6 +1000,7 @@ static struct device *create_device(struct DeviceInfoSet *set,
     }
 
     TRACE("Created new device %p.\n", device);
+    if (created) *created = TRUE;
     return device;
 }
 
@@ -1597,7 +1599,7 @@ BOOL WINAPI SetupDiCreateDeviceInfoW(HDEVINFO devinfo, const WCHAR *name, const 
         }
     }
 
-    if (!(device = create_device(set, class, id, TRUE)))
+    if (!(device = create_device(set, class, id, TRUE, NULL)))
         return FALSE;
 
     if (description)
@@ -2199,19 +2201,16 @@ static void SETUPDI_EnumerateMatchingInterfaces(HDEVINFO DeviceInfoSet,
                             {
                                 GUID deviceClass;
                                 struct device *device;
+                                BOOL created;
 
                                 deviceClassStr[37] = 0;
                                 UuidFromStringW(&deviceClassStr[1],
                                         &deviceClass);
-                                if ((device = create_device(set, &deviceClass, deviceInst, FALSE)))
+                                if ((device = create_device(set, &deviceClass, deviceInst, FALSE, &created)))
                                     SETUPDI_AddDeviceInterfaces(device, subKey, guid, flags);
-                                /*
-                                 * If there weren't any interfaces present for
-                                 * this device, remove it from the device info
-                                 * list.
-                                 */
-                                if (device && ((flags & DIGCF_PRESENT) && !list_count(&device->interfaces)))
-                                    remove_device(device);
+                                /* Discard only new info-set entries, without uninstalling the device. */
+                                if (device && created && (flags & DIGCF_PRESENT) && list_empty(&device->interfaces))
+                                    delete_device(device);
                             }
                             RegCloseKey(deviceKey);
                         }
@@ -2451,7 +2450,7 @@ static void SETUPDI_EnumerateMatchingDeviceInstances(struct DeviceInfoSet *set,
                                     (!(flags & DIGCF_PRESENT) ||
                                      is_device_instance_linked(subKey, interfacesKey, id)))
                             {
-                                create_device(set, &deviceClass, id, FALSE);
+                                create_device(set, &deviceClass, id, FALSE, NULL);
                             }
 
                         }
@@ -4055,7 +4054,7 @@ BOOL WINAPI SetupDiOpenDeviceInfoW(HDEVINFO devinfo, PCWSTR instance_id, HWND hw
         goto done;
     }
 
-    if (!(device = create_device(set, &guid, instance_id, FALSE)))
+    if (!(device = create_device(set, &guid, instance_id, FALSE, NULL)))
         goto done;
 
     if (!device_data || device_data->cbSize == sizeof(SP_DEVINFO_DATA))
