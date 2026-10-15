@@ -1,0 +1,300 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef unsigned char BYTE, UCHAR;
+typedef unsigned long ULONG;
+typedef long NTSTATUS;
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+#define CALLBACK
+#define STATUS_SUCCESS 0
+#define STATUS_PENDING 0x103
+#define STATUS_NO_MEMORY ((NTSTATUS)0xc0000017)
+#define STATUS_INVALID_USER_BUFFER ((NTSTATUS)0xc00000e8)
+#define STATUS_INVALID_PARAMETER ((NTSTATUS)0xc000000d)
+#define STATUS_CANCELLED ((NTSTATUS)0xc0000120)
+#define STATUS_DEVICE_NOT_CONNECTED ((NTSTATUS)0xc000009d)
+#define IO_NO_INCREMENT 0
+#define NormalPagePriority 0
+#define HidP_Input 0
+#define HidP_Output 1
+#define HidP_Feature 2
+#define IOCTL_HID_GET_FEATURE 1
+#define IOCTL_HID_GET_INPUT_REPORT 2
+#define IOCTL_HID_SET_FEATURE 3
+#define IOCTL_HID_SET_OUTPUT_REPORT 4
+#define IOCTL_HID_WRITE_REPORT 5
+#define TRACE(...) do {} while (0)
+
+typedef struct { void *DeviceExtension; } DEVICE_OBJECT;
+typedef struct
+{
+    union
+    {
+        struct { ULONG InputBufferLength, OutputBufferLength; } DeviceIoControl;
+        struct { ULONG Length; } Write;
+    } Parameters;
+} IO_STACK_LOCATION;
+typedef struct irp IRP;
+struct irp
+{
+    struct { NTSTATUS Status; uintptr_t Information; } IoStatus;
+    struct { void *SystemBuffer; } AssociatedIrp;
+    void *MdlAddress;
+    IO_STACK_LOCATION stack;
+    unsigned int pending, completed;
+    NTSTATUS (*completion)(DEVICE_OBJECT *, IRP *, void *);
+    void *context;
+};
+typedef struct
+{
+    BYTE reportId;
+    BYTE *reportBuffer;
+    ULONG reportBufferLen;
+} HID_XFER_PACKET;
+typedef struct
+{
+    BYTE ReportID, CollectionNumber;
+    ULONG InputLength, OutputLength, FeatureLength;
+} HIDP_REPORT_IDS;
+typedef struct { HIDP_REPORT_IDS *ReportIDs; ULONG ReportIDsLength; } HIDP_DEVICE_DESC;
+struct func_device { HIDP_DEVICE_DESC device_desc; };
+struct phys_device
+{
+    DEVICE_OBJECT *parent_fdo;
+    struct { unsigned int CollectionNumber; } *collection_desc;
+};
+
+static struct func_device fdo;
+static DEVICE_OBJECT parent = {&fdo};
+static HIDP_REPORT_IDS reports[2];
+static unsigned int parameter_allocations, parameter_frees, completions, driver_calls;
+static BOOL allocation_fails, build_fails, deferred;
+static NTSTATUS minidriver_status;
+static uintptr_t minidriver_length;
+static IRP *pending_irp, *original_irp;
+static HID_XFER_PACKET last_packet;
+static ULONG last_code;
+
+static void *parameter_calloc(size_t count, size_t size)
+{
+    void *result;
+    if (allocation_fails) return NULL;
+    result = calloc(count, size);
+    assert(result);
+    ++parameter_allocations;
+    return result;
+}
+
+static void parameter_free(void *memory)
+{
+    assert(memory && parameter_allocations > parameter_frees);
+    ++parameter_frees;
+    free(memory);
+}
+
+static IO_STACK_LOCATION *IoGetCurrentIrpStackLocation(IRP *irp) { return &irp->stack; }
+static struct func_device *fdo_from_DEVICE_OBJECT(DEVICE_OBJECT *device) { return device->DeviceExtension; }
+static void *MmGetSystemAddressForMdlSafe(void *mdl, unsigned int priority) { return mdl; }
+
+static IRP *IoBuildDeviceIoControlRequest(ULONG code, DEVICE_OBJECT *device, void *input, ULONG input_len,
+                                        void *output, ULONG output_len, BOOL internal, void *event, void *io)
+{
+    IRP *irp;
+    assert(device == &parent && internal);
+    last_packet = *(HID_XFER_PACKET *)(input ? input : output);
+    last_code = code;
+    if (code == IOCTL_HID_GET_FEATURE || code == IOCTL_HID_GET_INPUT_REPORT)
+        assert(output_len == sizeof(last_packet) && !input_len);
+    else assert(input_len == sizeof(last_packet) && !output_len);
+    if (build_fails) return NULL;
+    irp = calloc(1, sizeof(*irp));
+    assert(irp);
+    return irp;
+}
+
+static void IoMarkIrpPending(IRP *irp)
+{
+    assert(irp == original_irp);
+    ++irp->pending;
+}
+
+static void IoSetCompletionRoutine(IRP *irp, NTSTATUS (*callback)(DEVICE_OBJECT *, IRP *, void *),
+                                   void *context, BOOL success, BOOL error, BOOL cancel)
+{
+    assert(success && error && cancel);
+    irp->completion = callback;
+    irp->context = context;
+}
+
+static void IoCompleteRequest(IRP *irp, unsigned int boost)
+{
+    assert(irp == original_irp && !boost);
+    ++irp->completed;
+    ++completions;
+}
+
+static void finish_minidriver(IRP *irp)
+{
+    NTSTATUS status;
+    irp->IoStatus.Status = minidriver_status;
+    irp->IoStatus.Information = minidriver_length;
+    status = irp->completion(&parent, irp, irp->context);
+    assert(status == STATUS_SUCCESS);
+    free(irp);
+}
+
+static NTSTATUS IoCallDriver(DEVICE_OBJECT *device, IRP *irp)
+{
+    assert(device == &parent);
+    ++driver_calls;
+    if (deferred) pending_irp = irp;
+    else finish_minidriver(irp);
+    return STATUS_PENDING;
+}
+
+#define calloc parameter_calloc
+#define free parameter_free
+/* PRODUCTION_HELPERS */
+#undef free
+#undef calloc
+
+static void init(IRP *irp, struct phys_device *pdo, BYTE id, BYTE *bytes, ULONG length, ULONG code)
+{
+    static struct { unsigned int CollectionNumber; } collection;
+
+    assert(parameter_allocations == parameter_frees && !pending_irp);
+    parameter_allocations = parameter_frees = completions = driver_calls = 0;
+    allocation_fails = build_fails = deferred = FALSE;
+    minidriver_status = STATUS_SUCCESS;
+    minidriver_length = 1;
+    memset(reports, 0, sizeof(reports));
+    reports[0].CollectionNumber = 1;
+    reports[0].ReportID = id;
+    reports[0].InputLength = reports[0].OutputLength = reports[0].FeatureLength = 4;
+    reports[1] = reports[0];
+    reports[1].CollectionNumber = 2;
+    reports[1].ReportID = 0x55;
+    fdo.device_desc.ReportIDs = reports;
+    fdo.device_desc.ReportIDsLength = 2;
+    collection.CollectionNumber = 1;
+    pdo->collection_desc = (void *)&collection;
+    pdo->parent_fdo = &parent;
+    memset(irp, 0, sizeof(*irp));
+    irp->AssociatedIrp.SystemBuffer = irp->MdlAddress = bytes;
+    if (code == IOCTL_HID_WRITE_REPORT) irp->stack.Parameters.Write.Length = length;
+    else if (code == IOCTL_HID_GET_FEATURE || code == IOCTL_HID_GET_INPUT_REPORT)
+        irp->stack.Parameters.DeviceIoControl.OutputBufferLength = length;
+    else irp->stack.Parameters.DeviceIoControl.InputBufferLength = length;
+    original_irp = irp;
+    bytes[0] = id;
+}
+
+static void test_write(BYTE id, uintptr_t driver_length, NTSTATUS driver_status, BOOL async)
+{
+    struct phys_device pdo;
+    BYTE bytes[8] = {0};
+    IRP irp;
+    NTSTATUS status;
+
+    init(&irp, &pdo, id, bytes, sizeof(bytes), IOCTL_HID_WRITE_REPORT);
+    minidriver_length = driver_length;
+    minidriver_status = driver_status;
+    deferred = async;
+    status = hid_device_xfer_report(&pdo, IOCTL_HID_WRITE_REPORT, &irp);
+    assert(status == STATUS_PENDING && irp.pending == 1 && driver_calls == 1);
+    assert(last_code == IOCTL_HID_WRITE_REPORT && last_packet.reportId == id);
+    assert(last_packet.reportBuffer == bytes + (id ? 0 : 1));
+    assert(last_packet.reportBufferLen == (id ? 4 : 3));
+    if (async)
+    {
+        assert(!completions && !parameter_frees && pending_irp);
+        finish_minidriver(pending_irp);
+        pending_irp = NULL;
+    }
+    assert(completions == 1 && irp.completed == 1);
+    assert(irp.IoStatus.Status == driver_status && irp.IoStatus.Information == 4);
+    assert(parameter_allocations == 1 && parameter_frees == 1);
+}
+
+static void test_other_transfer(ULONG code, BYTE id)
+{
+    struct phys_device pdo;
+    BYTE bytes[8] = {0};
+    IRP irp;
+    NTSTATUS status;
+
+    init(&irp, &pdo, id, bytes, sizeof(bytes), code);
+    minidriver_length = 2;
+    status = hid_device_xfer_report(&pdo, code, &irp);
+    assert(status == STATUS_PENDING && irp.pending == 1 && driver_calls == 1);
+    assert(irp.completed == 1 && completions == 1);
+    assert(irp.IoStatus.Status == STATUS_SUCCESS && irp.IoStatus.Information == 2);
+    assert(last_code == code && last_packet.reportId == id);
+    assert(last_packet.reportBuffer == bytes + (id ? 0 : 1));
+    assert(parameter_allocations == parameter_frees);
+}
+
+static void test_invalid(unsigned int mode, NTSTATUS expected)
+{
+    struct phys_device pdo;
+    BYTE bytes[8] = {0};
+    IRP irp;
+    NTSTATUS status;
+
+    init(&irp, &pdo, 1, bytes, sizeof(bytes), IOCTL_HID_WRITE_REPORT);
+    switch (mode)
+    {
+    case 0: irp.stack.Parameters.Write.Length = 0; break;
+    case 1: irp.AssociatedIrp.SystemBuffer = NULL; break;
+    case 2: irp.stack.Parameters.Write.Length = 3; break;
+    case 3: bytes[0] = 9; break;
+    case 4: reports[0].CollectionNumber = 2; break;
+    case 5: allocation_fails = TRUE; break;
+    case 6: build_fails = TRUE; break;
+    }
+    status = hid_device_xfer_report(&pdo, IOCTL_HID_WRITE_REPORT, &irp);
+    assert(status == expected && !irp.pending && !irp.completed && !driver_calls);
+    assert(parameter_allocations == parameter_frees);
+}
+
+int main(void)
+{
+    const uintptr_t counts[] = {0, 1, 3, 4, 99};
+    const NTSTATUS statuses[] = {STATUS_SUCCESS, STATUS_CANCELLED, STATUS_DEVICE_NOT_CONNECTED};
+    ULONG code;
+    unsigned int id, count, status, async, cases = 0;
+
+    for (id = 0; id < 2; ++id)
+        for (count = 0; count < sizeof(counts) / sizeof(*counts); ++count)
+            for (status = 0; status < sizeof(statuses) / sizeof(*statuses); ++status)
+                for (async = 0; async < 2; ++async)
+                {
+                    test_write(id, counts[count], statuses[status], async);
+                    ++cases;
+                }
+    for (code = IOCTL_HID_GET_FEATURE; code <= IOCTL_HID_SET_OUTPUT_REPORT; ++code)
+        for (id = 0; id < 2; ++id)
+        {
+            test_other_transfer(code, id);
+            ++cases;
+        }
+    test_invalid(0, STATUS_INVALID_USER_BUFFER);
+    test_invalid(1, STATUS_INVALID_USER_BUFFER);
+    test_invalid(2, STATUS_INVALID_PARAMETER);
+    test_invalid(3, STATUS_INVALID_PARAMETER);
+    test_invalid(4, STATUS_INVALID_PARAMETER);
+    test_invalid(5, STATUS_NO_MEMORY);
+    test_invalid(6, STATUS_NO_MEMORY);
+    printf("%u output transfer cases passed\n", cases + 7);
+    return 0;
+}
