@@ -5790,6 +5790,21 @@ static void test_driver_store(struct testsign_context *ctx)
     ok(ret, "Failed to destroy device list.\n");
 }
 
+static void check_winehid_presence_(unsigned int line, BOOL present)
+{
+    SP_DEVINFO_DATA found = {sizeof(found)};
+    HDEVINFO set;
+    BOOL ret;
+
+    set = SetupDiGetClassDevsW(&guid, L"USB\\WINE_TEST_SERVICE", NULL, DIGCF_PRESENT);
+    ok_(__FILE__, line)(set != INVALID_HANDLE_VALUE, "GetClassDevs failed: %lu.\n", GetLastError());
+    if (set == INVALID_HANDLE_VALUE) return;
+    ret = SetupDiEnumDeviceInfo(set, 0, &found);
+    ok_(__FILE__, line)(ret == present, "Device presence is %u, expected %u.\n", ret, present);
+    SetupDiDestroyDeviceInfoList(set);
+}
+#define check_winehid_presence(present) check_winehid_presence_(__LINE__, present)
+
 static void test_winehid_device_presence(void)
 {
     static const struct
@@ -5808,11 +5823,18 @@ static void test_winehid_device_presence(void)
     };
     static const WCHAR usb_id[] = L"USB\\WINE_TEST_SERVICE\\0000";
     static const WCHAR hid_id[] = L"HID\\WINE_TEST_SERVICE\\0000";
+    static const WCHAR child_id[] = L"HID\\WINE_TEST_SERVICE\\2&abcdef01&0&0000";
+    static const WCHAR other_parent[] = L"USB\\WINE_TEST_SERVICE\\0001";
+    static const WCHAR device_key[] = L"System\\CurrentControlSet\\Enum\\USB\\WINE_TEST_SERVICE\\0000";
+    static const WCHAR child_key[] = L"System\\CurrentControlSet\\Enum\\HID\\WINE_TEST_SERVICE\\2&abcdef01&0&0000";
     static const WCHAR link_key[] = L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
             L"{6a55b5a4-3f65-11db-b704-0011955c2bdb}\\"
             L"##?#HID#WINE_TEST_SERVICE#0000#{6a55b5a4-3f65-11db-b704-0011955c2bdb}\\#\\Control";
-    SP_DEVINFO_DATA usb = {sizeof(usb)}, hid = {sizeof(hid)}, found = {sizeof(found)};
-    HDEVINFO set, present_set;
+    static const WCHAR child_link_key[] = L"System\\CurrentControlSet\\Control\\DeviceClasses\\"
+            L"{6a55b5a4-3f65-11db-b704-0011955c2bdb}\\"
+            L"##?#HID#WINE_TEST_SERVICE#2&abcdef01&0&0000#{6a55b5a4-3f65-11db-b704-0011955c2bdb}\\#\\Control";
+    SP_DEVINFO_DATA usb = {sizeof(usb)}, hid = {sizeof(hid)}, child = {sizeof(child)};
+    HDEVINFO set;
     HKEY key, service_key;
     DWORD linked = 1;
     unsigned int i;
@@ -5849,27 +5871,96 @@ static void test_winehid_device_presence(void)
     ok(!status, "Set Linked failed: %lu.\n", status);
     RegCloseKey(key);
 
-    service_key = SetupDiOpenDevRegKey(set, &usb, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_ALL_ACCESS);
-    ok(service_key != INVALID_HANDLE_VALUE, "OpenDevRegKey failed: %lu.\n", GetLastError());
-    if (service_key == INVALID_HANDLE_VALUE) goto remove_hid;
+    status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, device_key, 0, KEY_ALL_ACCESS, &service_key);
+    ok(!status, "Open device key failed: %lu.\n", status);
+    if (status) goto remove_hid;
     for (i = 0; i < ARRAY_SIZE(tests); ++i)
     {
         winetest_push_context("case %u", i);
         status = RegSetValueExW(service_key, L"Service", 0, tests[i].type,
                 (const BYTE *)tests[i].service, tests[i].size);
         ok(!status, "Set Service failed: %lu.\n", status);
-        present_set = SetupDiGetClassDevsW(&guid, L"USB\\WINE_TEST_SERVICE", NULL, DIGCF_PRESENT);
-        ok(present_set != INVALID_HANDLE_VALUE, "GetClassDevs failed: %lu.\n", GetLastError());
-        if (present_set != INVALID_HANDLE_VALUE)
-        {
-            ret = SetupDiEnumDeviceInfo(present_set, 0, &found);
-            ok(ret == tests[i].present, "Device presence is %u, expected %u.\n", ret, tests[i].present);
-            SetupDiDestroyDeviceInfoList(present_set);
-        }
+        check_winehid_presence(tests[i].present);
         winetest_pop_context();
     }
+    status = RegSetValueExW(service_key, L"Service", 0, REG_SZ, (const BYTE *)L"winehid", sizeof(L"winehid"));
+    ok(!status, "Set Service failed: %lu.\n", status);
     RegCloseKey(service_key);
 
+    /* Published parent information takes precedence over a legacy ID match. */
+    ret = SetupDiSetDevicePropertyW(set, &hid, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
+            (const BYTE *)other_parent, sizeof(other_parent), 0);
+    ok(ret, "Set legacy child parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(FALSE);
+    ret = SetupDiSetDevicePropertyW(set, &hid, &DEVPKEY_Device_Parent, DEVPROP_TYPE_EMPTY, NULL, 0, 0);
+    ok(ret, "Clear legacy child parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(TRUE);
+
+    /* The legacy child must not mask the new child relationship checks. */
+    status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, link_key, 0, KEY_ALL_ACCESS, &key);
+    ok(!status, "Open link key failed: %lu.\n", status);
+    if (status) goto remove_hid;
+    linked = 0;
+    status = RegSetValueExW(key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+    ok(!status, "Set Linked failed: %lu.\n", status);
+    RegCloseKey(key);
+    check_winehid_presence(FALSE);
+
+    ret = SetupDiCreateDeviceInfoW(set, child_id, &guid, NULL, NULL, 0, &child);
+    ok(ret, "Create child device failed: %lu.\n", GetLastError());
+    if (!ret) goto remove_hid;
+    ret = SetupDiRegisterDeviceInfo(set, &child, 0, NULL, NULL, NULL);
+    ok(ret, "Register child device failed: %lu.\n", GetLastError());
+    ret = SetupDiCreateDeviceInterfaceW(set, &child, &guid, NULL, 0, NULL);
+    ok(ret, "Create child interface failed: %lu.\n", GetLastError());
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, child_link_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+    ok(!status, "Create child link key failed: %lu.\n", status);
+    if (status) goto remove_child;
+    linked = 1;
+    status = RegSetValueExW(key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+    ok(!status, "Set child Linked failed: %lu.\n", status);
+
+    /* A linked interface is not enough without the matching parent. */
+    check_winehid_presence(FALSE);
+    ret = SetupDiSetDevicePropertyW(set, &child, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
+            (const BYTE *)other_parent, sizeof(other_parent), 0);
+    ok(ret, "Set other parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(FALSE);
+    ret = SetupDiSetDevicePropertyW(set, &child, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
+            (const BYTE *)usb_id, sizeof(usb_id), 0);
+    ok(ret, "Set child parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(TRUE);
+
+    linked = 0;
+    status = RegSetValueExW(key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+    ok(!status, "Clear child Linked failed: %lu.\n", status);
+    check_winehid_presence(FALSE);
+    linked = 1;
+    status = RegSetValueExW(key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(linked));
+    ok(!status, "Restore child Linked failed: %lu.\n", status);
+    check_winehid_presence(TRUE);
+
+    ret = SetupDiSetDevicePropertyW(set, &child, &DEVPKEY_Device_Parent, DEVPROP_TYPE_BINARY,
+            (const BYTE *)usb_id, sizeof(usb_id), 0);
+    ok(ret, "Set binary parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(FALSE);
+    ret = SetupDiSetDevicePropertyW(set, &child, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
+            (const BYTE *)usb_id, sizeof(usb_id) - sizeof(WCHAR), 0);
+    ok(ret, "Set unterminated parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(FALSE);
+    ret = SetupDiSetDevicePropertyW(set, &child, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
+            (const BYTE *)usb_id, sizeof(usb_id), 0);
+    ok(ret, "Restore child parent failed: %lu.\n", GetLastError());
+    check_winehid_presence(TRUE);
+
+    /* A stale linked interface must not make a deleted child present. */
+    status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, child_key);
+    ok(!status, "Delete child key failed: %lu.\n", status);
+    check_winehid_presence(FALSE);
+    RegCloseKey(key);
+
+remove_child:
+    SetupDiRemoveDevice(set, &child);
 remove_hid:
     SetupDiRemoveDevice(set, &hid);
 remove_usb:

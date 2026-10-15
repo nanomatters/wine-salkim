@@ -2286,6 +2286,33 @@ static void SETUPDI_EnumerateInterfaces(HDEVINFO DeviceInfoSet,
 }
 
 
+static DWORD get_device_reg_property( HKEY base_key, const DEVPROPKEY *prop_key, DEVPROPTYPE *prop_type,
+                                      BYTE *buf, DWORD buf_size, DWORD *req_size, DWORD flags );
+
+static BOOL is_winehid_child(const WCHAR *instance, const WCHAR *parent, const WCHAR *legacy_instance)
+{
+    WCHAR parent_id[MAX_DEVICE_ID_LEN];
+    HKEY enum_key, device_key;
+    DEVPROPTYPE type;
+    DWORD ret, size;
+
+    if (wcsnicmp(instance, L"HID\\", 4)) return FALSE;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, Enum, 0, KEY_READ, &enum_key)) return FALSE;
+    ret = RegOpenKeyExW(enum_key, instance, 0, KEY_READ, &device_key);
+    RegCloseKey(enum_key);
+    if (ret) return FALSE;
+
+    ret = get_device_reg_property(device_key, &DEVPKEY_Device_Parent, &type, (BYTE *)parent_id,
+            sizeof(parent_id), &size, 0);
+    RegCloseKey(device_key);
+    if (!ret)
+        return type == DEVPROP_TYPE_STRING && size >= sizeof(WCHAR) && !(size % sizeof(WCHAR))
+                && !parent_id[size / sizeof(WCHAR) - 1] && !wcsicmp(parent_id, parent);
+
+    /* Older prefixes only linked the bus and HID devices through their IDs. */
+    return ret == ERROR_NOT_FOUND && !wcsicmp(instance, legacy_instance);
+}
+
 /* iterate over all interfaces supported by this device instance. if any of
  * them are "linked", return TRUE */
 static BOOL is_device_instance_linked(HKEY subKey, HKEY interfacesKey, const WCHAR *deviceInstance)
@@ -2297,17 +2324,17 @@ static BOOL is_device_instance_linked(HKEY subKey, HKEY interfacesKey, const WCH
     WCHAR interface_devinstance[MAX_DEVICE_ID_LEN];
     WCHAR alt_devinstance[MAX_DEVICE_ID_LEN];
     WCHAR service[40];
+    BOOL winehid = FALSE;
 
     len = sizeof(service);
     l = RegGetValueW(subKey, NULL, L"Service", RRF_RT_REG_SZ, NULL, service, &len);
-    if (!l && !wcsicmp(service, L"winehid") && !wcsstr(deviceInstance, L"HID\\"))
+    if (!l && !wcsicmp(service, L"winehid") && wcsnicmp(deviceInstance, L"HID\\", 4))
     {
         const WCHAR *tmp = wcschr(deviceInstance, L'\\');
 
         if (tmp && (swprintf(alt_devinstance, ARRAY_SIZE(alt_devinstance), L"HID%s", tmp) != -1))
         {
-            TRACE("Found winehid device instance, checking for link with device instance %s.\n", debugstr_w(alt_devinstance));
-            deviceInstance = alt_devinstance;
+            winehid = TRUE;
         }
     }
 
@@ -2342,7 +2369,8 @@ static BOOL is_device_instance_linked(HKEY subKey, HKEY interfacesKey, const WCH
                 continue;
             }
 
-            if (lstrcmpiW(interface_devinstance, deviceInstance))
+            if (lstrcmpiW(interface_devinstance, deviceInstance)
+                    && (!winehid || !is_winehid_child(interface_devinstance, deviceInstance, alt_devinstance)))
             {
                 /* not our device instance */
                 RegCloseKey(device_key);
