@@ -2417,6 +2417,40 @@ static void test_opengl3(HDC hdc)
         wglDeleteContext(gl3Ctx);
     }
 
+    /* An OpenGL 3.1 context requested without flags supports deprecated features. */
+    {
+        static const int attribs[] = {WGL_CONTEXT_MAJOR_VERSION_ARB, 3, WGL_CONTEXT_MINOR_VERSION_ARB, 1, 0};
+        static const int compat_attribs[] = {WGL_CONTEXT_MAJOR_VERSION_ARB, 3, WGL_CONTEXT_MINOR_VERSION_ARB, 2,
+                WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB, 0};
+        HGLRC old_ctx = wglGetCurrentContext(), ctx;
+        HDC old_dc = wglGetCurrentDC();
+        const char *extensions;
+        GLenum error;
+        BOOL ret;
+
+        if ((ctx = pwglCreateContextAttribsARB(hdc, NULL, compat_attribs)))
+        {
+            wglDeleteContext(ctx);
+            ctx = pwglCreateContextAttribsARB(hdc, NULL, attribs);
+            ret = ctx && wglMakeCurrent(hdc, ctx);
+            ok(ret, "Failed to make the OpenGL 3.1 context current, error %lu.\n", GetLastError());
+            if (ret)
+            {
+                extensions = (const char *)glGetString(GL_EXTENSIONS);
+                error = glGetError();
+                todo_wine ok(error == GL_NO_ERROR, "glGetString(GL_EXTENSIONS) returned error %#x.\n", error);
+                todo_wine ok(extensions && gl_extension_supported(extensions, "GL_ARB_compatibility"),
+                        "Missing GL_ARB_compatibility.\n");
+
+                ret = wglMakeCurrent(old_dc, old_ctx);
+                ok(ret, "Failed to restore the previous context, error %lu.\n", GetLastError());
+            }
+            if (ctx) wglDeleteContext(ctx);
+        }
+        else
+            skip("OpenGL 3.2 compatibility profile is unavailable.\n");
+    }
+
     /* Test matching an OpenGL 3.0 context with an older one, OpenGL 3.0 should allow it until the new object model is introduced in a future revision */
     {
         HGLRC glCtx = wglCreateContext(hdc);
