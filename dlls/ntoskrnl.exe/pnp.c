@@ -147,11 +147,36 @@ static NTSTATUS send_pnp_irp( DEVICE_OBJECT *device, UCHAR minor )
     return irp_status.Status;
 }
 
+static NTSTATUS build_device_instance_id( WCHAR *buffer, const WCHAR *device_id,
+                                         const WCHAR *instance_id, const WCHAR *parent_prefix )
+{
+    size_t device_len = wcslen( device_id ), instance_len = wcslen( instance_id );
+    size_t prefix_len = wcslen( parent_prefix ), offset;
+
+    if (device_len + instance_len + prefix_len + 1 + !!prefix_len >= MAX_DEVICE_ID_LEN)
+    {
+        buffer[0] = 0;
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    memcpy( buffer, device_id, device_len * sizeof(WCHAR) );
+    buffer[device_len] = '\\';
+    offset = device_len + 1;
+    if (prefix_len)
+    {
+        memcpy( buffer + offset, parent_prefix, prefix_len * sizeof(WCHAR) );
+        offset += prefix_len;
+        buffer[offset++] = '&';
+    }
+    memcpy( buffer + offset, instance_id, (instance_len + 1) * sizeof(WCHAR) );
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS get_device_instance_id( DEVICE_OBJECT *device, WCHAR *buffer )
 {
     struct wine_device *pdo_dev;
     NTSTATUS status;
-    WCHAR *id;
+    WCHAR *device_id, *instance_id;
 
     while (device->DeviceObjectExtension->AttachedTo)
         device = device->DeviceObjectExtension->AttachedTo;
@@ -165,24 +190,22 @@ static NTSTATUS get_device_instance_id( DEVICE_OBJECT *device, WCHAR *buffer )
     pdo_dev = CONTAINING_RECORD(device, struct wine_device, device_obj);
     if (!wcslen( pdo_dev->device_instance_id ))
     {
-        if ((status = get_device_id( device, BusQueryDeviceID, &id )))
+        if ((status = get_device_id( device, BusQueryDeviceID, &device_id )))
         {
             ERR("Failed to get device ID, status %#lx.\n", status);
             return status;
         }
 
-        wcscpy( pdo_dev->device_instance_id, id );
-        wcscat( pdo_dev->device_instance_id, L"\\" );
-        ExFreePool( id );
-
-        if ((status = get_device_id( device, BusQueryInstanceID, &id )))
+        if ((status = get_device_id( device, BusQueryInstanceID, &instance_id )))
         {
             ERR("Failed to get instance ID, status %#lx.\n", status);
-            pdo_dev->device_instance_id[0] = 0;
+            ExFreePool( device_id );
             return status;
         }
-        wcscat( pdo_dev->device_instance_id, id );
-        ExFreePool( id );
+        status = build_device_instance_id( pdo_dev->device_instance_id, device_id, instance_id, L"" );
+        ExFreePool( instance_id );
+        ExFreePool( device_id );
+        if (status) return status;
     }
 
     wcscpy( buffer, pdo_dev->device_instance_id );
@@ -450,7 +473,13 @@ static unsigned int hash_wchar_path( const WCHAR *id_path )
     return ret;
 }
 
-static void get_parent_id_prefix( DEVICE_OBJECT *parent, WCHAR *prefix_out )
+static BOOL is_valid_parent_id_prefix( const WCHAR *prefix, DWORD size, DWORD type )
+{
+    return type == REG_SZ && size >= 2 * sizeof(WCHAR) && size <= MAX_DEVICE_ID_LEN * sizeof(WCHAR)
+            && !(size % sizeof(WCHAR)) && prefix[0] && !prefix[size / sizeof(WCHAR) - 1];
+}
+
+static BOOL get_parent_id_prefix( DEVICE_OBJECT *parent, WCHAR *prefix_out )
 {
     struct wine_device *wine_device = CONTAINING_RECORD(parent, struct wine_device, device_obj);
     static const WCHAR *enum_key_path = L"System\\CurrentControlSet\\Enum";
@@ -458,21 +487,21 @@ static void get_parent_id_prefix( DEVICE_OBJECT *parent, WCHAR *prefix_out )
     WCHAR tmp_buf[MAX_PATH] = { 0 };
     HKEY dev_hkey;
     LSTATUS ret;
-    DWORD size;
+    DWORD size, type;
 
     *prefix_out = 0;
-    get_device_instance_id( parent, instance_id );
+    if (get_device_instance_id( parent, instance_id )) return FALSE;
     swprintf( tmp_buf, ARRAY_SIZE(tmp_buf), L"%s\\%s", enum_key_path, instance_id );
     ret = RegOpenKeyExW( HKEY_LOCAL_MACHINE, tmp_buf, 0, KEY_ALL_ACCESS, &dev_hkey );
     if (ret)
     {
         ERR( "Failed to open parent device registry key, ret %#lx.\n", ret );
-        return;
+        return FALSE;
     }
 
     tmp_buf[0] = 0;
-    size = sizeof(tmp_buf);
-    ret = RegQueryValueExW( dev_hkey, L"ParentIdPrefix", NULL, NULL, (BYTE *)tmp_buf, &size );
+    size = MAX_DEVICE_ID_LEN * sizeof(WCHAR);
+    ret = RegQueryValueExW( dev_hkey, L"ParentIdPrefix", NULL, &type, (BYTE *)tmp_buf, &size );
     /* No ParentIdPrefix value, need to create one. */
     if (ret == ERROR_FILE_NOT_FOUND)
     {
@@ -485,33 +514,52 @@ static void get_parent_id_prefix( DEVICE_OBJECT *parent, WCHAR *prefix_out )
         {
             ERR( "Failed to open enum hkey, ret %#lx.\n", ret );
             RegCloseKey( dev_hkey );
-            return;
+            return FALSE;
         }
 
         swprintf( tmp_buf, ARRAY_SIZE(tmp_buf), L"NextParentID.%lx.%d", hash, wine_device->level );
         size = sizeof(next_seq_val);
-        ret = RegQueryValueExW( enum_hkey, tmp_buf, NULL, NULL, (BYTE *)&next_seq_val, &size );
-        if (ret && ret != ERROR_FILE_NOT_FOUND)
-            ERR( "Failed to get value %s, ret %#lx.\n", debugstr_w(tmp_buf), ret );
+        ret = RegQueryValueExW( enum_hkey, tmp_buf, NULL, &type, (BYTE *)&next_seq_val, &size );
+        if ((ret && ret != ERROR_FILE_NOT_FOUND)
+                || (!ret && (type != REG_DWORD || size != sizeof(next_seq_val))) || next_seq_val == ~0u)
+        {
+            ERR( "Invalid or unreadable value %s, error %#lx.\n", debugstr_w(tmp_buf),
+                    ret ? ret : ERROR_INVALID_DATA );
+            RegCloseKey( enum_hkey );
+            RegCloseKey( dev_hkey );
+            return FALSE;
+        }
 
         next_seq_val++;
         ret = RegSetValueExW( enum_hkey, tmp_buf, 0, REG_DWORD, (const BYTE *)&next_seq_val, sizeof(next_seq_val) );
         if (ret)
+        {
             ERR( "Failed to set next sequence val hkey, ret %#lx.\n", ret );
+            RegCloseKey( enum_hkey );
+            RegCloseKey( dev_hkey );
+            return FALSE;
+        }
         RegCloseKey( enum_hkey );
 
         size = swprintf( tmp_buf, ARRAY_SIZE(tmp_buf), L"%lx&%lx&%lx", wine_device->level, hash, next_seq_val - 1 );
         ret = RegSetValueExW( dev_hkey, L"ParentIdPrefix", 0, REG_SZ, (const BYTE *)&tmp_buf, (size + 1) * sizeof(WCHAR) );
         if (ret)
+        {
             ERR( "Failed to set parent ID prefix val hkey, ret %#lx.\n", ret );
+            RegCloseKey( dev_hkey );
+            return FALSE;
+        }
     }
-    else if (ret != STATUS_SUCCESS)
+    else if (ret || !is_valid_parent_id_prefix( tmp_buf, size, type ))
     {
-        ERR( "Failed to get ParentIdPrefix, ret %#lx.\n", ret );
+        ERR( "Invalid or unreadable ParentIdPrefix, error %#lx.\n", ret ? ret : ERROR_INVALID_DATA );
+        RegCloseKey( dev_hkey );
+        return FALSE;
     }
 
     wcscpy( prefix_out, tmp_buf );
     RegCloseKey( dev_hkey );
+    return TRUE;
 }
 
 static INT32 cm_devcaps_from_device_capabalities(DEVICE_CAPABILITIES *caps)
@@ -553,12 +601,13 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
     SP_DEVINFO_DATA sp_device = {sizeof(sp_device)};
     WCHAR device_instance_id[MAX_DEVICE_ID_LEN];
     WCHAR parent_id[MAX_DEVICE_ID_LEN];
+    WCHAR parent_id_prefix[MAX_DEVICE_ID_LEN] = {0};
     INT32 cm_devcaps, cm_devcaps_prev;
     DEVICE_CAPABILITIES caps;
     BOOL need_driver = TRUE;
     NTSTATUS status;
     HKEY key;
-    WCHAR *id;
+    WCHAR *id, *device_id;
 
     while (parent_device->DeviceObjectExtension->AttachedTo)
         parent_device = parent_device->DeviceObjectExtension->AttachedTo;
@@ -567,42 +616,40 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
         ERR( "Lowest device in stack is not a PDO.\n" );
 
     device->Flags |= DO_BUS_ENUMERATED_DEVICE;
-    if ((status = get_device_id( device, BusQueryDeviceID, &id )))
+    if ((status = get_device_id( device, BusQueryDeviceID, &device_id )))
     {
         ERR( "Failed to get device ID, status %#lx.\n", status );
         return;
     }
 
-    wcscpy( device_instance_id, id );
-    ExFreePool( id );
-
     if ((status = get_device_caps( device, &caps )))
     {
-        ERR( "Failed to get caps for device %s, status %#lx.\n", debugstr_w(device_instance_id), status );
+        ERR( "Failed to get caps for device %s, status %#lx.\n", debugstr_w(device_id), status );
+        ExFreePool( device_id );
         return;
     }
 
     if ((status = get_device_id( device, BusQueryInstanceID, &id )))
     {
         ERR( "Failed to get device instance ID, status %#lx.\n", status );
+        ExFreePool( device_id );
         return;
     }
 
-    wcscat( device_instance_id, L"\\" );
-    if (!caps.UniqueID)
+    if (!caps.UniqueID && !get_parent_id_prefix( parent_device, parent_id_prefix ))
     {
-        WCHAR parent_id_prefix[MAX_DEVICE_ID_LEN];
-
-        get_parent_id_prefix( parent_device, parent_id_prefix );
-        if (parent_id_prefix[0])
-        {
-            wcscat( device_instance_id, parent_id_prefix );
-            wcscat( device_instance_id, L"&" );
-        }
+        ExFreePool( id );
+        ExFreePool( device_id );
+        return;
     }
-
-    wcscat( device_instance_id, id );
+    status = build_device_instance_id( device_instance_id, device_id, id, parent_id_prefix );
     ExFreePool( id );
+    ExFreePool( device_id );
+    if (status)
+    {
+        ERR( "Device instance ID is too long, status %#lx.\n", status );
+        return;
+    }
 
     wcscpy( wine_device->device_instance_id, device_instance_id );
     if (!create_or_open_setupapi_device_info( set, device_instance_id, &sp_device ))
@@ -734,6 +781,21 @@ static BOOL device_in_list( const DEVICE_RELATIONS *list, const DEVICE_OBJECT *d
     return FALSE;
 }
 
+static ULONG copy_assigned_device_ids( const DEVICE_RELATIONS *relations, WCHAR (*ids)[MAX_DEVICE_ID_LEN] )
+{
+    ULONG i, count = 0;
+
+    for (i = 0; i < relations->Count; ++i)
+    {
+        const struct wine_device *child = CONTAINING_RECORD(relations->Objects[i], struct wine_device, device_obj);
+        const WCHAR *id = child->device_instance_id;
+
+        if (!id[0]) continue;
+        memcpy( ids[count++], id, (wcslen( id ) + 1) * sizeof(WCHAR) );
+    }
+    return count;
+}
+
 static void handle_bus_relations( DEVICE_OBJECT *parent )
 {
     struct wine_device *wine_parent = CONTAINING_RECORD(parent, struct wine_device, device_obj);
@@ -810,11 +872,9 @@ static void handle_bus_relations( DEVICE_OBJECT *parent )
     ExFreePool( wine_parent->children );
     wine_parent->children = relations;
 
-    count = relations->Count;
-    child_ids = malloc( count * sizeof(*child_ids) );
-
-    for (i = 0; i < count; ++i)
-        get_device_instance_id( relations->Objects[i], child_ids[i] );
+    child_ids = malloc( relations->Count * sizeof(*child_ids) );
+    if (relations->Count && !child_ids) goto done;
+    count = copy_assigned_device_ids( relations, child_ids );
 
     if (count && !get_device_instance_id( parent, parent_id )
             && SetupDiOpenDeviceInfoW( set, parent_id, NULL, 0, &parent_sp ))
@@ -867,8 +927,8 @@ static void handle_bus_relations( DEVICE_OBJECT *parent )
             free( siblings_multi );
         }
     }
+done:
     free( child_ids );
-
     SetupDiDestroyDeviceInfoList( set );
 }
 

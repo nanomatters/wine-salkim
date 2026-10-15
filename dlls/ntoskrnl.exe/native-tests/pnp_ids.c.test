@@ -1,0 +1,158 @@
+/* Test the PnP identity helpers without creating devices or registry keys. */
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+
+int wcsicmp(const wchar_t *, const wchar_t *);
+
+#include "../pnp.c"
+
+_Static_assert(sizeof(WCHAR) == 2 && sizeof(wchar_t) == 2, "Tests require UTF-16 wide strings");
+
+/* libc's wide strings use 32-bit characters on the test host. */
+size_t wcslen( const WCHAR *str )
+{
+    const WCHAR *end = str;
+    while (*end) ++end;
+    return end - str;
+}
+
+LONG WINAPI RtlCompareUnicodeString(const UNICODE_STRING *left, const UNICODE_STRING *right, BOOLEAN insensitive)
+{
+    assert(!"Unexpected device-interface lookup");
+    return 0;
+}
+
+static void test_instance_ids(void)
+{
+    struct
+    {
+        WCHAR id[MAX_DEVICE_ID_LEN];
+        WCHAR guard;
+    } buffer;
+    WCHAR long_id[MAX_DEVICE_ID_LEN + 1], expected[MAX_DEVICE_ID_LEN];
+    const WCHAR *prefixes[] = {L"", L"1&12345678&0"};
+    unsigned int i, j;
+    size_t device_len;
+    NTSTATUS status;
+
+    status = build_device_instance_id(buffer.id, L"WINE\\TEST", L"01", L"");
+    assert(status == STATUS_SUCCESS);
+    assert(!memcmp(buffer.id, L"WINE\\TEST\\01", sizeof(L"WINE\\TEST\\01")));
+    status = build_device_instance_id(buffer.id, L"HID\\TEST", L"0000", L"1&12345678&0");
+    assert(status == STATUS_SUCCESS);
+    assert(!memcmp(buffer.id, L"HID\\TEST\\1&12345678&0&0000", sizeof(L"HID\\TEST\\1&12345678&0&0000")));
+
+    for (i = 0; i < ARRAY_SIZE(prefixes); ++i)
+    {
+        const WCHAR *prefix = prefixes[i];
+        size_t prefix_len = wcslen(prefix);
+
+        device_len = MAX_DEVICE_ID_LEN - 1 - 1 - 1 - prefix_len - !!prefix_len;
+        for (j = 0; j < device_len; ++j) long_id[j] = 'X';
+        long_id[device_len] = 0;
+        memset(&buffer, 0xcc, sizeof(buffer));
+        status = build_device_instance_id(buffer.id, long_id, L"0", prefix);
+        assert(status == STATUS_SUCCESS);
+        assert(wcslen(buffer.id) == MAX_DEVICE_ID_LEN - 1);
+        assert(buffer.guard == 0xcccc);
+        memcpy(expected, buffer.id, sizeof(expected));
+
+        long_id[device_len++] = 'X';
+        long_id[device_len] = 0;
+        memset(&buffer, 0xcc, sizeof(buffer));
+        status = build_device_instance_id(buffer.id, long_id, L"0", prefix);
+        assert(status == STATUS_BUFFER_TOO_SMALL);
+        assert(!buffer.id[0]);
+        for (j = 1; j < ARRAY_SIZE(buffer.id); ++j) assert(buffer.id[j] == 0xcccc);
+        assert(buffer.guard == 0xcccc);
+
+        /* A rejected ID must not poison the next successful construction. */
+        long_id[--device_len] = 0;
+        status = build_device_instance_id(buffer.id, long_id, L"0", prefix);
+        assert(status == STATUS_SUCCESS);
+        assert(!memcmp(buffer.id, expected, sizeof(expected)));
+        assert(buffer.guard == 0xcccc);
+    }
+
+    for (j = 0; j < ARRAY_SIZE(long_id) - 1; ++j) long_id[j] = 'X';
+    long_id[j] = 0;
+    status = build_device_instance_id(buffer.id, L"HID\\TEST", long_id, L"1&12345678&0");
+    assert(status == STATUS_BUFFER_TOO_SMALL);
+    assert(!buffer.id[0]);
+    assert(buffer.guard == 0xcccc);
+}
+
+static void test_parent_prefixes(void)
+{
+    WCHAR prefix[MAX_DEVICE_ID_LEN + 1];
+    unsigned int i;
+
+    assert(is_valid_parent_id_prefix(L"1&12345678&0", sizeof(L"1&12345678&0"), REG_SZ));
+    assert(!is_valid_parent_id_prefix(L"1&12345678&0", sizeof(L"1&12345678&0"), REG_BINARY));
+    assert(!is_valid_parent_id_prefix(L"1&12345678&0", sizeof(L"1&12345678&0"), REG_MULTI_SZ));
+    assert(!is_valid_parent_id_prefix(L"", sizeof(L""), REG_SZ));
+    assert(!is_valid_parent_id_prefix(L"1", 0, REG_SZ));
+    assert(!is_valid_parent_id_prefix(L"1", 1, REG_SZ));
+    assert(!is_valid_parent_id_prefix(L"12", sizeof(L"12") - 1, REG_SZ));
+    assert(!is_valid_parent_id_prefix(L"12", sizeof(L"12") - sizeof(WCHAR), REG_SZ));
+
+    for (i = 0; i < ARRAY_SIZE(prefix); ++i) prefix[i] = 'X';
+    assert(!is_valid_parent_id_prefix(prefix, MAX_DEVICE_ID_LEN * sizeof(WCHAR), REG_SZ));
+    prefix[MAX_DEVICE_ID_LEN - 1] = 0;
+    assert(is_valid_parent_id_prefix(prefix, MAX_DEVICE_ID_LEN * sizeof(WCHAR), REG_SZ));
+    prefix[MAX_DEVICE_ID_LEN] = 0;
+    assert(!is_valid_parent_id_prefix(prefix, sizeof(prefix), REG_SZ));
+}
+
+static void test_assigned_device_ids(void)
+{
+    struct wine_device devices[3] = {0};
+    struct
+    {
+        WCHAR ids[3][MAX_DEVICE_ID_LEN];
+        WCHAR guard;
+    } buffer;
+    DEVICE_RELATIONS *relations;
+    ULONG count;
+
+    relations = malloc(offsetof(DEVICE_RELATIONS, Objects[3]));
+    assert(relations);
+    relations->Count = ARRAY_SIZE(devices);
+    relations->Objects[0] = &devices[0].device_obj;
+    relations->Objects[1] = &devices[1].device_obj;
+    relations->Objects[2] = &devices[2].device_obj;
+
+    assert(!build_device_instance_id(devices[0].device_instance_id, L"WINE\\TEST", L"00", L""));
+    assert(!build_device_instance_id(devices[2].device_instance_id, L"HID\\TEST", L"0000", L"1&12345678&0"));
+    memset(&buffer, 0xcc, sizeof(buffer));
+    count = copy_assigned_device_ids(relations, buffer.ids);
+    assert(count == 2);
+    assert(!memcmp(buffer.ids[0], devices[0].device_instance_id,
+                   (wcslen(devices[0].device_instance_id) + 1) * sizeof(WCHAR)));
+    assert(!memcmp(buffer.ids[1], devices[2].device_instance_id,
+                   (wcslen(devices[2].device_instance_id) + 1) * sizeof(WCHAR)));
+    assert(buffer.ids[2][0] == 0xcccc);
+    assert(buffer.guard == 0xcccc);
+
+    memset(devices, 0, sizeof(devices));
+    memset(&buffer, 0xcc, sizeof(buffer));
+    assert(!copy_assigned_device_ids(relations, buffer.ids));
+    assert(buffer.ids[0][0] == 0xcccc);
+    assert(buffer.guard == 0xcccc);
+
+    relations->Count = 0;
+    assert(!copy_assigned_device_ids(relations, NULL));
+    free(relations);
+}
+
+int main(void)
+{
+    test_instance_ids();
+    test_parent_prefixes();
+    test_assigned_device_ids();
+    puts("PnP identity tests passed");
+    return 0;
+}
