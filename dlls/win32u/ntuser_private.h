@@ -130,6 +130,7 @@ struct user_thread_info
     struct received_message_info *receive_info;           /* Message being currently received */
     struct imm_thread_data       *imm_thread_data;        /* IMM thread data */
     HKL                           kbd_layout;             /* Current keyboard layout */
+    HKL                           kbd_layout_id_hkl;      /* Layout of the cached keyboard layout ID */
     UINT                          kbd_layout_id;          /* Current keyboard layout ID */
     struct hardware_msg_data     *rawinput;               /* Current rawinput message data */
     WCHAR                         kbd_deadkey;            /* Current keyboard dead key */

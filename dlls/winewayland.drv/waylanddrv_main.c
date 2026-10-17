@@ -213,6 +213,9 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
     return 0;
 
 err:
+    /* Initial keymap events may have published a layout before a later failure.
+     * Do not leave it behind if another display driver is selected. */
+    wayland_keyboard_clear_layout();
     if (dmabuf_epoll_fd >= 0) close(dmabuf_epoll_fd);
     dmabuf_epoll_fd = -1;
     return STATUS_UNSUCCESSFUL;

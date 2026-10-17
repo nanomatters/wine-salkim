@@ -3707,6 +3707,11 @@ static void dump_get_cursor_data_reply( const struct get_cursor_data_reply *req 
     dump_varargs_bytes( ", data=", cur_size );
 }
 
+static void dump_set_process_layout_request( const struct set_process_layout_request *req )
+{
+    dump_uint64( " layout=", &req->layout );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4034,6 +4039,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_window_cloaked_request,
     (dump_func)dump_set_cursor_data_request,
     (dump_func)dump_get_cursor_data_request,
+    (dump_func)dump_set_process_layout_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4361,6 +4367,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     NULL,
     (dump_func)dump_get_cursor_data_reply,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4688,6 +4695,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "set_window_cloaked",
     "set_cursor_data",
     "get_cursor_data",
+    "set_process_layout",
 };
 
 static const struct

@@ -1,0 +1,321 @@
+/* Exercise process keyboard defaults through the real Wine client/server path.
+ * This uses a private Wine call. Run only with a matching Wine build and a
+ * disposable en_US prefix, with DISPLAY and WAYLAND_DISPLAY unset. */
+
+#define __WINESRC__
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "windef.h"
+#include "winbase.h"
+#include "wingdi.h"
+#include "winuser.h"
+#include "winnls.h"
+#include "imm.h"
+#include "immdev.h"
+#include "ntuser.h"
+
+#define TIMEOUT 10000
+#define LAYOUT_US ((HKL)(ULONG_PTR)0x04090409)
+#define LAYOUT_DE ((HKL)(ULONG_PTR)0x04070409)
+#define LAYOUT_FR ((HKL)(ULONG_PTR)0x040c0409)
+
+static ULONG_PTR (WINAPI *call_one_param)(ULONG_PTR, ULONG);
+static HIMC (WINAPI *create_input_context)(UINT_PTR);
+static unsigned int checks, failures;
+
+static void check(BOOL condition, const char *message)
+{
+    ++checks;
+    if (!condition) ++failures;
+    printf("%s: %s\n", condition ? "PASS" : "FAIL", message);
+    fflush(stdout);
+}
+
+static BOOL publish(HKL layout)
+{
+    return call_one_param((ULONG_PTR)layout, NtUserCallOneParam_SetDefaultKeyboardLayout);
+}
+
+static BOOL initialize(void)
+{
+    HMODULE module;
+
+    if (!GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version"))
+    {
+        puts("SKIP: this probe uses Wine-private calls and cannot run on Windows");
+        return FALSE;
+    }
+    module = LoadLibraryW(L"win32u.dll");
+    if (!module || !(call_one_param = (void *)GetProcAddress(module, "NtUserCallOneParam")) ||
+        !(create_input_context = (void *)GetProcAddress(module, "NtUserCreateInputContext")))
+    {
+        puts("SKIP: Wine-private win32u calls are unavailable");
+        return FALSE;
+    }
+    if (GetUserDefaultLCID() != 0x0409)
+    {
+        printf("SKIP: use an en_US prefix, user locale is %#lx\n", GetUserDefaultLCID());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+struct worker
+{
+    HANDLE request, reply, thread;
+    DWORD tid;
+    BOOL stop, activate, name_ok, attach_ok;
+    HKL requested, previous, observed;
+    HIMC attach_context;
+    WCHAR name[KL_NAMELENGTH];
+};
+
+static DWORD WINAPI worker_proc(void *opaque)
+{
+    struct worker *worker = opaque;
+
+    for (;;)
+    {
+        if (WaitForSingleObject(worker->request, INFINITE) != WAIT_OBJECT_0) return 2;
+        if (worker->stop) return 0;
+        if (worker->attach_context)
+        {
+            worker->attach_ok = !!ImmLockIMC(worker->attach_context);
+            if (worker->attach_ok) ImmUnlockIMC(worker->attach_context);
+            worker->attach_context = NULL;
+        }
+        if (worker->activate) worker->previous = ActivateKeyboardLayout(worker->requested, 0);
+        worker->observed = GetKeyboardLayout(0);
+        worker->name_ok = GetKeyboardLayoutNameW(worker->name);
+        SetEvent(worker->reply);
+    }
+}
+
+static BOOL request_worker(struct worker *worker, HKL activate)
+{
+    worker->activate = !!activate;
+    worker->requested = activate;
+    if (!SetEvent(worker->request) ||
+        WaitForSingleObject(worker->reply, TIMEOUT) != WAIT_OBJECT_0)
+    {
+        check(FALSE, "worker request completed");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void check_worker(struct worker *worker, HKL expected, const WCHAR *name,
+                         const char *context)
+{
+    HKL queried = GetKeyboardLayout(worker->tid);
+    BOOL correct = worker->observed == expected && queried == expected &&
+                   worker->name_ok && !lstrcmpiW(worker->name, name);
+
+    if (!correct)
+        printf("  local %p, cross-thread %p, expected %p, name %ls\n",
+               worker->observed, queried, expected, worker->name);
+    check(correct, context);
+}
+
+static void check_current(HKL expected, const WCHAR *name, const char *context)
+{
+    WCHAR actual[KL_NAMELENGTH] = {0};
+    HKL layout = GetKeyboardLayout(0);
+    BOOL correct = GetKeyboardLayoutNameW(actual) && layout == expected &&
+                   !lstrcmpiW(actual, name);
+
+    if (!correct) printf("  layout %p, expected %p, name %ls\n", layout, expected, actual);
+    check(correct, context);
+}
+
+struct child_state
+{
+    DWORD tid;
+    HKL observed;
+};
+
+static void object_name(WCHAR *name, DWORD parent, const WCHAR *suffix)
+{
+    wsprintfW(name, L"Local\\wine-keyboard-default-%lu-%s", parent, suffix);
+}
+
+static int child_main(DWORD parent)
+{
+    struct child_state *state;
+    WCHAR name[128];
+    HANDLE mapping, ready = NULL, done = NULL;
+    DWORD result = 5;
+
+    object_name(name, parent, L"mapping");
+    mapping = OpenFileMappingW(FILE_MAP_WRITE, FALSE, name);
+    if (!mapping) return 3;
+    state = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(*state));
+    CloseHandle(mapping);
+    if (!state) return 4;
+    object_name(name, parent, L"ready");
+    ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+    object_name(name, parent, L"done");
+    done = OpenEventW(SYNCHRONIZE, FALSE, name);
+    if (!ready || !done) goto cleanup;
+
+    state->tid = GetCurrentThreadId();
+    state->observed = publish(LAYOUT_FR) ? GetKeyboardLayout(0) : NULL;
+    SetEvent(ready);
+    result = WaitForSingleObject(done, TIMEOUT) == WAIT_OBJECT_0 ? 0 : 6;
+cleanup:
+    if (ready) CloseHandle(ready);
+    if (done) CloseHandle(done);
+    UnmapViewOfFile(state);
+    return result;
+}
+
+static void test_other_process(void)
+{
+    WCHAR name[128], executable[MAX_PATH], command[MAX_PATH + 64];
+    struct child_state *state = NULL;
+    STARTUPINFOW startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process = {0};
+    HANDLE mapping = NULL, ready = NULL, done = NULL;
+    HANDLE waits[2];
+    DWORD parent = GetCurrentProcessId(), exit_code = ~0u, length;
+    HKL layout;
+
+    object_name(name, parent, L"mapping");
+    mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                sizeof(*state), name);
+    if (!mapping) goto failed;
+    state = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(*state));
+    if (!state) goto failed;
+    object_name(name, parent, L"ready");
+    ready = CreateEventW(NULL, FALSE, FALSE, name);
+    object_name(name, parent, L"done");
+    done = CreateEventW(NULL, FALSE, FALSE, name);
+    if (!ready || !done) goto failed;
+    length = GetModuleFileNameW(NULL, executable, sizeof(executable) / sizeof(*executable));
+    if (!length || length >= sizeof(executable) / sizeof(*executable)) goto failed;
+    wsprintfW(command, L"\"%s\" --child %lu", executable, parent);
+    if (!CreateProcessW(executable, command, NULL, NULL, FALSE, 0, NULL, NULL,
+                        &startup, &process)) goto failed;
+    waits[0] = ready;
+    waits[1] = process.hProcess;
+    if (WaitForMultipleObjects(2, waits, FALSE, TIMEOUT) != WAIT_OBJECT_0) goto failed;
+
+    layout = GetKeyboardLayout(state->tid);
+    check(state->observed == LAYOUT_FR && layout == LAYOUT_FR,
+          "cross-process query resolves the target process default");
+    check(publish(LAYOUT_US), "publish US in parent while child uses French");
+    check(GetKeyboardLayout(state->tid) == LAYOUT_FR,
+          "parent publication does not change another process default");
+    check(publish(NULL), "clear the parent process default");
+    check(GetKeyboardLayout(state->tid) == LAYOUT_FR,
+          "clearing the parent default does not change a cross-process query");
+    SetEvent(done);
+    if (WaitForSingleObject(process.hProcess, TIMEOUT) != WAIT_OBJECT_0) goto failed;
+    check(GetExitCodeProcess(process.hProcess, &exit_code) && !exit_code,
+          "child process exits successfully");
+    goto cleanup;
+
+failed:
+    check(FALSE, "cross-process test setup and completion");
+    if (done) SetEvent(done);
+    if (process.hProcess) WaitForSingleObject(process.hProcess, TIMEOUT);
+cleanup:
+    if (process.hThread) CloseHandle(process.hThread);
+    if (process.hProcess) CloseHandle(process.hProcess);
+    if (state) UnmapViewOfFile(state);
+    if (mapping) CloseHandle(mapping);
+    if (ready) CloseHandle(ready);
+    if (done) CloseHandle(done);
+}
+
+int main(int argc, char **argv)
+{
+    struct worker worker = {0};
+    DWORD exit_code = ~0u;
+    HIMC context = NULL, placeholder = NULL;
+
+    if (!initialize()) return 77;
+    if (argc == 3 && !strcmp(argv[1], "--child"))
+        return child_main(strtoul(argv[2], NULL, 10));
+
+    check(publish(NULL), "clear any initial process keyboard default");
+    check_current(LAYOUT_US, L"00000409", "initial locale layout and name");
+    context = ImmCreateContext();
+    check(!!context, "create a real IME client context before host layout publication");
+    placeholder = create_input_context(0);
+    check(!!placeholder, "create a placeholder context before host layout publication");
+    if (!context || !placeholder) goto cleanup;
+    worker.request = CreateEventW(NULL, FALSE, FALSE, NULL);
+    worker.reply = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!worker.request || !worker.reply) goto failed;
+    worker.thread = CreateThread(NULL, 0, worker_proc, &worker, 0, &worker.tid);
+    if (!worker.thread) goto failed;
+
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check_worker(&worker, LAYOUT_US, L"00000409", "untouched worker starts with locale fallback");
+    worker.attach_context = placeholder;
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check(worker.attach_ok, "worker attaches a real client to another thread's context");
+    check_worker(&worker, LAYOUT_US, L"00000409", "attachment leaves worker's provisional layout unchanged");
+    check(publish(LAYOUT_DE), "publish German keyboard with English locale");
+    check_current(LAYOUT_DE, L"00000407", "context owner follows first publication and invalidates provisional name");
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check_worker(&worker, LAYOUT_DE, L"00000407", "cross-thread client attachment did not pin worker to locale");
+
+    check(publish(LAYOUT_US), "publish US keyboard");
+    check_current(LAYOUT_US, L"00000409", "main-thread name follows new default");
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check_worker(&worker, LAYOUT_US, L"00000409", "untouched worker follows default replacement");
+
+    if (!request_worker(&worker, LAYOUT_US)) goto cleanup;
+    check(worker.previous == LAYOUT_US, "activation of current default returns that layout");
+    check_worker(&worker, LAYOUT_US, L"00000409", "worker explicitly activates the current default");
+    check(publish(LAYOUT_DE), "replace default after explicit activation of the same layout");
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check_worker(&worker, LAYOUT_US, L"00000409", "activation of current default pins the worker layout");
+
+    if (!request_worker(&worker, LAYOUT_DE)) goto cleanup;
+    check(worker.previous == LAYOUT_US, "activation returns effective previous default");
+    check_worker(&worker, LAYOUT_DE, L"00000407", "worker explicitly activates German");
+    check(publish(LAYOUT_FR), "publish French keyboard");
+    check_current(LAYOUT_FR, L"0000040C", "untouched main thread uses French default");
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check_worker(&worker, LAYOUT_DE, L"00000407", "explicit worker layout survives default replacement");
+    check(publish(NULL), "clear published process default");
+    check_current(LAYOUT_US, L"00000409", "cleared default restores locale layout and name");
+    if (!request_worker(&worker, NULL)) goto cleanup;
+    check_worker(&worker, LAYOUT_DE, L"00000407", "explicit worker layout survives default clearing");
+
+    check(publish(LAYOUT_DE), "publish parent German default for cross-process test");
+    test_other_process();
+
+    check(publish(LAYOUT_FR), "replace default while both input contexts still exist");
+    check_current(LAYOUT_FR, L"0000040C", "IME context owner keeps following the host default");
+    check(ActivateKeyboardLayout(LAYOUT_FR, 0) == LAYOUT_FR,
+          "explicit activation returns the effective layout, independent of IME context creation");
+    check(publish(LAYOUT_US), "replace default after context owner explicitly selected French");
+    check_current(LAYOUT_FR, L"0000040C", "explicit context-owner selection survives publication");
+    goto cleanup;
+
+failed:
+    check(FALSE, "worker setup");
+cleanup:
+    if (worker.thread)
+    {
+        worker.stop = TRUE;
+        SetEvent(worker.request);
+        check(WaitForSingleObject(worker.thread, TIMEOUT) == WAIT_OBJECT_0 &&
+              GetExitCodeThread(worker.thread, &exit_code) && !exit_code,
+              "worker exits successfully");
+        CloseHandle(worker.thread);
+    }
+    if (worker.request) CloseHandle(worker.request);
+    if (worker.reply) CloseHandle(worker.reply);
+    if (placeholder) check(ImmDestroyContext(placeholder), "destroy the context attached by another thread");
+    if (context) check(ImmDestroyContext(context), "destroy the original IME client context");
+    printf("%u checks, %u failures\n", checks, failures);
+    return !!failures;
+}

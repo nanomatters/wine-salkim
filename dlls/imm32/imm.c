@@ -3246,6 +3246,7 @@ static BOOL is_ime_ui_msg(UINT msg)
 
 static LRESULT ime_internal_msg( WPARAM wparam, LPARAM lparam)
 {
+    struct imc *imc;
     HWND hwnd;
     HIMC himc;
 
@@ -3267,9 +3268,12 @@ static LRESULT ime_internal_msg( WPARAM wparam, LPARAM lparam)
         if (!(hwnd = get_ime_ui_window())) break;
         SendMessageW( hwnd, WM_IME_SELECT, TRUE, lparam );
         break;
-   case IME_INTERNAL_HKL_DEACTIVATE:
-        if (!(hwnd = get_ime_ui_window())) break;
-        SendMessageW( hwnd, WM_IME_SELECT, FALSE, lparam );
+    case IME_INTERNAL_HKL_DEACTIVATE:
+        /* The host default may already have changed. Deselect the existing
+         * UI without selecting an IME for the new layout first. */
+        himc = (HIMC)(UINT_PTR)NtUserGetThreadInfo()->default_imc;
+        if (!(imc = query_imc_data( himc )) || !imc->ime || !(hwnd = imc->ui_hwnd)) break;
+        SendMessageW( hwnd, WM_IME_SELECT, FALSE, (LPARAM)imc->ime->hkl );
         break;
     default:
         FIXME("wparam = %Ix\n", wparam);

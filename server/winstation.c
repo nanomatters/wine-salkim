@@ -834,7 +834,7 @@ DECL_HANDLER(get_thread_layout)
     struct thread *thread;
 
     if (!(thread = get_thread_from_id( req->tid ))) return;
-    reply->layout = thread->layout;
+    reply->layout = thread->layout ? thread->layout : thread->process->default_layout;
 
     release_object( thread );
 }
@@ -848,6 +848,12 @@ DECL_HANDLER(set_thread_layout)
     thread->layout = req->layout;
 
     release_object( thread );
+}
+
+/* set the default keyboard layout for the calling process */
+DECL_HANDLER(set_process_layout)
+{
+    current->process->default_layout = req->layout;
 }
 
 /* set the thread current desktop */

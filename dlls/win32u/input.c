@@ -1079,6 +1079,33 @@ DWORD get_last_input_time(void)
     return ret;
 }
 
+/* The driver publishes the host layout independently of thread activation.
+ * Threads without an activated layout use this process default. */
+static HKL default_kbd_layout;
+static pthread_mutex_t default_kbd_layout_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+BOOL set_default_keyboard_layout( HKL layout )
+{
+    NTSTATUS status;
+
+    layout = LongToHandle( (LONG)(ULONG_PTR)layout );
+    pthread_mutex_lock( &default_kbd_layout_mutex );
+    if (layout == default_kbd_layout)
+    {
+        pthread_mutex_unlock( &default_kbd_layout_mutex );
+        return TRUE;
+    }
+    SERVER_START_REQ(set_process_layout)
+    {
+        req->layout = wine_server_client_ptr( layout );
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    if (!status) WritePointerRelease( (void **)&default_kbd_layout, layout );
+    pthread_mutex_unlock( &default_kbd_layout_mutex );
+    return !status;
+}
+
 /***********************************************************************
  *           get_locale_kbd_layout
  */
@@ -1105,8 +1132,8 @@ static HKL get_locale_kbd_layout(void)
 /***********************************************************************
  *	     NtUserGetKeyboardLayout    (win32u.@)
  *
- * Device handle for keyboard layout defaulted to
- * the language id. This is the way Windows default works.
+ * Use the host default until the thread explicitly activates its own layout.
+ * The locale is a provisional fallback before the driver publishes a layout.
  */
 HKL WINAPI NtUserGetKeyboardLayout( DWORD thread_id )
 {
@@ -1119,10 +1146,12 @@ HKL WINAPI NtUserGetKeyboardLayout( DWORD thread_id )
         {
             req->tid = thread_id;
             if (!wine_server_call(req))
-                layout = wine_server_get_ptr(reply->layout);
+                layout = LongToHandle( (LONG)reply->layout );
         }
         SERVER_END_REQ;
-    } else layout = thread->kbd_layout;
+    }
+    else if (!(layout = thread->kbd_layout))
+        layout = ReadPointerAcquire( (void **)&default_kbd_layout );
 
     if (!layout) return get_locale_kbd_layout();
     return layout;
@@ -1492,7 +1521,7 @@ INT WINAPI NtUserToUnicodeEx( UINT virt, UINT scan, const BYTE *state,
 HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
 {
     struct user_thread_info *info = get_user_thread_info();
-    HKL old_layout;
+    HKL old_layout, old_default, host_layout;
     LCID locale;
     HWND focus;
     static int once;
@@ -1516,17 +1545,29 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
         return 0;
     }
 
+    old_default = ReadPointerAcquire( (void **)&default_kbd_layout );
+    old_layout = NtUserGetKeyboardLayout( 0 );
     if (!user_driver->pActivateKeyboardLayout( layout, flags ))
         return 0;
 
-    old_layout = info->kbd_layout;
-    if (old_layout != layout)
+    /* Loading the driver may replace the provisional locale layout. Keep
+     * following that default if the requested placeholder has no tables. */
+    if (!info->kbd_layout && !old_default && layout == old_layout &&
+        (host_layout = ReadPointerAcquire( (void **)&default_kbd_layout )) && host_layout != layout)
+    {
+        const KBDTABLES *tables = user_driver->pKbdLayerDescriptor( layout );
+        if (!tables) return old_layout;
+        user_driver->pReleaseKbdTables( tables );
+    }
+
+    if (info->kbd_layout != layout)
     {
         HWND ime_hwnd = get_default_ime_window( 0 );
         const NLS_LOCALE_DATA *data;
         CHARSETINFO cs = {0};
 
-        if (ime_hwnd) send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_HKL_DEACTIVATE, HandleToUlong(old_layout) );
+        if (ime_hwnd)
+            send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)old_layout );
 
         if (HIWORD(layout) & 0x8000)
             FIXME( "Aliased keyboard layout not yet implemented\n" );
@@ -1546,13 +1587,13 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
         }
         SERVER_END_REQ;
 
-        if (ime_hwnd) send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_HKL_ACTIVATE, HandleToUlong(layout) );
+        if (ime_hwnd)
+            send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_HKL_ACTIVATE, (LPARAM)layout );
 
         if ((focus = get_focus()) && get_window_thread( focus, NULL ) == GetCurrentThreadId())
             send_message( focus, WM_INPUTLANGCHANGE, cs.ciCharset, (LPARAM)layout );
     }
 
-    if (!old_layout) return get_locale_kbd_layout();
     return old_layout;
 }
 
@@ -1608,14 +1649,14 @@ BOOL WINAPI NtUserGetKeyboardLayoutName( WCHAR *name )
         return FALSE;
     }
 
-    if (info->kbd_layout_id)
+    layout = NtUserGetKeyboardLayout( 0 );
+    if (info->kbd_layout_id && info->kbd_layout_id_hkl == layout)
     {
         snprintf( buffer, sizeof(buffer), "%08X", info->kbd_layout_id );
         asciiz_to_unicode( name, buffer );
         return TRUE;
     }
 
-    layout = NtUserGetKeyboardLayout( 0 );
     id = HandleToUlong( layout );
     if (HIWORD( id ) == LOWORD( id )) id = LOWORD( id );
     snprintf( buffer, sizeof(buffer), "%08X", id );
@@ -1646,6 +1687,7 @@ BOOL WINAPI NtUserGetKeyboardLayoutName( WCHAR *name )
     }
 
     info->kbd_layout_id = wcstoul( name, NULL, 16 );
+    info->kbd_layout_id_hkl = layout;
 
     TRACE_(keyboard)( "ret %s\n", debugstr_w( name ) );
     return TRUE;

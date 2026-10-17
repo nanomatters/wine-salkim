@@ -1,0 +1,1049 @@
+/* The policy functions below are extracted verbatim from production sources.
+ * Registry, server transport and window messaging are fixture implementations. */
+#include <assert.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "wine/list.h"
+
+typedef void *HKL;
+typedef void *HWND;
+typedef void *HKEY;
+typedef void *HIMC;
+typedef uint16_t WCHAR;
+typedef uint16_t WORD;
+typedef uint16_t USHORT;
+typedef uint8_t BYTE;
+typedef uint16_t LANGID;
+typedef uint32_t DWORD;
+typedef uint32_t UINT;
+typedef uint32_t ULONG;
+typedef uint32_t LCID;
+typedef uintptr_t UINT_PTR;
+typedef uintptr_t ULONG_PTR;
+typedef intptr_t LPARAM;
+typedef int BOOL;
+typedef int NTSTATUS;
+typedef int INT;
+typedef int32_t LONG;
+#define WINAPI
+#define TRUE 1
+#define FALSE 0
+#define KL_NAMELENGTH 9
+#define ERROR_NOACCESS 998
+#define ERROR_CALL_NOT_IMPLEMENTED 120
+#define NTUSER_OBJ_IMC 1
+#define NtUserInputContextClientPtr 0
+#define OBJ_OTHER_PROCESS ((void *)-1)
+#define LANG_INVARIANT 0x7f
+#define SUBLANG_DEFAULT 1
+#define MAKELANGID(lang,sub) ((lang) | ((sub) << 10))
+#define LOWORD(value) ((uint16_t)(uintptr_t)(value))
+#define HIWORD(value) ((uint16_t)((uintptr_t)(value) >> 16))
+#define MAKELONG(low,high) ((LONG)((uint32_t)(uint16_t)(low) | (uint32_t)(uint16_t)(high) << 16))
+#define ULongToHandle(value) ((void *)(uintptr_t)(value))
+#define LongToHandle(value) ((void *)(intptr_t)(int32_t)(value))
+#define ULongToPtr(value) ((void *)(uintptr_t)(value))
+#define HandleToUlong(value) ((uint32_t)(uintptr_t)(value))
+#define HKL_NEXT 1
+#define HKL_PREV 0
+#define WM_IME_INTERNAL 0x100
+#define IME_INTERNAL_HKL_ACTIVATE 1
+#define IME_INTERNAL_HKL_DEACTIVATE 2
+#define WM_INPUTLANGCHANGE 0x51
+#define WM_INPUTLANGCHANGEREQUEST 0x50
+#define TCI_SRCCODEPAGE 1
+#define VK__none_ 0xff
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_CAPITAL 0x14
+#define VK_ESCAPE 0x1b
+#define VK_PRIOR 0x21
+#define VK_NEXT 0x22
+#define VK_END 0x23
+#define VK_HOME 0x24
+#define VK_LEFT 0x25
+#define VK_UP 0x26
+#define VK_RIGHT 0x27
+#define VK_DOWN 0x28
+#define VK_INSERT 0x2d
+#define VK_DELETE 0x2e
+#define VK_CLEAR 0x0c
+#define VK_NUMPAD0 0x60
+#define VK_NUMPAD1 0x61
+#define VK_NUMPAD2 0x62
+#define VK_NUMPAD3 0x63
+#define VK_NUMPAD4 0x64
+#define VK_NUMPAD5 0x65
+#define VK_NUMPAD6 0x66
+#define VK_NUMPAD7 0x67
+#define VK_NUMPAD8 0x68
+#define VK_NUMPAD9 0x69
+#define VK_DECIMAL 0x6e
+#define VK_LSHIFT 0xa0
+#define VK_RSHIFT 0xa1
+#define VK_LCONTROL 0xa2
+#define VK_RCONTROL 0xa3
+#define VK_LMENU 0xa4
+#define VK_RMENU 0xa5
+#define MAPVK_VK_TO_VSC 0
+#define MAPVK_VSC_TO_VK 1
+#define MAPVK_VK_TO_CHAR 2
+#define MAPVK_VSC_TO_VK_EX 3
+#define MAPVK_VK_TO_VSC_EX 4
+#define WCH_NONE 0xf000
+#define WCH_DEAD 0xf001
+#define CAPLOK 1
+#define SGCAPS 2
+#define KBDSHIFT 1
+#define KLLF_ALTGR 1
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#define NEXT_ENTRY(table,entry) ((void *)&(entry)->wch[(table)->nModifications])
+#define TRACE(...) do {} while (0)
+#define WARN(...) do {} while (0)
+#define ERR(...) do {} while (0)
+#define FIXME(...) do {} while (0)
+#define TRACE_(channel) TRACE
+#define FIXME_(channel) FIXME
+#define ReadPointerAcquire(ptr) __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#define WritePointerRelease(ptr,value) __atomic_store_n((ptr), (value), __ATOMIC_RELEASE)
+#define InterlockedExchangePointer(ptr,value) __atomic_exchange_n((ptr), (value), __ATOMIC_SEQ_CST)
+#define InterlockedExchange(ptr,value) __atomic_exchange_n((ptr), (value), __ATOMIC_SEQ_CST)
+
+typedef struct { BYTE Vsc; USHORT Vk; } VSC_VK;
+typedef struct { BYTE vsc; WCHAR *pwsz; } VSC_LPWSTR;
+typedef struct { BYTE VirtualKey, Attributes; WCHAR wch[1]; } VK_TO_WCHARS1;
+typedef struct { VK_TO_WCHARS1 *pVkToWchars; BYTE nModifications; } VK_TO_WCHAR_TABLE;
+typedef struct { BYTE Vk, ModBits; } VK_TO_BIT;
+typedef struct { DWORD dwBoth; WCHAR wchComposed; } DEADKEY;
+typedef struct { VK_TO_BIT *pVkToBit; WORD wMaxModBits; BYTE ModNumber[1]; } MODIFIERS;
+typedef struct
+{
+    unsigned int identity;
+    USHORT *pusVSCtoVK;
+    BYTE bMaxVSCtoVK;
+    VSC_VK *pVSCtoVK_E0, *pVSCtoVK_E1;
+    VK_TO_WCHAR_TABLE *pVkToWcharTable;
+    VSC_LPWSTR *pKeyNames, *pKeyNamesExt;
+    WCHAR **pKeyNamesDead;
+    MODIFIERS *pCharModifiers;
+    DEADKEY *pDeadKey;
+    DWORD fLocaleFlags;
+} KBDTABLES;
+static const KBDTABLES *WAYLAND_KbdLayerDescriptor(HKL hkl);
+static void WAYLAND_ReleaseKbdTables(const KBDTABLES *tables);
+
+struct user_thread_info
+{
+    HKL kbd_layout;
+    UINT kbd_layout_id;
+    HKL kbd_layout_id_hkl;
+    WCHAR kbd_deadkey;
+};
+struct process
+{
+    uintptr_t default_layout;
+    HKL client_default;
+    LCID locale;
+};
+struct thread
+{
+    DWORD id;
+    struct process *process;
+    uintptr_t layout;
+    struct user_thread_info info;
+};
+static struct process processes[2];
+static struct thread threads[4];
+static struct thread *current;
+static pthread_mutex_t default_kbd_layout_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define default_kbd_layout (current->process->client_default)
+static DWORD last_error;
+static unsigned int server_calls, registry_enumerations, posts;
+static int server_failure, activation_failure, locale_failure;
+static HKL driver_default;
+static struct user_thread_info *get_user_thread_info(void) { return &current->info; }
+static DWORD GetCurrentThreadId(void) { return current->id; }
+static int NtQueryDefaultLocale(BOOL user, LCID *locale)
+{
+    *locale = current->process->locale;
+    return locale_failure;
+}
+static void RtlSetLastWin32Error(DWORD error) { last_error = error; }
+
+struct request { int operation; DWORD tid; uintptr_t layout; };
+struct reply { uintptr_t layout; };
+static struct request *req;
+static struct reply *reply;
+enum { request_get_thread_layout, request_set_thread_layout, request_set_process_layout };
+static int server_error;
+static struct thread *get_thread_from_id(DWORD id)
+{
+    unsigned int i;
+    for (i = 0; i < 4; i++) if (threads[i].id == id) return &threads[i];
+    server_error = 1;
+    return NULL;
+}
+static void release_object(struct thread *thread) {}
+
+/* SERVER_FUNCTIONS */
+
+static int call_server(struct request *request, struct reply *response)
+{
+    server_calls++;
+    if (server_failure) return 1;
+    req = request;
+    reply = response;
+    server_error = 0;
+    if (request->operation == request_get_thread_layout) server_get_thread_layout();
+    else if (request->operation == request_set_thread_layout) server_set_thread_layout();
+    else server_set_process_layout();
+    req = NULL;
+    reply = NULL;
+    return server_error;
+}
+#define SERVER_START_REQ(name) do { \
+    struct request request_ = {.operation = request_##name}; \
+    struct reply reply_ = {0}; \
+    struct request *req = &request_; \
+    struct reply *reply = &reply_; (void)reply;
+#define SERVER_END_REQ } while (0)
+#define wine_server_call(request) call_server((request), reply)
+#define wine_server_call_err(request) call_server((request), reply)
+#define wine_server_get_ptr(value) ((void *)(uintptr_t)(value))
+#define wine_server_client_ptr(value) ((uintptr_t)(value))
+
+typedef struct { unsigned int idefaultansicodepage; } NLS_LOCALE_DATA;
+typedef struct { unsigned int ciCharset; } CHARSETINFO;
+static const NLS_LOCALE_DATA *get_locale_data(WORD lang)
+{
+    static const NLS_LOCALE_DATA data = {1252};
+    return &data;
+}
+static BOOL translate_charset_info(void *codepage, CHARSETINFO *info, DWORD flags)
+{
+    info->ciCharset = 1252;
+    return TRUE;
+}
+static HWND ime_hwnd;
+static HKL ime_selected;
+static HKL ime_previous;
+static unsigned int ime_messages;
+static HWND focus_hwnd;
+static HKL lang_change_hkl;
+static unsigned int lang_changes;
+static HWND get_default_ime_window(HWND hwnd) { return ime_hwnd; }
+static HWND get_focus(void) { return focus_hwnd; }
+static DWORD get_window_thread(HWND hwnd, void *process) { return GetCurrentThreadId(); }
+static HKL WINAPI NtUserGetKeyboardLayout(DWORD thread_id);
+static void send_message(HWND hwnd, UINT message, uintptr_t wparam, LPARAM lparam)
+{
+    if (message == WM_INPUTLANGCHANGE)
+    {
+        assert(hwnd == focus_hwnd && wparam == 1252);
+        lang_change_hkl = (HKL)lparam;
+        lang_changes++;
+        return;
+    }
+    assert(hwnd == ime_hwnd && message == WM_IME_INTERNAL);
+    if (wparam == IME_INTERNAL_HKL_DEACTIVATE)
+    {
+        assert(ime_selected);
+        assert((HKL)lparam == ime_previous);
+        ime_selected = NULL;
+    }
+    else
+    {
+        assert(wparam == IME_INTERNAL_HKL_ACTIVATE && !ime_selected);
+        ime_selected = NtUserGetKeyboardLayout(0);
+        assert((HKL)lparam == ime_selected);
+    }
+    ime_messages++;
+}
+static BOOL set_default_keyboard_layout(HKL layout);
+static BOOL activate_keyboard_layout(HKL layout, UINT flags)
+{
+    ime_previous = NtUserGetKeyboardLayout(0);
+    if (driver_default) assert(set_default_keyboard_layout(driver_default));
+    return !activation_failure;
+}
+static UINT map_virtual_key(UINT code, UINT type, HKL layout) { return -1; }
+static INT get_key_name(LONG lparam, WCHAR *name, INT size) { return -1; }
+static INT to_unicode(UINT virt, UINT scan, const BYTE *state, WCHAR *str,
+                       INT size, UINT flags, HKL layout) { return -2; }
+static struct
+{
+    BOOL (*pActivateKeyboardLayout)(HKL, UINT);
+    UINT (*pMapVirtualKeyEx)(UINT, UINT, HKL);
+    INT (*pGetKeyNameText)(LONG, WCHAR *, INT);
+    INT (*pToUnicodeEx)(UINT, UINT, const BYTE *, WCHAR *, INT, UINT, HKL);
+    const KBDTABLES *(*pKbdLayerDescriptor)(HKL);
+    void (*pReleaseKbdTables)(const KBDTABLES *);
+} driver = {activate_keyboard_layout, map_virtual_key, get_key_name, to_unicode,
+            WAYLAND_KbdLayerDescriptor, WAYLAND_ReleaseKbdTables};
+static typeof(driver) *user_driver = &driver;
+
+/* A tiny registry with the same KLIDs Wine installs for ordinary German/US. */
+typedef struct { ULONG NameLength; WCHAR Name[KL_NAMELENGTH]; } KEY_NODE_INFORMATION;
+typedef struct { ULONG Type; unsigned char Data[32]; } KEY_VALUE_PARTIAL_INFORMATION;
+#define KeyNodeInformation 1
+#define REG_SZ 1
+static const WCHAR keyboard_layouts_keyW[] = {'K',0};
+static void asciiz_to_unicode(WCHAR *dst, const char *src)
+{
+    do { *dst++ = (unsigned char)*src; } while (*src++);
+}
+static unsigned long wide_to_ulong(const WCHAR *str, WCHAR **end, int base)
+{
+    char buffer[64];
+    unsigned int i;
+    for (i = 0; str[i] && i < sizeof(buffer) - 1; i++) buffer[i] = str[i];
+    buffer[i] = 0;
+    return strtoul(buffer, NULL, base);
+}
+#define wcstoul wide_to_ulong
+static unsigned int wide_length(const WCHAR *str)
+{
+    unsigned int i = 0;
+    while (str[i]) i++;
+    return i;
+}
+#define wcslen wide_length
+static WCHAR *lstrcpynW(WCHAR *dst, const WCHAR *src, int count)
+{
+    int i;
+    for (i = 0; i < count - 1 && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
+    return dst;
+}
+static HKEY reg_open_key(HKEY root, const WCHAR *name, unsigned int bytes)
+{
+    return root ? (HKEY)2 : (HKEY)1;
+}
+static int NtEnumerateKey(HKEY key, ULONG index, int type, KEY_NODE_INFORMATION *info,
+                          unsigned int size, ULONG *length)
+{
+    static const char *names[] = {"00000409", "00000407"};
+    registry_enumerations++;
+    if (index >= 2) return 1;
+    asciiz_to_unicode(info->Name, names[index]);
+    *length = sizeof(*info);
+    info->NameLength = 8 * sizeof(WCHAR);
+    return 0;
+}
+static BOOL query_reg_ascii_value(HKEY key, const char *name,
+                                  KEY_VALUE_PARTIAL_INFORMATION *value, unsigned int size) { return FALSE; }
+static int NtClose(HKEY key) { return 0; }
+
+/* WIN32U_FUNCTIONS */
+
+struct imc { DWORD thread_id; UINT_PTR client_ptr; };
+static unsigned int imc_handles;
+static BOOL handle_failure;
+static HIMC alloc_user_handle(struct imc *imc, UINT type)
+{
+    assert(type == NTUSER_OBJ_IMC);
+    if (handle_failure) return NULL;
+    imc_handles++;
+    return imc;
+}
+static struct imc *free_user_handle(HIMC imc, UINT type)
+{
+    assert(type == NTUSER_OBJ_IMC && imc_handles);
+    imc_handles--;
+    return imc;
+}
+static struct imc *get_imc_ptr(HIMC imc) { return imc; }
+static void release_imc_ptr(struct imc *imc) {}
+
+/* INPUT_CONTEXT_FUNCTIONS */
+
+typedef unsigned int xkb_layout_index_t;
+struct layout
+{
+    struct list entry;
+    xkb_layout_index_t xkb_group;
+    LANGID lang;
+    WORD layout_id;
+    WORD index;
+    unsigned int refs;
+    KBDTABLES tables;
+};
+static struct list xkb_layouts = LIST_INIT(xkb_layouts);
+static pthread_mutex_t xkb_layouts_mutex = PTHREAD_MUTEX_INITIALIZER;
+static HKL keyboard_hkl;
+static xkb_layout_index_t keyboard_group;
+#define XKB_LAYOUT_INVALID ((xkb_layout_index_t)-1)
+static HWND focused_hwnd;
+static HKL posted_hkl;
+static struct layout layouts[2];
+static KBDTABLES kbdus_tables;
+static USHORT scan_maps[2][0x2d];
+static WCHAR key_z[] = {'Z',0}, key_y[] = {'Y',0};
+static VSC_LPWSTR german_names[] = {{0x15,key_z},{0x2c,key_y},{0,NULL}};
+static VSC_LPWSTR us_names[] = {{0x15,key_y},{0x2c,key_z},{0,NULL}};
+static VSC_LPWSTR empty_names[] = {{0,NULL}};
+static VK_TO_WCHARS1 letter_chars[] = {{'Y',0,{'y'}},{'Z',0,{'z'}},{0,0,{0}}};
+static VK_TO_WCHAR_TABLE char_table[] = {{letter_chars,1},{NULL,0}};
+static VK_TO_BIT modifier_bits[] = {{0,0}};
+static MODIFIERS modifiers = {modifier_bits,0,{0}};
+static void xkb_layout_addref(struct layout *layout) { layout->refs++; }
+static void xkb_layout_release(struct layout *layout) { assert(layout->refs); layout->refs--; }
+#define CONTAINING_RECORD(address,type,field) ((type *)((char *)(address) - offsetof(type,field)))
+static HWND wayland_keyboard_get_focused_hwnd(void) { return focused_hwnd; }
+static HWND NtUserGetForegroundWindow(void) { return focused_hwnd; }
+static HWND wayland_keyboard_get_input_hwnd(HWND hwnd, HWND foreground) { return hwnd; }
+static BOOL NtUserPostMessage(HWND hwnd, UINT message, uintptr_t wparam, LPARAM lparam)
+{
+    assert(hwnd == focused_hwnd && message == WM_INPUTLANGCHANGEREQUEST && !wparam);
+    posted_hkl = (HKL)lparam;
+    /* Default publication must already be visible before notifying the window. */
+    if (!server_failure)
+    {
+        assert(current->process->client_default == posted_hkl);
+        assert(current->process->default_layout == (uintptr_t)posted_hkl);
+    }
+    posts++;
+    return TRUE;
+}
+static BOOL check_deinit_lock;
+static void assert_keyboard_mutex_unlocked(void);
+static BOOL NtUserSetDefaultKeyboardLayout(HKL layout)
+{
+    if (check_deinit_lock) assert_keyboard_mutex_unlocked();
+    return set_default_keyboard_layout(layout);
+}
+
+struct wl_keyboard { UINT unused; } wl_keyboard;
+struct xkb_context { UINT unused; } xkb_context;
+struct rxkb_context { UINT unused; } rxkb_context_object;
+static struct rxkb_context *rxkb_context;
+struct xkb_state { UINT group; } xkb_state;
+struct wayland_keyboard
+{
+    pthread_mutex_t mutex;
+    HWND focused_hwnd;
+    struct wl_keyboard *wl_keyboard;
+    struct xkb_context *xkb_context;
+    struct xkb_state *xkb_state;
+};
+static struct
+{
+    LONG input_serial;
+    struct wayland_keyboard keyboard;
+} process_wayland = {.keyboard.mutex = PTHREAD_MUTEX_INITIALIZER};
+static unsigned int keyboard_destroyed, context_released, state_released, rules_released, focus_released;
+static void assert_keyboard_mutex_unlocked(void)
+{
+    assert(!pthread_mutex_trylock(&process_wayland.keyboard.mutex));
+    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+}
+static void wl_keyboard_destroy(struct wl_keyboard *keyboard)
+{
+    assert(keyboard == &wl_keyboard);
+    keyboard_destroyed++;
+}
+static void xkb_context_unref(struct xkb_context *context)
+{
+    assert(context == &xkb_context);
+    context_released++;
+}
+static void xkb_state_unref(struct xkb_state *state)
+{
+    assert(state == &xkb_state);
+    state_released++;
+}
+static void rxkb_context_unref(struct rxkb_context *context)
+{
+    assert(context == &rxkb_context_object);
+    rules_released++;
+}
+static void wayland_external_input_set_keyboard_focus(BOOL focused)
+{
+    assert_keyboard_mutex_unlocked();
+    assert(!focused && !keyboard_hkl && keyboard_group == XKB_LAYOUT_INVALID);
+    assert(!processes[0].default_layout && !processes[0].client_default);
+    focus_released++;
+}
+static void xkb_state_update_mask(struct xkb_state *state, UINT depressed, UINT latched,
+                                  UINT locked, UINT base, UINT latch, UINT group)
+{
+    state->group = group;
+}
+
+/* WAYLAND_FUNCTIONS */
+
+/* TRANSLATION_FUNCTIONS */
+
+static void select_thread(unsigned int index) { assert(index < 4); current = &threads[index]; }
+static void expect_name(const char *expected)
+{
+    WCHAR name[KL_NAMELENGTH];
+    unsigned int i;
+    assert(NtUserGetKeyboardLayoutName(name));
+    for (i = 0; i < KL_NAMELENGTH; i++) assert(name[i] == (unsigned char)expected[i]);
+}
+static void reset(void)
+{
+    unsigned int i;
+    memset(processes, 0, sizeof(processes));
+    memset(threads, 0, sizeof(threads));
+    for (i = 0; i < 2; i++) processes[i].locale = 0x0409;
+    for (i = 0; i < 4; i++)
+    {
+        threads[i].id = 0x100 + i;
+        threads[i].process = &processes[i / 2];
+    }
+    select_thread(0);
+    server_calls = registry_enumerations = posts = 0;
+    server_failure = activation_failure = locale_failure = 0;
+    driver_default = NULL;
+    last_error = 0;
+    keyboard_hkl = posted_hkl = NULL;
+    keyboard_group = XKB_LAYOUT_INVALID;
+    ime_hwnd = NULL;
+    ime_selected = NULL;
+    ime_previous = NULL;
+    ime_messages = 0;
+    focus_hwnd = NULL;
+    lang_change_hkl = NULL;
+    lang_changes = 0;
+    assert(!imc_handles);
+    handle_failure = FALSE;
+    check_deinit_lock = FALSE;
+    keyboard_destroyed = context_released = state_released = rules_released = focus_released = 0;
+    process_wayland.keyboard.focused_hwnd = NULL;
+    process_wayland.keyboard.wl_keyboard = NULL;
+    process_wayland.keyboard.xkb_context = NULL;
+    process_wayland.keyboard.xkb_state = &xkb_state;
+    rxkb_context = NULL;
+    focused_hwnd = NULL;
+    list_init(&xkb_layouts);
+    memset(layouts, 0, sizeof(layouts));
+    for (i = 0; i < 2; i++)
+    {
+        layouts[i].xkb_group = i;
+        layouts[i].lang = i ? 0x0409 : 0x0407;
+        layouts[i].refs = 1;
+        layouts[i].tables.identity = layouts[i].lang;
+        memset(scan_maps[i], 0, sizeof(scan_maps[i]));
+        scan_maps[i][0x15] = i ? 'Y' : 'Z';
+        scan_maps[i][0x2c] = i ? 'Z' : 'Y';
+        layouts[i].tables.pusVSCtoVK = scan_maps[i];
+        layouts[i].tables.bMaxVSCtoVK = ARRAY_SIZE(scan_maps[i]) - 1;
+        layouts[i].tables.pKeyNames = i ? us_names : german_names;
+        layouts[i].tables.pKeyNamesExt = empty_names;
+        layouts[i].tables.pVkToWcharTable = char_table;
+        layouts[i].tables.pCharModifiers = &modifiers;
+        list_add_tail(&xkb_layouts, &layouts[i].entry);
+    }
+    kbdus_tables = layouts[1].tables;
+}
+
+static void test_default_publication(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    unsigned int calls, enumerations;
+    reset();
+
+    /* Startup may ask for a layout name before a Wayland keymap exists. */
+    assert(NtUserGetKeyboardLayout(0) == us);
+    expect_name("00000409");
+    assert(!current->info.kbd_layout && !current->layout);
+
+    set_default_keyboard_layout(de);
+    assert(processes[0].default_layout == (uintptr_t)de);
+    /* Setting a process default does not redefine the thread request's tid=0. */
+    SERVER_START_REQ(set_thread_layout)
+    {
+        req->tid = 0;
+        req->layout = (uintptr_t)us;
+        assert(wine_server_call(req));
+    }
+    SERVER_END_REQ;
+    assert(processes[0].default_layout == (uintptr_t)de);
+    assert(!current->info.kbd_layout && !current->layout);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    expect_name("00000407");
+    enumerations = registry_enumerations;
+    expect_name("00000407");
+    assert(registry_enumerations == enumerations);
+
+    /* Current-thread/default lookups remain a local operation. */
+    calls = server_calls;
+    assert(NtUserGetKeyboardLayout(GetCurrentThreadId()) == de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(server_calls == calls);
+
+    assert(NtUserGetKeyboardLayout(threads[1].id) == de);
+    select_thread(1);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    expect_name("00000407");
+
+    set_default_keyboard_layout(us);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    expect_name("00000409");
+    select_thread(0);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    expect_name("00000409");
+
+    last_error = 0;
+    assert(!NtUserGetKeyboardLayoutName(NULL));
+    assert(last_error == ERROR_NOACCESS);
+
+    /* Failed driver initialization withdraws any host default already sent. */
+    assert(set_default_keyboard_layout(de));
+    expect_name("00000407");
+    assert(set_default_keyboard_layout(NULL));
+    assert(!processes[0].default_layout && !processes[0].client_default);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    assert(NtUserGetKeyboardLayout(threads[1].id) == us);
+    expect_name("00000409");
+}
+
+static void test_explicit_layouts(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    reset();
+    set_default_keyboard_layout(de);
+
+    /* Selecting the current default must still create an explicit selection. */
+    assert(NtUserActivateKeyboardLayout(de, 0) == de);
+    assert(current->info.kbd_layout == de && current->layout == (uintptr_t)de);
+    set_default_keyboard_layout(us);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    expect_name("00000407");
+    assert(NtUserGetKeyboardLayout(threads[1].id) == us);
+
+    select_thread(1);
+    assert(NtUserGetKeyboardLayout(threads[0].id) == de);
+    assert(NtUserActivateKeyboardLayout(de, 0) == us);
+    assert(NtUserActivateKeyboardLayout(us, 0) == de);
+    set_default_keyboard_layout(de);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    expect_name("00000409");
+    activation_failure = 1;
+    assert(!NtUserActivateKeyboardLayout(de, 0));
+    assert(NtUserGetKeyboardLayout(0) == us);
+    assert(set_default_keyboard_layout(NULL));
+    assert(NtUserGetKeyboardLayout(threads[0].id) == de);
+    assert(NtUserGetKeyboardLayout(0) == us);
+}
+
+static void test_activation_snapshot_and_ime(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+
+    reset();
+    driver_default = de;
+    assert(NtUserGetKeyboardLayout(0) == us);
+    assert(NtUserActivateKeyboardLayout(de, 0) == us);
+    assert(NtUserGetKeyboardLayout(0) == de);
+
+    reset();
+    ime_hwnd = (HWND)0x456;
+    ime_selected = us;
+    assert(set_default_keyboard_layout(de));
+    assert(NtUserActivateKeyboardLayout(de, 0) == de);
+    assert(ime_selected == de && ime_messages == 2);
+    assert(set_default_keyboard_layout(us));
+    assert(NtUserGetKeyboardLayout(0) == de);
+
+}
+
+static void test_lazy_activation_placeholder(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    HKL requested;
+    WCHAR name[8];
+
+    /* A first driver load replaces a locale placeholder with a real layout. */
+    reset();
+    list_remove(&layouts[1].entry);
+    focus_hwnd = (HWND)0x345;
+    requested = NtUserGetKeyboardLayout(0);
+    driver_default = de;
+    assert(requested == us && NtUserActivateKeyboardLayout(requested, 0) == us);
+    assert(!current->info.kbd_layout && !current->layout && !lang_changes && !ime_messages);
+    assert(NtUserGetKeyboardLayout(0) == de && NtUserGetKeyboardLayout(threads[1].id) == de);
+    expect_name("00000407");
+    assert(NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0)) == 'Z');
+    assert(NtUserGetKeyNameText(0x15 << 16, name, ARRAY_SIZE(name)) == 1 && name[0] == 'Z');
+    assert(layouts[0].refs == 1);
+
+    /* The same request must pin when US is actually configured. */
+    reset();
+    driver_default = de;
+    assert(NtUserActivateKeyboardLayout(NtUserGetKeyboardLayout(0), 0) == us);
+    assert(current->info.kbd_layout == us && current->layout == (uintptr_t)us);
+    assert(NtUserGetKeyboardLayout(0) == us && layouts[1].refs == 1);
+
+    /* Legacy drivers need not expose tables or publish a host default. */
+    reset();
+    list_init(&xkb_layouts);
+    assert(NtUserActivateKeyboardLayout(NtUserGetKeyboardLayout(0), 0) == us);
+    assert(current->info.kbd_layout == us && current->layout == (uintptr_t)us);
+
+    /* A later host switch cannot discard an explicit selection of US. */
+    reset();
+    list_remove(&layouts[1].entry);
+    assert(set_default_keyboard_layout(us));
+    driver_default = de;
+    assert(NtUserActivateKeyboardLayout(us, 0) == us);
+    assert(current->info.kbd_layout == us && current->layout == (uintptr_t)us);
+    assert(NtUserGetKeyboardLayout(0) == us);
+
+    reset();
+    list_remove(&layouts[1].entry);
+    assert(set_default_keyboard_layout(de));
+    assert(NtUserActivateKeyboardLayout(us, 0) == de);
+    assert(NtUserGetKeyboardLayout(0) == us && current->info.kbd_layout == us);
+}
+
+static void test_cross_process_layouts(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    reset();
+    set_default_keyboard_layout(de);
+    select_thread(2);
+    set_default_keyboard_layout(us);
+    assert(NtUserGetKeyboardLayout(threads[0].id) == de);
+    assert(NtUserGetKeyboardLayout(threads[1].id) == de);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    assert(NtUserActivateKeyboardLayout(de, 0) == us);
+    select_thread(0);
+    assert(NtUserGetKeyboardLayout(threads[2].id) == de);
+    assert(NtUserGetKeyboardLayout(threads[3].id) == us);
+    set_default_keyboard_layout(us);
+    select_thread(2);
+    assert(NtUserGetKeyboardLayout(threads[0].id) == us);
+    assert(NtUserGetKeyboardLayout(0) == de);
+}
+
+static void test_wayland_publication(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    const KBDTABLES *tables;
+    unsigned int calls;
+    reset();
+    expect_name("00000409");
+    set_current_xkb_group(0);
+    assert(keyboard_hkl == de && !posts);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    expect_name("00000407");
+
+    focused_hwnd = (HWND)0x234;
+    set_current_xkb_group(1);
+    assert(keyboard_hkl == us && posts == 1 && posted_hkl == us);
+    calls = server_calls;
+    set_current_xkb_group(1);
+    assert(posts == 1 && server_calls == calls);
+    set_current_xkb_group(99);
+    assert(keyboard_hkl == us && posts == 1 && server_calls == calls);
+
+    /* Explicit translation requests continue resolving their own layout. */
+    tables = WAYLAND_KbdLayerDescriptor(de);
+    assert(tables == &layouts[0].tables && layouts[0].refs == 2);
+    set_current_xkb_group(0);
+    assert(posts == 2 && posted_hkl == de);
+    assert(tables->identity == 0x0407);
+    WAYLAND_ReleaseKbdTables(tables);
+    assert(layouts[0].refs == 1);
+    tables = WAYLAND_KbdLayerDescriptor(us);
+    assert(tables == &layouts[1].tables);
+    WAYLAND_ReleaseKbdTables(tables);
+    assert(!WAYLAND_KbdLayerDescriptor((HKL)0x040c0409));
+}
+
+static void test_publication_failure(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    reset();
+    server_failure = 1;
+    assert(!set_default_keyboard_layout(de));
+    assert(!processes[0].default_layout && !processes[0].client_default);
+    assert(NtUserGetKeyboardLayout(0) == us);
+
+    focused_hwnd = (HWND)0x234;
+    set_current_xkb_group(0);
+    assert(keyboard_hkl == de && posts == 1 && posted_hkl == de);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    server_failure = 0;
+    set_current_xkb_group(0);
+    assert(keyboard_hkl == de && posts == 1);
+    expect_name("00000407");
+
+    server_failure = 1;
+    set_current_xkb_group(1);
+    assert(keyboard_hkl == us && posts == 2 && posted_hkl == us);
+    assert(processes[0].default_layout == (uintptr_t)de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    expect_name("00000407");
+    server_failure = 0;
+    set_current_xkb_group(1);
+    assert(keyboard_hkl == us && posts == 2);
+    assert(NtUserGetKeyboardLayout(threads[1].id) == us);
+}
+
+static void test_initial_group(void)
+{
+    const HKL de = (HKL)0x04070409, us = (HKL)0x04090409;
+    unsigned int calls;
+
+    reset();
+    reset_keyboard_layout(2);
+    assert(!keyboard_hkl && !server_calls);
+    /* Compositors may report the actual group without keyboard focus. */
+    keyboard_handle_modifiers(NULL, NULL, 1, 0, 0, 0, 1);
+    assert(keyboard_hkl == us && NtUserGetKeyboardLayout(0) == us && !posts);
+    assert(xkb_state.group == 1);
+    focused_hwnd = (HWND)0x234;
+    calls = server_calls;
+    reset_keyboard_layout(2);
+    assert(keyboard_hkl == us && processes[0].client_default == us && !posts);
+    assert(server_calls == calls);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    focused_hwnd = NULL;
+    keyboard_group = XKB_LAYOUT_INVALID; /* A different map has no reported group yet. */
+    reset_keyboard_layout(1);
+    assert(keyboard_hkl == de && NtUserGetKeyboardLayout(0) == de && !posts);
+    process_wayland.keyboard.xkb_state = NULL;
+    calls = server_calls;
+    keyboard_handle_modifiers(NULL, NULL, 2, 0, 0, 0, 1);
+    assert(keyboard_hkl == de && server_calls == calls);
+    locale_failure = 1;
+    set_current_xkb_group(1);
+    assert(keyboard_hkl == de && server_calls == calls);
+    wayland_keyboard_clear_layout();
+    assert(!keyboard_hkl && keyboard_group == XKB_LAYOUT_INVALID);
+    assert(!processes[0].default_layout && !processes[0].client_default);
+}
+
+static void test_keyboard_seat_lifecycle(void)
+{
+    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    const HKL de = (HKL)0x04070409, us = (HKL)0x04090409;
+    unsigned int calls;
+
+    reset();
+    keyboard->focused_hwnd = (HWND)0x234;
+    keyboard->wl_keyboard = &wl_keyboard;
+    keyboard->xkb_context = &xkb_context;
+    rxkb_context = &rxkb_context_object;
+    keyboard_handle_modifiers(NULL, NULL, 1, 0, 0, 0, 1);
+    assert(keyboard_group == 1 && keyboard_hkl == us);
+    assert(processes[0].client_default == us && processes[0].default_layout == (uintptr_t)us);
+
+    check_deinit_lock = TRUE;
+    wayland_keyboard_deinit();
+    assert(!keyboard->focused_hwnd && !keyboard->wl_keyboard && !keyboard->xkb_context && !keyboard->xkb_state);
+    assert(!rxkb_context && !keyboard_hkl && keyboard_group == XKB_LAYOUT_INVALID);
+    assert(!processes[0].client_default && !processes[0].default_layout);
+    assert(keyboard_destroyed == 1 && context_released == 1 && state_released == 1);
+    assert(rules_released == 1 && focus_released == 1);
+    calls = server_calls;
+    wayland_keyboard_deinit();
+    assert(server_calls == calls);
+    assert(keyboard_destroyed == 1 && context_released == 1 && state_released == 1);
+    assert(rules_released == 1 && focus_released == 1);
+    check_deinit_lock = FALSE;
+
+    /* A new keyboard's map may number its groups differently. It must wait
+     * for its own modifiers event rather than reuse the departed seat's group. */
+    layouts[0].xkb_group = 1;
+    layouts[1].xkb_group = 0;
+    keyboard->xkb_state = &xkb_state;
+    reset_keyboard_layout(2);
+    assert(keyboard_group == XKB_LAYOUT_INVALID && !keyboard_hkl);
+    assert(!processes[0].client_default && !processes[0].default_layout);
+    keyboard_handle_modifiers(NULL, NULL, 2, 0, 0, 0, 1);
+    assert(keyboard_group == 1 && keyboard_hkl == de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+}
+
+static void test_notification_baseline(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+
+    reset();
+    focus_hwnd = focused_hwnd = (HWND)0x345;
+    assert(NtUserGetKeyboardLayout(0) == us);
+    set_current_xkb_group(0);
+    assert(posted_hkl == de && NtUserGetKeyboardLayout(threads[1].id) == de);
+    /* An unrelated query between publication and activation must not suppress
+     * the first WM_INPUTLANGCHANGE or replace the activation return value. */
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserActivateKeyboardLayout(de, 0) == de);
+    assert(lang_changes == 1 && lang_change_hkl == de && current->info.kbd_layout == de);
+    assert(NtUserActivateKeyboardLayout(de, 0) == de && lang_changes == 1);
+
+    select_thread(1);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserActivateKeyboardLayout(de, 0) == de);
+    assert(lang_changes == 2 && current->info.kbd_layout == de);
+    set_current_xkb_group(1);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserActivateKeyboardLayout(us, 0) == de);
+    assert(lang_changes == 3 && lang_change_hkl == us);
+
+    reset();
+    focus_hwnd = (HWND)0x345;
+    assert(NtUserActivateKeyboardLayout(us, 0) == us);
+    assert(current->info.kbd_layout == us && current->layout == (uintptr_t)us);
+    assert(lang_changes == 1 && server_calls == 1);
+    set_default_keyboard_layout(de);
+    assert(NtUserGetKeyboardLayout(threads[1].id) == de);
+    assert(NtUserActivateKeyboardLayout(de, 0) == us);
+    assert(lang_changes == 2 && current->info.kbd_layout == de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserActivateKeyboardLayout(de, 0) == de && lang_changes == 2);
+}
+
+static void test_input_context_layout(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    HIMC imc, second;
+    unsigned int calls;
+
+    reset();
+    /* A real client context created before focus must not pin the locale HKL. */
+    calls = server_calls;
+    imc = NtUserCreateInputContext(1);
+    assert(imc && ((struct imc *)imc)->client_ptr == 1);
+    assert(!current->info.kbd_layout && !current->layout && server_calls == calls);
+    expect_name("00000409");
+    set_default_keyboard_layout(de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    expect_name("00000407");
+    set_default_keyboard_layout(us);
+    assert(NtUserGetKeyboardLayout(0) == us);
+    assert(NtUserDestroyInputContext(imc));
+
+    /* Attaching a client to a placeholder does not activate a layout either. */
+    reset();
+    imc = NtUserCreateInputContext(0);
+    assert(imc && !current->info.kbd_layout);
+    calls = server_calls;
+    assert(NtUserUpdateInputContext(imc, NtUserInputContextClientPtr, 1));
+    assert(!current->info.kbd_layout && !current->layout && server_calls == calls);
+    assert(((struct imc *)imc)->client_ptr == 1);
+    set_default_keyboard_layout(de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserDestroyInputContext(imc));
+
+    /* Another thread attaching the client must not select either thread's HKL. */
+    reset();
+    imc = NtUserCreateInputContext(0);
+    assert(imc && ((struct imc *)imc)->thread_id == threads[0].id);
+    select_thread(1);
+    calls = server_calls;
+    assert(NtUserUpdateInputContext(imc, NtUserInputContextClientPtr, 1));
+    assert(server_calls == calls && ((struct imc *)imc)->thread_id == threads[0].id);
+    assert(!threads[0].info.kbd_layout && !threads[0].layout);
+    assert(!threads[1].info.kbd_layout && !threads[1].layout);
+    set_default_keyboard_layout(de);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserGetKeyboardLayout(threads[0].id) == de);
+    select_thread(0);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserDestroyInputContext(imc));
+
+    /* Explicit activation continues to pin a layout, independently of IMCs. */
+    assert(NtUserActivateKeyboardLayout(de, 0) == de);
+    second = NtUserCreateInputContext(2);
+    assert(second && NtUserUpdateInputContext(second, NtUserInputContextClientPtr, 3));
+    set_default_keyboard_layout(us);
+    assert(NtUserGetKeyboardLayout(0) == de);
+    assert(NtUserGetKeyboardLayout(threads[1].id) == us);
+    assert(NtUserDestroyInputContext(second));
+
+    /* Context lifetime and client attachment no longer depend on publication. */
+    reset();
+    server_failure = 1;
+    calls = server_calls;
+    second = NtUserCreateInputContext(1);
+    assert(second && !current->info.kbd_layout && !current->layout);
+    imc = NtUserCreateInputContext(0);
+    assert(imc && NtUserUpdateInputContext(imc, NtUserInputContextClientPtr, 1));
+    assert(((struct imc *)imc)->client_ptr == 1 && server_calls == calls);
+    assert(!current->info.kbd_layout && !current->layout);
+    assert(NtUserDestroyInputContext(imc));
+    assert(NtUserDestroyInputContext(second));
+}
+
+static void test_worker_translations(void)
+{
+    const HKL us = (HKL)0x04090409, de = (HKL)0x04070409;
+    WCHAR name[8];
+    BYTE state[256] = {0};
+    UINT vkey;
+    reset();
+    set_current_xkb_group(0);
+    select_thread(1);
+    assert(NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0)) == 'Z');
+    assert(NtUserMapVirtualKeyEx(0x2c, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0)) == 'Y');
+    assert(NtUserGetKeyNameText(0x15 << 16, name, ARRAY_SIZE(name)) == 1);
+    assert(name[0] == 'Z' && !name[1]);
+    assert(NtUserGetKeyNameText(0x2c << 16, name, ARRAY_SIZE(name)) == 1);
+    assert(name[0] == 'Y' && !name[1]);
+    vkey = NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0));
+    assert(NtUserToUnicodeEx(vkey, 0x15, state, name, ARRAY_SIZE(name), 0,
+                             NtUserGetKeyboardLayout(0)) == 1);
+    assert(name[0] == 'z' && !name[1]);
+
+    assert(NtUserActivateKeyboardLayout(us, 0) == de);
+    assert(NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0)) == 'Y');
+    assert(NtUserGetKeyNameText(0x15 << 16, name, ARRAY_SIZE(name)) == 1);
+    assert(name[0] == 'Y' && !name[1]);
+    vkey = NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0));
+    assert(NtUserToUnicodeEx(vkey, 0x15, state, name, ARRAY_SIZE(name), 0,
+                             NtUserGetKeyboardLayout(0)) == 1);
+    assert(name[0] == 'y' && !name[1]);
+    assert(NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, de) == 'Z');
+    assert(layouts[0].refs == 1 && layouts[1].refs == 1);
+}
+
+static void test_worker_variant_translation(void)
+{
+    const KBDTABLES *tables;
+    HKL layout;
+    WCHAR name[8];
+
+    reset();
+    layouts[0].layout_id = 0x123;
+    layout = get_layout_hkl(&layouts[0], processes[0].locale);
+    assert(set_current_xkb_group(0));
+    select_thread(1);
+    assert(NtUserGetKeyboardLayout(0) == layout);
+    tables = WAYLAND_KbdLayerDescriptor(NtUserGetKeyboardLayout(0));
+    assert(tables == &layouts[0].tables);
+    WAYLAND_ReleaseKbdTables(tables);
+    assert(NtUserMapVirtualKeyEx(0x15, MAPVK_VSC_TO_VK, NtUserGetKeyboardLayout(0)) == 'Z');
+    assert(NtUserGetKeyNameText(0x15 << 16, name, ARRAY_SIZE(name)) == 1);
+    assert(name[0] == 'Z' && !name[1]);
+    assert(layouts[0].refs == 1);
+}
+
+int main(void)
+{
+    test_default_publication();
+    test_explicit_layouts();
+    test_activation_snapshot_and_ime();
+    test_lazy_activation_placeholder();
+    test_cross_process_layouts();
+    test_wayland_publication();
+    test_publication_failure();
+    test_initial_group();
+    test_keyboard_seat_lifecycle();
+    test_notification_baseline();
+    test_input_context_layout();
+    test_worker_translations();
+    test_worker_variant_translation();
+    puts("keyboard defaults: worker translation, explicit selections, notifications, context lifetime and process isolation passed");
+    return 0;
+}

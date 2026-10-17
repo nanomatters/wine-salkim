@@ -79,6 +79,7 @@ static struct list xkb_layouts = LIST_INIT(xkb_layouts);
 /* These are only used from the wayland event thread and don't need locking */
 static struct rxkb_context *rxkb_context;
 static HKL keyboard_hkl; /* the HKL matching the currently active xkb group */
+static xkb_layout_index_t keyboard_group = XKB_LAYOUT_INVALID;
 
 static void xkb_layout_addref(struct layout *layout)
 {
@@ -780,13 +781,19 @@ HWND wayland_keyboard_get_input_hwnd(HWND surface_hwnd, HWND foreground)
     return surface_hwnd;
 }
 
-static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+static void publish_keyboard_layout(HKL hkl)
 {
-    LCID locale = LOWORD(NtUserGetKeyboardLayout(0));
+    if (!NtUserSetDefaultKeyboardLayout(hkl)) ERR("Failed to publish default keyboard layout %p\n", hkl);
+}
+
+static BOOL set_current_xkb_group(xkb_layout_index_t xkb_group)
+{
+    LCID locale;
     struct layout *layout;
     HWND hwnd;
     HKL hkl;
 
+    if (NtQueryDefaultLocale(TRUE, &locale)) return FALSE;
     pthread_mutex_lock(&xkb_layouts_mutex);
 
     LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
@@ -796,18 +803,38 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
     else
     {
         ERR("Failed to find Xkb Layout for group %d\n", xkb_group);
-        hkl = keyboard_hkl;
+        pthread_mutex_unlock(&xkb_layouts_mutex);
+        return FALSE;
     }
 
     pthread_mutex_unlock(&xkb_layouts_mutex);
 
-    if (hkl == keyboard_hkl) return;
+    publish_keyboard_layout(hkl);
+    if (hkl == keyboard_hkl) return TRUE;
     keyboard_hkl = hkl;
 
     TRACE("Changing keyboard layout to %p\n", hkl);
     if ((hwnd = wayland_keyboard_get_focused_hwnd()))
         NtUserPostMessage(wayland_keyboard_get_input_hwnd(hwnd, NtUserGetForegroundWindow()),
                           WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
+    return TRUE;
+}
+
+static void reset_keyboard_layout(UINT count)
+{
+    /* Keep the compositor's reported group across keymap resends. Before the
+     * first group event, only a single-layout map is unambiguous. */
+    if (keyboard_group != XKB_LAYOUT_INVALID && set_current_xkb_group(keyboard_group)) return;
+    if (count == 1 && set_current_xkb_group(0)) return;
+    keyboard_hkl = NULL;
+    publish_keyboard_layout(NULL);
+}
+
+void wayland_keyboard_clear_layout(void)
+{
+    keyboard_hkl = NULL;
+    keyboard_group = XKB_LAYOUT_INVALID;
+    publish_keyboard_layout(NULL);
 }
 
 static BOOL find_xkb_layout_variant(const char *name, const char **layout, const char **variant)
@@ -906,6 +933,12 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
     }
     if (!xkb_compose) ERR("Failed to load Xkb compose table, deadkeys won't be supported\n");
 
+    if (!(xkb_state = xkb_state_new(xkb_keymap)))
+    {
+        ERR("Failed to create Xkb state\n");
+        goto done;
+    }
+
     pthread_mutex_lock(&xkb_layouts_mutex);
 
     LIST_FOR_EACH_ENTRY_SAFE(entry, next, &xkb_layouts, struct layout, entry)
@@ -933,19 +966,18 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
         add_xkb_layout(buffer, xkb_keymap, xkb_compose, xkb_group, lang);
     }
 
+    if (keyboard_group >= xkb_keymap_num_layouts(xkb_keymap)) keyboard_group = XKB_LAYOUT_INVALID;
     pthread_mutex_unlock(&xkb_layouts_mutex);
 
-    if ((xkb_state = xkb_state_new(xkb_keymap)))
-    {
-        pthread_mutex_lock(&keyboard->mutex);
-        xkb_state_unref(keyboard->xkb_state);
-        keyboard->xkb_state = xkb_state;
-        pthread_mutex_unlock(&keyboard->mutex);
+    pthread_mutex_lock(&keyboard->mutex);
+    xkb_state_unref(keyboard->xkb_state);
+    keyboard->xkb_state = xkb_state;
+    pthread_mutex_unlock(&keyboard->mutex);
 
-        set_current_xkb_group(0);
-    }
+    reset_keyboard_layout(xkb_keymap_num_layouts(xkb_keymap));
 
-    xkb_keymap_unref(xkb_keymap);
+done:
+    if (xkb_keymap) xkb_keymap_unref(xkb_keymap);
 #ifdef HAVE_XKBCOMMON_XKBCOMMON_COMPOSE_H
     if (xkb_compose) xkb_compose_table_unref(xkb_compose);
 #endif
@@ -977,7 +1009,8 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
 
     input_hwnd = wayland_keyboard_get_input_hwnd(hwnd, NtUserGetForegroundWindow());
     /* Input language follows Win32 focus while surface state remains tied to the Wayland toplevel. */
-    NtUserPostMessage(input_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
+    if (keyboard_hkl)
+        NtUserPostMessage(input_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
     NtUserPostMessage(wayland_keyboard_get_focus_owner(hwnd), WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
@@ -1205,16 +1238,20 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
 
     InterlockedExchange(&process_wayland.input_serial, serial);
 
-    if (!wayland_keyboard_get_focused_hwnd()) return;
-
     TRACE("serial=%u mods_depressed=%#x mods_latched=%#x mods_locked=%#x xkb_group=%d\n",
           serial, mods_depressed, mods_latched, mods_locked, xkb_group);
 
     pthread_mutex_lock(&keyboard->mutex);
+    if (!keyboard->xkb_state)
+    {
+        pthread_mutex_unlock(&keyboard->mutex);
+        return;
+    }
     xkb_state_update_mask(keyboard->xkb_state, mods_depressed, mods_latched,
                           mods_locked, 0, 0, xkb_group);
     pthread_mutex_unlock(&keyboard->mutex);
 
+    keyboard_group = xkb_group;
     set_current_xkb_group(xkb_group);
 }
 
@@ -1302,6 +1339,7 @@ void wayland_keyboard_deinit(void)
         keyboard->xkb_state = NULL;
     }
     pthread_mutex_unlock(&keyboard->mutex);
+    wayland_keyboard_clear_layout();
     if (focused) wayland_external_input_set_keyboard_focus(FALSE);
 
     if (rxkb_context)

@@ -1,0 +1,328 @@
+/* Production IME selection and message handlers with injected UI/IME services. */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef void *HKL;
+typedef void *HIMC;
+typedef void *HWND;
+typedef unsigned int UINT;
+typedef uintptr_t UINT_PTR;
+typedef uintptr_t WPARAM;
+typedef intptr_t LPARAM;
+typedef intptr_t LRESULT;
+typedef intptr_t LONG_PTR;
+typedef int BOOL;
+typedef struct { unsigned int cookie; } INPUTCONTEXT;
+#define WINAPI
+#define CALLBACK
+#define TRUE 1
+#define FALSE 0
+#define TRACE(...) do {} while (0)
+#define WARN(...) do {} while (0)
+#define FIXME(...) do {} while (0)
+#define WS_EX_TOOLWINDOW 1
+#define WS_POPUP 2
+#define HWND_BOTTOM ((HWND)(uintptr_t)1)
+#define SWP_NOMOVE 1
+#define SWP_NOSIZE 2
+#define SWP_NOACTIVATE 4
+#define IMMGWL_IMC 0
+#define WM_IME_SELECT 0x285
+enum { IME_INTERNAL_ACTIVATE, IME_INTERNAL_DEACTIVATE,
+       IME_INTERNAL_HKL_ACTIVATE, IME_INTERNAL_HKL_DEACTIVATE };
+
+struct ime
+{
+    HKL hkl;
+    const void *ui_class;
+    void *module;
+    BOOL (*pImeSelect)(HIMC himc, BOOL selected);
+};
+struct imc
+{
+    HIMC handle;
+    struct ime *ime;
+    HWND ui_hwnd;
+    INPUTCONTEXT IMC;
+    UINT dwLock;
+};
+static struct { UINT default_imc; } thread_info;
+static struct imc context;
+static struct ime old_ime, new_ime;
+static HKL current_layout, explicit_layout;
+static unsigned int ui_creations, context_requests, activation_calls, enum_calls;
+static BOOL activation_fails;
+enum operation { UI_DEACTIVATE, UI_DESTROY, IME_DESELECT, IME_RELEASE,
+                 IME_ACQUIRE, IME_SELECT, UI_CREATE, UI_ACTIVATE };
+static struct { enum operation operation; HKL hkl; } events[32];
+static unsigned int event_count;
+
+static void record(enum operation operation, HKL hkl)
+{
+    assert(event_count < sizeof(events) / sizeof(events[0]));
+    events[event_count].operation = operation;
+    events[event_count++].hkl = hkl;
+}
+static void expect_event(unsigned int index, enum operation operation, HKL hkl)
+{
+    assert(index < event_count);
+    assert(events[index].operation == operation);
+    assert(events[index].hkl == hkl);
+}
+static BOOL old_select(HIMC himc, BOOL selected)
+{
+    assert(himc == context.handle);
+    record(selected ? IME_SELECT : IME_DESELECT, old_ime.hkl);
+    return TRUE;
+}
+static BOOL new_select(HIMC himc, BOOL selected)
+{
+    assert(himc == context.handle);
+    record(selected ? IME_SELECT : IME_DESELECT, new_ime.hkl);
+    return TRUE;
+}
+static HKL GetKeyboardLayout(UINT thread) { return current_layout; }
+static HKL ActivateKeyboardLayout(HKL hkl, UINT flags)
+{
+    HKL previous = current_layout;
+
+    assert(!flags);
+    activation_calls++;
+    if (activation_fails) return NULL;
+    current_layout = explicit_layout = hkl;
+    return previous;
+}
+#define NtUserGetThreadInfo() (&thread_info)
+static struct imc *query_imc_data(HIMC himc)
+{
+    return himc == context.handle ? &context : NULL;
+}
+static struct imc *get_imc_data(HIMC himc) { return query_imc_data(himc); }
+static struct imc *default_input_context(void)
+{
+    context_requests++;
+    assert((HIMC)(UINT_PTR)thread_info.default_imc == context.handle);
+    return &context;
+}
+static struct ime *ime_acquire(HKL hkl)
+{
+    struct ime *ime = hkl == old_ime.hkl ? &old_ime : &new_ime;
+    assert(ime->hkl == hkl);
+    record(IME_ACQUIRE, hkl);
+    return ime;
+}
+static void ime_release(struct ime *ime) { record(IME_RELEASE, ime->hkl); }
+static INPUTCONTEXT *ime_find_input_context(struct ime *ime, HIMC himc) { return NULL; }
+static void ime_save_input_context(struct ime *ime, HIMC himc, INPUTCONTEXT *input)
+{
+    input->cookie = ime == &old_ime ? 1 : 2;
+}
+static BOOL DestroyWindow(HWND hwnd)
+{
+    assert(hwnd == context.ui_hwnd);
+    record(UI_DESTROY, hwnd == (HWND)(UINT_PTR)10 ? old_ime.hkl : new_ime.hkl);
+    return TRUE;
+}
+static HWND CreateWindowExW(UINT exstyle, const void *ui_class, const void *name, UINT style,
+                           int x, int y, int width, int height, HWND parent, void *menu,
+                           void *module, void *data)
+{
+    ui_creations++;
+    assert(context.ime);
+    record(UI_CREATE, context.ime->hkl);
+    return (HWND)(UINT_PTR)(context.ime == &old_ime ? 10 : 11);
+}
+static BOOL SetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) { return TRUE; }
+static LONG_PTR SetWindowLongPtrW(HWND hwnd, int offset, LONG_PTR value) { return 0; }
+static HWND ImmGetDefaultIMEWnd(HWND hwnd) { return (HWND)(UINT_PTR)20; }
+static HWND GetFocus(void) { return (HWND)(UINT_PTR)30; }
+static HIMC NtUserGetWindowInputContext(HWND hwnd) { return context.handle; }
+static BOOL ImmSetActiveContext(HWND hwnd, HIMC himc, BOOL active) { return TRUE; }
+static void set_ime_ui_window_himc(HIMC himc) {}
+static BOOL ImmEnumInputContext(UINT thread, BOOL (*callback)(HIMC, LPARAM), LPARAM lparam)
+{
+    enum_calls++;
+    return callback(context.handle, lparam);
+}
+static LRESULT SendMessageW(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    assert(message == WM_IME_SELECT);
+    assert(hwnd == context.ui_hwnd);
+    assert(context.ime && (HKL)lparam == context.ime->hkl);
+    record(wparam ? UI_ACTIVATE : UI_DEACTIVATE, (HKL)lparam);
+    return 0;
+}
+
+/* IME_FUNCTIONS */
+
+static void reset(void)
+{
+    memset(&context, 0, sizeof(context));
+    memset(events, 0, sizeof(events));
+    thread_info.default_imc = 1;
+    context.handle = (HIMC)(UINT_PTR)1;
+    context.ime = &old_ime;
+    context.ui_hwnd = (HWND)(UINT_PTR)10;
+    context.IMC.cookie = 1;
+    old_ime.hkl = (HKL)(UINT_PTR)0x04090409;
+    old_ime.pImeSelect = old_select;
+    new_ime.hkl = (HKL)(UINT_PTR)0x04070409;
+    new_ime.pImeSelect = new_select;
+    current_layout = old_ime.hkl;
+    explicit_layout = NULL;
+    activation_fails = FALSE;
+    event_count = ui_creations = context_requests = activation_calls = enum_calls = 0;
+}
+
+static void test_switch(BOOL default_changed)
+{
+    reset();
+    if (default_changed) current_layout = new_ime.hkl;
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)new_ime.hkl);
+    assert(event_count == 1);
+    expect_event(0, UI_DEACTIVATE, old_ime.hkl);
+    assert(context.ime == &old_ime && context.IMC.cookie == 1);
+    assert(!context_requests && !ui_creations);
+
+    current_layout = new_ime.hkl;
+    ime_internal_msg(IME_INTERNAL_HKL_ACTIVATE, (LPARAM)current_layout);
+    assert(event_count == 8);
+    expect_event(1, UI_DESTROY, old_ime.hkl);
+    expect_event(2, IME_DESELECT, old_ime.hkl);
+    expect_event(3, IME_RELEASE, old_ime.hkl);
+    expect_event(4, IME_ACQUIRE, new_ime.hkl);
+    expect_event(5, IME_SELECT, new_ime.hkl);
+    expect_event(6, UI_CREATE, new_ime.hkl);
+    expect_event(7, UI_ACTIVATE, new_ime.hkl);
+    assert(context.ime == &new_ime && context.IMC.cookie == 2 && !context.dwLock);
+    assert(context_requests == 1 && ui_creations == 1);
+}
+
+static void test_absent_context(void)
+{
+    reset();
+    thread_info.default_imc = 0;
+    current_layout = new_ime.hkl;
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)current_layout);
+    assert(!event_count && !context_requests && !ui_creations);
+
+    thread_info.default_imc = 2; /* An existing handle with no IMM client data. */
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)current_layout);
+    assert(!event_count && !context_requests && !ui_creations);
+}
+
+static void test_absent_ui(void)
+{
+    reset();
+    context.ui_hwnd = NULL;
+    current_layout = new_ime.hkl;
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)current_layout);
+    assert(!event_count && !context_requests && !ui_creations);
+    assert(context.ime == &old_ime);
+
+    context.ime = NULL;
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)current_layout);
+    assert(!event_count && !context_requests && !ui_creations);
+}
+
+static void test_prior_lazy_selection(void)
+{
+    reset();
+    current_layout = new_ime.hkl;
+    assert(ImmLockIMC(context.handle) == &context.IMC);
+    assert(ImmUnlockIMC(context.handle));
+    assert(context.ime == &new_ime && !context.ui_hwnd);
+    assert(event_count == 5);
+    expect_event(0, UI_DESTROY, old_ime.hkl);
+    expect_event(1, IME_DESELECT, old_ime.hkl);
+    expect_event(2, IME_RELEASE, old_ime.hkl);
+    expect_event(3, IME_ACQUIRE, new_ime.hkl);
+    expect_event(4, IME_SELECT, new_ime.hkl);
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)old_ime.hkl);
+    assert(event_count == 5 && !context_requests && !ui_creations);
+}
+
+static void test_variant_hkl(void)
+{
+    reset();
+    old_ime.hkl = (HKL)(intptr_t)(int32_t)0xf0010409;
+    new_ime.hkl = (HKL)(intptr_t)(int32_t)0xf0020409;
+    current_layout = new_ime.hkl;
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)current_layout);
+    assert(event_count == 1);
+    expect_event(0, UI_DEACTIVATE, old_ime.hkl);
+    assert(!context_requests && !ui_creations);
+
+    ime_internal_msg(IME_INTERNAL_HKL_ACTIVATE, (LPARAM)current_layout);
+    assert(event_count == 8);
+    expect_event(7, UI_ACTIVATE, new_ime.hkl);
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)old_ime.hkl);
+    assert(event_count == 9);
+    expect_event(8, UI_DEACTIVATE, new_ime.hkl);
+}
+
+static void test_activate_effective_default(void)
+{
+    reset();
+    assert(ImmActivateLayout(current_layout));
+    assert(!activation_calls && !explicit_layout);
+    assert(!enum_calls && !event_count && !context_requests && !ui_creations);
+}
+
+static void test_activate_stale_context(void)
+{
+    reset();
+    current_layout = new_ime.hkl;
+    assert(ImmActivateLayout(current_layout));
+    assert(!activation_calls && !explicit_layout && !enum_calls);
+    assert(context.ime == &old_ime && !context.dwLock);
+    assert(!event_count && !context_requests && !ui_creations);
+}
+
+static void test_already_selected_target(void)
+{
+    reset();
+    ime_internal_msg(IME_INTERNAL_HKL_DEACTIVATE, (LPARAM)current_layout);
+    assert(event_count == 1);
+    expect_event(0, UI_DEACTIVATE, old_ime.hkl);
+    ime_internal_msg(IME_INTERNAL_HKL_ACTIVATE, (LPARAM)current_layout);
+    assert(event_count == 2 && !ui_creations);
+    expect_event(1, UI_ACTIVATE, old_ime.hkl);
+}
+
+static void test_activate_changed_default(void)
+{
+    reset();
+    assert(ImmActivateLayout(new_ime.hkl));
+    assert(activation_calls == 1 && explicit_layout == new_ime.hkl && enum_calls == 1);
+    assert(context.ime == &new_ime && !context.dwLock);
+    assert(event_count == 5 && !context_requests && !ui_creations);
+}
+
+static void test_activate_failure(void)
+{
+    reset();
+    activation_fails = TRUE;
+    assert(!ImmActivateLayout(new_ime.hkl));
+    assert(activation_calls == 1 && !explicit_layout);
+    assert(!enum_calls && !event_count && !context_requests && !ui_creations);
+}
+
+int main(void)
+{
+    test_switch(FALSE);
+    test_switch(TRUE);
+    test_absent_context();
+    test_absent_ui();
+    test_prior_lazy_selection();
+    test_variant_hkl();
+    test_activate_effective_default();
+    test_activate_stale_context();
+    test_already_selected_target();
+    test_activate_changed_default();
+    test_activate_failure();
+    puts("keyboard IME: 11 scenarios passed");
+    return 0;
+}

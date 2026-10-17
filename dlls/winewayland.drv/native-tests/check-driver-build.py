@@ -15,7 +15,10 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--all", action="store_true", help="compile all driver translation units")
     parser.add_argument("--win32u", action="store_true", help="also compile the display-cache implementation")
+    parser.add_argument("--source", action="append", help="compile only these repository-relative sources")
     args = parser.parse_args()
+    if args.source and (args.all or args.win32u):
+        parser.error("--source cannot be combined with --all or --win32u")
     repo = Path(__file__).resolve().parents[3]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for arch in ("x86_64", "i386"):
@@ -28,13 +31,15 @@ def main():
         paths = tuple("dlls/winewayland.drv/" + filename for filename in filenames)
         if args.win32u:
             paths += ("dlls/win32u/sysparams.c",)
+        if args.source:
+            paths = tuple(args.source)
         for path in paths:
             filename = Path(path).name
             entry = next(item for item in database if item["file"].endswith("/" + path))
             command = shlex.split(entry["command"])
             if arch == "i386" and not shutil.which(command[0]):
                 command[:1] = ["gcc", "-m32"]
-            stem = filename.removesuffix(".c") + "-" + arch
+            stem = (path.replace("/", "-") if args.source else filename).removesuffix(".c") + "-" + arch
             command[command.index("-o") + 1] = str(args.output_dir / (stem + ".o"))
             staged = str(args.wine_build / "src-wine")
             live = []

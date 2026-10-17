@@ -8385,6 +8385,9 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
     case NtUserCallOneParam_SetKeyboardAutoRepeat:
         return set_keyboard_auto_repeat( arg );
 
+    case NtUserCallOneParam_SetDefaultKeyboardLayout:
+        return set_default_keyboard_layout( (HKL)arg );
+
     case NtUserCallOneParam_SetThreadDpiAwarenessContext:
         return set_thread_dpi_awareness_context( arg );
 

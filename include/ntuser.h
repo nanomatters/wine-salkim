@@ -1192,7 +1192,14 @@ enum
     NtUserCallOneParam_DisplayModeChanged,
     /* temporary exports */
     NtUserGetDeskPattern,
+    /* Private driver calls, appended to preserve the existing call indices. */
+    NtUserCallOneParam_SetDefaultKeyboardLayout,
 };
+
+static inline BOOL NtUserSetDefaultKeyboardLayout( HKL layout )
+{
+    return NtUserCallOneParam( (UINT_PTR)layout, NtUserCallOneParam_SetDefaultKeyboardLayout );
+}
 
 static inline HICON NtUserCreateCursorIcon( BOOL is_icon )
 {

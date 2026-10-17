@@ -34,6 +34,35 @@ it does not simulate a compositor or assert that a frame was displayed. These
 are transport/policy unit tests, not an end-to-end Wayland window-lifecycle or
 game performance test.
 
+## Keyboard defaults
+
+`make keyboard-check BUILD_DIR=/path/to/build` checks the focused host-layout
+publication change. The native fixture compiles production win32u queries,
+activation, name lookup and translation functions, server handlers, input-context
+operations and Wayland publication. Server transport, registry metadata and small
+German/US keyboard tables are injected.
+
+The principal case is an English locale with a German keyboard on a windowless
+worker. It checks `MapVirtualKeyEx`, `GetKeyNameText` and `ToUnicodeEx`, explicit
+thread selections, process isolation, startup name-cache invalidation, publication
+failure and retry, repeated group events, and initialization cleanup. Queries must
+not change selection or notification state. Intervening queries must not suppress
+`WM_INPUTLANGCHANGE`. Current-thread queries must not contact the server.
+Creating or attaching an IME context must not activate a thread layout.
+Lazy activation must not pin a missing locale placeholder when driver loading
+publishes the actual host layout. Configured selections and drivers without
+table-based layouts retain their existing behavior. Keyboard capability loss
+must clear the old group and default before a new keyboard supplies its state.
+
+The IME fixture verifies that a host-default update does not make deactivation
+select the new IME before deselecting the existing UI. It also checks that the
+existing `ImmActivateLayout` behavior is preserved.
+
+The [runtime probe](keyboard-default-runtime.md) runs the real rebuilt client and
+server in a disposable prefix. Neither fixture replaces actual compositor/game
+testing. Layout loading, enumeration and loaded-layout lifetime are outside this
+change.
+
 ## Monitor placement and fullscreen targets
 
 `make monitor-check BUILD_DIR=/path/to/build` runs seven suites that compile
@@ -162,6 +191,18 @@ python3 dlls/winewayland.drv/native-tests/check-driver-build.py \
     --all --win32u \
     --wine-build /opt/devel/wineland/build \
     --output-dir "$HOME/tmp/wayland-monitor-tests/driver"
+```
+
+Use repeated `--source` arguments to compile selected repository-relative C
+sources instead of the default driver files. This option cannot be combined
+with `--all` or `--win32u`:
+
+```sh
+python3 dlls/winewayland.drv/native-tests/check-driver-build.py \
+    --source dlls/win32u/input.c \
+    --source dlls/winewayland.drv/wayland_keyboard.c \
+    --wine-build /opt/devel/wineland/build \
+    --output-dir "$HOME/tmp/wayland-keyboard-tests/compile"
 ```
 
 These are implementation-level regression tests. They do not prove actual

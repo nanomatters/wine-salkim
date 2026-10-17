@@ -11,6 +11,7 @@
 typedef long NTSTATUS;
 typedef uintptr_t HANDLE;
 typedef uintptr_t HWND;
+typedef void *HKL;
 typedef int BOOL;
 #define TRUE 1
 #define FALSE 0
@@ -35,6 +36,8 @@ static _Thread_local struct thread_info { unsigned int top_window; } thread_info
 static struct thread_info *NtUserGetThreadInfo(void) { return &thread_info; }
 static int epoll_fail, process_fail, thread_fail, sequence, published, closed_fd;
 static int process_initialized, closed_handle, display_error;
+static HKL default_layout;
+static int default_layout_resets;
 static atomic_int dispatch_count, terminated;
 static pthread_t reader;
 static sem_t waiting;
@@ -62,10 +65,21 @@ static int epoll_create1(int flags)
     assert(++sequence == 1);
     return epoll_fail ? -1 : 17;
 }
+static BOOL NtUserSetDefaultKeyboardLayout(HKL layout)
+{
+    assert(!published && !dispatch_count);
+    default_layout = layout;
+    if (!layout) default_layout_resets++;
+    return TRUE;
+}
+static void wayland_keyboard_clear_layout(void) { NtUserSetDefaultKeyboardLayout(NULL); }
 static BOOL wayland_process_init(void)
 {
     assert(++sequence == 2);
     assert(dmabuf_epoll_fd == 17);
+    /* Initial registry roundtrips can deliver a keymap before a later
+     * required-global check fails. A different driver must not inherit it. */
+    NtUserSetDefaultKeyboardLayout((HKL)0x04070409);
     process_initialized = !process_fail;
     return process_initialized;
 }
@@ -142,6 +156,8 @@ static void reset(void)
     dmabuf_epoll_fd = -1;
     epoll_fail = process_fail = thread_fail = sequence = published = closed_fd = 0;
     process_initialized = closed_handle = dispatch_count = terminated = display_error = 0;
+    default_layout = NULL;
+    default_layout_resets = 0;
     reader_entry = NULL;
     reader_desktop = 0;
     reader_ready = FALSE;
@@ -161,18 +177,21 @@ int main(void)
     reset();
     assert(!waylanddrv_unix_init(NULL));
     assert(sequence == 5 && published == 1 && closed_handle == 1 && !closed_fd);
+    assert(default_layout == (HKL)0x04070409 && !default_layout_resets);
     finish();
 
     reset();
     epoll_fail = 1;
     assert(waylanddrv_unix_init(NULL) == STATUS_UNSUCCESSFUL);
     assert(sequence == 1 && !reader_entry && !published && !closed_fd);
+    assert(!default_layout && default_layout_resets == 1);
     assert(!sem_destroy(&waiting));
 
     reset();
     process_fail = 1;
     assert(waylanddrv_unix_init(NULL) == STATUS_UNSUCCESSFUL);
     assert(sequence == 2 && !reader_entry && !published && closed_fd == 1);
+    assert(!default_layout && default_layout_resets == 1);
     assert(dmabuf_epoll_fd == -1);
     assert(!sem_destroy(&waiting));
 
@@ -180,6 +199,7 @@ int main(void)
     thread_fail = 1;
     assert(waylanddrv_unix_init(NULL) == STATUS_UNSUCCESSFUL);
     assert(sequence == 3 && !published && !closed_handle && closed_fd == 1);
+    assert(!default_layout && default_layout_resets == 1);
     assert(dmabuf_epoll_fd == -1);
     assert(!sem_destroy(&waiting));
 

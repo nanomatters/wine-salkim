@@ -700,6 +700,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->dir_cache       = NULL;
     process->winstation      = 0;
     process->desktop         = 0;
+    process->default_layout  = 0;
     process->token           = NULL;
     process->trace_data      = 0;
     process->rawinput_devices = NULL;

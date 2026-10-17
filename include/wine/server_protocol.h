@@ -6576,6 +6576,18 @@ struct get_cursor_data_reply
 };
 
 
+struct set_process_layout_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    client_ptr_t layout;
+};
+struct set_process_layout_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6901,6 +6913,7 @@ enum request
     REQ_set_window_cloaked,
     REQ_set_cursor_data,
     REQ_get_cursor_data,
+    REQ_set_process_layout,
     REQ_NB_REQUESTS
 };
 
@@ -7231,6 +7244,7 @@ union generic_request
     struct set_window_cloaked_request set_window_cloaked_request;
     struct set_cursor_data_request set_cursor_data_request;
     struct get_cursor_data_request get_cursor_data_request;
+    struct set_process_layout_request set_process_layout_request;
 };
 union generic_reply
 {
@@ -7559,8 +7573,9 @@ union generic_reply
     struct set_window_cloaked_reply set_window_cloaked_reply;
     struct set_cursor_data_reply set_cursor_data_reply;
     struct get_cursor_data_reply get_cursor_data_reply;
+    struct set_process_layout_reply set_process_layout_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 949
+#define SERVER_PROTOCOL_VERSION 950
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
