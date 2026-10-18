@@ -298,6 +298,8 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_PRESENTATION_HW_CLOCK       0x00000002
 #define HWND_DMABUF_PRESENTATION_HW_COMPLETION  0x00000004
 #define HWND_DMABUF_PRESENTATION_ZERO_COPY      0x00000008
+#define HWND_DMABUF_PRESENTATION_FIXED_RATE     0x00000010
+#define HWND_DMABUF_PRESENTATION_VARIABLE_RATE  0x00000020
 
 
 /* image_id names a dmabuf slot whose backing store stays valid until its release
@@ -7576,6 +7578,6 @@ union generic_reply
     struct set_process_layout_reply set_process_layout_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 950
+#define SERVER_PROTOCOL_VERSION 951
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

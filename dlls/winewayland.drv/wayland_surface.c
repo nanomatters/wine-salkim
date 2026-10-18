@@ -908,6 +908,14 @@ static void hwnd_dmabuf_presentation_handle_presented(
         presentation_flags |= HWND_DMABUF_PRESENTATION_HW_COMPLETION;
     if (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY)
         presentation_flags |= HWND_DMABUF_PRESENTATION_ZERO_COPY;
+    /* Parts may follow different refresh timelines. */
+    if (presentation->part_count == 1)
+    {
+        if (flags & WP_PRESENTATION_FEEDBACK_KIND_FIXED_RATE)
+            presentation_flags |= HWND_DMABUF_PRESENTATION_FIXED_RATE;
+        if (flags & WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE)
+            presentation_flags |= HWND_DMABUF_PRESENTATION_VARIABLE_RATE;
+    }
     if (presentation->remaining == presentation->part_count)
         presentation->presentation_flags = presentation_flags;
     else
@@ -7703,6 +7711,10 @@ static void presentation_feedback_handle_presented(
         presentation_flags |= CLIENT_SURFACE_PRESENTATION_HW_COMPLETION;
     if (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY)
         presentation_flags |= CLIENT_SURFACE_PRESENTATION_ZERO_COPY;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_FIXED_RATE)
+        presentation_flags |= CLIENT_SURFACE_PRESENTATION_FIXED_RATE;
+    if (flags & WP_PRESENTATION_FEEDBACK_KIND_VARIABLE_RATE)
+        presentation_flags |= CLIENT_SURFACE_PRESENTATION_VARIABLE_RATE;
     if (wayland_presentation_time_to_monotonic(source_ns, &presented_ns))
     {
         client_surface_set_presentation_timing(client, presented_ns, refresh,

@@ -34,6 +34,17 @@ it does not simulate a compositor or assert that a frame was displayed. These
 are transport/policy unit tests, not an end-to-end Wayland window-lifecycle or
 game performance test.
 
+## Presentation feedback
+
+`make presentation-check BUILD_DIR=/path/to/build` compiles the production
+presentation registry branch and both ordinary and HWND dmabuf feedback
+callbacks. It checks version negotiation, fixed and variable cadence, legacy
+feedback, successive cadence changes, unknown bits and discarded feedback.
+Multipart feedback retains the latest timestamp and existing flag aggregation
+but leaves cadence unspecified. Real Unix packet sockets verify the dmabuf
+release record and its unchanged layout. Wayland proxy and client callbacks are
+injected; this does not test compositor timing or game frame pacing.
+
 ## Keyboard defaults
 
 `make keyboard-check BUILD_DIR=/path/to/build` checks the focused host-layout

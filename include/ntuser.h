@@ -58,6 +58,8 @@ enum wine_display_backend
 #define WINE_DISPLAY_FEEDBACK_HW_CLOCK           0x00000200
 #define WINE_DISPLAY_FEEDBACK_HW_COMPLETION      0x00000400
 #define WINE_DISPLAY_FEEDBACK_DIRECT_SCANOUT     0x00000800
+#define WINE_DISPLAY_FEEDBACK_FIXED_RATE         0x00001000
+#define WINE_DISPLAY_FEEDBACK_VARIABLE_RATE      0x00002000
 
 /* Process-local HUD toggle parity, not visibility or a consumable event. */
 #define WINE_DISPLAY_FEEDBACK_HUD_VISIBILITY     0x00010000

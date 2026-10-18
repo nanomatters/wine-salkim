@@ -1,0 +1,265 @@
+/* Production callbacks with injected Wayland/client calls and real release sockets. */
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "dmabuf.h"
+
+#undef TRACE
+#undef TRACE_
+#undef WARN
+#define TRACE(...) ((void)0)
+#define TRACE_(channel) TRACE
+#define WARN(...) fprintf(stderr, __VA_ARGS__)
+
+/* PROTOCOL_FLAGS */
+struct wp_presentation_feedback { unsigned int destroyed; };
+struct wl_output { unsigned int id; };
+struct wp_presentation { unsigned int version; };
+struct wl_registry;
+struct wayland_hwnd_dmabuf_presentation;
+/* PRODUCTION_TYPES */
+
+_Static_assert(sizeof(hwnd_dmabuf_release_t) == 64, "release ABI size");
+_Static_assert(offsetof(hwnd_dmabuf_release_t, presentation_flags) == 36, "release flags ABI");
+_Static_assert(offsetof(hwnd_dmabuf_release_t, presented_ns) == 40, "release timestamp ABI");
+_Static_assert(HWND_DMABUF_PRESENTATION_FIXED_RATE == CLIENT_SURFACE_PRESENTATION_FIXED_RATE, "fixed flag ABI");
+_Static_assert(HWND_DMABUF_PRESENTATION_VARIABLE_RATE == CLIENT_SURFACE_PRESENTATION_VARIABLE_RATE, "variable flag ABI");
+_Static_assert((CLIENT_SURFACE_PRESENTATION_FIXED_RATE << WINE_DISPLAY_FEEDBACK_PRESENTATION_SHIFT) == WINE_DISPLAY_FEEDBACK_FIXED_RATE, "fixed public flag ABI");
+_Static_assert((CLIENT_SURFACE_PRESENTATION_VARIABLE_RATE << WINE_DISPLAY_FEEDBACK_PRESENTATION_SHIFT) == WINE_DISPLAY_FEEDBACK_VARIABLE_RATE, "variable public flag ABI");
+
+struct client_surface
+{
+    struct client_surface_presentation_timing timing;
+    unsigned int samples, releases;
+};
+struct wayland_client_surface
+{
+    struct client_surface client;
+    struct wp_presentation_feedback *presentation_feedback;
+    LONG presentation_feedback_pending;
+};
+static struct wayland_client_surface *impl_from_client_surface(struct client_surface *client)
+{
+    return (struct wayland_client_surface *)client;
+}
+static void wp_presentation_feedback_destroy(struct wp_presentation_feedback *feedback)
+{
+    assert(!feedback->destroyed++);
+}
+static BOOL wayland_presentation_time_to_monotonic(UINT64 source_ns, UINT64 *monotonic_ns)
+{
+    *monotonic_ns = source_ns;
+    return TRUE;
+}
+static void client_surface_set_presentation_timing(struct client_surface *client,
+        UINT64 presented_ns, UINT64 refresh_ns, UINT64 refresh_count, UINT flags)
+{
+    client->timing = (struct client_surface_presentation_timing){
+        .presented_ns = presented_ns, .refresh_ns = refresh_ns,
+        .refresh_count = refresh_count, .flags = flags,
+    };
+    client->samples++;
+}
+static void client_surface_release(struct client_surface *client)
+{
+    client->releases++;
+}
+
+static const int wp_presentation_interface, presentation_listener;
+static struct wp_presentation presentation;
+static struct { struct wp_presentation *wp_presentation; } process_wayland;
+static unsigned int listeners;
+static void *wl_registry_bind(struct wl_registry *registry, uint32_t id,
+                              const void *interface, uint32_t version)
+{
+    assert(!registry && id == 7 && interface == &wp_presentation_interface);
+    presentation.version = version;
+    return &presentation;
+}
+static int wp_presentation_add_listener(struct wp_presentation *object, const void *listener, void *data)
+{
+    assert(object == &presentation && listener == &presentation_listener && !data);
+    listeners++;
+    return 0;
+}
+static void registry_presentation(uint32_t version)
+{
+    struct wl_registry *registry = NULL;
+    uint32_t id = 7;
+    const char *interface = "wp_presentation";
+
+    if (0) {}
+/* PRODUCTION_REGISTRY */
+}
+
+/* PRODUCTION_CALLBACKS */
+
+static void test_versions(void)
+{
+    const unsigned int offered[] = {1, 2, 3, 9}, expected[] = {1, 2, 3, 3};
+    unsigned int i;
+    for (i = 0; i < 4; ++i)
+    {
+        registry_presentation(offered[i]);
+        assert(process_wayland.wp_presentation == &presentation);
+        assert(presentation.version == expected[i] && listeners == i + 1);
+    }
+}
+
+static struct wayland_hwnd_dmabuf_presentation *new_presentation(
+        unsigned int count, struct wp_presentation_feedback *feedback, int *reader)
+{
+    struct wayland_hwnd_dmabuf_presentation *value;
+    unsigned int i;
+    int pair[2];
+
+    assert(!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair));
+    *reader = pair[1];
+    value = calloc(1, offsetof(struct wayland_hwnd_dmabuf_presentation, parts) + count * sizeof(value->parts[0]));
+    assert(value);
+    value->channel_fd = pair[0];
+    value->producer_unique_id = 0x123456789abcdef0ull;
+    value->release_token = 0xfedcba9876543210ull;
+    value->frame_seq = 17;
+    value->image_id = 4;
+    value->ring_generation = 9;
+    value->part_count = value->remaining = count;
+    value->timing_valid = TRUE;
+    for (i = 0; i < count; ++i)
+    {
+        value->parts[i].presentation = value;
+        value->parts[i].feedback = &feedback[i];
+    }
+    return value;
+}
+
+static hwnd_dmabuf_release_t receive_result(int reader)
+{
+    hwnd_dmabuf_release_t result;
+    char extra;
+    ssize_t received = recv(reader, &result, sizeof(result), MSG_DONTWAIT);
+
+    if (received != sizeof(result)) fprintf(stderr, "release receive: %zd bytes, errno %d\n", received, errno);
+    assert(received == sizeof(result));
+    assert(result.producer_unique_id == 0x123456789abcdef0ull);
+    assert(result.release_token == 0xfedcba9876543210ull);
+    assert(result.frame_seq == 17 && result.image_id == 4 && result.ring_generation == 9);
+    assert(!result.reserved);
+    assert(!recv(reader, &extra, sizeof(extra), MSG_DONTWAIT));
+    close(reader);
+    return result;
+}
+
+static void test_single_samples(void)
+{
+    /* Successive samples must replace old cadence, including legacy feedback. */
+    static const struct { unsigned int flags, refresh, expected; } cases[] = {
+        {0x1f, 16666667, 0x1f}, {0x2f, 8333333, 0x2f},
+        {0x0f, 16666667, 0x0f}, {0x0f, 0, 0x0f},
+        {0, 16666667, 0}, {0x8000002f, 8333333, 0x2f},
+    };
+    struct wayland_client_surface surface = {0};
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    {
+        struct wp_presentation_feedback direct = {0}, dmabuf = {0};
+        struct wayland_hwnd_dmabuf_presentation *value;
+        hwnd_dmabuf_release_t result;
+        int reader;
+
+        surface.presentation_feedback = &direct;
+        surface.presentation_feedback_pending = TRUE;
+        presentation_feedback_handle_presented(&surface.client, &direct,
+                0, 1, 123, cases[i].refresh, 2, 7, cases[i].flags);
+        assert(surface.client.timing.flags == cases[i].expected);
+        assert(surface.client.timing.presented_ns == 1000000123ull);
+        assert(surface.client.timing.refresh_ns == cases[i].refresh);
+        assert(surface.client.timing.refresh_count == 0x200000007ull);
+        assert(surface.client.samples == i + 1 && surface.client.releases == i + 1);
+        assert(direct.destroyed == 1 && !surface.presentation_feedback_pending && !surface.presentation_feedback);
+
+        value = new_presentation(1, &dmabuf, &reader);
+        hwnd_dmabuf_presentation_handle_presented(&value->parts[0], &dmabuf,
+                0, 1, 123, cases[i].refresh, 2, 7, cases[i].flags);
+        result = receive_result(reader);
+        assert(result.flags == HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK);
+        assert(result.presentation_flags == cases[i].expected && dmabuf.destroyed == 1);
+        assert(result.presented_ns == 1000000123ull && result.refresh_ns == cases[i].refresh);
+        assert(result.refresh_count == 0x200000007ull);
+    }
+}
+
+static void test_multipart_samples(void)
+{
+    static const struct { unsigned int flags[2], refresh[2], time[2]; } cases[] = {
+        {{0x1f, 0x1f}, {16666667, 8333333}, {100, 200}},
+        {{0x1f, 0x27}, {16666667, 8333333}, {200, 100}},
+        {{0x2f, 0x2f}, {8333333, 8333333}, {100, 200}},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    {
+        struct wp_presentation_feedback feedback[2] = {{0}, {0}};
+        struct wl_output outputs[2] = {{1}, {2}};
+        struct wayland_hwnd_dmabuf_presentation *value;
+        unsigned int latest = cases[i].time[0] > cases[i].time[1] ? 0 : 1;
+        hwnd_dmabuf_release_t result;
+        int reader;
+        char extra;
+
+        value = new_presentation(2, feedback, &reader);
+        hwnd_dmabuf_presentation_handle_sync_output(&value->parts[0], &feedback[0], &outputs[0]);
+        hwnd_dmabuf_presentation_handle_sync_output(&value->parts[1], &feedback[1], &outputs[1]);
+        hwnd_dmabuf_presentation_handle_presented(&value->parts[0], &feedback[0],
+                0, 1, cases[i].time[0], cases[i].refresh[0], 0, 17, cases[i].flags[0]);
+        assert(recv(reader, &extra, sizeof(extra), MSG_DONTWAIT) == -1 && errno == EAGAIN);
+        hwnd_dmabuf_presentation_handle_presented(&value->parts[1], &feedback[1],
+                0, 1, cases[i].time[1], cases[i].refresh[1], 0, 18, cases[i].flags[1]);
+        result = receive_result(reader);
+        assert(result.flags == HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK);
+        assert(result.presentation_flags == (cases[i].flags[0] & cases[i].flags[1] & 0xf));
+        assert(result.presented_ns == 1000000000ull + cases[i].time[latest]);
+        assert(result.refresh_ns == cases[i].refresh[latest] && result.refresh_count == 17 + latest);
+        assert(feedback[0].destroyed == 1 && feedback[1].destroyed == 1);
+    }
+}
+
+static void test_discarded(void)
+{
+    struct wp_presentation_feedback direct = {0}, feedback[2] = {{0}, {0}};
+    struct wayland_client_surface surface = {0};
+    struct wayland_hwnd_dmabuf_presentation *value;
+    hwnd_dmabuf_release_t result;
+    int reader;
+
+    surface.presentation_feedback = &direct;
+    surface.presentation_feedback_pending = TRUE;
+    presentation_feedback_handle_discarded(&surface.client, &direct);
+    assert(!surface.client.samples && surface.client.releases == 1);
+    assert(direct.destroyed == 1 && !surface.presentation_feedback_pending && !surface.presentation_feedback);
+
+    value = new_presentation(2, feedback, &reader);
+    hwnd_dmabuf_presentation_handle_presented(&value->parts[0], &feedback[0],
+            0, 1, 100, 16666667, 0, 17, 0x1f);
+    hwnd_dmabuf_presentation_handle_discarded(&value->parts[1], &feedback[1]);
+    result = receive_result(reader);
+    assert(result.flags == (HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK | HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED));
+    assert(result.presentation_flags == 0xf && result.presented_ns == 1000000100ull);
+    assert(feedback[0].destroyed == 1 && feedback[1].destroyed == 1);
+}
+
+int main(void)
+{
+    test_versions();
+    test_single_samples();
+    test_multipart_samples();
+    test_discarded();
+    puts("presentation-feedback: PASS");
+    return 0;
+}

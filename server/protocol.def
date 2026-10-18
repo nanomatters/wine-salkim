@@ -314,6 +314,8 @@ enum hwnd_dmabuf_status
 #define HWND_DMABUF_PRESENTATION_HW_CLOCK       0x00000002
 #define HWND_DMABUF_PRESENTATION_HW_COMPLETION  0x00000004
 #define HWND_DMABUF_PRESENTATION_ZERO_COPY      0x00000008
+#define HWND_DMABUF_PRESENTATION_FIXED_RATE     0x00000010
+#define HWND_DMABUF_PRESENTATION_VARIABLE_RATE  0x00000020
 
 /* hwnd_dmabuf_frame_desc_t.flags bits */
 /* image_id names a dmabuf slot whose backing store stays valid until its release

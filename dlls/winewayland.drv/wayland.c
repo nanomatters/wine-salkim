@@ -691,7 +691,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     {
         process_wayland.wp_presentation =
             wl_registry_bind(registry, id, &wp_presentation_interface,
-                             version < 2 ? version : 2);
+                             version < 3 ? version : 3);
         wp_presentation_add_listener(process_wayland.wp_presentation,
                                      &presentation_listener, NULL);
     }

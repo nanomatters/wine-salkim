@@ -5,14 +5,14 @@ CPPFLAGS += -D_GNU_SOURCE -D__WINESRC__ -I../../../include
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Werror -UNDEBUG
 
-.PHONY: all check reader-check monitor-check keyboard-check
+.PHONY: all check reader-check monitor-check keyboard-check presentation-check
 all: $(BUILD_DIR)/dmabuf
 
 $(BUILD_DIR)/dmabuf: dmabuf.c.test ../dmabuf.h ../../../include/wine/hwnd_dmabuf.h ../../../include/wine/server_protocol.h
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -x c dmabuf.c.test -x none $(LDFLAGS) -o $@
 
-check: $(BUILD_DIR)/dmabuf reader-check monitor-check keyboard-check
+check: $(BUILD_DIR)/dmabuf reader-check monitor-check keyboard-check presentation-check
 	$(BUILD_DIR)/dmabuf
 
 reader-check:
@@ -40,3 +40,7 @@ monitor-check:
 	    --cflags '$(CFLAGS) -Wno-unused-parameter'
 	python3 monitor-outputs.py --build-dir $(BUILD_DIR)/monitor --cc '$(CC)' \
 	    --cflags '$(CFLAGS) -Wno-unused-parameter'
+
+presentation-check:
+	python3 presentation-feedback.py --build-dir $(BUILD_DIR)/presentation --cc '$(CC)' \
+	    --cflags '$(CFLAGS)'
