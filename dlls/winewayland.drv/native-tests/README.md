@@ -45,6 +45,14 @@ but leaves cadence unspecified. Real Unix packet sockets verify the dmabuf
 release record and its unchanged layout. Wayland proxy and client callbacks are
 injected; this does not test compositor timing or game frame pacing.
 
+`make timing-check BUILD_DIR=/path/to/build` also runs as part of
+`presentation-check`. It compiles the production managed feedback handler and
+Vulkan timing query. It checks fixed, variable and unknown cadence, including
+VRR with tearing, cadence changes at an unchanged refresh period, stale and
+discarded feedback, startup values, error outputs and host forwarding. Release
+draining and platform calls are injected, so this checks metadata and locking
+scope rather than Vulkan presentation timing support or actual display timing.
+
 ## Keyboard defaults
 
 `make keyboard-check BUILD_DIR=/path/to/build` checks the focused host-layout

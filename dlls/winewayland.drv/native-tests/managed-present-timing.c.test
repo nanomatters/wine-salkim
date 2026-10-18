@@ -1,0 +1,246 @@
+/* Actual feedback and query functions; platform calls and release draining are injected. */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "wine/hwnd_dmabuf.h"
+
+#undef TRACE
+#define TRACE(...) ((void)0)
+#define VK_SUCCESS 0
+#define VK_ERROR_OUT_OF_DATE_KHR (-1000001004)
+typedef int VkResult;
+typedef uintptr_t VkDevice, VkSwapchainKHR;
+typedef struct
+{
+    uint32_t sType;
+    void *pNext;
+    uint64_t refreshDuration, refreshInterval;
+} VkSwapchainTimingPropertiesEXT;
+
+struct test_mutex { int depth; };
+struct client_surface { UINT64 timestamp, period, count; UINT flags, samples; };
+struct wine_managed_swapchain
+{
+    struct test_mutex lock;
+    UINT64 producer_unique_id, timing_presented_ns, timing_properties_counter;
+    UINT64 refresh_duration_ns, refresh_interval_ns;
+    unsigned int ring_generation, tracked_frame, completions, drains;
+    BOOL tracked, lost, lose_on_drain;
+    struct client_surface *client_surface;
+    const hwnd_dmabuf_release_t *pending;
+};
+struct swapchain
+{
+    struct wine_managed_swapchain *managed;
+    struct { struct { VkSwapchainKHR swapchain; } host; } obj;
+    BOOL out_of_date;
+};
+struct vulkan_device
+{
+    struct { VkDevice device; } host;
+    VkResult (*p_vkGetSwapchainTimingPropertiesEXT)(VkDevice, VkSwapchainKHR,
+            VkSwapchainTimingPropertiesEXT *, uint64_t *);
+};
+static int test_lock(struct test_mutex *lock) { assert(!lock->depth++); return 0; }
+static int test_unlock(struct test_mutex *lock) { assert(lock->depth-- == 1); return 0; }
+#define pthread_mutex_lock test_lock
+#define pthread_mutex_unlock test_unlock
+static struct vulkan_device *vulkan_device_from_handle(VkDevice device) { return (void *)device; }
+static struct swapchain *swapchain_from_handle(VkSwapchainKHR swapchain) { return (void *)swapchain; }
+static BOOL swapchain_is_out_of_date(struct swapchain *swapchain) { return swapchain->out_of_date; }
+static BOOL managed_complete_feedback_locked(struct wine_managed_swapchain *managed, uint32_t frame)
+{
+    assert(managed->lock.depth == 1);
+    managed->completions++;
+    if (!managed->tracked || frame != managed->tracked_frame) return FALSE;
+    managed->tracked = FALSE;
+    return TRUE;
+}
+static void client_surface_set_presentation_timing(struct client_surface *client,
+        UINT64 timestamp, UINT64 period, UINT64 count, UINT flags)
+{
+    client->timestamp = timestamp;
+    client->period = period;
+    client->count = count;
+    client->flags = flags;
+    client->samples++;
+}
+static void managed_handle_presentation_feedback(struct wine_managed_swapchain *, const hwnd_dmabuf_release_t *);
+static void managed_drain_releases(struct wine_managed_swapchain *managed)
+{
+    assert(managed->lock.depth == 1);
+    managed->drains++;
+    if (managed->pending)
+    {
+        managed_handle_presentation_feedback(managed, managed->pending);
+        managed->pending = NULL;
+    }
+    if (managed->lose_on_drain) managed->lost = TRUE;
+}
+
+/* PRODUCTION_TIMING */
+
+struct fixture
+{
+    struct wine_managed_swapchain managed;
+    struct client_surface client;
+    struct swapchain swapchain;
+};
+static void init(struct fixture *fixture)
+{
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->managed.producer_unique_id = 0x123456789abcdef0ull;
+    fixture->managed.ring_generation = 7;
+    fixture->managed.client_surface = &fixture->client;
+    fixture->swapchain.managed = &fixture->managed;
+}
+static struct vulkan_device device;
+static VkResult query(struct fixture *fixture, VkSwapchainTimingPropertiesEXT *properties, uint64_t *counter)
+{
+    return win32u_vkGetSwapchainTimingPropertiesEXT((VkDevice)&device,
+            (VkSwapchainKHR)&fixture->swapchain, properties, counter);
+}
+static void check(struct fixture *fixture, uint64_t duration, uint64_t interval, uint64_t expected_counter)
+{
+    VkSwapchainTimingPropertiesEXT properties = {.sType = 42, .pNext = fixture};
+    uint64_t counter = UINT64_MAX;
+    assert(query(fixture, &properties, &counter) == VK_SUCCESS);
+    assert(properties.refreshDuration == duration && properties.refreshInterval == interval);
+    assert(properties.sType == 42 && properties.pNext == fixture && counter == expected_counter);
+    assert(!fixture->managed.lock.depth);
+}
+static hwnd_dmabuf_release_t feedback(struct fixture *fixture, UINT64 timestamp, UINT64 period, unsigned int flags)
+{
+    return (hwnd_dmabuf_release_t){
+        .producer_unique_id = fixture->managed.producer_unique_id,
+        .ring_generation = fixture->managed.ring_generation, .frame_seq = 17,
+        .flags = HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK,
+        .presented_ns = timestamp, .refresh_ns = period, .refresh_count = 99,
+        .presentation_flags = flags,
+    };
+}
+static void queue(struct fixture *fixture, const hwnd_dmabuf_release_t *release)
+{
+    assert(!fixture->managed.pending);
+    fixture->managed.pending = release;
+    fixture->managed.tracked_frame = 17;
+    fixture->managed.tracked = TRUE;
+}
+static void test_cadence(void)
+{
+    static const struct { unsigned int flags; uint64_t period, interval, counter; } cases[] = {
+        {0x10, 16666667, 16666667, 1}, {0x1f, 16666667, 16666667, 1},
+        {0x21, 16666667, UINT64_MAX, 2}, {0x2e, 16666667, UINT64_MAX, 2},
+        {0x0f, 16666667, 0, 3}, {0, 16666667, 0, 3},
+        {0x10, 16666667, 16666667, 4}, {0x10, 8333333, 8333333, 5},
+        {0x20, 8333333, UINT64_MAX, 6}, {0x20, 0, 0, 7}, {0x10, 0, 0, 7},
+    };
+    struct fixture fixture;
+    unsigned int i;
+    init(&fixture);
+    check(&fixture, 0, 0, 0);
+    assert(!fixture.client.samples);
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    {
+        hwnd_dmabuf_release_t release = feedback(&fixture, 100 + i, cases[i].period, cases[i].flags);
+        queue(&fixture, &release);
+        check(&fixture, cases[i].period, cases[i].interval, cases[i].counter);
+        assert(fixture.client.samples == i + 1 && fixture.client.timestamp == 100 + i);
+        assert(fixture.client.period == cases[i].period && fixture.client.flags == cases[i].flags);
+        assert(fixture.client.count == 99 && !fixture.managed.tracked);
+    }
+}
+static void test_ignored_feedback(void)
+{
+    struct fixture fixture;
+    hwnd_dmabuf_release_t release;
+    unsigned int i;
+    init(&fixture);
+    release = feedback(&fixture, 100, 16666667, 0x20);
+    queue(&fixture, &release);
+    check(&fixture, 16666667, UINT64_MAX, 1);
+    for (i = 0; i < 7; ++i)
+    {
+        unsigned int before = fixture.managed.completions;
+        release = feedback(&fixture, 200, 8333333, 0x10);
+        if (i == 0) release.producer_unique_id++;
+        if (i == 1) release.ring_generation++;
+        if (i == 2) release.flags |= HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED;
+        if (i == 3) release.presented_ns = 99;
+        if (i == 4) release.presented_ns = 100;
+        if (i == 5) release.frame_seq++;
+        if (i == 6) release.presented_ns = 0;
+        queue(&fixture, &release);
+        check(&fixture, 16666667, UINT64_MAX, 1);
+        assert(fixture.client.samples == 1 && fixture.managed.timing_presented_ns == 100);
+        assert(fixture.managed.completions == before + (i >= 2));
+    }
+}
+static void test_status_errors(void)
+{
+    struct fixture fixture;
+    VkSwapchainTimingPropertiesEXT properties, saved = {.sType = 42, .refreshDuration = 11, .refreshInterval = 22};
+    uint64_t counter;
+    unsigned int i;
+    for (i = 0; i < 3; ++i)
+    {
+        init(&fixture);
+        properties = saved;
+        counter = 123;
+        fixture.swapchain.out_of_date = i == 0;
+        fixture.managed.lost = i == 1;
+        fixture.managed.lose_on_drain = i == 2;
+        assert(query(&fixture, &properties, &counter) == VK_ERROR_OUT_OF_DATE_KHR);
+        assert(!memcmp(&properties, &saved, sizeof(saved)) && counter == 123);
+        assert(!fixture.managed.lock.depth);
+    }
+    assert(win32u_vkGetSwapchainTimingPropertiesEXT((VkDevice)&device, 0, &properties, &counter) == VK_ERROR_OUT_OF_DATE_KHR);
+    assert(!memcmp(&properties, &saved, sizeof(saved)) && counter == 123);
+    init(&fixture);
+    assert(query(&fixture, &properties, NULL) == VK_SUCCESS);
+    assert(!properties.refreshDuration && !properties.refreshInterval);
+    assert(managed_swapchain_get_status(&fixture.swapchain, NULL, NULL) == VK_SUCCESS);
+    assert(fixture.managed.drains == 2 && !fixture.managed.lock.depth);
+}
+static VkSwapchainTimingPropertiesEXT *host_properties;
+static uint64_t *host_counter;
+static unsigned int host_calls;
+static VkResult host_query(VkDevice raw_device, VkSwapchainKHR raw_swapchain,
+        VkSwapchainTimingPropertiesEXT *properties, uint64_t *counter)
+{
+    assert(raw_device == 123 && raw_swapchain == 456);
+    assert(properties == host_properties && counter == host_counter);
+    properties->refreshDuration = 11;
+    properties->refreshInterval = 22;
+    if (counter) *counter = 33;
+    host_calls++;
+    return 7;
+}
+static void test_host_forwarding(void)
+{
+    struct fixture fixture;
+    VkSwapchainTimingPropertiesEXT properties = {0};
+    uint64_t counter = 0;
+    init(&fixture);
+    fixture.swapchain.managed = NULL;
+    fixture.swapchain.obj.host.swapchain = 456;
+    device.host.device = 123;
+    device.p_vkGetSwapchainTimingPropertiesEXT = host_query;
+    host_properties = &properties;
+    host_counter = &counter;
+    assert(query(&fixture, &properties, &counter) == 7);
+    assert(properties.refreshDuration == 11 && properties.refreshInterval == 22 && counter == 33);
+    host_counter = NULL;
+    assert(query(&fixture, &properties, NULL) == 7);
+    assert(host_calls == 2 && !fixture.managed.drains);
+}
+int main(void)
+{
+    test_cadence();
+    test_ignored_feedback();
+    test_status_errors();
+    test_host_forwarding();
+    puts("managed-present-timing: PASS");
+    return 0;
+}

@@ -5,7 +5,7 @@ CPPFLAGS += -D_GNU_SOURCE -D__WINESRC__ -I../../../include
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Werror -UNDEBUG
 
-.PHONY: all check reader-check monitor-check keyboard-check presentation-check
+.PHONY: all check reader-check monitor-check keyboard-check presentation-check timing-check
 all: $(BUILD_DIR)/dmabuf
 
 $(BUILD_DIR)/dmabuf: dmabuf.c.test ../dmabuf.h ../../../include/wine/hwnd_dmabuf.h ../../../include/wine/server_protocol.h
@@ -41,6 +41,10 @@ monitor-check:
 	python3 monitor-outputs.py --build-dir $(BUILD_DIR)/monitor --cc '$(CC)' \
 	    --cflags '$(CFLAGS) -Wno-unused-parameter'
 
-presentation-check:
+presentation-check: timing-check
 	python3 presentation-feedback.py --build-dir $(BUILD_DIR)/presentation --cc '$(CC)' \
+	    --cflags '$(CFLAGS)'
+
+timing-check:
+	python3 managed-present-timing.py --build-dir $(BUILD_DIR)/managed-timing --cc '$(CC)' \
 	    --cflags '$(CFLAGS)'

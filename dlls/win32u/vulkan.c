@@ -436,7 +436,8 @@ struct wine_managed_swapchain
     BOOL routed_response_overflow;
     UINT64 timing_properties_counter;
     UINT64 timing_presented_ns;
-    UINT64 refresh_interval_ns;     /* latest compositor refresh interval */
+    UINT64 refresh_duration_ns;
+    UINT64 refresh_interval_ns;
     unsigned int ring_generation;
     DWORD ring_full_since_ms;
 
@@ -4926,6 +4927,45 @@ static void managed_route_response( struct wine_managed_swapchain *managed,
     pthread_mutex_unlock( &managed_consumers_lock );
 }
 
+/* Caller holds managed->lock. */
+static void managed_handle_presentation_feedback( struct wine_managed_swapchain *managed,
+                                                  const hwnd_dmabuf_release_t *rel )
+{
+    UINT64 refresh_interval_ns = 0;
+    BOOL discarded;
+
+    if (rel->producer_unique_id != managed->producer_unique_id ||
+        rel->ring_generation != managed->ring_generation)
+        return;
+    discarded = !!(rel->flags & HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED);
+    if (managed_complete_feedback_locked( managed, rel->frame_seq ) &&
+        !discarded && rel->presented_ns > managed->timing_presented_ns)
+    {
+        if (rel->refresh_ns)
+        {
+            if (rel->presentation_flags & HWND_DMABUF_PRESENTATION_VARIABLE_RATE)
+                refresh_interval_ns = UINT64_MAX;
+            else if (rel->presentation_flags & HWND_DMABUF_PRESENTATION_FIXED_RATE)
+                refresh_interval_ns = rel->refresh_ns;
+        }
+        managed->timing_presented_ns = rel->presented_ns;
+        if (managed->refresh_duration_ns != rel->refresh_ns ||
+            managed->refresh_interval_ns != refresh_interval_ns)
+        {
+            managed->refresh_duration_ns = rel->refresh_ns;
+            managed->refresh_interval_ns = refresh_interval_ns;
+            managed->timing_properties_counter++;
+        }
+        client_surface_set_presentation_timing(
+            managed->client_surface, rel->presented_ns, rel->refresh_ns,
+            rel->refresh_count, rel->presentation_flags );
+    }
+    TRACE( "hwnd %p frame %u %s at %s ns, refresh %s ns, flags %#x\n",
+           managed->hwnd, rel->frame_seq, discarded ? "discarded" : "presented",
+           wine_dbgstr_longlong(rel->presented_ns), wine_dbgstr_longlong(rel->refresh_ns),
+           rel->presentation_flags );
+}
+
 /* Drain exact release tokens from the consumer. Caller holds managed->lock. */
 static void managed_drain_releases( struct wine_managed_swapchain *managed )
 {
@@ -4967,32 +5007,7 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
             }
             if (rel.flags & HWND_DMABUF_RELEASE_PRESENTATION_FEEDBACK)
             {
-                BOOL discarded;
-
-                if (rel.producer_unique_id != managed->producer_unique_id ||
-                    rel.ring_generation != managed->ring_generation)
-                    continue;
-                discarded = !!(rel.flags & HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED);
-                if (managed_complete_feedback_locked( managed, rel.frame_seq ) &&
-                    !discarded && rel.presented_ns > managed->timing_presented_ns)
-                {
-                    managed->timing_presented_ns = rel.presented_ns;
-                    if (managed->refresh_interval_ns != rel.refresh_ns)
-                    {
-                        managed->refresh_interval_ns = rel.refresh_ns;
-                        managed->timing_properties_counter++;
-                    }
-                    client_surface_set_presentation_timing(
-                        managed->client_surface, rel.presented_ns, rel.refresh_ns,
-                        rel.refresh_count, rel.presentation_flags );
-                }
-                TRACE( "hwnd %p frame %u %s at %s ns, refresh %s ns, flags %#x\n",
-                       managed->hwnd, rel.frame_seq,
-                       rel.flags & HWND_DMABUF_RELEASE_PRESENTATION_DISCARDED ?
-                       "discarded" : "presented",
-                       wine_dbgstr_longlong(rel.presented_ns),
-                       wine_dbgstr_longlong(rel.refresh_ns),
-                       rel.presentation_flags );
+                managed_handle_presentation_feedback( managed, &rel );
                 continue;
             }
             /* Zero-token records update the channel's consumer state. */
@@ -6315,16 +6330,23 @@ static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapch
 }
 
 static VkResult managed_swapchain_get_status( struct swapchain *swapchain,
-                                              UINT64 *counter, UINT64 *refresh_ns )
+                                              UINT64 *counter, VkSwapchainTimingPropertiesEXT *properties )
 {
     struct wine_managed_swapchain *managed = swapchain->managed;
     VkResult res = VK_SUCCESS;
 
     pthread_mutex_lock( &managed->lock );
     managed_drain_releases( managed );
-    if (counter) *counter = managed->timing_properties_counter;
-    if (refresh_ns) *refresh_ns = managed->refresh_interval_ns;
     if (managed->lost) res = VK_ERROR_OUT_OF_DATE_KHR;
+    else
+    {
+        if (counter) *counter = managed->timing_properties_counter;
+        if (properties)
+        {
+            properties->refreshDuration = managed->refresh_duration_ns;
+            properties->refreshInterval = managed->refresh_interval_ns;
+        }
+    }
     pthread_mutex_unlock( &managed->lock );
     return res;
 }
@@ -6349,24 +6371,11 @@ static VkResult win32u_vkGetSwapchainTimingPropertiesEXT( VkDevice client_device
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
-    VkResult res;
 
     if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
 
     if (swapchain->managed)
-    {
-        UINT64 timing_counter, refresh_ns;
-
-        res = managed_swapchain_get_status( swapchain, &timing_counter,
-                                            &refresh_ns );
-        if (res < VK_SUCCESS) return res;
-        /* wp_presentation supplies one fixed refresh period, or zero when no
-         * cadence is known. Equal nonzero values are Vulkan's FRR encoding. */
-        properties->refreshDuration = refresh_ns;
-        properties->refreshInterval = refresh_ns;
-        if (counter) *counter = timing_counter;
-        return VK_SUCCESS;
-    }
+        return managed_swapchain_get_status( swapchain, counter, properties );
 
     return device->p_vkGetSwapchainTimingPropertiesEXT( device->host.device, swapchain->obj.host.swapchain,
                                                         properties, counter );
