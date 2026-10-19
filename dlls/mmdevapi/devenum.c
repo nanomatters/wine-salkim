@@ -1708,7 +1708,11 @@ struct NotificationClientWrapper {
 };
 
 static struct list g_notif_clients = LIST_INIT(g_notif_clients);
-static HANDLE g_notif_thread;
+static struct notification_thread
+{
+    HANDLE stop_event;
+    HMODULE module;
+} *g_notif_thread;
 
 static CRITICAL_SECTION g_notif_lock;
 static CRITICAL_SECTION_DEBUG g_notif_lock_debug =
@@ -1719,17 +1723,68 @@ static CRITICAL_SECTION_DEBUG g_notif_lock_debug =
 };
 static CRITICAL_SECTION g_notif_lock = { &g_notif_lock_debug, -1, 0, 0, 0, 0 };
 
-static void notify_clients(EDataFlow flow, ERole role, const WCHAR *id)
+static IMMNotificationClient **snapshot_notification_clients(unsigned int *count)
 {
     struct NotificationClientWrapper *wrapper;
+    IMMNotificationClient **clients;
+    unsigned int i = 0;
+
+    EnterCriticalSection(&g_notif_lock);
+    *count = list_count(&g_notif_clients);
+    if (!(clients = malloc(max(1, *count) * sizeof(*clients))))
+    {
+        LeaveCriticalSection(&g_notif_lock);
+        return NULL;
+    }
     LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients,
             struct NotificationClientWrapper, entry)
-        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, flow,
-                role, id);
+    {
+        clients[i++] = wrapper->client;
+        IMMNotificationClient_AddRef(wrapper->client);
+    }
+    LeaveCriticalSection(&g_notif_lock);
+    return clients;
+}
 
-    /* Windows 7 treats changes to eConsole as changes to eMultimedia */
-    if(role == eConsole)
-        notify_clients(flow, eMultimedia, id);
+static void release_notification_clients(IMMNotificationClient **clients, unsigned int count)
+{
+    unsigned int i;
+
+    for (i = 0; i < count; ++i) IMMNotificationClient_Release(clients[i]);
+    free(clients);
+}
+
+static void notify_default_clients(IMMNotificationClient **clients, unsigned int count,
+                                   EDataFlow flow, ERole role, const WCHAR *id)
+{
+    unsigned int i;
+
+    for (i = 0; i < count; ++i)
+    {
+        IMMNotificationClient_OnDefaultDeviceChanged(clients[i], flow, role, id);
+        if (role == eConsole)
+            IMMNotificationClient_OnDefaultDeviceChanged(clients[i], flow, eMultimedia, id);
+    }
+}
+
+static void notify_clients(EDataFlow flow, ERole role, const WCHAR *id)
+{
+    IMMNotificationClient **clients;
+    unsigned int count;
+
+    if (!(clients = snapshot_notification_clients(&count))) return;
+    notify_default_clients(clients, count, flow, role, id);
+    release_notification_clients(clients, count);
+}
+
+static IMMDevice *get_system_default(EDataFlow flow)
+{
+    MMDevice *device;
+
+    EnterCriticalSection(&device_lock);
+    device = flow == eRender ? MMDevice_def_play : MMDevice_def_rec;
+    LeaveCriticalSection(&device_lock);
+    return device ? &device->IMMDevice_iface : NULL;
 }
 
 static BOOL notify_if_changed(EDataFlow flow, ERole role, HKEY key,
@@ -1795,10 +1850,13 @@ static BOOL notify_if_changed(EDataFlow flow, ERole role, HKEY key,
 
 static DWORD WINAPI notif_thread_proc(void *user)
 {
-    HKEY key;
+    struct notification_thread *thread = user;
+    HANDLE events[2] = {thread->stop_event, NULL};
+    HKEY key = NULL;
     WCHAR reg_key[256];
     WCHAR out_name[64], vout_name[64], in_name[64], vin_name[64];
-    DWORD size;
+    DWORD size, status;
+    HMODULE module = thread->module;
 
     SetThreadDescription(GetCurrentThread(), L"wine_mmdevapi_notification");
 
@@ -1806,10 +1864,17 @@ static DWORD WINAPI notif_thread_proc(void *user)
     lstrcatW(reg_key, L"\\");
     lstrcatW(reg_key, drvs.module_name);
 
-    if(RegCreateKeyExW(HKEY_CURRENT_USER, reg_key, 0, NULL, 0,
-                MAXIMUM_ALLOWED, NULL, &key, NULL) != ERROR_SUCCESS){
-        ERR("RegCreateKeyEx failed: %lu\n", GetLastError());
-        return 1;
+    if ((status = RegCreateKeyExW(HKEY_CURRENT_USER, reg_key, 0, NULL, 0,
+                                  MAXIMUM_ALLOWED, NULL, &key, NULL)))
+    {
+        ERR("RegCreateKeyEx failed: %lu\n", status);
+        goto done;
+    }
+    if (!(events[1] = CreateEventW(NULL, FALSE, FALSE, NULL))) goto done;
+    if ((status = RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, events[1], TRUE)))
+    {
+        ERR("RegNotifyChangeKeyValue failed: %lu\n", status);
+        goto done;
     }
 
     size = sizeof(out_name);
@@ -1828,40 +1893,61 @@ static DWORD WINAPI notif_thread_proc(void *user)
     if(RegQueryValueExW(key, L"DefaultVoiceInput", 0, NULL, (BYTE*)vin_name, &size) != ERROR_SUCCESS)
         vin_name[0] = 0;
 
-    while(1){
-        if(RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET,
-                    NULL, FALSE) != ERROR_SUCCESS){
-            ERR("RegNotifyChangeKeyValue failed: %lu\n", GetLastError());
-            RegCloseKey(key);
-            g_notif_thread = NULL;
-            return 1;
+    for (;;)
+    {
+        status = WaitForMultipleObjects(ARRAY_SIZE(events), events, FALSE, INFINITE);
+        if (status == WAIT_OBJECT_0)
+        {
+            EnterCriticalSection(&g_notif_lock);
+            if (list_empty(&g_notif_clients))
+            {
+                g_notif_thread = NULL;
+                LeaveCriticalSection(&g_notif_lock);
+                break;
+            }
+            /* A new registration arrived before this worker retired. */
+            ResetEvent(thread->stop_event);
+            LeaveCriticalSection(&g_notif_lock);
+            continue;
+        }
+        if (status != WAIT_OBJECT_0 + 1) goto done;
+        /* Keep watching while callbacks run, including reentrant changes. */
+        if ((status = RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, events[1], TRUE)))
+        {
+            ERR("RegNotifyChangeKeyValue failed: %lu\n", status);
+            goto done;
         }
 
-        EnterCriticalSection(&g_notif_lock);
-
         notify_if_changed(eRender, eConsole, key, L"DefaultOutput",
-                out_name, &MMDevice_def_play->IMMDevice_iface);
+                out_name, get_system_default(eRender));
         notify_if_changed(eRender, eCommunications, key, L"DefaultVoiceOutput",
-                vout_name, &MMDevice_def_play->IMMDevice_iface);
+                vout_name, get_system_default(eRender));
         notify_if_changed(eCapture, eConsole, key, L"DefaultInput",
-                in_name, &MMDevice_def_rec->IMMDevice_iface);
+                in_name, get_system_default(eCapture));
         notify_if_changed(eCapture, eCommunications, key, L"DefaultVoiceInput",
-                vin_name, &MMDevice_def_rec->IMMDevice_iface);
+                vin_name, get_system_default(eCapture));
 
-        LeaveCriticalSection(&g_notif_lock);
     }
 
-    RegCloseKey(key);
-
-    g_notif_thread = NULL;
-
-    return 0;
+done:
+    EnterCriticalSection(&g_notif_lock);
+    if (g_notif_thread == thread) g_notif_thread = NULL;
+    LeaveCriticalSection(&g_notif_lock);
+    if (key) RegCloseKey(key);
+    if (events[1]) CloseHandle(events[1]);
+    CloseHandle(thread->stop_event);
+    free(thread);
+    FreeLibraryAndExitThread(module, 0);
 }
 
 static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEnumerator *iface, IMMNotificationClient *client)
 {
     MMDevEnumImpl *This = impl_from_IMMDeviceEnumerator(iface);
     struct NotificationClientWrapper *wrapper;
+    struct notification_thread *thread = NULL;
+    HANDLE handle;
+    HMODULE module;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->(%p)\n", This, client);
 
@@ -1872,21 +1958,56 @@ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEn
     if(!wrapper)
         return E_OUTOFMEMORY;
 
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (const WCHAR *)notif_thread_proc, &module))
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        free(wrapper);
+        return hr;
+    }
     wrapper->client = client;
 
     EnterCriticalSection(&g_notif_lock);
 
     list_add_tail(&g_notif_clients, &wrapper->entry);
 
-    if(!g_notif_thread){
-        g_notif_thread = CreateThread(NULL, 0, notif_thread_proc, NULL, 0, NULL);
-        if(!g_notif_thread)
-            ERR("CreateThread failed: %lu\n", GetLastError());
+    if (!g_notif_thread)
+    {
+        if (!(thread = calloc(1, sizeof(*thread)))) hr = E_OUTOFMEMORY;
+        else if (!(thread->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL)))
+            hr = HRESULT_FROM_WIN32(GetLastError());
+        else
+        {
+            thread->module = module;
+            g_notif_thread = thread;
+            if ((handle = CreateThread(NULL, 0, notif_thread_proc, thread, 0, NULL)))
+            {
+                CloseHandle(handle);
+                module = NULL; /* The worker owns the module reference. */
+            }
+            else
+            {
+                hr = HRESULT_FROM_WIN32(GetLastError());
+                g_notif_thread = NULL;
+            }
+        }
+        if (FAILED(hr)) list_remove(&wrapper->entry);
     }
+    else ResetEvent(g_notif_thread->stop_event);
 
     LeaveCriticalSection(&g_notif_lock);
 
-    return S_OK;
+    if (FAILED(hr))
+    {
+        if (thread)
+        {
+            if (thread->stop_event) CloseHandle(thread->stop_event);
+            free(thread);
+        }
+        free(wrapper);
+    }
+    if (module) FreeLibrary(module);
+    return hr;
 }
 
 static HRESULT WINAPI MMDevEnum_UnregisterEndpointNotificationCallback(IMMDeviceEnumerator *iface, IMMNotificationClient *client)
@@ -1905,6 +2026,7 @@ static HRESULT WINAPI MMDevEnum_UnregisterEndpointNotificationCallback(IMMDevice
         if(wrapper->client == client){
             list_remove(&wrapper->entry);
             free(wrapper);
+            if (list_empty(&g_notif_clients) && g_notif_thread) SetEvent(g_notif_thread->stop_event);
             LeaveCriticalSection(&g_notif_lock);
             return S_OK;
         }

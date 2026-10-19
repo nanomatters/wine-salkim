@@ -1,0 +1,130 @@
+/* Registry-notification lifetime regression probe. Run in a disposable prefix.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#define COBJMACROS
+#define INITGUID
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <stdio.h>
+#include <string.h>
+
+static IMMDeviceEnumerator *enumerator;
+static LONG failures, refs = 1;
+
+static HRESULT WINAPI query(IMMNotificationClient *iface, REFIID iid, void **out)
+{
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!IsEqualIID(iid, &IID_IUnknown) && !IsEqualIID(iid, &IID_IMMNotificationClient))
+        return E_NOINTERFACE;
+    *out = iface;
+    IMMNotificationClient_AddRef(iface);
+    return S_OK;
+}
+
+static ULONG WINAPI addref(IMMNotificationClient *iface) { return InterlockedIncrement(&refs); }
+static ULONG WINAPI release(IMMNotificationClient *iface) { return InterlockedDecrement(&refs); }
+static HRESULT WINAPI state(IMMNotificationClient *iface, LPCWSTR id, DWORD value) { return S_OK; }
+static HRESULT WINAPI device(IMMNotificationClient *iface, LPCWSTR id) { return S_OK; }
+static HRESULT WINAPI defaults(IMMNotificationClient *iface, EDataFlow flow, ERole role, LPCWSTR id) { return S_OK; }
+static HRESULT WINAPI property(IMMNotificationClient *iface, LPCWSTR id, const PROPERTYKEY key) { return S_OK; }
+static IMMNotificationClientVtbl vtable = {query, addref, release, state, device, device, defaults, property};
+static IMMNotificationClient notification = {&vtable};
+
+/* ProcessHandleCount is a stub in this base. Enumerate real server handles. */
+static BOOL get_handle_count(DWORD *count)
+{
+    struct handle_entry
+    {
+        void *object;
+        ULONG_PTR process, handle;
+        ULONG access;
+        USHORT creator, type;
+        ULONG attributes, reserved;
+    };
+    struct handle_information
+    {
+        ULONG_PTR count, reserved;
+        struct handle_entry entries[1];
+    } *info;
+    LONG (WINAPI *query_system)(ULONG, void *, ULONG, ULONG *);
+    ULONG size = 32768, needed;
+    ULONG_PTR i;
+    LONG status;
+
+    query_system = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
+    if (!query_system) return FALSE;
+    for (;;)
+    {
+        if (!(info = HeapAlloc(GetProcessHeap(), 0, size))) return FALSE;
+        status = query_system(64 /* SystemExtendedHandleInformation */, info, size, &needed);
+        if (status != (LONG)0xc0000004 /* STATUS_INFO_LENGTH_MISMATCH */) break;
+        HeapFree(GetProcessHeap(), 0, info);
+        size = needed > size ? needed : size * 2;
+    }
+    *count = 0;
+    if (!status)
+        for (i = 0; i < info->count; ++i)
+            if (info->entries[i].process == GetCurrentProcessId()) ++*count;
+    HeapFree(GetProcessHeap(), 0, info);
+    return !status;
+}
+
+static DWORD WINAPI race(void *arg)
+{
+    unsigned int i;
+
+    for (i = 0; i < 500; ++i)
+    {
+        if (FAILED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(enumerator, &notification)))
+        {
+            InterlockedIncrement(&failures);
+            continue;
+        }
+        if (!(i % 16)) SwitchToThread();
+        if (FAILED(IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(enumerator, &notification)))
+            InterlockedIncrement(&failures);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    HANDLE threads[4];
+    DWORD before, after;
+    unsigned int i;
+    HRESULT hr;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 1;
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IMMDeviceEnumerator, (void **)&enumerator);
+    if (FAILED(hr)) return 2;
+    if (!get_handle_count(&before)) return 3;
+    for (i = 0; i < ARRAYSIZE(threads); ++i)
+        if (!(threads[i] = CreateThread(NULL, 0, race, NULL, 0, NULL))) return 4;
+    if (WaitForMultipleObjects(ARRAYSIZE(threads), threads, TRUE, 15000) != WAIT_OBJECT_0) return 5;
+    for (i = 0; i < ARRAYSIZE(threads); ++i) CloseHandle(threads[i]);
+    for (i = 0; i < 100; ++i)
+    {
+        if (FAILED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(enumerator, &notification))) return 6;
+        if (FAILED(IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(enumerator, &notification))) return 7;
+        Sleep(1);
+    }
+    Sleep(100);
+    if (!get_handle_count(&after)) return 8;
+    printf("REGISTRY_LIFETIME failures=%ld refs=%ld handles=%lu->%lu\n", failures, refs, before, after);
+    if (failures || refs != 1 || after > before + 16) return 9;
+    IMMDeviceEnumerator_Release(enumerator);
+    CoUninitialize();
+    if (argc == 2 && !strcmp(argv[1], "exitprocess"))
+    {
+        puts("EXIT_PROCESS");
+        return 0;
+    }
+    puts("EXIT_THREAD");
+    ExitThread(0);
+    return 10;
+}
