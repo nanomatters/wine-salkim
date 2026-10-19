@@ -19,6 +19,8 @@
 #include <stdarg.h>
 #include <wchar.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #define COBJMACROS
 #include "windef.h"
 #include "winbase.h"

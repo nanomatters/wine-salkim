@@ -95,6 +95,7 @@ typedef struct _DriverFuncs {
      * priority value reflecting the likelihood that they are actually
      * valid. See enum _DriverPriority. */
     int priority;
+    BOOL endpoint_notifications;
 } DriverFuncs;
 
 extern DriverFuncs drvs;

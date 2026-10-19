@@ -21,6 +21,11 @@
 #include "mmdeviceapi.h"
 
 #ifdef WINE_UNIX_LIB
+static inline NTSTATUS unsupported_endpoint_notifications(void *args)
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
 /* helper to create a thread on the Unix side */
 static inline NTSTATUS create_unix_thread( HANDLE *handle, const WCHAR *name,
                                            void (*entry)(void *), void *param )
@@ -243,6 +248,19 @@ struct test_connect_params
 {
     const WCHAR *name;
     enum driver_priority priority;
+    BOOL endpoint_notifications;
+};
+
+#define ENDPOINT_CHANGE_DEVICES         0x01
+#define ENDPOINT_CHANGE_DEFAULT_RENDER  0x02
+#define ENDPOINT_CHANGE_DEFAULT_CAPTURE 0x04
+
+/* Optional calls, advertised by test_connect. No pointers: identical WoW64 ABI. */
+struct endpoint_changes_params
+{
+    unsigned int changes;
+    BOOL refresh;
+    BOOL disconnected;
 };
 
 struct is_started_params
@@ -358,5 +376,9 @@ enum unix_funcs
     midi_in_message,
     midi_notify_wait,
     aux_message,
+    start_endpoint_notifications,
+    wait_endpoint_changes,
+    stop_endpoint_notifications,
+    interrupt_endpoint_notifications,
     funcs_count
 };

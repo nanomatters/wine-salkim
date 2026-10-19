@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #define COBJMACROS
 #include "initguid.h"
 #include "windef.h"

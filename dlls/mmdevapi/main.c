@@ -100,6 +100,7 @@ static BOOL load_driver(const WCHAR *name, DriverFuncs *driver)
     params.name     = wcsrchr(path, '\\');
     params.name     = params.name ? params.name + 1 : path;
     params.priority = Priority_Neutral;
+    params.endpoint_notifications = FALSE;
 
     if ((status = __wine_unix_call(driver->module_unixlib, test_connect, &params))) {
         ERR("Unable to retrieve driver priority: %lx\n", status);
@@ -107,6 +108,7 @@ static BOOL load_driver(const WCHAR *name, DriverFuncs *driver)
     }
 
     driver->priority = params.priority;
+    driver->endpoint_notifications = params.endpoint_notifications;
 
     lstrcpyW(driver->module_name, driver_module);
 

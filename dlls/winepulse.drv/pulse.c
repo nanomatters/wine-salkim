@@ -2889,6 +2889,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     pulse_not_implemented,
     pulse_not_implemented,
     pulse_not_implemented,
+    unsupported_endpoint_notifications,
+    unsupported_endpoint_notifications,
+    unsupported_endpoint_notifications,
+    unsupported_endpoint_notifications,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -3372,6 +3376,10 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     pulse_not_implemented,
     pulse_not_implemented,
     pulse_not_implemented,
+    unsupported_endpoint_notifications,
+    unsupported_endpoint_notifications,
+    unsupported_endpoint_notifications,
+    unsupported_endpoint_notifications,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
