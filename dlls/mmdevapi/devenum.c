@@ -1315,7 +1315,7 @@ static HRESULT WINAPI MMDevice_GetState(IMMDevice *iface, DWORD *state)
 
     if (!state)
         return E_POINTER;
-    *state = This->state;
+    *state = ReadAcquire((LONG *)&This->state);
     return S_OK;
 }
 
@@ -1390,6 +1390,7 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD 
     This->devices_count = 0;
     *ppv = &This->IMMDeviceCollection_iface;
 
+    EnterCriticalSection(&device_lock);
     LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
     {
         if ((cur->flow == flow || flow == eAll) && (cur->state & state))
@@ -1399,8 +1400,13 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD 
     if (This->devices_count)
     {
         This->devices = malloc(This->devices_count * sizeof(IMMDevice *));
-        if (!This->devices_count)
+        if (!This->devices)
+        {
+            LeaveCriticalSection(&device_lock);
+            free(This);
+            *ppv = NULL;
             return E_OUTOFMEMORY;
+        }
 
         LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
         {
@@ -1413,6 +1419,7 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD 
         }
     }
 
+    LeaveCriticalSection(&device_lock);
     return S_OK;
 }
 
@@ -1575,6 +1582,7 @@ static HRESULT WINAPI MMDevEnum_GetDefaultAudioEndpoint(IMMDeviceEnumerator *ifa
     WCHAR reg_key[256];
     HKEY key;
     HRESULT hr;
+    MMDevice *def;
 
     TRACE("(%p)->(%u,%u,%p)\n", This, flow, role, device);
 
@@ -1619,11 +1627,14 @@ static HRESULT WINAPI MMDevEnum_GetDefaultAudioEndpoint(IMMDeviceEnumerator *ifa
                     RegCloseKey(key);
                     return S_OK;
                 }
+                IMMDevice_Release(*device);
+                *device = NULL;
             }
 
             TRACE("Unable to find voice device %s\n", wine_dbgstr_w(def_id));
         }
 
+        size = sizeof(def_id);
         if(RegQueryValueExW(key, reg_x_name, 0, NULL,
                     (BYTE*)def_id, &size) == ERROR_SUCCESS){
             hr = IMMDeviceEnumerator_GetDevice(iface, def_id, device);
@@ -1633,6 +1644,8 @@ static HRESULT WINAPI MMDevEnum_GetDefaultAudioEndpoint(IMMDeviceEnumerator *ifa
                     RegCloseKey(key);
                     return S_OK;
                 }
+                IMMDevice_Release(*device);
+                *device = NULL;
             }
 
             TRACE("Unable to find device %s\n", wine_dbgstr_w(def_id));
@@ -1641,15 +1654,13 @@ static HRESULT WINAPI MMDevEnum_GetDefaultAudioEndpoint(IMMDeviceEnumerator *ifa
         RegCloseKey(key);
     }
 
-    if (flow == eRender)
-        *device = &MMDevice_def_play->IMMDevice_iface;
-    else
-        *device = &MMDevice_def_rec->IMMDevice_iface;
+    EnterCriticalSection(&device_lock);
+    def = flow == eRender ? MMDevice_def_play : MMDevice_def_rec;
+    if (def) *device = &def->IMMDevice_iface;
 
-    if (!*device)
-        return E_NOTFOUND;
-    IMMDevice_AddRef(*device);
-    return S_OK;
+    if (*device) IMMDevice_AddRef(*device);
+    LeaveCriticalSection(&device_lock);
+    return *device ? S_OK : E_NOTFOUND;
 }
 
 static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHAR *name, IMMDevice **device)
@@ -1663,6 +1674,7 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
     if(!name || !device)
         return E_POINTER;
 
+    EnterCriticalSection(&device_lock);
     LIST_FOR_EACH_ENTRY(impl, &device_list, MMDevice, entry)
     {
         HRESULT hr;
@@ -1680,10 +1692,12 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
             CoTaskMemFree(str);
             IMMDevice_AddRef(dev);
             *device = dev;
+            LeaveCriticalSection(&device_lock);
             return S_OK;
         }
         CoTaskMemFree(str);
     }
+    LeaveCriticalSection(&device_lock);
     TRACE("Could not find device %s\n", debugstr_w(name));
     return E_INVALIDARG;
 }
@@ -1936,12 +1950,14 @@ static HRESULT MMDevPropStore_Create(MMDevice *parent, DWORD access, IPropertySt
     This->IPropertyStore_iface.lpVtbl = &MMDevPropVtbl;
     This->ref = 1;
     This->parent = parent;
+    IMMDevice_AddRef(&parent->IMMDevice_iface);
     This->access = access;
     return S_OK;
 }
 
 static void MMDevPropStore_Destroy(MMDevPropStore *This)
 {
+    IMMDevice_Release(&This->parent->IMMDevice_iface);
     free(This);
 }
 
