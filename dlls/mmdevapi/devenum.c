@@ -79,6 +79,14 @@ static const IMMEndpointVtbl MMEndpointVtbl;
 
 static MMDevEnumImpl enumerator;
 static struct list device_list = LIST_INIT(device_list);
+static CRITICAL_SECTION device_lock;
+static CRITICAL_SECTION_DEBUG device_lock_debug =
+{
+    0, 0, &device_lock,
+    { &device_lock_debug.ProcessLocksList, &device_lock_debug.ProcessLocksList },
+    0, 0, { (DWORD_PTR)(__FILE__ ": device_lock") }
+};
+static CRITICAL_SECTION device_lock = { &device_lock_debug, -1, 0, 0, 0, 0 };
 
 typedef struct MMDevColImpl
 {
@@ -171,7 +179,7 @@ static struct device *find_device_in_cache( const GUID *guid )
     return NULL;
 }
 
-BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
+static BOOL get_device_name_from_guid_locked( const GUID *guid, char **name, EDataFlow *flow )
 {
     struct device *dev;
     WCHAR key_name[MAX_PATH];
@@ -182,7 +190,7 @@ BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
     {
         *name = strdup(dev->name);
         *flow = dev->flow;
-        return TRUE;
+        return *name != NULL;
     }
 
     swprintf( key_name, ARRAY_SIZE(key_name), L"Software\\Wine\\Drivers\\%s\\devices", drvs.module_name );
@@ -220,32 +228,64 @@ BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
     return FALSE;
 }
 
-static void get_device_guid( EDataFlow flow, const char *dev_name, GUID *guid )
+BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
+{
+    BOOL result;
+
+    EnterCriticalSection(&device_lock);
+    result = get_device_name_from_guid_locked(guid, name, flow);
+    LeaveCriticalSection(&device_lock);
+    return result;
+}
+
+static BOOL get_device_guid( EDataFlow flow, const char *dev_name, GUID *guid )
 {
     WCHAR name[512];
     DWORD type, size = sizeof(*guid);
-    HKEY key;
+    HANDLE mutex;
+    HKEY key = NULL;
     LSTATUS status;
+    DWORD wait;
+    BOOL ret = FALSE;
     int len;
 
     len = swprintf( name, ARRAY_SIZE(name), L"Software\\Wine\\Drivers\\%s\\devices\\%u,",
                     drvs.module_name, flow == eCapture );
-    MultiByteToWideChar( CP_UNIXCP, 0, dev_name, -1, name + len, ARRAY_SIZE(name) - len );
+    if (len < 0 || !MultiByteToWideChar(CP_UNIXCP, 0, dev_name, -1, name + len, ARRAY_SIZE(name) - len))
+        return FALSE;
+    /* Every process observes the same hotplug. Serialize the read/create/write
+     * transaction, not just access to this process's name cache. */
+    if (!(mutex = CreateMutexW(NULL, FALSE, L"Global\\wine_mmdevapi_device_guid"))) return FALSE;
+    wait = WaitForSingleObject(mutex, INFINITE);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+    {
+        CloseHandle(mutex);
+        return FALSE;
+    }
     status = RegCreateKeyExW( HKEY_CURRENT_USER, name, 0, NULL, 0,
                               KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, NULL, &key, NULL);
     if (status)
     {
         ERR( "Failed to create key %s: %lu\n", debugstr_w(name), status );
-        return;
+        goto done;
     }
     status = RegQueryValueExW( key, L"guid", 0, &type, (BYTE *)guid, &size );
     if (status != ERROR_SUCCESS || type != REG_BINARY || size != sizeof(*guid))
     {
-        CoCreateGuid( guid );
-        RegSetValueExW( key, L"guid", 0, REG_BINARY, (BYTE *)guid, sizeof(*guid) );
+        if (FAILED(CoCreateGuid(guid)) ||
+            RegSetValueExW(key, L"guid", 0, REG_BINARY, (BYTE *)guid, sizeof(*guid)))
+            goto done;
     }
-    RegCloseKey( key );
+    ret = TRUE;
+done:
+    if (key) RegCloseKey(key);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    if (!ret) return FALSE;
+    EnterCriticalSection(&device_lock);
     if (!find_device_in_cache( guid )) add_device_to_cache( guid, dev_name, flow );
+    LeaveCriticalSection(&device_lock);
+    return TRUE;
 }
 
 static HRESULT MMDevPropStore_OpenPropKey(const GUID *guid, DWORD flow, HKEY *propkey)
@@ -1080,7 +1120,7 @@ HRESULT load_driver_devices(EDataFlow flow)
         const WCHAR *name = (WCHAR *)((char *)params.endpoints + params.endpoints[i].name);
         const char *dev_name = (char *)params.endpoints + params.endpoints[i].device;
 
-        get_device_guid( flow, dev_name, &guid );
+        if (!get_device_guid(flow, dev_name, &guid)) continue;
 
         dev = MMDevice_Create(name, &guid, flow, DEVICE_STATE_ACTIVE, params.default_idx == i);
         set_format(dev);
