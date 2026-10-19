@@ -1,0 +1,563 @@
+/* Event-driven endpoint monitor regression tests.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include <stdlib.h>
+#include <signal.h>
+static void *hotplug_calloc(size_t count, size_t size);
+static int hotplug_sigmask(int how, const sigset_t *mask, sigset_t *previous);
+#define calloc hotplug_calloc
+#define pthread_sigmask hotplug_sigmask
+#include "test.h"
+#undef calloc
+#undef pthread_sigmask
+
+static pthread_mutex_t loop_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t loop_condition = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t entered_condition = PTHREAD_COND_INITIALIZER;
+static _Thread_local unsigned int loop_depth;
+static struct probe *test_probe;
+static unsigned int signals, waits, destroyed, stopped;
+static unsigned int endpoint_events;
+static int pending_seq;
+static unsigned int pending_graph_change;
+static BOOL fail_allocation, fail_sync, fail_core_sync;
+static unsigned int startup_failure;
+static char loop_token, context_token;
+#define TEST_LOOP ((struct pw_thread_loop *)&loop_token)
+#define TEST_CONTEXT ((struct pw_context *)&context_token)
+static struct spa_interface core, registry;
+static void add_node(uint32_t id, const char *type, const char *name);
+
+static void assert_quit_blocked(void)
+{
+    sigset_t mask;
+    assert(!pthread_sigmask(SIG_SETMASK, NULL, &mask));
+    assert(sigismember(&mask, SIGQUIT));
+}
+
+static int hotplug_sigmask(int how, const sigset_t *mask, sigset_t *previous)
+{
+    if (how == SIG_SETMASK && mask)
+    {
+        /* A pending termination is delivered by this call. No monitor lock
+         * may still be owned by the thread which is about to terminate. */
+        assert(!loop_depth);
+        assert(!pthread_mutex_trylock(&endpoint_monitor_mutex));
+        pthread_mutex_unlock(&endpoint_monitor_mutex);
+    }
+    return pthread_sigmask(how, mask, previous);
+}
+
+struct pw_thread_loop *pw_thread_loop_new(const char *name, const struct spa_dict *props)
+{
+    assert_quit_blocked();
+    return startup_failure == 1 ? NULL : TEST_LOOP;
+}
+
+struct pw_loop *pw_thread_loop_get_loop(struct pw_thread_loop *loop)
+{
+    assert(loop == TEST_LOOP);
+    return (struct pw_loop *)TEST_LOOP;
+}
+
+struct pw_context *pw_context_new(struct pw_loop *loop, struct pw_properties *props, size_t size)
+{
+    assert_quit_blocked();
+    return startup_failure == 2 ? NULL : TEST_CONTEXT;
+}
+
+int pw_thread_loop_start(struct pw_thread_loop *loop)
+{
+    assert_quit_blocked();
+    return startup_failure == 3 ? -EIO : 0;
+}
+
+struct pw_core *pw_context_connect(struct pw_context *context, struct pw_properties *props, size_t size)
+{
+    assert(context == TEST_CONTEXT && loop_depth == 1);
+    assert_quit_blocked();
+    return startup_failure == 4 ? NULL : (void *)&core;
+}
+
+void pw_context_destroy(struct pw_context *context)
+{
+    assert(context == TEST_CONTEXT && !loop_depth);
+    assert_quit_blocked();
+}
+
+NTSTATUS WINAPI NtSetEvent(HANDLE event, LONG *previous)
+{
+    assert(event == (HANDLE)0x1234 && !previous && loop_depth == 1);
+    ++endpoint_events;
+    return STATUS_SUCCESS;
+}
+
+static void *hotplug_calloc(size_t count, size_t size)
+{
+    if (fail_allocation) { fail_allocation = FALSE; return NULL; }
+    return calloc(count, size);
+}
+
+void pw_thread_loop_lock(struct pw_thread_loop *loop)
+{
+    assert(loop == TEST_LOOP && !loop_depth);
+    pthread_mutex_lock(&loop_mutex);
+    ++loop_depth;
+}
+
+void pw_thread_loop_unlock(struct pw_thread_loop *loop)
+{
+    assert(loop == TEST_LOOP && loop_depth == 1);
+    --loop_depth;
+    pthread_mutex_unlock(&loop_mutex);
+}
+
+void pw_thread_loop_wait(struct pw_thread_loop *loop)
+{
+    assert(loop == TEST_LOOP && loop_depth == 1);
+    ++waits;
+    pthread_cond_broadcast(&entered_condition);
+    --loop_depth;
+    pthread_cond_wait(&loop_condition, &loop_mutex);
+    ++loop_depth;
+}
+
+void pw_thread_loop_signal(struct pw_thread_loop *loop, bool accept)
+{
+    assert(loop == TEST_LOOP && loop_depth == 1 && !accept);
+    ++signals;
+    pthread_cond_broadcast(&loop_condition);
+}
+
+int pw_thread_loop_get_time(struct pw_thread_loop *loop, struct timespec *deadline, int64_t timeout)
+{
+    assert(loop == TEST_LOOP && loop_depth == 1 && timeout == 2 * SPA_NSEC_PER_SEC);
+    memset(deadline, 0, sizeof(*deadline));
+    return 0;
+}
+
+int pw_thread_loop_timed_wait_full(struct pw_thread_loop *loop, const struct timespec *deadline)
+{
+    assert(loop == TEST_LOOP && loop_depth == 1);
+    if (fail_sync) return -ETIMEDOUT;
+    if (fail_core_sync)
+    {
+        on_probe_core_error(test_probe, PW_ID_CORE, 0, -EPIPE, "disconnected during sync");
+        return 0;
+    }
+    if (pending_graph_change)
+    {
+        if (pending_graph_change == 1) add_node(2, "Audio/Sink", "sink");
+        else on_probe_registry_global_remove(test_probe, 2);
+        pending_graph_change = 0;
+    }
+    on_probe_core_done(test_probe, PW_ID_CORE, pending_seq);
+    return 0;
+}
+
+void pw_thread_loop_stop(struct pw_thread_loop *loop)
+{
+    assert(loop == TEST_LOOP && !loop_depth);
+    assert_quit_blocked();
+    ++stopped;
+}
+
+void pw_thread_loop_destroy(struct pw_thread_loop *loop)
+{
+    assert(loop == TEST_LOOP && !loop_depth);
+    assert_quit_blocked();
+    ++destroyed;
+}
+
+void pw_proxy_destroy(struct pw_proxy *proxy)
+{
+    assert(proxy && loop_depth == 1);
+}
+
+int pw_core_disconnect(struct pw_core *object)
+{
+    assert(object == test_probe->core && loop_depth == 1);
+    assert_quit_blocked();
+    return 0;
+}
+
+DWORD ntdll_umbstowcs(const char *source, DWORD length, WCHAR *dest, DWORD size)
+{
+    DWORD i;
+    for (i = 0; i < min(length, size); ++i) dest[i] = (unsigned char)source[i];
+    return min(length, size);
+}
+
+static int sync_core(void *object, uint32_t id, int seq)
+{
+    assert(loop_depth == 1 && id == PW_ID_CORE);
+    return pending_seq = seq + 1;
+}
+
+static void *bind_node(void *object, uint32_t id, const char *type, uint32_t version, size_t size)
+{
+    assert(loop_depth == 1 && !strcmp(type, PW_TYPE_INTERFACE_Node));
+    return NULL;
+}
+
+static int add_core_listener(void *object, struct spa_hook *hook,
+                             const struct pw_core_events *events, void *data)
+{
+    test_probe = data;
+    assert_quit_blocked();
+    return startup_failure == 5 ? -EIO : 0;
+}
+
+static struct pw_registry *get_registry(void *object, uint32_t version, size_t size)
+{
+    return startup_failure == 6 ? NULL : (void *)&registry;
+}
+
+static int add_registry_listener(void *object, struct spa_hook *hook,
+                                 const struct pw_registry_events *events, void *data)
+{
+    return startup_failure == 7 ? -EIO : 0;
+}
+
+static const struct pw_core_methods core_methods = {
+    .version = PW_VERSION_CORE_METHODS, .sync = sync_core,
+    .add_listener = add_core_listener, .get_registry = get_registry,
+};
+static const struct pw_registry_methods registry_methods = {
+    .version = PW_VERSION_REGISTRY_METHODS, .bind = bind_node,
+    .add_listener = add_registry_listener,
+};
+static struct spa_interface core = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Core,
+    PW_VERSION_CORE, &core_methods, NULL);
+static struct spa_interface registry = SPA_INTERFACE_INIT(PW_TYPE_INTERFACE_Registry,
+    PW_VERSION_REGISTRY, &registry_methods, NULL);
+
+static void initialize_monitor(void)
+{
+    assert(!endpoint_monitor);
+    test_probe = calloc(1, sizeof(*test_probe));
+    assert(test_probe);
+    list_init(&test_probe->nodes);
+    list_init(&test_probe->devices);
+    test_probe->core = (void *)&core;
+    test_probe->registry = (void *)&registry;
+    test_probe->loop = TEST_LOOP;
+    test_probe->loop_started = test_probe->watching = TRUE;
+    endpoint_monitor = test_probe;
+}
+
+static void add_node(uint32_t id, const char *type, const char *name)
+{
+    struct spa_dict_item items[] = {
+        {PW_KEY_MEDIA_CLASS, type}, {PW_KEY_NODE_NAME, name}, {PW_KEY_NODE_DESCRIPTION, name},
+    };
+    struct spa_dict properties = SPA_DICT_INIT_ARRAY(items);
+    on_probe_registry_global(test_probe, id, PW_PERM_ALL, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &properties);
+}
+
+struct wait_result
+{
+    NTSTATUS status;
+    struct endpoint_changes_params params;
+};
+
+static void *wait_for_changes(void *arg)
+{
+    struct wait_result *result = arg;
+    result->status = pipewire_wait_endpoint_changes(&result->params);
+    return NULL;
+}
+
+static void await_waiter(unsigned int previous)
+{
+    pw_thread_loop_lock(TEST_LOOP);
+    while (waits == previous) pthread_cond_wait(&entered_condition, &loop_mutex);
+    pw_thread_loop_unlock(TEST_LOOP);
+}
+
+static LONG reader_stop;
+static void *read_formats(void *arg)
+{
+    WAVEFORMATEXTENSIBLE format;
+    struct get_mix_format_params params = {.flow = eRender, .device = "sink", .fmt = &format};
+
+    while (!ReadAcquire(&reader_stop))
+    {
+        pipewire_get_mix_format(&params);
+        assert(params.result == S_OK || params.result == AUDCLNT_E_DEVICE_INVALIDATED);
+        if (params.result == S_OK) assert(format.Format.nChannels == 2);
+    }
+    return NULL;
+}
+
+static void read_sink_path(WCHAR *path, unsigned int size)
+{
+    static const GUID guid = {0x12345678,0x2345,0x6789,{0xab,0xcd,0xef,0x01,0x23,0x45,0x67,0x89}};
+    PROPVARIANT value = {0};
+    struct get_prop_value_params params = {.guid = &guid, .value = &value, .buffer = path, .buffer_size = &size};
+    struct pw_phys_device *device = find_device(eRender, "sink");
+
+    assert(device);
+    memset(path, 0, size);
+    get_device_path(device, &params);
+    assert(params.result == S_OK && value.vt == VT_LPWSTR && value.pwszVal == path);
+}
+
+static void assert_signal_mask(const sigset_t *expected)
+{
+    sigset_t mask;
+    unsigned int signal;
+    assert(!pthread_sigmask(SIG_SETMASK, NULL, &mask));
+    for (signal = 1; signal < NSIG; ++signal)
+        assert(sigismember(&mask, signal) == sigismember(expected, signal));
+}
+
+static void test_monitor_signal_mask(void)
+{
+    sigset_t original, mask;
+    unsigned int blocked, failure;
+
+    assert(!pthread_sigmask(SIG_SETMASK, NULL, &original));
+    for (blocked = 0; blocked < 2; ++blocked)
+    {
+        mask = original;
+        sigaddset(&mask, SIGUSR1);
+        if (blocked) sigaddset(&mask, SIGQUIT);
+        else sigdelset(&mask, SIGQUIT);
+        assert(!pthread_sigmask(SIG_SETMASK, &mask, NULL));
+        for (failure = 1; failure <= 8; ++failure)
+        {
+            startup_failure = failure;
+            fail_sync = failure == 8;
+            assert(pipewire_start_endpoint_notifications(NULL) == STATUS_DEVICE_NOT_CONNECTED);
+            assert(!endpoint_monitor);
+            assert_signal_mask(&mask);
+        }
+        startup_failure = 0;
+        fail_sync = FALSE;
+        fail_allocation = TRUE;
+        assert(pipewire_start_endpoint_notifications(NULL) == STATUS_NO_MEMORY);
+        assert_signal_mask(&mask);
+        assert(pipewire_start_endpoint_notifications(NULL) == STATUS_SUCCESS);
+        assert(endpoint_monitor);
+        assert_signal_mask(&mask);
+        assert(pipewire_start_endpoint_notifications(NULL) == STATUS_SUCCESS);
+        assert_signal_mask(&mask);
+        assert(pipewire_stop_endpoint_notifications(NULL) == STATUS_SUCCESS);
+        assert(!endpoint_monitor);
+        assert_signal_mask(&mask);
+        assert(pipewire_stop_endpoint_notifications(NULL) == STATUS_SUCCESS);
+        assert_signal_mask(&mask);
+    }
+    assert(!pthread_sigmask(SIG_SETMASK, &original, NULL));
+}
+
+int main(void)
+{
+    struct endpoint_changes_params params = {0};
+    struct wait_result result = {0};
+    pthread_t thread, reader;
+    struct pipewire_stream pinned = {.dataflow = eRender, .device = "sink", .event = (HANDLE)0x1234};
+    struct pipewire_stream follows_default = {.dataflow = eRender, .device = ""};
+    WCHAR original_path[128], current_path[128];
+    unsigned int before, i;
+
+    initialize_monitor();
+    before = waits;
+    assert(!pthread_create(&thread, NULL, wait_for_changes, &result));
+    await_waiter(before);
+    assert(pipewire_interrupt_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    assert(!pthread_join(thread, NULL));
+    assert(result.status == STATUS_ALERTED && !result.params.changes);
+    /* Interrupting the consumer must neither stop the monitor nor consume
+     * device changes which it will reconcile if a new consumer arrives. */
+    pw_thread_loop_lock(TEST_LOOP);
+    add_node(99, "Audio/Sink", "interrupted");
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_interrupt_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_ALERTED);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(find_device(eRender, "interrupted"));
+    pw_thread_loop_lock(TEST_LOOP);
+    on_probe_registry_global_remove(test_probe, 99);
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    before = waits;
+    assert(!pthread_create(&thread, NULL, wait_for_changes, &result));
+    await_waiter(before);
+    pw_thread_loop_lock(TEST_LOOP);
+    add_node(1, "Stream/Output/Audio", "ignored-stream");
+    assert(!test_probe->changes);
+    add_node(2, "Audio/Sink", "sink");
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(!pthread_join(thread, NULL));
+    assert(result.status == STATUS_SUCCESS && result.params.changes == ENDPOINT_CHANGE_DEVICES);
+    assert(list_count(&g_render_devices) == 2 && list_count(&g_capture_devices) == 1);
+    assert(find_device(eRender, "sink"));
+    read_sink_path(original_path, sizeof(original_path));
+
+    /* A delayed process may hold a removal snapshot after another process
+     * has registered a replug. Reconciliation forces a roundtrip under its
+     * shared registration lock, even without an already-delivered event. */
+    pw_thread_loop_lock(TEST_LOOP);
+    on_probe_registry_global_remove(test_probe, 2);
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(!find_device(eRender, "sink"));
+    before = waits;
+    pending_graph_change = 1;
+    params.refresh = TRUE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(find_device(eRender, "sink") && waits == before);
+    assert(params.changes == ENDPOINT_CHANGE_DEVICES && !test_probe->changes);
+    pending_graph_change = 2;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(!find_device(eRender, "sink") && waits == before);
+    pending_graph_change = 1;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(find_device(eRender, "sink") && waits == before);
+    assert(pipewire_interrupt_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(test_probe->interrupted); /* Reconciliation doesn't lose retirement requests. */
+    params.refresh = FALSE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_ALERTED);
+
+    {
+        struct probe_node *node = LIST_ENTRY(list_head(&test_probe->nodes), struct probe_node, entry);
+        struct pw_node_info info = {.change_mask = PW_NODE_CHANGE_MASK_PARAMS};
+
+        pw_thread_loop_lock(TEST_LOOP);
+        node->active_format.channels = 6;
+        on_probe_node_info(node, &info);
+        assert(!node->active_format.channels && test_probe->changes == ENDPOINT_CHANGE_DEVICES);
+        pw_thread_loop_unlock(TEST_LOOP);
+        assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+        assert(find_device(eRender, "sink")->fmt.Format.nChannels == 2);
+    }
+
+    pw_thread_loop_lock(TEST_LOOP);
+    on_probe_metadata_property(test_probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":\"sink\"}");
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(params.changes == ENDPOINT_CHANGE_DEFAULT_RENDER && !strcmp(g_default_sink, "sink"));
+    before = signals;
+    pw_thread_loop_lock(TEST_LOOP);
+    on_probe_metadata_property(test_probe, PW_ID_CORE, "default.audio.sink", NULL, "{\"name\":\"sink\"}");
+    on_probe_registry_global_remove(test_probe, 123456);
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(signals == before && !test_probe->changes);
+
+    pw_thread_loop_lock(TEST_LOOP);
+    add_node(3, "Audio/Duplex", "duplex");
+    pw_thread_loop_unlock(TEST_LOOP);
+    fail_allocation = TRUE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_NO_MEMORY);
+    assert(test_probe->changes && !find_device(eRender, "duplex"));
+    read_sink_path(current_path, sizeof(current_path));
+    assert(!memcmp(current_path, original_path, sizeof(current_path)) && !strcmp(g_default_sink, "sink"));
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(find_device(eRender, "duplex") && find_device(eCapture, "duplex"));
+    read_sink_path(current_path, sizeof(current_path));
+    assert(!memcmp(current_path, original_path, sizeof(current_path)));
+
+    list_add_tail(&g_streams, &pinned.entry);
+    list_add_tail(&g_streams, &follows_default.entry);
+    pw_loop_global = TEST_LOOP;
+    assert(!pthread_create(&reader, NULL, read_formats, NULL));
+    for (i = 0; i < 200; ++i)
+    {
+        pw_thread_loop_lock(TEST_LOOP);
+        on_probe_registry_global_remove(test_probe, 2);
+        pw_thread_loop_unlock(TEST_LOOP);
+        assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+        assert(!find_device(eRender, "sink") && find_device(eRender, "duplex"));
+        assert(!stream_endpoint_present(&pinned) && stream_endpoint_present(&follows_default));
+        assert(pinned.invalidated && !follows_default.invalidated && endpoint_events == 1);
+        pw_thread_loop_lock(TEST_LOOP);
+        add_node(2, "Audio/Sink", "sink");
+        pw_thread_loop_unlock(TEST_LOOP);
+        assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+        assert(find_device(eRender, "sink"));
+        read_sink_path(current_path, sizeof(current_path));
+        assert(!memcmp(current_path, original_path, sizeof(current_path)));
+        assert(stream_endpoint_present(&pinned));
+        assert(pinned.invalidated); /* Reconnection requires a new WASAPI stream. */
+    }
+    WriteRelease(&reader_stop, TRUE);
+    assert(!pthread_join(reader, NULL));
+    list_remove(&pinned.entry);
+    list_remove(&follows_default.entry);
+    pw_loop_global = NULL;
+
+    pw_thread_loop_lock(TEST_LOOP);
+    on_probe_registry_global_remove(test_probe, 3);
+    pw_thread_loop_unlock(TEST_LOOP);
+    fail_sync = TRUE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_DEVICE_NOT_CONNECTED);
+    assert(find_device(eRender, "duplex")); /* A failed sync cannot publish removals. */
+    fail_sync = FALSE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(!find_device(eRender, "duplex"));
+
+    /* An allocation failure in a callback must retain the published cache
+     * and request a new connection, not report an incomplete graph. */
+    pw_thread_loop_lock(TEST_LOOP);
+    fail_allocation = TRUE;
+    add_node(4, "Audio/Sink", "lost-allocation");
+    assert(test_probe->incomplete);
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_RETRY);
+    assert(!find_device(eRender, "lost-allocation") && find_device(eRender, "sink"));
+    /* A real connection loss takes priority even when the graph is incomplete. */
+    pw_thread_loop_lock(TEST_LOOP);
+    on_probe_core_error(test_probe, PW_ID_CORE, 0, -EPIPE, "disconnected");
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(params.changes == (ENDPOINT_CHANGE_DEVICES | ENDPOINT_CHANGE_DEFAULT_RENDER |
+                              ENDPOINT_CHANGE_DEFAULT_CAPTURE));
+    assert(list_count(&g_render_devices) == 1 && list_count(&g_capture_devices) == 1);
+    params.refresh = TRUE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_DEVICE_NOT_CONNECTED && params.disconnected);
+    params.refresh = FALSE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_DEVICE_NOT_CONNECTED);
+    assert(pipewire_stop_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    assert(!endpoint_monitor && stopped == 1 && destroyed == 1);
+
+    initialize_monitor();
+    pw_thread_loop_lock(TEST_LOOP);
+    add_node(5, "Audio/Sink", "sync-disconnect");
+    pw_thread_loop_unlock(TEST_LOOP);
+    fail_core_sync = TRUE;
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    assert(list_count(&g_render_devices) == 1 && !find_device(eRender, "sync-disconnect"));
+    fail_core_sync = FALSE;
+    assert(pipewire_stop_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    assert(!endpoint_monitor && stopped == 2 && destroyed == 2);
+
+    initialize_monitor();
+    before = waits;
+    assert(!pthread_create(&thread, NULL, wait_for_changes, &result));
+    await_waiter(before);
+    assert(pipewire_stop_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    assert(!pthread_join(thread, NULL));
+    assert(result.status == STATUS_CANCELLED && !result.params.changes);
+    assert(!endpoint_monitor && stopped == 3 && destroyed == 3);
+    free_device_lists();
+
+    /* A new process can enumerate the same endpoints in a different order. */
+    initialize_monitor();
+    pw_thread_loop_lock(TEST_LOOP);
+    add_node(42, "Audio/Duplex", "duplex");
+    add_node(43, "Audio/Sink", "sink");
+    pw_thread_loop_unlock(TEST_LOOP);
+    assert(pipewire_wait_endpoint_changes(&params) == STATUS_SUCCESS);
+    read_sink_path(current_path, sizeof(current_path));
+    assert(!memcmp(current_path, original_path, sizeof(current_path)));
+    assert(pipewire_stop_endpoint_notifications(NULL) == STATUS_SUCCESS);
+    free_device_lists();
+    test_monitor_signal_mask();
+    puts("PipeWire hotplug, snapshot failure, concurrent reader and shutdown tests passed.");
+    return 0;
+}

@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <signal.h>
 #include <time.h>
 #include <dlfcn.h>
 #include <limits.h>
@@ -115,6 +116,7 @@ struct pipewire_stream
     char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
     BOOL pending_error;
     BOOL initial_mute_set;
+    BOOL invalidated;
 
     DWORD flags;
     AUDCLNT_SHAREMODE share;
@@ -229,6 +231,10 @@ static BOOL core_error_logged;
 static struct list g_streams = LIST_INIT(g_streams); /* loop-lock protected */
 
 static pthread_mutex_t pw_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t device_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static NTSTATUS pipewire_stop_endpoint_notifications(void *args);
+static void invalidate_removed_streams(void);
 
 static struct list g_render_devices = LIST_INIT(g_render_devices);
 static struct list g_capture_devices = LIST_INIT(g_capture_devices);
@@ -625,20 +631,24 @@ static struct pw_phys_device *add_device(struct list *list, const char *pw_name,
     return dev;
 }
 
-static void free_device_lists(void)
+static void free_device_list(struct list *list)
 {
-    static struct list *const lists[] = { &g_render_devices, &g_capture_devices, NULL };
-    struct list *const *list = lists;
     struct pw_phys_device *dev, *next;
 
-    do {
-        LIST_FOR_EACH_ENTRY_SAFE(dev, next, *list, struct pw_phys_device, entry)
-        {
-            list_remove(&dev->entry);
-            free(dev->display);
-            free(dev);
-        }
-    } while (*(++list));
+    LIST_FOR_EACH_ENTRY_SAFE(dev, next, list, struct pw_phys_device, entry)
+    {
+        list_remove(&dev->entry);
+        free(dev->display);
+        free(dev);
+    }
+}
+
+static void free_device_lists(void)
+{
+    pthread_mutex_lock(&device_cache_mutex);
+    free_device_list(&g_render_devices);
+    free_device_list(&g_capture_devices);
+    pthread_mutex_unlock(&device_cache_mutex);
 }
 
 /* ----------------------------------------------------------------------
@@ -771,6 +781,7 @@ static NTSTATUS pipewire_process_attach(void *args)
 static NTSTATUS pipewire_process_detach(void *args)
 {
     if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
+    pipewire_stop_endpoint_notifications(NULL);
     /* main_loop_stop tears down the library after stopping the native loop.
      * Do not unload PipeWire modules while that thread is still running. */
     free_device_lists();
@@ -913,6 +924,7 @@ out:
 static NTSTATUS pipewire_main_loop_stop(void *args)
 {
     if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
+    pipewire_stop_endpoint_notifications(NULL);
     pthread_mutex_lock(&pw_init_mutex);
     if (pw_loop_global)
     {
@@ -953,6 +965,7 @@ static NTSTATUS pipewire_main_loop_stop(void *args)
 
 struct probe_node
 {
+    struct probe *probe;
     struct list entry;
     uint32_t id;
     EDataFlow flow;
@@ -970,6 +983,7 @@ struct probe_node
 
 struct probe_device
 {
+    struct probe *probe;
     struct list entry;
     uint32_t id;
     struct pw_device *proxy;
@@ -1001,7 +1015,35 @@ struct probe
     uint32_t min_quantum;
     uint32_t force_quantum;
     BOOL core_error;
+    BOOL watching, stopped, loop_started, disconnected, incomplete, interrupted;
+    unsigned int changes, waiters;
 };
+
+static pthread_mutex_t endpoint_monitor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct probe *endpoint_monitor;
+
+static void probe_changed(struct probe *p, unsigned int changes)
+{
+    if (!p || !p->watching) return;
+    p->changes |= changes;
+    pw_thread_loop_signal(p->loop, false);
+}
+
+static void update_probe_string(struct probe_node *node, char **target, const char *value)
+{
+    char *copy;
+
+    if (!value || (*target && !strcmp(*target, value))) return;
+    if (!(copy = strdup(value)))
+    {
+        if (node->probe) node->probe->incomplete = TRUE;
+        probe_changed(node->probe, ENDPOINT_CHANGE_DEVICES);
+        return;
+    }
+    free(*target);
+    *target = copy;
+    probe_changed(node->probe, ENDPOINT_CHANGE_DEVICES);
+}
 
 static void on_probe_node_param(void *data, int seq, uint32_t id, uint32_t index,
                                 uint32_t next, const struct spa_pod *param)
@@ -1012,7 +1054,11 @@ static void on_probe_node_param(void *data, int seq, uint32_t id, uint32_t index
 
     if (id != SPA_PARAM_EnumFormat && id != SPA_PARAM_Format)
         return;
-    if (id == SPA_PARAM_Format) spa_zero(pn->active_format);
+    if (id == SPA_PARAM_Format)
+    {
+        spa_zero(pn->active_format);
+        probe_changed(pn->probe, ENDPOINT_CHANGE_DEVICES);
+    }
     if (!param) return;
     if (id == SPA_PARAM_Format && (spa_format_parse(param, &media_type, &media_subtype) < 0 ||
                                    media_type != SPA_MEDIA_TYPE_audio || media_subtype != SPA_MEDIA_SUBTYPE_raw))
@@ -1040,6 +1086,7 @@ static void on_probe_node_param(void *data, int seq, uint32_t id, uint32_t index
         pn->channels = info.channels;
         memcpy(pn->position, info.position, sizeof(info.position));
         pn->have_format = 1;
+        probe_changed(pn->probe, ENDPOINT_CHANGE_DEVICES);
     }
 }
 
@@ -1048,6 +1095,12 @@ static void on_probe_node_info(void *data, const struct pw_node_info *info)
     struct probe_node *pn = data;
     unsigned int i;
 
+    if ((info->change_mask & PW_NODE_CHANGE_MASK_PROPS) && info->props)
+    {
+        update_probe_string(pn, &pn->node_name, spa_dict_lookup(info->props, PW_KEY_NODE_NAME));
+        update_probe_string(pn, &pn->display, spa_dict_lookup(info->props, PW_KEY_NODE_DESCRIPTION));
+        update_probe_string(pn, &pn->nickname, spa_dict_lookup(info->props, PW_KEY_NODE_NICK));
+    }
     if (!(info->change_mask & PW_NODE_CHANGE_MASK_PARAMS)) return;
     for (i = 0; i < info->n_params; ++i)
     {
@@ -1058,7 +1111,11 @@ static void on_probe_node_info(void *data, const struct pw_node_info *info)
             return;
         break;
     }
-    spa_zero(pn->active_format);
+    if (pn->active_format.channels)
+    {
+        spa_zero(pn->active_format);
+        probe_changed(pn->probe, ENDPOINT_CHANGE_DEVICES);
+    }
 }
 
 static const struct pw_node_events probe_node_events = {
@@ -1072,6 +1129,8 @@ static void on_probe_device_info(void *data, const struct pw_device_info *info)
     struct probe_device *device = data;
 
     device->info = pw_device_info_update(device->info, info);
+    if (info->change_mask & PW_DEVICE_CHANGE_MASK_PROPS)
+        probe_changed(device->probe, ENDPOINT_CHANGE_DEVICES);
 }
 
 static const struct pw_device_events probe_device_events = {
@@ -1109,13 +1168,18 @@ static int on_probe_metadata_property(void *data, uint32_t subject, const char *
                                       const char *type, const char *value)
 {
     struct probe *p = data;
+    char old[sizeof(p->default_sink)];
     char *dst;
+    unsigned int change;
 
     if (subject != PW_ID_CORE)
         return 0;
     if (!key)
     {
+        change = (p->default_sink[0] ? ENDPOINT_CHANGE_DEFAULT_RENDER : 0) |
+                 (p->default_source[0] ? ENDPOINT_CHANGE_DEFAULT_CAPTURE : 0);
         p->default_sink[0] = p->default_source[0] = 0;
+        if (change) probe_changed(p, change);
         return 0;
     }
     if (!strcmp(key, "default.audio.sink"))
@@ -1124,8 +1188,11 @@ static int on_probe_metadata_property(void *data, uint32_t subject, const char *
         dst = p->default_source;
     else
         return 0;
+    copy_cstr(old, sizeof(old), dst);
     if (!value || parse_json_str_field(value, "name", dst, sizeof(p->default_sink)) < 0)
         dst[0] = 0;
+    if (strcmp(old, dst))
+        probe_changed(p, dst == p->default_sink ? ENDPOINT_CHANGE_DEFAULT_RENDER : ENDPOINT_CHANGE_DEFAULT_CAPTURE);
     return 0;
 }
 
@@ -1146,6 +1213,8 @@ static int on_probe_settings_property(void *data, uint32_t subject, const char *
         return 0;
     if (!key)
     {
+        if (p->clock_rate || p->force_rate || p->min_quantum || p->force_quantum)
+            probe_changed(p, ENDPOINT_CHANGE_DEVICES);
         p->clock_rate = p->force_rate = p->min_quantum = p->force_quantum = 0;
         return 0;
     }
@@ -1157,7 +1226,9 @@ static int on_probe_settings_property(void *data, uint32_t subject, const char *
 
     /* SPA raw format rates are represented by signed integer pods. */
     limit = setting == &p->clock_rate || setting == &p->force_rate ? INT32_MAX : UINT32_MAX;
-    *setting = parse_unsigned(value, 10, limit, &value64) ? value64 : 0;
+    value64 = parse_unsigned(value, 10, limit, &value64) ? value64 : 0;
+    if (*setting != value64) probe_changed(p, ENDPOINT_CHANGE_DEVICES);
+    *setting = value64;
     return 0;
 }
 
@@ -1200,7 +1271,12 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
             return;
 
         if (!(pn = calloc(1, sizeof(*pn))))
+        {
+            p->incomplete = TRUE;
+            probe_changed(p, ENDPOINT_CHANGE_DEVICES);
             return;
+        }
+        pn->probe = p;
         pn->id = id;
         pn->device_id = parse_unsigned(spa_dict_lookup(props, PW_KEY_DEVICE_ID), 10, UINT32_MAX,
                                        &device_id) ? device_id : SPA_ID_INVALID;
@@ -1214,9 +1290,12 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
             free(pn->display);
             free(pn->nickname);
             free(pn);
+            p->incomplete = TRUE;
+            probe_changed(p, ENDPOINT_CHANGE_DEVICES);
             return;
         }
         list_add_tail(&p->nodes, &pn->entry);
+        probe_changed(p, ENDPOINT_CHANGE_DEVICES);
 
         /* Bind the node and ask for its supported formats so we can report
          * the real channel layout.  The param events arrive during the sync
@@ -1232,7 +1311,13 @@ static void on_probe_registry_global(void *data, uint32_t id, uint32_t permissio
     {
         struct probe_device *device;
 
-        if (!(device = calloc(1, sizeof(*device)))) return;
+        if (!(device = calloc(1, sizeof(*device))))
+        {
+            p->incomplete = TRUE;
+            probe_changed(p, ENDPOINT_CHANGE_DEVICES);
+            return;
+        }
+        device->probe = p;
         device->id = id;
         list_add_tail(&p->devices, &device->entry);
         device->proxy = pw_registry_bind(p->registry, id, PW_TYPE_INTERFACE_Device,
@@ -1280,12 +1365,14 @@ static void on_probe_registry_global_remove(void *data, uint32_t id)
         if (node->id == id)
         {
             release_probe_node(node);
+            probe_changed(p, ENDPOINT_CHANGE_DEVICES);
             break;
         }
     LIST_FOR_EACH_ENTRY(device, &p->devices, struct probe_device, entry)
         if (device->id == id)
         {
             release_probe_device(device);
+            probe_changed(p, ENDPOINT_CHANGE_DEVICES);
             break;
         }
     if (p->meta_default && p->meta_default_id == id)
@@ -1355,7 +1442,7 @@ static BOOL probe_roundtrip(struct probe *p)
 /* Synthetic default endpoint (empty pw_name -> session manager
  * default routing).  When the default node is known, mirror its format so
  * the default endpoint advertises the real speaker layout. */
-static void add_default_device(struct list *list, EndpointFormFactor form, const char *match,
+static BOOL add_default_device(struct list *list, EndpointFormFactor form, const char *match,
                                uint32_t rate, REFERENCE_TIME def_period, REFERENCE_TIME min_period)
 {
     struct pw_phys_device *dev, *def_src = NULL, *def;
@@ -1366,11 +1453,11 @@ static void add_default_device(struct list *list, EndpointFormFactor form, const
             if (!strcmp(dev->pw_name, match)) { def_src = dev; break; }
     }
     if (!(def = calloc(1, sizeof(*def) + 1)))
-        return;
+        return FALSE;
     if (!(def->display = utf8_to_wstr(form == Speakers ? "PipeWire Output" : "PipeWire Input")))
     {
         free(def);
-        return;
+        return FALSE;
     }
     def->pw_name[0] = '\0';
     def->form = form;
@@ -1387,11 +1474,12 @@ static void add_default_device(struct list *list, EndpointFormFactor form, const
         {
             free(def->display);
             free(def);
-            return;
+            return FALSE;
         }
         def->channel_mask = def->fmt.dwChannelMask;
     }
     list_add_head(list, &def->entry);
+    return TRUE;
 }
 
 /* Use winebus's USB-parent identity so the audio and HID siblings share a container. */
@@ -1494,18 +1582,17 @@ static BOOL get_probe_periods(const struct probe *p, uint32_t *rate, REFERENCE_T
     return TRUE;
 }
 
-static void build_device_cache(struct probe *p)
+static BOOL build_device_cache(struct probe *p)
 {
     struct probe_node *pn;
     uint32_t rate;
     REFERENCE_TIME def_period, min_period;
     struct pw_phys_device *dev;
+    struct list render = LIST_INIT(render), capture = LIST_INIT(capture);
+    struct list *lists[] = {&render, &capture};
 
     if (!get_probe_periods(p, &rate, &def_period, &min_period))
-        return;
-
-    copy_cstr(g_default_sink, sizeof(g_default_sink), p->default_sink);
-    copy_cstr(g_default_source, sizeof(g_default_source), p->default_source);
+        return FALSE;
 
     LIST_FOR_EACH_ENTRY(pn, &p->nodes, struct probe_node, entry)
     {
@@ -1523,18 +1610,38 @@ static void build_device_cache(struct probe *p)
 
         for (flow = eRender; flow <= eCapture; ++flow)
         {
-            struct list *list = flow == eRender ? &g_render_devices : &g_capture_devices;
+            struct list *list = lists[flow];
             EndpointFormFactor form = flow == eRender ? Speakers : Microphone;
 
             if (pn->flow != flow && pn->flow != eAll) continue;
+            LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
+                if (!strcmp(dev->pw_name, pn->node_name)) break;
+            if (&dev->entry != list) continue;
             dev = add_device(list, pn->node_name, pn->display, form, node_rate, channels, mask, def_period, min_period);
+            if (!dev) goto failed;
             shorten_device_display(dev, pn->nickname, pn->node_name);
             set_device_identity(dev, p, pn->device_id);
         }
     }
 
-    add_default_device(&g_render_devices, Speakers, g_default_sink, rate, def_period, min_period);
-    add_default_device(&g_capture_devices, Microphone, g_default_source, rate, def_period, min_period);
+    if (!add_default_device(&render, Speakers, p->default_sink, rate, def_period, min_period) ||
+        !add_default_device(&capture, Microphone, p->default_source, rate, def_period, min_period)) goto failed;
+
+    /* Publish both flows together, and never expose a partial allocation. */
+    pthread_mutex_lock(&device_cache_mutex);
+    free_device_list(&g_render_devices);
+    free_device_list(&g_capture_devices);
+    list_move_tail(&g_render_devices, &render);
+    list_move_tail(&g_capture_devices, &capture);
+    copy_cstr(g_default_sink, sizeof(g_default_sink), p->default_sink);
+    copy_cstr(g_default_source, sizeof(g_default_source), p->default_source);
+    pthread_mutex_unlock(&device_cache_mutex);
+    return TRUE;
+
+failed:
+    free_device_list(&render);
+    free_device_list(&capture);
+    return FALSE;
 }
 
 static void probe_teardown(struct probe *p)
@@ -1671,6 +1778,210 @@ static NTSTATUS pipewire_test_connect(void *args)
           list_count(&g_capture_devices), debugstr_a(g_default_source), p.force_rate ? p.force_rate : p.clock_rate);
 
     params->priority = Priority_Preferred;
+    params->endpoint_notifications = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static void destroy_endpoint_monitor(struct probe *p)
+{
+    struct probe_node *node, *next;
+    struct probe_device *device, *device_next;
+
+    if (p->loop_started) pw_thread_loop_lock(p->loop);
+    probe_teardown(p);
+    if (p->loop_started)
+    {
+        pw_thread_loop_unlock(p->loop);
+        pw_thread_loop_stop(p->loop);
+    }
+    LIST_FOR_EACH_ENTRY_SAFE(node, next, &p->nodes, struct probe_node, entry)
+        release_probe_node(node);
+    LIST_FOR_EACH_ENTRY_SAFE(device, device_next, &p->devices, struct probe_device, entry)
+        release_probe_device(device);
+    if (p->context) pw_context_destroy(p->context);
+    if (p->loop) pw_thread_loop_destroy(p->loop);
+    free(p);
+}
+
+static void block_monitor_termination(sigset_t *old_mask)
+{
+    sigset_t mask;
+
+    /* PipeWire may load or unload plugins here. Wine's SIGQUIT handler exits
+     * the calling thread, which must not abandon the native loader lock.
+     * Restore the mask only after releasing all monitor locks. */
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGQUIT);
+    pthread_sigmask(SIG_BLOCK, &mask, old_mask);
+}
+
+static NTSTATUS pipewire_start_endpoint_notifications(void *args)
+{
+    struct probe *p;
+    sigset_t old_mask;
+    NTSTATUS status = STATUS_DEVICE_NOT_CONNECTED;
+
+    if (ntdll_process_is_exiting()) return STATUS_CANCELLED;
+    block_monitor_termination(&old_mask);
+    pthread_mutex_lock(&endpoint_monitor_mutex);
+    if (endpoint_monitor)
+    {
+        status = STATUS_SUCCESS;
+        goto done;
+    }
+    if (!(p = calloc(1, sizeof(*p))))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    list_init(&p->nodes);
+    list_init(&p->devices);
+    if (!(p->loop = pw_thread_loop_new("winepipewire-devices", NULL))) goto failed;
+    if (!(p->context = pw_context_new(pw_thread_loop_get_loop(p->loop), NULL, 0))) goto failed;
+    if (pw_thread_loop_start(p->loop) < 0) goto failed;
+    p->loop_started = TRUE;
+    pw_thread_loop_lock(p->loop);
+    p->core = pw_context_connect(p->context, NULL, 0);
+    if (p->core)
+    {
+        if (pw_core_add_listener(p->core, &p->core_listener, &probe_core_events, p) < 0)
+        {
+            pw_thread_loop_unlock(p->loop);
+            goto failed;
+        }
+        p->registry = pw_core_get_registry(p->core, PW_VERSION_REGISTRY, 0);
+        if (p->registry)
+        {
+            p->watching = TRUE;
+            if (pw_registry_add_listener(p->registry, &p->registry_listener, &probe_registry_events, p) >= 0 &&
+                probe_roundtrip(p) && probe_roundtrip(p) && probe_roundtrip(p) && !p->incomplete)
+                status = STATUS_SUCCESS;
+        }
+    }
+    /* Initial reconciliation closes the gap after the driver's startup probe. */
+    p->changes = ENDPOINT_CHANGE_DEVICES;
+    pthread_mutex_lock(&device_cache_mutex);
+    if (strcmp(g_default_sink, p->default_sink)) p->changes |= ENDPOINT_CHANGE_DEFAULT_RENDER;
+    if (strcmp(g_default_source, p->default_source)) p->changes |= ENDPOINT_CHANGE_DEFAULT_CAPTURE;
+    pthread_mutex_unlock(&device_cache_mutex);
+    pw_thread_loop_unlock(p->loop);
+    if (status) goto failed;
+    endpoint_monitor = p;
+    goto done;
+
+failed:
+    destroy_endpoint_monitor(p);
+done:
+    pthread_mutex_unlock(&endpoint_monitor_mutex);
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+    return status;
+}
+
+static NTSTATUS pipewire_wait_endpoint_changes(void *args)
+{
+    struct endpoint_changes_params *params = args;
+    struct probe empty, *p;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    params->changes = 0;
+    params->disconnected = FALSE;
+    if (ntdll_process_is_exiting()) return STATUS_CANCELLED;
+    pthread_mutex_lock(&endpoint_monitor_mutex);
+    if (!(p = endpoint_monitor))
+    {
+        pthread_mutex_unlock(&endpoint_monitor_mutex);
+        return STATUS_CANCELLED;
+    }
+    pw_thread_loop_lock(p->loop);
+    ++p->waiters;
+    pthread_mutex_unlock(&endpoint_monitor_mutex);
+    while (!params->refresh && !p->changes && !p->core_error && !p->stopped && !p->interrupted)
+        pw_thread_loop_wait(p->loop);
+    if (p->stopped) status = STATUS_CANCELLED;
+    else if (p->interrupted && !params->refresh)
+    {
+        p->interrupted = FALSE;
+        status = STATUS_ALERTED;
+    }
+    else if (p->core_error) goto disconnected;
+    else if (p->incomplete) status = STATUS_RETRY;
+    else if (!probe_roundtrip(p) || !probe_roundtrip(p) || !probe_roundtrip(p))
+    {
+        if (p->core_error) goto disconnected;
+        status = STATUS_DEVICE_NOT_CONNECTED;
+    }
+    else if (p->incomplete) status = STATUS_RETRY;
+    else if (!build_device_cache(p)) status = STATUS_NO_MEMORY;
+    else
+    {
+        params->changes = p->changes;
+        p->changes = 0;
+    }
+    goto done;
+
+disconnected:
+    {
+        params->disconnected = TRUE;
+        if (p->disconnected) status = STATUS_DEVICE_NOT_CONNECTED;
+        else
+        {
+            memset(&empty, 0, sizeof(empty));
+            list_init(&empty.nodes);
+            if (!build_device_cache(&empty)) status = STATUS_NO_MEMORY;
+            else
+            {
+                params->changes = ENDPOINT_CHANGE_DEVICES | ENDPOINT_CHANGE_DEFAULT_RENDER |
+                                  ENDPOINT_CHANGE_DEFAULT_CAPTURE;
+                p->disconnected = TRUE;
+                if (params->refresh) status = STATUS_DEVICE_NOT_CONNECTED;
+            }
+        }
+    }
+done:
+    --p->waiters;
+    pw_thread_loop_signal(p->loop, false);
+    pw_thread_loop_unlock(p->loop);
+    if (!status) invalidate_removed_streams();
+    return status;
+}
+
+static NTSTATUS pipewire_stop_endpoint_notifications(void *args)
+{
+    struct probe *p;
+    sigset_t old_mask;
+
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
+    block_monitor_termination(&old_mask);
+    pthread_mutex_lock(&endpoint_monitor_mutex);
+    if ((p = endpoint_monitor))
+    {
+        pw_thread_loop_lock(p->loop);
+        p->stopped = TRUE;
+        pw_thread_loop_signal(p->loop, false);
+        while (p->waiters) pw_thread_loop_wait(p->loop);
+        pw_thread_loop_unlock(p->loop);
+        endpoint_monitor = NULL;
+        destroy_endpoint_monitor(p);
+    }
+    pthread_mutex_unlock(&endpoint_monitor_mutex);
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS pipewire_interrupt_endpoint_notifications(void *args)
+{
+    struct probe *p;
+
+    if (ntdll_process_is_exiting()) return STATUS_SUCCESS;
+    pthread_mutex_lock(&endpoint_monitor_mutex);
+    if ((p = endpoint_monitor))
+    {
+        pw_thread_loop_lock(p->loop);
+        p->interrupted = TRUE;
+        pw_thread_loop_signal(p->loop, false);
+        pw_thread_loop_unlock(p->loop);
+    }
+    pthread_mutex_unlock(&endpoint_monitor_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -1688,6 +1999,7 @@ static NTSTATUS pipewire_get_endpoint_ids(void *args)
     struct pw_phys_device *dev;
 
     if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
+    pthread_mutex_lock(&device_cache_mutex);
     params->num = list_count(list);
     offset = needed = params->num * sizeof(*params->endpoints);
 
@@ -1717,6 +2029,7 @@ static NTSTATUS pipewire_get_endpoint_ids(void *args)
     }
     else
         params->result = S_OK;
+    pthread_mutex_unlock(&device_cache_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -1740,12 +2053,52 @@ static struct pw_phys_device *find_device(EDataFlow flow, const char *name)
     return NULL;
 }
 
+static BOOL stream_endpoint_present(const struct pipewire_stream *stream)
+{
+    struct pw_phys_device *device;
+    struct list *devices;
+    BOOL found = FALSE;
+
+    if (!stream->device || !stream->device[0]) return TRUE;
+    devices = stream->dataflow == eRender || (stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK)
+            ? &g_render_devices : &g_capture_devices;
+    pthread_mutex_lock(&device_cache_mutex);
+    LIST_FOR_EACH_ENTRY(device, devices, struct pw_phys_device, entry)
+        if (!strcmp(stream->device, device->pw_name)) { found = TRUE; break; }
+    pthread_mutex_unlock(&device_cache_mutex);
+    return found;
+}
+
+static void invalidate_removed_streams(void)
+{
+    struct pipewire_stream *stream;
+
+    /* A removed, explicitly selected endpoint must not silently migrate or
+     * revive an old WASAPI stream when another node appears with its name. */
+    pthread_mutex_lock(&pw_init_mutex);
+    if (pw_loop_global)
+    {
+        pw_thread_loop_lock(pw_loop_global);
+        LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
+        {
+            if (!stream->invalidated && !stream_endpoint_present(stream))
+            {
+                stream->invalidated = TRUE;
+                if (stream->event) NtSetEvent(stream->event, NULL);
+            }
+        }
+        pw_thread_loop_unlock(pw_loop_global);
+    }
+    pthread_mutex_unlock(&pw_init_mutex);
+}
+
 static NTSTATUS pipewire_get_mix_format(void *args)
 {
     struct get_mix_format_params *params = args;
     struct pw_phys_device *dev;
 
     if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
+    pthread_mutex_lock(&device_cache_mutex);
     dev = find_device(params->flow, params->device);
     if (dev)
     {
@@ -1755,8 +2108,9 @@ static NTSTATUS pipewire_get_mix_format(void *args)
     else
     {
         WARN("device not found: flow %d %s.\n", params->flow, debugstr_a(params->device));
-        params->result = E_FAIL;
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
     }
+    pthread_mutex_unlock(&device_cache_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -1768,12 +2122,17 @@ static HRESULT get_device_period_helper(EDataFlow flow, const char *pw_name,
     if (!def && !min)
         return E_POINTER;
 
+    pthread_mutex_lock(&device_cache_mutex);
     if (!(dev = find_device(flow, pw_name)))
-        return E_FAIL;
+    {
+        pthread_mutex_unlock(&device_cache_mutex);
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    }
     if (def)
         *def = dev->def_period;
     if (min)
         *min = dev->min_period;
+    pthread_mutex_unlock(&device_cache_mutex);
     return S_OK;
 }
 
@@ -1834,15 +2193,20 @@ static NTSTATUS pipewire_get_prop_value(void *args)
         {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
     };
     struct get_prop_value_params *params = args;
+    struct pw_phys_device copy;
     struct pw_phys_device *dev;
 
     if (pipewire_is_exiting(&params->result)) return STATUS_SUCCESS;
+    pthread_mutex_lock(&device_cache_mutex);
     dev = find_device(params->flow, params->device);
+    if (dev) copy = *dev;
+    pthread_mutex_unlock(&device_cache_mutex);
     if (!dev)
     {
         params->result = E_FAIL;
         return STATUS_SUCCESS;
     }
+    dev = &copy;
     if (IsEqualPropertyKey(*params->prop, devicepath_key))
     {
         get_device_path(dev, params);
@@ -2326,7 +2690,7 @@ static BOOL stream_valid(struct pipewire_stream *stream)
 {
     enum pw_stream_state st;
 
-    if (!stream)
+    if (!stream || stream->invalidated)
         return FALSE;
     if (stream->pending_error)
     {
@@ -2348,10 +2712,17 @@ static BOOL stream_valid(struct pipewire_stream *stream)
 static BOOL device_is_sink(const char *device)
 {
     struct pw_phys_device *dev;
+    BOOL found = FALSE;
+
+    pthread_mutex_lock(&device_cache_mutex);
     LIST_FOR_EACH_ENTRY(dev, &g_render_devices, struct pw_phys_device, entry)
         if (!strcmp(device, dev->pw_name))
-            return TRUE;
-    return FALSE;
+        {
+            found = TRUE;
+            break;
+        }
+    pthread_mutex_unlock(&device_cache_mutex);
+    return found;
 }
 
 /* Called with the loop lock held. */
@@ -2580,6 +2951,14 @@ static NTSTATUS pipewire_create_stream(void *args)
     hr = pipewire_stream_connect(stream, params->device, params->name);
     if (FAILED(hr))
         goto exit;
+    /* Connecting can release the loop lock. Catch a removal which was already
+     * reconciled before this stream could be added to g_streams. A later
+     * removal will see it in the list and invalidate it in the usual way. */
+    if (!stream_endpoint_present(stream))
+    {
+        hr = AUDCLNT_E_DEVICE_INVALIDATED;
+        goto exit;
+    }
 
     stream->rate_connected = stream->info.rate;
     stream->latency = (REFERENCE_TIME)(stream->period_bytes / stream->frame_size)
@@ -3827,10 +4206,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     pipewire_not_implemented,
     pipewire_not_implemented,
     pipewire_not_implemented,
-    unsupported_endpoint_notifications,
-    unsupported_endpoint_notifications,
-    unsupported_endpoint_notifications,
-    unsupported_endpoint_notifications,
+    pipewire_start_endpoint_notifications,
+    pipewire_wait_endpoint_changes,
+    pipewire_stop_endpoint_notifications,
+    pipewire_interrupt_endpoint_notifications,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -4219,6 +4598,7 @@ static NTSTATUS pipewire_wow64_test_connect(void *args)
     {
         PTR32 name;
         enum driver_priority priority;
+        BOOL endpoint_notifications;
     } *params32 = args;
     struct test_connect_params params =
     {
@@ -4226,6 +4606,7 @@ static NTSTATUS pipewire_wow64_test_connect(void *args)
     };
     pipewire_test_connect(&params);
     params32->priority = params.priority;
+    params32->endpoint_notifications = params.endpoint_notifications;
     return STATUS_SUCCESS;
 }
 
@@ -4325,10 +4706,10 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     pipewire_not_implemented,
     pipewire_not_implemented,
     pipewire_not_implemented,
-    unsupported_endpoint_notifications,
-    unsupported_endpoint_notifications,
-    unsupported_endpoint_notifications,
-    unsupported_endpoint_notifications,
+    pipewire_start_endpoint_notifications,
+    pipewire_wait_endpoint_changes,
+    pipewire_stop_endpoint_notifications,
+    pipewire_interrupt_endpoint_notifications,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
