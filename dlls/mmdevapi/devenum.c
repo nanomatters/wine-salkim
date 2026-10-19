@@ -573,7 +573,7 @@ static HRESULT set_get_driver_prop_value(GUID *id, const EDataFlow flow, const P
 
     if (FAILED(params.result)) {
         CoTaskMemFree(params.buffer);
-        PropVariantInit(&pv);
+        PropVariantInit(pv);
     } else {
         MMDevice_SetPropValue(id, flow, prop, pv);
     }

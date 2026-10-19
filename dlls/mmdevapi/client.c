@@ -124,7 +124,7 @@ static HRESULT get_periods(struct audio_client *client,
 
     wine_unix_call(get_device_period, &params);
 
-    if (def_period) *def_period = max(*def_period, min_def_period);
+    if (SUCCEEDED(params.result) && def_period) *def_period = max(*def_period, min_def_period);
 
     return params.result;
 }
