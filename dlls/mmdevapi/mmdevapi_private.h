@@ -110,6 +110,10 @@ typedef struct MMDevice {
     GUID devguid;
     WCHAR *drv_id;
 
+    PROPVARIANT device_path;
+    PROPVARIANT container_id;
+    BOOL pnp_present;
+
     struct list entry;
 } MMDevice;
 
