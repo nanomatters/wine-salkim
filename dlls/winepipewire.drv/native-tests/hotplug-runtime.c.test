@@ -1,0 +1,472 @@
+/* WASAPI hotplug integration probe; use only with the private test server.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#define COBJMACROS
+#define INITGUID
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <propsys.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <setupapi.h>
+#include <stdio.h>
+#include <wchar.h>
+
+static IMMDeviceEnumerator *enumerator;
+static LONG adds, removes, defaults, states, properties, failures;
+static LONG references = 1, queued_count;
+static IUnknown *queued[4096];
+static unsigned int drained;
+static IMMDevice *held_device;
+static WCHAR *held_id;
+static IMMDeviceCollection *held_collection;
+static IAudioClient *held_client;
+static IPropertyStore *held_store;
+
+static void check_at(BOOL success, unsigned int line, const char *expression)
+{
+    if (!success)
+    {
+        fprintf(stderr, "Failed check at line %u: %s\n", line, expression);
+        InterlockedIncrement(&failures);
+    }
+}
+#define check(condition) check_at((condition), __LINE__, #condition)
+
+static void queue_release(IUnknown *object)
+{
+    LONG slot = InterlockedIncrement(&queued_count) - 1;
+    if (slot < ARRAYSIZE(queued)) InterlockedExchangePointer((void **)&queued[slot], object);
+    else check(FALSE);
+}
+
+static void drain_references(void)
+{
+    IUnknown *object;
+    while (drained < ARRAYSIZE(queued) &&
+           (object = InterlockedCompareExchangePointer((void **)&queued[drained], NULL, NULL)))
+    {
+        IUnknown_Release(object);
+        ++drained;
+    }
+}
+
+static HRESULT WINAPI query_interface(IMMNotificationClient *iface, REFIID iid, void **object)
+{
+    if (!object) return E_POINTER;
+    *object = NULL;
+    if (!IsEqualIID(iid, &IID_IUnknown) && !IsEqualIID(iid, &IID_IMMNotificationClient)) return E_NOINTERFACE;
+    *object = iface;
+    IMMNotificationClient_AddRef(iface);
+    return S_OK;
+}
+
+static ULONG WINAPI add_ref(IMMNotificationClient *iface) { return InterlockedIncrement(&references); }
+static ULONG WINAPI release(IMMNotificationClient *iface) { return InterlockedDecrement(&references); }
+
+static void check_endpoint(const WCHAR *id)
+{
+    IMMDeviceCollection *collection;
+    IMMDevice *device;
+
+    /* Query back into MMDevAPI, but defer releasing final references to the
+     * main thread, as required by IMMNotificationClient's callback contract. */
+    if (SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(enumerator, eAll, DEVICE_STATEMASK_ALL, &collection)))
+        queue_release((IUnknown *)collection);
+    else check(FALSE);
+    if (SUCCEEDED(IMMDeviceEnumerator_GetDevice(enumerator, id, &device)))
+        queue_release((IUnknown *)device);
+    else check(FALSE);
+}
+
+static HRESULT WINAPI state_changed(IMMNotificationClient *iface, const WCHAR *id, DWORD state)
+{
+    check_endpoint(id);
+    InterlockedIncrement(&states);
+    return S_OK;
+}
+
+static HRESULT WINAPI device_added(IMMNotificationClient *iface, const WCHAR *id)
+{
+    check_endpoint(id);
+    InterlockedIncrement(&adds);
+    return S_OK;
+}
+
+static HRESULT WINAPI device_removed(IMMNotificationClient *iface, const WCHAR *id)
+{
+    check_endpoint(id);
+    InterlockedIncrement(&removes);
+    return S_OK;
+}
+
+static HRESULT WINAPI default_changed(IMMNotificationClient *iface, EDataFlow flow, ERole role, const WCHAR *id)
+{
+    if (id) check_endpoint(id);
+    InterlockedIncrement(&defaults);
+    return S_OK;
+}
+
+static HRESULT WINAPI property_changed(IMMNotificationClient *iface, const WCHAR *id, const PROPERTYKEY key)
+{
+    check_endpoint(id);
+    InterlockedIncrement(&properties);
+    return S_OK;
+}
+
+static IMMNotificationClientVtbl notification_vtable = {
+    query_interface, add_ref, release, state_changed, device_added, device_removed,
+    default_changed, property_changed,
+};
+static IMMNotificationClient notification = {&notification_vtable};
+
+static UINT device_count(EDataFlow flow)
+{
+    IMMDeviceCollection *collection = NULL;
+    UINT count = 0;
+    check(SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(enumerator, flow, DEVICE_STATE_ACTIVE, &collection)));
+    if (collection)
+    {
+        check(SUCCEEDED(IMMDeviceCollection_GetCount(collection, &count)));
+        IMMDeviceCollection_Release(collection);
+    }
+    return count;
+}
+
+static void hold_new_endpoint(void)
+{
+    IMMDeviceCollection *collection;
+    IMMDevice *device;
+    IPropertyStore *store;
+    PROPVARIANT value;
+    UINT count, i;
+
+    check(!held_device);
+    if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(enumerator, eRender, DEVICE_STATE_ACTIVE, &collection)))
+        { check(FALSE); return; }
+    IMMDeviceCollection_GetCount(collection, &count);
+    for (i = 0; i < count; ++i)
+    {
+        if (FAILED(IMMDeviceCollection_Item(collection, i, &device))) continue;
+        if (SUCCEEDED(IMMDevice_OpenPropertyStore(device, STGM_READ, &store)))
+        {
+            PropVariantInit(&value);
+            if (SUCCEEDED(IPropertyStore_GetValue(store, &PKEY_Device_FriendlyName, &value)) &&
+                value.vt == VT_LPWSTR && wcsstr(value.pwszVal, L"HotplugNew"))
+            {
+                held_device = device;
+                check(SUCCEEDED(IMMDevice_GetId(device, &held_id)));
+            }
+            PropVariantClear(&value);
+            IPropertyStore_Release(store);
+        }
+        if (device != held_device) IMMDevice_Release(device);
+    }
+    held_collection = collection;
+    check(held_device != NULL);
+}
+
+static void override_default(BOOL enable)
+{
+    static const WCHAR *names[] = {L"DefaultOutput", L"DefaultVoiceOutput"};
+    HKEY key;
+    unsigned int i;
+
+    check(!RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\Drivers\\winepipewire.drv", &key));
+    for (i = 0; i < ARRAYSIZE(names); ++i)
+    {
+        if (enable)
+            check(!RegSetValueExW(key, names[i], 0, REG_SZ, (BYTE *)held_id,
+                                 (wcslen(held_id) + 1) * sizeof(WCHAR)));
+        else check(!RegDeleteValueW(key, names[i]));
+    }
+    RegCloseKey(key);
+}
+
+static void print_endpoint_id(const char *name)
+{
+    IMMDeviceCollection *collection;
+    IMMDevice *device;
+    IPropertyStore *store;
+    PROPVARIANT value;
+    WCHAR description[128], *id;
+    char text[256] = "-";
+    UINT count = 0, i, found = 0;
+
+    check(MultiByteToWideChar(CP_UTF8, 0, name, -1, description, ARRAYSIZE(description)) != 0);
+    if (SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(enumerator, eRender, DEVICE_STATE_ACTIVE, &collection)))
+    {
+        check(SUCCEEDED(IMMDeviceCollection_GetCount(collection, &count)));
+        for (i = 0; i < count; ++i)
+        {
+            if (FAILED(IMMDeviceCollection_Item(collection, i, &device))) { check(FALSE); continue; }
+            if (SUCCEEDED(IMMDevice_OpenPropertyStore(device, STGM_READ, &store)))
+            {
+                PropVariantInit(&value);
+                if (SUCCEEDED(IPropertyStore_GetValue(store, &PKEY_Device_FriendlyName, &value)) &&
+                    value.vt == VT_LPWSTR && wcsstr(value.pwszVal, description))
+                {
+                    ++found;
+                    if (SUCCEEDED(IMMDevice_GetId(device, &id)))
+                    {
+                        check(WideCharToMultiByte(CP_UTF8, 0, id, -1, text, sizeof(text), NULL, NULL) != 0);
+                        CoTaskMemFree(id);
+                    }
+                    else check(FALSE);
+                }
+                PropVariantClear(&value);
+                IPropertyStore_Release(store);
+            }
+            IMMDevice_Release(device);
+        }
+        IMMDeviceCollection_Release(collection);
+    }
+    else check(FALSE);
+    printf("ID %u %s %ld\n", found, text, failures);
+}
+
+static void check_pnp_present(const WCHAR *id)
+{
+    static const GUID render_interface = {0xe6327cad,0xdcec,0x4949,{0xae,0x8a,0x99,0x1e,0x97,0x6a,0x79,0xd2}};
+    SP_DEVICE_INTERFACE_DATA iface = {.cbSize = sizeof(iface)};
+    SP_DEVINFO_DATA device = {.cbSize = sizeof(device)};
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail;
+    WCHAR expected[256], instance[256];
+    DWORD index, size, present = 0, active = 0;
+    HDEVINFO set;
+
+    check(id != NULL);
+    if (!id) { printf("PNP 0 0 %ld\n", failures); return; }
+    swprintf(expected, ARRAYSIZE(expected), L"SWD\\MMDEVAPI\\%ls", id);
+    set = SetupDiGetClassDevsW(&render_interface, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    check(set != INVALID_HANDLE_VALUE);
+    if (set != INVALID_HANDLE_VALUE)
+    {
+        for (index = 0; SetupDiEnumDeviceInterfaces(set, NULL, &render_interface, index, &iface); ++index)
+        {
+            size = 0;
+            SetupDiGetDeviceInterfaceDetailW(set, &iface, NULL, 0, &size, NULL);
+            if (size < sizeof(*detail)) { check(FALSE); continue; }
+            if (!(detail = HeapAlloc(GetProcessHeap(), 0, size))) { check(FALSE); continue; }
+            detail->cbSize = sizeof(*detail);
+            if (SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, size, NULL, &device) &&
+                SetupDiGetDeviceInstanceIdW(set, &device, instance, ARRAYSIZE(instance), NULL))
+            {
+                if (!wcsicmp(instance, expected))
+                {
+                    ++present;
+                    if (iface.Flags & SPINT_ACTIVE) ++active;
+                }
+            }
+            else check(FALSE);
+            HeapFree(GetProcessHeap(), 0, detail);
+        }
+        check(GetLastError() == ERROR_NO_MORE_ITEMS);
+        SetupDiDestroyDeviceInfoList(set);
+    }
+    printf("PNP %lu %lu %ld\n", present, active, failures);
+}
+
+static void release_enumerator(void)
+{
+    ULONGLONG deadline = GetTickCount64() + 10000;
+
+    check(SUCCEEDED(IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(enumerator, &notification)));
+    /* Unregister excludes future snapshots but an already retained callback
+     * batch may finish afterwards. Keep its enumerator alive until the
+     * snapshot's reference to our client has been released. */
+    while (InterlockedCompareExchange(&references, 0, 0) != 1 && GetTickCount64() < deadline) Sleep(1);
+    if (InterlockedCompareExchange(&references, 0, 0) != 1)
+    {
+        fputs("Notification callbacks did not finish after unregister.\n", stderr);
+        ExitProcess(20);
+    }
+    drain_references();
+    check(drained == InterlockedCompareExchange(&queued_count, 0, 0));
+    IMMDeviceEnumerator_Release(enumerator);
+    enumerator = NULL;
+}
+
+static void check_retained(void)
+{
+    WAVEFORMATEX *format = NULL;
+    PROPVARIANT value;
+    DWORD state = 0;
+    HRESULT hr = E_FAIL;
+
+    check(held_device && held_client && held_store);
+    if (held_device) check(SUCCEEDED(IMMDevice_GetState(held_device, &state)));
+    if (held_client)
+    {
+        hr = IAudioClient_GetMixFormat(held_client, &format);
+        check(hr == S_OK || hr == AUDCLNT_E_DEVICE_INVALIDATED);
+        CoTaskMemFree(format);
+    }
+    if (held_store)
+    {
+        PropVariantInit(&value);
+        check(SUCCEEDED(IPropertyStore_GetValue(held_store, &PKEY_Device_FriendlyName, &value)));
+        check(value.vt == VT_LPWSTR);
+        PropVariantClear(&value);
+    }
+    printf("RETAINED %lu %#lx %ld\n", state, (unsigned long)hr, failures);
+}
+
+static int exit_thread_probe(BOOL register_notifications)
+{
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 10;
+    if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                               &IID_IMMDeviceEnumerator, (void **)&enumerator))) return 11;
+    if (register_notifications)
+    {
+        if (FAILED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(enumerator, &notification))) return 12;
+        release_enumerator();
+    }
+    else IMMDeviceEnumerator_Release(enumerator);
+    CoUninitialize();
+    printf("EXIT_THREAD %ld\n", failures);
+    ExitThread(failures ? 1 : 0);
+    return 13;
+}
+
+int main(int argc, char **argv)
+{
+    HRESULT (WINAPI *get_class_object)(REFCLSID, REFIID, void **);
+    IClassFactory *factory;
+    HMODULE module;
+    char command[256];
+    HRESULT hr;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && !strcmp(argv[1], "exitthread")) return exit_thread_probe(FALSE);
+    if (argc == 2 && !strcmp(argv[1], "exitthread-notify")) return exit_thread_probe(TRUE);
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 1;
+    module = LoadLibraryA("mmdevapi.dll");
+    if (!module || !(get_class_object = (void *)GetProcAddress(module, "DllGetClassObject"))) return 2;
+    hr = get_class_object(&CLSID_MMDeviceEnumerator, &IID_IClassFactory, (void **)&factory);
+    if (FAILED(hr)) return 3;
+    hr = IClassFactory_CreateInstance(factory, NULL, &IID_IMMDeviceEnumerator, (void **)&enumerator);
+    IClassFactory_Release(factory);
+    if (FAILED(hr)) return 4;
+    check(SUCCEEDED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(enumerator, &notification)));
+    puts("READY");
+    while (fgets(command, sizeof(command), stdin))
+    {
+        drain_references();
+        if (!strncmp(command, "snapshot", 8))
+            printf("SNAPSHOT %u %u %ld %ld %ld %ld %ld %ld\n", device_count(eRender), device_count(eCapture),
+                   adds, removes, defaults, states, properties, failures);
+        else if (!strncmp(command, "id ", 3))
+        {
+            command[strcspn(command, "\r\n")] = 0;
+            print_endpoint_id(command + 3);
+        }
+        else if (!strncmp(command, "pnp ", 4))
+        {
+            WCHAR id[256];
+            command[strcspn(command, "\r\n")] = 0;
+            check(MultiByteToWideChar(CP_UTF8, 0, command + 4, -1, id, ARRAYSIZE(id)) != 0);
+            check_pnp_present(id);
+        }
+        else if (!strncmp(command, "pnp", 3)) check_pnp_present(held_id);
+        else if (!strncmp(command, "pause-enumerator", 16))
+        {
+            check(held_device && !held_client && !held_store);
+            if (held_device)
+            {
+                check(SUCCEEDED(IMMDevice_Activate(held_device, &IID_IAudioClient, CLSCTX_INPROC_SERVER,
+                                                   NULL, (void **)&held_client)));
+                check(SUCCEEDED(IMMDevice_OpenPropertyStore(held_device, STGM_READ, &held_store)));
+            }
+            if (held_collection) IMMDeviceCollection_Release(held_collection);
+            held_collection = NULL;
+            release_enumerator();
+            printf("PAUSED %ld\n", failures);
+        }
+        else if (!strncmp(command, "retained", 8)) check_retained();
+        else if (!strncmp(command, "stop-enumerator", 15))
+        {
+            if (held_client) IAudioClient_Release(held_client);
+            if (held_store) IPropertyStore_Release(held_store);
+            if (held_device) IMMDevice_Release(held_device);
+            if (held_collection) IMMDeviceCollection_Release(held_collection);
+            held_client = NULL;
+            held_store = NULL;
+            held_device = NULL;
+            held_collection = NULL;
+            release_enumerator();
+            printf("STOPPED %ld\n", failures);
+        }
+        else if (!strncmp(command, "resume-enumerator", 17))
+        {
+            check(!enumerator);
+            check(SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                              &IID_IMMDeviceEnumerator, (void **)&enumerator)));
+            if (enumerator)
+                check(SUCCEEDED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(enumerator, &notification)));
+            printf("RESUMED %ld\n", failures);
+        }
+        else if (!strncmp(command, "hold", 4))
+        {
+            hold_new_endpoint();
+            printf("HOLD %ld\n", failures);
+        }
+        else if (!strncmp(command, "state", 5))
+        {
+            IMMDevice *device = NULL;
+            IAudioClient *client = NULL;
+            WAVEFORMATEX *format = NULL;
+            UINT count = 0;
+            DWORD state = 0;
+            check(held_device != NULL);
+            if (held_device) check(SUCCEEDED(IMMDevice_GetState(held_device, &state)));
+            if (held_id) IMMDeviceEnumerator_GetDevice(enumerator, held_id, &device);
+            if (held_collection) IMMDeviceCollection_GetCount(held_collection, &count);
+            if (held_device)
+            {
+                check(SUCCEEDED(IMMDevice_Activate(held_device, &IID_IAudioClient, CLSCTX_INPROC_SERVER,
+                                                   NULL, (void **)&client)));
+                if (client)
+                {
+                    check(IAudioClient_GetMixFormat(client, &format) ==
+                          (state == DEVICE_STATE_ACTIVE ? S_OK : AUDCLNT_E_DEVICE_INVALIDATED));
+                    CoTaskMemFree(format);
+                    IAudioClient_Release(client);
+                }
+            }
+            printf("STATE %lu %u %u %ld\n", state, device == held_device, count, failures);
+            if (device) IMMDevice_Release(device);
+        }
+        else if (!strncmp(command, "override", 8))
+        {
+            override_default(TRUE);
+            printf("OVERRIDE %ld\n", failures);
+        }
+        else if (!strncmp(command, "clear", 5))
+        {
+            override_default(FALSE);
+            printf("CLEAR %ld\n", failures);
+        }
+        else if (!strncmp(command, "selected", 8))
+        {
+            IMMDevice *device = NULL;
+            check(SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender,
+                                                                       eConsole, &device)));
+            printf("SELECTED %u %ld\n", device == held_device, failures);
+            if (device) IMMDevice_Release(device);
+        }
+        else if (!strncmp(command, "quit", 4)) break;
+        else check(FALSE);
+    }
+    if (enumerator) release_enumerator();
+    if (held_client) IAudioClient_Release(held_client);
+    if (held_store) IPropertyStore_Release(held_store);
+    if (held_device) IMMDevice_Release(held_device);
+    if (held_collection) IMMDeviceCollection_Release(held_collection);
+    CoTaskMemFree(held_id);
+    CoUninitialize();
+    printf("DONE %ld\n", failures);
+    return failures ? 1 : 0;
+}
