@@ -1,0 +1,421 @@
+/* Native tests for endpoint identity updates and PnP removal.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+#include <assert.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+
+typedef int BOOL, HRESULT;
+typedef int LONG;
+typedef unsigned int EDataFlow;
+typedef unsigned int DWORD;
+typedef unsigned char BYTE;
+typedef wchar_t WCHAR;
+typedef WCHAR *LPWSTR;
+typedef void *HDEVINFO, *HKEY, *HANDLE;
+typedef struct { uint32_t Data1; uint16_t Data2, Data3; unsigned char Data4[8]; } GUID;
+typedef struct { int vt; WCHAR *pwszVal; GUID *puuid; unsigned int ulVal; } PROPVARIANT;
+typedef struct { unsigned int cbSize, index; GUID ClassGuid; } SP_DEVINFO_DATA;
+typedef struct { GUID fmtid; unsigned int pid; } PROPERTYKEY;
+struct list { struct list *next, *prev; };
+typedef struct
+{
+    struct { const void *lpVtbl; } IMMDevice_iface, IMMEndpoint_iface;
+    GUID devguid;
+    unsigned int flow;
+    DWORD state;
+    WCHAR *drv_id;
+    struct list entry;
+    PROPVARIANT device_path, container_id;
+    BOOL pnp_present;
+} MMDevice;
+
+#define TRUE 1
+#define FALSE 0
+#define S_OK 0
+#define E_OUTOFMEMORY (-1)
+#define E_FAIL (-2)
+#define FAILED(hr) ((hr) < 0)
+#define SUCCEEDED(hr) ((hr) >= 0)
+#define VT_EMPTY 0
+#define VT_UI4 19
+#define VT_LPWSTR 31
+#define VT_CLSID 72
+#define DEVICE_ID_LEN 69
+#define FRIENDLY_NAME_MAX 200
+#define eRender 0
+#define eCapture 1
+#define DEVICE_STATE_ACTIVE 1
+#define DEVICE_STATE_NOTPRESENT 4
+#define Speakers 1
+#define Microphone 4
+#define KEY_WRITE 1
+#define KEY_READ 2
+#define KEY_WOW64_64KEY 4
+#define KEY_SET_VALUE 8
+#define ERROR_SUCCESS 0
+#define REG_DWORD 4
+#define WARN(...) ((void)0)
+#define WriteRelease(ptr, value) (*(ptr) = (value))
+#define ENDPOINT_IDENTITY_PATH 1
+#define ENDPOINT_IDENTITY_CONTAINER 2
+#define ERROR_NO_SUCH_DEVINST 1
+#define ERROR_ACCESS_DENIED 2
+#define INVALID_HANDLE_VALUE ((void *)(intptr_t)-1)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define IsEqualGUID(a, b) (!memcmp(a, b, sizeof(GUID)))
+
+static const PROPERTYKEY devicepath_key = {.pid = 1}, DEVPKEY_Device_ContainerId = {.pid = 2};
+static const PROPERTYKEY DEVPKEY_Device_FriendlyName = {.pid = 3}, DEVPKEY_DeviceInterface_FriendlyName = {.pid = 4};
+static const PROPERTYKEY DEVPKEY_Device_DeviceDesc = {.pid = 5}, DEVPKEY_Device_Driver = {.pid = 6};
+static const PROPERTYKEY PKEY_AudioEndpoint_FormFactor = {.pid = 7}, PKEY_AudioEndpoint_PhysicalSpeakers = {.pid = 8};
+static const GUID AudioEndpoint_ClassGUID = {.Data1 = 1}, MEDIA_ClassGUID = {.Data1 = 2};
+static const GUID GUID_NULL;
+static const WCHAR root_path[] = L"{1}.ROOT\\MEDIA\\test";
+static const WCHAR usb_path[] = L"{1}.USB\\VID_054C&PID_0CE6\\test";
+static const WCHAR *driver_path;
+static GUID driver_container;
+static unsigned int queries, fail_query, allocations;
+static WCHAR opened[2][128], removed[2][128];
+static unsigned int open_count, remove_count, destroy_count, fail_open, fail_remove;
+static DWORD open_error;
+static BOOL fail_create, wrong_class;
+static struct list device_list = {&device_list, &device_list};
+static MMDevice *MMDevice_def_play, *MMDevice_def_rec;
+static int MMDeviceVtbl, MMEndpointVtbl, device_lock, device_lock_depth, registration_depth;
+static unsigned int registry_opens, registry_closes, registrations, prop_writes;
+static unsigned int fail_prop_write;
+static BOOL fail_registry, fail_registration, fail_state_write;
+static const WCHAR *saved_owner;
+static HKEY key_render = (void *)10, key_capture = (void *)11;
+static struct { BOOL endpoint_notifications; WCHAR module_name[64]; } drvs = {TRUE, L"winepipewire.drv"};
+
+#define LIST_FOR_EACH_ENTRY(pos, head, type, field) \
+    for (struct list *_entry = (head)->next; _entry != (head) && \
+         ((pos) = (type *)((char *)_entry - offsetof(type, field)), 1); _entry = _entry->next)
+
+static void list_add_tail(struct list *head, struct list *entry)
+{
+    entry->prev = head->prev; entry->next = head; head->prev->next = entry; head->prev = entry;
+}
+static void EnterCriticalSection(int *lock) { assert(!device_lock_depth++); }
+static void LeaveCriticalSection(int *lock) { assert(device_lock_depth-- == 1); }
+static HANDLE lock_endpoint_registration(void) { assert(!registration_depth++); return (void *)1; }
+static void unlock_endpoint_registration(HANDLE mutex) { assert(registration_depth-- == 1); }
+static void PropVariantInit(PROPVARIANT *value) { memset(value, 0, sizeof(*value)); }
+static int wcsicmp(const WCHAR *a, const WCHAR *b) { return wcscasecmp(a, b); }
+
+static HRESULT get_driver_prop_value(GUID *guid, const PROPERTYKEY *key, PROPVARIANT *value)
+{
+    if (++queries == fail_query) return E_OUTOFMEMORY;
+    if (key->pid == devicepath_key.pid)
+    {
+        value->vt = VT_LPWSTR;
+        value->pwszVal = wcsdup(driver_path);
+        assert(value->pwszVal);
+    }
+    else
+    {
+        assert(key->pid == DEVPKEY_Device_ContainerId.pid);
+        value->vt = VT_CLSID;
+        value->puuid = malloc(sizeof(*value->puuid));
+        assert(value->puuid);
+        *value->puuid = driver_container;
+    }
+    allocations++;
+    return S_OK;
+}
+
+static void PropVariantClear(PROPVARIANT *value)
+{
+    if (value->vt == VT_LPWSTR) { free(value->pwszVal); allocations--; }
+    if (value->vt == VT_CLSID) { free(value->puuid); allocations--; }
+    memset(value, 0, sizeof(*value));
+}
+
+static HRESULT MMDevice_GetPropValue(GUID *id, EDataFlow flow, const PROPERTYKEY *key, PROPVARIANT *value)
+{
+    if (key->pid == DEVPKEY_Device_Driver.pid && saved_owner)
+    {
+        value->vt = VT_LPWSTR;
+        value->pwszVal = wcsdup(saved_owner);
+        assert(value->pwszVal);
+        allocations++;
+        return S_OK;
+    }
+    return E_FAIL;
+}
+static HRESULT MMDevice_SetPropValue(GUID *id, EDataFlow flow, const PROPERTYKEY *key, PROPVARIANT *value)
+{
+    return ++prop_writes == fail_prop_write ? E_FAIL : S_OK;
+}
+static HRESULT set_get_driver_prop_value(GUID *id, EDataFlow flow, const PROPERTYKEY *key, PROPVARIANT *value)
+{
+    HRESULT hr = get_driver_prop_value(id, key, value);
+    return FAILED(hr) ? hr : MMDevice_SetPropValue(id, flow, key, value);
+}
+static HRESULT set_driver_prop_value(GUID *id, EDataFlow flow, const PROPERTYKEY *key) { return S_OK; }
+static const WCHAR *find_product_name_override(const WCHAR *path) { return NULL; }
+static BOOL MMDevice_Register(const WCHAR *guid, const WCHAR *name, const WCHAR *iname,
+                               const WCHAR *path, const GUID *container, EDataFlow flow)
+{
+    registrations++;
+    return !fail_registration;
+}
+static LONG RegCreateKeyExW(HKEY root, const WCHAR *name, int reserved, void *class, DWORD options,
+                             DWORD access, void *security, HKEY *key, void *disposition)
+{
+    if (fail_registry) return ERROR_ACCESS_DENIED;
+    registry_opens++;
+    *key = (void *)1;
+    return ERROR_SUCCESS;
+}
+static LONG RegSetValueExW(HKEY key, const WCHAR *name, int reserved, DWORD type, const BYTE *value, DWORD size)
+{
+    return fail_state_write ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+}
+static LONG RegOpenKeyExW(HKEY root, const WCHAR *name, DWORD reserved, DWORD access, HKEY *key)
+{
+    if (fail_registry) return ERROR_ACCESS_DENIED;
+    registry_opens++;
+    *key = (void *)1;
+    return ERROR_SUCCESS;
+}
+static void RegCloseKey(HKEY key) { registry_closes++; }
+
+static HDEVINFO SetupDiCreateDeviceInfoList(void *class, void *window)
+{
+    return fail_create ? INVALID_HANDLE_VALUE : (void *)1;
+}
+
+static BOOL SetupDiOpenDeviceInfoW(HDEVINFO set, const WCHAR *name, void *window,
+                                   DWORD flags, SP_DEVINFO_DATA *data)
+{
+    assert(open_count < ARRAY_SIZE(opened));
+    data->index = open_count;
+    data->ClassGuid = !wcsncmp(name, L"SWD\\MMDEVAPI\\", 13) ? AudioEndpoint_ClassGUID : MEDIA_ClassGUID;
+    if (wrong_class) data->ClassGuid.Data1 = 3;
+    wcscpy(opened[open_count++], name);
+    return open_count != fail_open;
+}
+
+static DWORD GetLastError(void) { return open_error; }
+
+static BOOL SetupDiRemoveDevice(HDEVINFO set, SP_DEVINFO_DATA *data)
+{
+    assert(remove_count < ARRAY_SIZE(removed));
+    wcscpy(removed[remove_count++], opened[data->index]);
+    return remove_count != fail_remove;
+}
+
+static void SetupDiDestroyDeviceInfoList(HDEVINFO set) { destroy_count++; }
+
+static void StringFromGUID2(const GUID *guid, WCHAR *buffer, unsigned int count)
+{
+    wcscpy(buffer, L"{12345678-0000-0000-0000-000000000000}");
+}
+
+/* Wine's WCHAR printf family interprets %s as a wide string. */
+static int test_swprintf(WCHAR *buffer, size_t count, const WCHAR *format, ...)
+{
+    va_list args;
+    int ret;
+
+    va_start(args, format);
+    if (!wcsncmp(format, L"SWD\\", 4))
+    {
+        unsigned int flow = va_arg(args, unsigned int);
+        const WCHAR *guid = va_arg(args, const WCHAR *);
+        ret = swprintf(buffer, count, L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%ls", flow, guid);
+    }
+    else ret = vswprintf(buffer, count, format, args);
+    va_end(args);
+    return ret;
+}
+#define swprintf test_swprintf
+/* PRODUCTION_FUNCTIONS */
+#undef swprintf
+
+static void test_identity(void)
+{
+    GUID old_container = {0};
+    MMDevice device = {.device_path = {VT_LPWSTR, (WCHAR *)root_path},
+                       .container_id = {.vt = VT_CLSID, .puuid = &old_container}};
+    unsigned int changes;
+
+    driver_path = root_path;
+    assert(get_endpoint_identity_changes(&device, &changes) == S_OK && !changes);
+    assert(!allocations);
+
+    /* USB Device metadata can arrive after its Node, without a name change. */
+    driver_path = usb_path;
+    driver_container.Data1 = 0x0ce6054c;
+    assert(get_endpoint_identity_changes(&device, &changes) == S_OK);
+    assert(changes == (ENDPOINT_IDENTITY_PATH | ENDPOINT_IDENTITY_CONTAINER));
+    assert(!allocations);
+    device.device_path.pwszVal = (WCHAR *)usb_path;
+    old_container = driver_container;
+    assert(get_endpoint_identity_changes(&device, &changes) == S_OK && !changes);
+
+    /* Audio and HID must use the new container after the USB parent changes. */
+    driver_container.Data3++;
+    assert(get_endpoint_identity_changes(&device, &changes) == S_OK);
+    assert(changes == ENDPOINT_IDENTITY_CONTAINER);
+    assert(!allocations);
+
+    queries = 0;
+    fail_query = 1;
+    assert(get_endpoint_identity_changes(&device, &changes) == E_OUTOFMEMORY && !changes);
+    assert(!allocations && old_container.Data3 == 0);
+    queries = 0;
+    fail_query = 2;
+    assert(get_endpoint_identity_changes(&device, &changes) == E_OUTOFMEMORY && !changes);
+    assert(!allocations && old_container.Data3 == 0);
+    fail_query = 0;
+}
+
+static void reset_removal(void)
+{
+    open_count = remove_count = destroy_count = fail_open = fail_remove = 0;
+    fail_create = FALSE;
+    wrong_class = FALSE;
+    open_error = ERROR_NO_SUCH_DEVINST;
+}
+
+static void test_removal(void)
+{
+    MMDevice device = {.flow = 0, .device_path = {VT_LPWSTR, (WCHAR *)usb_path}};
+
+    reset_removal();
+    assert(MMDevice_Unregister(&device, TRUE));
+    assert(open_count == 2 && remove_count == 2 && destroy_count == 1);
+    assert(!wcscmp(removed[0], L"SWD\\MMDEVAPI\\{0.0.0.00000000}.{12345678-0000-0000-0000-000000000000}"));
+    assert(!wcscmp(removed[1], usb_path + 4));
+
+    reset_removal();
+    assert(MMDevice_Unregister(&device, FALSE));
+    assert(open_count == 1 && remove_count == 1 && destroy_count == 1);
+    assert(!wcscmp(removed[0], usb_path + 4));
+
+    reset_removal();
+    device.device_path.pwszVal = (WCHAR *)root_path;
+    assert(MMDevice_Unregister(&device, TRUE));
+    assert(open_count == 1 && remove_count == 1 && destroy_count == 1);
+
+    /* Another process may already have retired the same registration. */
+    reset_removal();
+    fail_open = 1;
+    assert(MMDevice_Unregister(&device, TRUE));
+    assert(!remove_count && destroy_count == 1);
+    reset_removal();
+    fail_open = 1;
+    open_error = ERROR_ACCESS_DENIED;
+    assert(!MMDevice_Unregister(&device, TRUE));
+    assert(!remove_count && destroy_count == 1);
+    reset_removal();
+    fail_remove = 1;
+    assert(!MMDevice_Unregister(&device, TRUE));
+    assert(remove_count == 1 && destroy_count == 1);
+    reset_removal();
+    fail_create = TRUE;
+    assert(!MMDevice_Unregister(&device, TRUE));
+    assert(!open_count && !destroy_count);
+    reset_removal();
+    wrong_class = TRUE;
+    assert(MMDevice_Unregister(&device, TRUE));
+    assert(open_count == 1 && !remove_count && destroy_count == 1);
+}
+
+static void destroy_device(MMDevice *device)
+{
+    device->entry.prev->next = device->entry.next;
+    device->entry.next->prev = device->entry.prev;
+    PropVariantClear(&device->device_path);
+    PropVariantClear(&device->container_id);
+    free(device->drv_id);
+    free(device);
+    assert(!device_lock_depth && !registration_depth && !allocations);
+    assert(registry_opens == registry_closes);
+}
+
+static void test_publication(void)
+{
+    GUID id = {.Data1 = 1234};
+    MMDevice *device;
+    WCHAR *old_display, *old_path;
+
+    driver_path = root_path;
+    reset_removal();
+    fail_registry = TRUE;
+    assert(!MMDevice_Create(L"initial", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device_list.next == &device_list && !allocations && !registration_depth);
+    fail_registry = FALSE;
+    fail_prop_write = prop_writes + 1;
+    assert(!MMDevice_Create(L"initial", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device_list.next == &device_list && !allocations && !registration_depth);
+    fail_prop_write = 0;
+    fail_registration = TRUE;
+    assert(!MMDevice_Create(L"initial", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device_list.next == &device_list && !allocations && !registration_depth);
+    fail_registration = FALSE;
+    fail_state_write = TRUE;
+    assert(!MMDevice_Create(L"initial", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device_list.next == &device_list && !allocations && !registration_depth);
+    fail_state_write = FALSE;
+
+    device = MMDevice_Create(L"initial", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE);
+    assert(device && device_list.next == &device->entry && device->pnp_present);
+    assert(device->state == DEVICE_STATE_ACTIVE && !wcscmp(device->drv_id, L"initial"));
+    old_display = device->drv_id;
+    old_path = device->device_path.pwszVal;
+    fail_registration = TRUE;
+    assert(!MMDevice_Create(L"renamed", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device->drv_id == old_display && device->device_path.pwszVal == old_path);
+    assert(!device->pnp_present && device->state == DEVICE_STATE_ACTIVE && allocations == 2);
+    device->state = DEVICE_STATE_NOTPRESENT;
+    assert(!MMDevice_Create(L"renamed", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device->state == DEVICE_STATE_NOTPRESENT && device->drv_id == old_display);
+    fail_registration = FALSE;
+    fail_query = queries + 1;
+    assert(!MMDevice_Create(L"renamed", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE));
+    assert(device->state == DEVICE_STATE_NOTPRESENT && device->device_path.pwszVal == old_path);
+    fail_query = 0;
+    assert(MMDevice_Create(L"renamed", &id, eRender, DEVICE_STATE_ACTIVE, FALSE, TRUE) == device);
+    assert(device->pnp_present && device->state == DEVICE_STATE_ACTIVE);
+    assert(!wcscmp(device->drv_id, L"renamed"));
+    reset_removal();
+    fail_state_write = TRUE;
+    assert(!set_endpoint_state(device, DEVICE_STATE_NOTPRESENT));
+    assert(device->state == DEVICE_STATE_ACTIVE && !device->pnp_present);
+    fail_state_write = FALSE;
+    assert(set_endpoint_state(device, DEVICE_STATE_NOTPRESENT));
+    assert(device->state == DEVICE_STATE_NOTPRESENT && !device->pnp_present);
+    destroy_device(device);
+
+    /* Loading another backend's absent records must not claim its PnP nodes. */
+    registrations = prop_writes = 0;
+    saved_owner = L"winepulse.drv";
+    device = MMDevice_Create(L"remembered", &id, eRender, DEVICE_STATE_NOTPRESENT, FALSE, FALSE);
+    assert(device && !device->pnp_present && !registrations && !prop_writes);
+    destroy_device(device);
+    saved_owner = L"winepipewire.drv";
+    device = MMDevice_Create(L"remembered", &id, eRender, DEVICE_STATE_NOTPRESENT, FALSE, FALSE);
+    assert(device && device->pnp_present && !registrations && !prop_writes);
+    destroy_device(device);
+    saved_owner = NULL;
+}
+
+int main(void)
+{
+    test_identity();
+    test_removal();
+    test_publication();
+    puts("endpoint identity and PnP removal tests passed");
+    return 0;
+}

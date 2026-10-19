@@ -80,6 +80,8 @@ static const IPropertyStoreVtbl MMDevPropVtbl;
 static const IMMEndpointVtbl MMEndpointVtbl;
 
 static MMDevEnumImpl enumerator;
+static void endpoint_notifications_addref(void);
+static void endpoint_notifications_release(void);
 static struct list device_list = LIST_INIT(device_list);
 static CRITICAL_SECTION device_lock;
 static CRITICAL_SECTION_DEBUG device_lock_debug =
@@ -728,6 +730,39 @@ static BOOL MMDevice_Unregister(MMDevice *device, BOOL endpoint)
     return ret;
 }
 
+static BOOL endpoint_registration_exists(const WCHAR *name, const GUID *class)
+{
+    WCHAR actual[39], expected[39];
+    DWORD size = sizeof(actual);
+    HKEY root, key;
+    BOOL exists = FALSE;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Enum", 0, KEY_READ, &root))
+        return FALSE;
+    if (!RegOpenKeyExW(root, name, 0, KEY_READ, &key))
+    {
+        StringFromGUID2(class, expected, ARRAY_SIZE(expected));
+        exists = !RegGetValueW(key, NULL, L"ClassGUID", RRF_RT_REG_SZ, NULL, actual, &size) &&
+                 !wcsicmp(actual, expected);
+        RegCloseKey(key);
+    }
+    RegCloseKey(root);
+    return exists;
+}
+
+static BOOL MMDevice_IsRegistered(MMDevice *device)
+{
+    WCHAR name[DEVICE_ID_LEN], guid[39];
+    const WCHAR *path;
+
+    StringFromGUID2(&device->devguid, guid, ARRAY_SIZE(guid));
+    swprintf(name, ARRAY_SIZE(name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", device->flow, guid);
+    if (!endpoint_registration_exists(name, &AudioEndpoint_ClassGUID)) return FALSE;
+    if (device->device_path.vt == VT_LPWSTR && (path = wcsstr(device->device_path.pwszVal, L"USB\\VID_")))
+        return endpoint_registration_exists(path, &MEDIA_ClassGUID);
+    return TRUE;
+}
+
 /* Create fake entries for an AudioEndpoint driver even though we are not actually one. */
 /* Fix DualSense Wireless Controller haptic detection for some. */
 /* This is way less code than even a skeleton pnp driver, not to mention the difficulty of setting friendly name */
@@ -1346,6 +1381,7 @@ static ULONG WINAPI MMDevice_AddRef(IMMDevice *iface)
     LONG ref;
 
     ref = InterlockedIncrement(&This->ref);
+    endpoint_notifications_addref();
     TRACE("Refcount now %li\n", ref);
     return ref;
 }
@@ -1356,6 +1392,7 @@ static ULONG WINAPI MMDevice_Release(IMMDevice *iface)
     LONG ref;
 
     ref = InterlockedDecrement(&This->ref);
+    endpoint_notifications_release();
     TRACE("Refcount now %li\n", ref);
     return ref;
 }
@@ -1685,7 +1722,10 @@ static const IMMDeviceCollectionVtbl MMDevColVtbl =
 
 HRESULT MMDevEnum_Create(REFIID riid, void **ppv)
 {
-    return IMMDeviceEnumerator_QueryInterface(&enumerator.IMMDeviceEnumerator_iface, riid, ppv);
+    HRESULT hr = IMMDeviceEnumerator_QueryInterface(&enumerator.IMMDeviceEnumerator_iface, riid, ppv);
+
+    if (SUCCEEDED(hr)) MMDevEnum_StartEndpointNotifications();
+    return hr;
 }
 
 void MMDevEnum_Free(void)
@@ -1723,6 +1763,7 @@ static ULONG WINAPI MMDevEnum_AddRef(IMMDeviceEnumerator *iface)
 {
     MMDevEnumImpl *This = impl_from_IMMDeviceEnumerator(iface);
     LONG ref = InterlockedIncrement(&This->ref);
+    endpoint_notifications_addref();
     TRACE("Refcount now %li\n", ref);
     return ref;
 }
@@ -1731,6 +1772,7 @@ static ULONG WINAPI MMDevEnum_Release(IMMDeviceEnumerator *iface)
 {
     MMDevEnumImpl *This = impl_from_IMMDeviceEnumerator(iface);
     LONG ref = InterlockedDecrement(&This->ref);
+    endpoint_notifications_release();
     TRACE("Refcount now %li\n", ref);
     return ref;
 }
@@ -1950,6 +1992,24 @@ static void notify_clients(EDataFlow flow, ERole role, const WCHAR *id)
     release_notification_clients(clients, count);
 }
 
+enum endpoint_event_type { ENDPOINT_ADDED, ENDPOINT_REMOVED, ENDPOINT_STATE, ENDPOINT_PROPERTY };
+
+struct endpoint_event
+{
+    enum endpoint_event_type type;
+    MMDevice *device;
+    DWORD state;
+    PROPERTYKEY property;
+};
+
+struct endpoint_update
+{
+    GUID guid;
+    EDataFlow flow;
+    const WCHAR *name;
+    BOOL is_default;
+};
+
 static IMMDevice *get_system_default(EDataFlow flow)
 {
     MMDevice *device;
@@ -1959,6 +2019,475 @@ static IMMDevice *get_system_default(EDataFlow flow)
     LeaveCriticalSection(&device_lock);
     return device ? &device->IMMDevice_iface : NULL;
 }
+
+static BOOL set_endpoint_state(MMDevice *device, DWORD state)
+{
+    WCHAR guid[39];
+    HANDLE mutex;
+    HKEY key;
+    LONG ret;
+
+    if (!(mutex = lock_endpoint_registration())) return FALSE;
+    if (state != DEVICE_STATE_ACTIVE && device->pnp_present)
+    {
+        if (!MMDevice_Unregister(device, TRUE))
+        {
+            unlock_endpoint_registration(mutex);
+            return FALSE;
+        }
+        device->pnp_present = FALSE;
+    }
+    StringFromGUID2(&device->devguid, guid, ARRAY_SIZE(guid));
+    if (!(ret = RegOpenKeyExW(device->flow == eRender ? key_render : key_capture, guid, 0,
+                            KEY_SET_VALUE | KEY_WOW64_64KEY, &key)))
+    {
+        ret = RegSetValueExW(key, L"DeviceState", 0, REG_DWORD, (BYTE *)&state, sizeof(state));
+        RegCloseKey(key);
+    }
+    if (!ret)
+    {
+        EnterCriticalSection(&device_lock);
+        WriteRelease((LONG *)&device->state, state);
+        LeaveCriticalSection(&device_lock);
+    }
+    unlock_endpoint_registration(mutex);
+    return !ret;
+}
+
+#define ENDPOINT_IDENTITY_PATH 1
+#define ENDPOINT_IDENTITY_CONTAINER 2
+
+static HRESULT get_endpoint_identity_changes(MMDevice *device, unsigned int *changes)
+{
+    PROPVARIANT path = {VT_EMPTY}, container = {VT_EMPTY};
+    HRESULT hr;
+
+    *changes = 0;
+    if (FAILED(hr = get_driver_prop_value(&device->devguid, &devicepath_key, &path))) goto done;
+    if (FAILED(hr = get_driver_prop_value(&device->devguid,
+            (const PROPERTYKEY *)&DEVPKEY_Device_ContainerId, &container))) goto done;
+    if (path.vt != device->device_path.vt || (path.vt == VT_LPWSTR &&
+        wcscmp(path.pwszVal, device->device_path.pwszVal))) *changes |= ENDPOINT_IDENTITY_PATH;
+    if (container.vt != device->container_id.vt || (container.vt == VT_CLSID &&
+        !IsEqualGUID(container.puuid, device->container_id.puuid))) *changes |= ENDPOINT_IDENTITY_CONTAINER;
+done:
+    PropVariantClear(&path);
+    PropVariantClear(&container);
+    return hr;
+}
+
+static BOOL update_endpoint_format(MMDevice *device)
+{
+    PROPVARIANT before = {VT_EMPTY}, after = {VT_EMPTY};
+    BOOL changed = FALSE;
+
+    MMDevice_GetPropValue(&device->devguid, device->flow, &PKEY_AudioEngine_DeviceFormat, &before);
+    if (SUCCEEDED(set_format(device)) &&
+        SUCCEEDED(MMDevice_GetPropValue(&device->devguid, device->flow, &PKEY_AudioEngine_DeviceFormat, &after)))
+        changed = before.vt != after.vt || (after.vt == VT_BLOB &&
+                  (before.blob.cbSize != after.blob.cbSize ||
+                   memcmp(before.blob.pBlobData, after.blob.pBlobData, after.blob.cbSize)));
+    PropVariantClear(&before);
+    PropVariantClear(&after);
+    return changed;
+}
+
+static void dispatch_endpoint_events(IMMNotificationClient **clients, unsigned int client_count,
+                                     struct endpoint_event *events, unsigned int count)
+{
+    unsigned int i, j;
+    WCHAR *id;
+
+    for (i = 0; i < count; ++i)
+    {
+        if (FAILED(MMDevice_GetId(&events[i].device->IMMDevice_iface, &id))) continue;
+        for (j = 0; j < client_count; ++j)
+            switch (events[i].type)
+            {
+            case ENDPOINT_ADDED:
+                IMMNotificationClient_OnDeviceAdded(clients[j], id);
+                break;
+            case ENDPOINT_REMOVED:
+                IMMNotificationClient_OnDeviceRemoved(clients[j], id);
+                break;
+            case ENDPOINT_STATE:
+                IMMNotificationClient_OnDeviceStateChanged(clients[j], id, events[i].state);
+                break;
+            case ENDPOINT_PROPERTY:
+                IMMNotificationClient_OnPropertyValueChanged(clients[j], id, events[i].property);
+                break;
+            }
+        CoTaskMemFree(id);
+    }
+}
+
+static HRESULT refresh_endpoint_devices(unsigned int changes)
+{
+    static unsigned int generation;
+    struct get_endpoint_ids_params snapshots[2] = {{0}};
+    struct endpoint_update *updates = NULL;
+    struct endpoint_event *events = NULL;
+    IMMNotificationClient **clients = NULL;
+    IMMDevice *defaults[2][2] = {{0}}, *current;
+    MMDevice *new_defaults[2] = {0};
+    unsigned int client_count, count = 0, event_count = 0, old_count, i, j, role;
+    MMDevice *device;
+    EDataFlow flow;
+    HANDLE registration_mutex = NULL;
+    struct endpoint_changes_params refresh = {.refresh = TRUE};
+    NTSTATUS status;
+    HRESULT hr;
+
+    /* Serialize observation with publication, not just the registry writes.
+     * A process delayed after a removal must see a later arrival before it
+     * can retire another process's freshly restored PnP registration. */
+    if (!(registration_mutex = lock_endpoint_registration())) return E_FAIL;
+    status = __wine_unix_call(drvs.module_unixlib, wait_endpoint_changes, &refresh);
+    if (status == STATUS_DEVICE_NOT_CONNECTED || status == STATUS_RETRY || status == STATUS_CANCELLED)
+    {
+        BOOL disconnected = refresh.disconnected;
+
+        __wine_unix_call(drvs.module_unixlib, stop_endpoint_notifications, NULL);
+        status = __wine_unix_call(drvs.module_unixlib, start_endpoint_notifications, NULL);
+        if (!status) status = __wine_unix_call(drvs.module_unixlib, wait_endpoint_changes, &refresh);
+        /* The previous wait published the empty graph after a proven core
+         * disconnect. A fresh connection attempt under the lock confirms
+         * that another process hasn't already observed a restarted server. */
+        else if (status == STATUS_DEVICE_NOT_CONNECTED && disconnected) status = STATUS_SUCCESS;
+    }
+    if (status) { hr = HRESULT_FROM_NT(status); goto done; }
+    changes |= refresh.changes;
+
+    /* Both driver lists come from one published snapshot. A failed query must
+     * not turn missing results into device removals. */
+    for (flow = eRender; flow <= eCapture; ++flow)
+    {
+        if (FAILED(hr = get_driver_endpoints(flow, &snapshots[flow]))) goto done;
+        if (snapshots[flow].num > snapshots[flow].size / sizeof(struct endpoint))
+        {
+            hr = E_UNEXPECTED;
+            goto done;
+        }
+    }
+    count = snapshots[eRender].num + snapshots[eCapture].num;
+    if (!(updates = calloc(max(1, count), sizeof(*updates)))) { hr = E_OUTOFMEMORY; goto done; }
+    for (flow = eRender, j = 0; flow <= eCapture; ++flow)
+        for (i = 0; i < snapshots[flow].num; ++i, ++j)
+        {
+            struct get_endpoint_ids_params *p = &snapshots[flow];
+            const char *name = (char *)p->endpoints + p->endpoints[i].device;
+
+            if (!get_device_guid(flow, name, &updates[j].guid)) { hr = E_FAIL; goto done; }
+            updates[j].flow = flow;
+            updates[j].name = (WCHAR *)((char *)p->endpoints + p->endpoints[i].name);
+            updates[j].is_default = p->default_idx == i;
+        }
+    EnterCriticalSection(&device_lock);
+    old_count = list_count(&device_list);
+    if (!++generation)
+    {
+        ++generation;
+        LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry) device->generation = 0;
+    }
+    LeaveCriticalSection(&device_lock);
+    if ((size_t)old_count > (SIZE_MAX / sizeof(*events) - 1) / 2 ||
+        (size_t)count > (SIZE_MAX / sizeof(*events) - (size_t)old_count * 2 - 1) / 8)
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    if (!(events = calloc((size_t)old_count * 2 + (size_t)count * 8 + 1, sizeof(*events))) ||
+        !(clients = snapshot_notification_clients(&client_count))) { hr = E_OUTOFMEMORY; goto done; }
+    for (flow = eRender; flow <= eCapture; ++flow)
+        for (role = 0; role < 2; ++role)
+            MMDevEnum_GetDefaultAudioEndpoint(&enumerator.IMMDeviceEnumerator_iface, flow,
+                                             role ? eCommunications : eConsole, &defaults[flow][role]);
+
+    for (i = 0; i < count; ++i)
+    {
+        struct endpoint_update *update = &updates[i];
+        unsigned int identity_changes = 0;
+        BOOL added, renamed;
+
+        EnterCriticalSection(&device_lock);
+        LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+            if (device->flow == update->flow && IsEqualGUID(&device->devguid, &update->guid)) break;
+        if (&device->entry == &device_list) device = NULL;
+        added = !device || device->state != DEVICE_STATE_ACTIVE;
+        renamed = device && wcscmp(device->drv_id, update->name);
+        LeaveCriticalSection(&device_lock);
+        if (device && FAILED(hr = get_endpoint_identity_changes(device, &identity_changes))) goto notify;
+        if (added || renamed || identity_changes || !device->pnp_present || !MMDevice_IsRegistered(device))
+            device = MMDevice_Create(update->name, &update->guid, update->flow, DEVICE_STATE_ACTIVE,
+                                     update->is_default, TRUE);
+        if (!device) { hr = E_OUTOFMEMORY; goto notify; }
+        if (update->is_default) new_defaults[update->flow] = device;
+        device->generation = generation;
+        if (added)
+        {
+            events[event_count++] = (struct endpoint_event){ENDPOINT_ADDED, device};
+            events[event_count++] = (struct endpoint_event){ENDPOINT_STATE, device, DEVICE_STATE_ACTIVE};
+        }
+        if (renamed || (!added && (identity_changes & ENDPOINT_IDENTITY_PATH)))
+        {
+            events[event_count++] = (struct endpoint_event){ENDPOINT_PROPERTY, device, 0,
+                *(const PROPERTYKEY *)&DEVPKEY_Device_FriendlyName};
+            events[event_count++] = (struct endpoint_event){ENDPOINT_PROPERTY, device, 0,
+                *(const PROPERTYKEY *)&DEVPKEY_DeviceInterface_FriendlyName};
+        }
+        if (!added && (identity_changes & ENDPOINT_IDENTITY_PATH))
+            events[event_count++] = (struct endpoint_event){ENDPOINT_PROPERTY, device, 0, devicepath_key};
+        if (!added && (identity_changes & ENDPOINT_IDENTITY_CONTAINER))
+            events[event_count++] = (struct endpoint_event){ENDPOINT_PROPERTY, device, 0,
+                *(const PROPERTYKEY *)&DEVPKEY_Device_ContainerId};
+        if (update_endpoint_format(device) && !added)
+        {
+            events[event_count++] = (struct endpoint_event){ENDPOINT_PROPERTY, device, 0,
+                PKEY_AudioEngine_DeviceFormat};
+            events[event_count++] = (struct endpoint_event){ENDPOINT_PROPERTY, device, 0,
+                PKEY_AudioEngine_OEMFormat};
+        }
+    }
+    EnterCriticalSection(&device_lock);
+    MMDevice_def_play = new_defaults[eRender];
+    MMDevice_def_rec = new_defaults[eCapture];
+    LeaveCriticalSection(&device_lock);
+    /* Only this worker mutates the list after initialization. Objects remain
+     * alive for existing IMMDevice references and immutable collections. */
+    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+        if (device->generation != generation &&
+            (device->state == DEVICE_STATE_ACTIVE || device->pnp_present))
+        {
+            BOOL removed = device->state == DEVICE_STATE_ACTIVE;
+
+            if (!set_endpoint_state(device, DEVICE_STATE_NOTPRESENT)) { hr = E_FAIL; goto notify; }
+            if (removed)
+            {
+                events[event_count++] = (struct endpoint_event){ENDPOINT_STATE, device, DEVICE_STATE_NOTPRESENT};
+                events[event_count++] = (struct endpoint_event){ENDPOINT_REMOVED, device};
+            }
+        }
+    hr = S_OK;
+
+notify:
+    unlock_endpoint_registration(registration_mutex);
+    registration_mutex = NULL;
+    /* Never enter application code with a driver, device or callback-list lock. */
+    dispatch_endpoint_events(clients, client_count, events, event_count);
+    for (flow = eRender; flow <= eCapture; ++flow)
+        for (role = 0; role < 2; ++role)
+        {
+            WCHAR *id = NULL;
+            unsigned int mask = flow == eRender ? ENDPOINT_CHANGE_DEFAULT_RENDER : ENDPOINT_CHANGE_DEFAULT_CAPTURE;
+
+            current = NULL;
+            MMDevEnum_GetDefaultAudioEndpoint(&enumerator.IMMDeviceEnumerator_iface, flow,
+                                             role ? eCommunications : eConsole, &current);
+            if (current != defaults[flow][role] || ((changes & mask) && current == get_system_default(flow)))
+            {
+                if (current) IMMDevice_GetId(current, &id);
+                notify_default_clients(clients, client_count, flow, role ? eCommunications : eConsole, id);
+                CoTaskMemFree(id);
+            }
+            if (current) IMMDevice_Release(current);
+        }
+
+done:
+    if (registration_mutex) unlock_endpoint_registration(registration_mutex);
+    for (flow = eRender; flow <= eCapture; ++flow)
+    {
+        free(snapshots[flow].endpoints);
+        for (role = 0; role < 2; ++role)
+            if (defaults[flow][role]) IMMDevice_Release(defaults[flow][role]);
+    }
+    if (clients) release_notification_clients(clients, client_count);
+    free(updates);
+    free(events);
+    return hr;
+}
+
+struct endpoint_worker
+{
+    HMODULE module;
+    HANDLE idle, ready;
+    DWORD thread_id;
+};
+
+static CRITICAL_SECTION endpoint_worker_lock;
+static CRITICAL_SECTION_DEBUG endpoint_worker_lock_debug =
+{
+    0, 0, &endpoint_worker_lock,
+    { &endpoint_worker_lock_debug.ProcessLocksList, &endpoint_worker_lock_debug.ProcessLocksList },
+    0, 0, { (DWORD_PTR)(__FILE__ ": endpoint_worker_lock") }
+};
+static CRITICAL_SECTION endpoint_worker_lock = { &endpoint_worker_lock_debug, -1, 0, 0, 0, 0 };
+static struct endpoint_worker *endpoint_worker;
+static unsigned int endpoint_users;
+
+static void endpoint_notifications_addref(void)
+{
+    if (!drvs.endpoint_notifications) return;
+    EnterCriticalSection(&endpoint_worker_lock);
+    ++endpoint_users;
+    if (endpoint_worker) ResetEvent(endpoint_worker->idle);
+    LeaveCriticalSection(&endpoint_worker_lock);
+}
+
+static void endpoint_notifications_release(void)
+{
+    if (!drvs.endpoint_notifications) return;
+    EnterCriticalSection(&endpoint_worker_lock);
+    assert(endpoint_users);
+    if (!--endpoint_users && endpoint_worker)
+    {
+        SetEvent(endpoint_worker->idle);
+        __wine_unix_call(drvs.module_unixlib, interrupt_endpoint_notifications, NULL);
+    }
+    LeaveCriticalSection(&endpoint_worker_lock);
+}
+
+/* Check only outside reconciliation: its temporary IMMDevice references must
+ * have been released first. No path under this lock acquires device_lock. */
+static BOOL endpoint_worker_idle(struct endpoint_worker *worker)
+{
+    BOOL idle;
+
+    EnterCriticalSection(&endpoint_worker_lock);
+    if ((idle = !endpoint_users))
+    {
+        __wine_unix_call(drvs.module_unixlib, stop_endpoint_notifications, NULL);
+        endpoint_worker = NULL;
+    }
+    LeaveCriticalSection(&endpoint_worker_lock);
+    return idle;
+}
+
+static DWORD WINAPI endpoint_notification_thread(void *arg)
+{
+    struct endpoint_worker *worker = arg;
+    struct endpoint_changes_params params = {0};
+    HMODULE module = worker->module;
+    NTSTATUS status;
+    unsigned int delay = 1000;
+    BOOL connected = FALSE, initialized;
+    HRESULT hr;
+
+    SetThreadDescription(GetCurrentThread(), L"wine_mmdevapi_hotplug");
+    initialized = SUCCEEDED(hr = CoInitializeEx(NULL, COINIT_MULTITHREADED));
+    if (initialized)
+    {
+        for (;;)
+        {
+            if (endpoint_worker_idle(worker)) break;
+            if (!connected)
+            {
+                status = __wine_unix_call(drvs.module_unixlib, start_endpoint_notifications, NULL);
+                if (status)
+                {
+                    /* Do not hold up enumerator creation while the host is
+                     * unavailable. Keep retrying while there are consumers. */
+                    SetEvent(worker->ready);
+                    WaitForSingleObject(worker->idle, delay);
+                    delay = min(delay * 2, 30000);
+                }
+                else
+                {
+                    connected = TRUE;
+                    delay = 1000;
+                }
+                continue;
+            }
+            status = __wine_unix_call(drvs.module_unixlib, wait_endpoint_changes, &params);
+            if (status == STATUS_ALERTED) continue;
+            if (status == STATUS_NO_MEMORY)
+            {
+                SetEvent(worker->ready);
+                WaitForSingleObject(worker->idle, 100);
+                continue;
+            }
+            if (status)
+            {
+                SetEvent(worker->ready);
+                __wine_unix_call(drvs.module_unixlib, stop_endpoint_notifications, NULL);
+                connected = FALSE;
+                WaitForSingleObject(worker->idle, 1000);
+                continue;
+            }
+            delay = 100;
+            while (FAILED(refresh_endpoint_devices(params.changes)))
+            {
+                SetEvent(worker->ready);
+                if (WaitForSingleObject(worker->idle, delay) == WAIT_OBJECT_0) break;
+                delay = min(delay * 2, 1000);
+            }
+            SetEvent(worker->ready);
+        }
+        CoUninitialize();
+    }
+    else
+    {
+        WARN("Unable to initialize hotplug COM apartment, hr %#lx.\n", hr);
+        EnterCriticalSection(&endpoint_worker_lock);
+        endpoint_worker = NULL;
+        LeaveCriticalSection(&endpoint_worker_lock);
+    }
+    SetEvent(worker->ready);
+    CloseHandle(worker->ready);
+    CloseHandle(worker->idle);
+    free(worker);
+    FreeLibraryAndExitThread(module, 0);
+}
+
+void MMDevEnum_StartEndpointNotifications(void)
+{
+    struct endpoint_worker *worker;
+    HANDLE thread, ready = NULL;
+    HMODULE module;
+
+    if (!drvs.endpoint_notifications) return;
+    /* The loader lock must precede private locks: DLL detach callbacks can
+     * release an enumerator or unregister a notification client. */
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            (const WCHAR *)endpoint_notification_thread, &module)) return;
+    EnterCriticalSection(&endpoint_worker_lock);
+    if (!(worker = endpoint_worker))
+    {
+        if (!(worker = calloc(1, sizeof(*worker)))) goto done;
+        worker->module = module;
+        if (!(worker->idle = CreateEventW(NULL, TRUE, FALSE, NULL)) ||
+            !(worker->ready = CreateEventW(NULL, TRUE, FALSE, NULL)))
+            goto failed;
+        endpoint_worker = worker;
+        if (!(thread = CreateThread(NULL, 0, endpoint_notification_thread, worker, 0, &worker->thread_id)))
+        {
+            endpoint_worker = NULL;
+            goto failed;
+        }
+        CloseHandle(thread);
+        module = NULL; /* The worker owns the module reference. */
+    }
+    if (GetCurrentThreadId() != worker->thread_id)
+        DuplicateHandle(GetCurrentProcess(), worker->ready, GetCurrentProcess(),
+                        &ready, SYNCHRONIZE, FALSE, 0);
+done:
+    LeaveCriticalSection(&endpoint_worker_lock);
+    if (module) FreeLibrary(module);
+    /* Only enumerator creation waits for the first snapshot, never AddRef
+     * under device_lock, nor a callback re-entering on the worker itself. */
+    if (ready)
+    {
+        WaitForSingleObject(ready, INFINITE);
+        CloseHandle(ready);
+    }
+    return;
+
+failed:
+    if (worker->ready) CloseHandle(worker->ready);
+    if (worker->idle) CloseHandle(worker->idle);
+    free(worker);
+    goto done;
+}
+
 
 static BOOL notify_if_changed(EDataFlow flow, ERole role, HKEY key,
                               const WCHAR *val_name, WCHAR *old_val, IMMDevice *def_dev)
@@ -2140,6 +2669,7 @@ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEn
     }
     wrapper->client = client;
 
+    endpoint_notifications_addref();
     EnterCriticalSection(&g_notif_lock);
 
     list_add_tail(&g_notif_clients, &wrapper->entry);
@@ -2178,6 +2708,7 @@ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEn
             free(thread);
         }
         free(wrapper);
+        endpoint_notifications_release();
     }
     if (module) FreeLibrary(module);
     return hr;
@@ -2201,6 +2732,7 @@ static HRESULT WINAPI MMDevEnum_UnregisterEndpointNotificationCallback(IMMDevice
             free(wrapper);
             if (list_empty(&g_notif_clients) && g_notif_thread) SetEvent(g_notif_thread->stop_event);
             LeaveCriticalSection(&g_notif_lock);
+            endpoint_notifications_release();
             return S_OK;
         }
     }

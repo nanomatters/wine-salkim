@@ -20,3 +20,4 @@ $(BUILD_DIR)/spatial: spatial.c.test $(SPATIAL_SOURCE) ../mmdevapi_private.h ../
 
 check: all
 	$(BUILD_DIR)/spatial
+	python3 endpoint-identity.py --build-dir $(BUILD_DIR)

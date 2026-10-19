@@ -19,3 +19,18 @@ or behavior on real devices.
 
 The `.c.test` suffix keeps the standalone fixture out of Wine's generated
 source lists. The native Makefile compiles it explicitly as C.
+
+Endpoint hotplug identity and synthetic-device removal:
+
+    python3 endpoint-identity.py --build-dir /tmp/mmdevapi-identity-tests
+
+This fixture extracts the production identity-comparison, endpoint creation,
+and PnP-removal helpers. It checks late USB identity metadata with unchanged
+node names, container-only updates, query-failure cleanup, endpoint/media
+registration removal, already-removed devices, foreign-class protection, and
+removal failures. Fault injection verifies that failed property/PnP writes
+do not publish new devices or lose pending arrival/rename state, and that
+loading remembered endpoints does not claim another backend's registrations.
+It does not require Wine or a PipeWire server. The PipeWire private-runtime
+test separately checks real SetupAPI present-interface enumeration before
+and after hotplug.

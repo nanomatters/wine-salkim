@@ -84,6 +84,7 @@ struct audio_client {
 
 extern HRESULT MMDevEnum_Create(REFIID riid, void **ppv);
 extern void MMDevEnum_Free(void);
+extern void MMDevEnum_StartEndpointNotifications(void);
 
 typedef struct _DriverFuncs {
     unixlib_module_t module;
@@ -115,6 +116,7 @@ typedef struct MMDevice {
     BOOL pnp_present;
 
     struct list entry;
+    unsigned int generation;
 } MMDevice;
 
 static inline void wine_unix_call(const unsigned int code, void *args)
