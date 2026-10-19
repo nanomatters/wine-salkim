@@ -191,7 +191,6 @@ struct pw_phys_device
     UINT channel_mask;
     REFERENCE_TIME min_period, def_period;
     WAVEFORMATEXTENSIBLE fmt;
-    uint32_t index;
     unsigned int bus;
     uint16_t vendor, product;
     GUID container;
@@ -1353,7 +1352,7 @@ static BOOL probe_roundtrip(struct probe *p)
     return !p->core_error;
 }
 
-/* Synthetic default endpoint at index 0 (empty pw_name -> session manager
+/* Synthetic default endpoint (empty pw_name -> session manager
  * default routing).  When the default node is known, mirror its format so
  * the default endpoint advertises the real speaker layout. */
 static void add_default_device(struct list *list, EndpointFormFactor form, const char *match,
@@ -1501,7 +1500,6 @@ static void build_device_cache(struct probe *p)
     uint32_t rate;
     REFERENCE_TIME def_period, min_period;
     struct pw_phys_device *dev;
-    UINT index = 0;
 
     if (!get_probe_periods(p, &rate, &def_period, &min_period))
         return;
@@ -1537,8 +1535,6 @@ static void build_device_cache(struct probe *p)
 
     add_default_device(&g_render_devices, Speakers, g_default_sink, rate, def_period, min_period);
     add_default_device(&g_capture_devices, Microphone, g_default_source, rate, def_period, min_period);
-    LIST_FOR_EACH_ENTRY(dev, &g_render_devices, struct pw_phys_device, entry) dev->index = index++;
-    LIST_FOR_EACH_ENTRY(dev, &g_capture_devices, struct pw_phys_device, entry) dev->index = index++;
 }
 
 static void probe_teardown(struct probe *p)
@@ -1794,23 +1790,26 @@ static NTSTATUS pipewire_get_device_period(void *args)
 static void get_device_path(const struct pw_phys_device *device, struct get_prop_value_params *params)
 {
     const GUID *guid = params->guid;
-    UINT32 serial = (UINT32)guid->Data4[4] << 24 | (UINT32)guid->Data4[5] << 16
-                 | (UINT32)guid->Data4[6] << 8 | guid->Data4[7];
-    char path[128];
+    char path[128], instance[39];
     unsigned int count, i;
 
+    /* Enumeration order and USB addresses can change on reconnect. Use the
+     * persistent endpoint identity, including all its bits, for the devnode. */
+    snprintf(instance, sizeof(instance), "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+             guid->Data1, guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1],
+             guid->Data4[2], guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
     switch (device->bus)
     {
     case DEVICE_BUS_USB:
-        count = snprintf(path, sizeof(path), "{1}.USB\\VID_%04X&PID_%04X\\%u&%08X",
-                         device->vendor, device->product, device->index, serial);
+        count = snprintf(path, sizeof(path), "{1}.USB\\VID_%04X&PID_%04X\\%s",
+                         device->vendor, device->product, instance);
         break;
     case DEVICE_BUS_PCI:
-        count = snprintf(path, sizeof(path), "{1}.HDAUDIO\\FUNC_01&VEN_%04X&DEV_%04X\\%u&%08X",
-                         device->vendor, device->product, device->index, serial);
+        count = snprintf(path, sizeof(path), "{1}.HDAUDIO\\FUNC_01&VEN_%04X&DEV_%04X\\%s",
+                         device->vendor, device->product, instance);
         break;
     default:
-        count = snprintf(path, sizeof(path), "{1}.ROOT\\MEDIA\\%04u", device->index);
+        count = snprintf(path, sizeof(path), "{1}.ROOT\\MEDIA\\%s", instance);
         break;
     }
     count++;

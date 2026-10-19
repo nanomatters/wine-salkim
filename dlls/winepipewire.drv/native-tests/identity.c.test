@@ -77,14 +77,13 @@ static void test_properties(void)
         .device = "usb", .flow = eRender, .guid = &guid, .prop = &path_key,
         .value = &value, .buffer_size = &size
     };
-    const char expected[] = "{1}.USB\\VID_054C&PID_0CE6\\7&12345678";
+    const char expected[] = "{1}.USB\\VID_054C&PID_0CE6\\00000000-0000-0000-0000-000012345678";
     unsigned int i;
 
     strcpy(device->pw_name, "usb");
     device->bus = DEVICE_BUS_USB;
     device->vendor = 0x054c;
     device->product = 0x0ce6;
-    device->index = 7;
     get_usb_container("/devices/controller/sound/card0", &device->container);
     list_add_tail(&g_render_devices, &device->entry);
     pipewire_get_prop_value(&params);
@@ -136,6 +135,47 @@ static void test_properties(void)
 #endif
     list_remove(&device->entry);
     free(device);
+}
+
+static void read_path(const struct pw_phys_device *device, const GUID *guid, WCHAR *path, unsigned int size)
+{
+    PROPVARIANT value = {0};
+    struct get_prop_value_params params = {.guid = guid, .value = &value, .buffer = path, .buffer_size = &size};
+
+    get_device_path(device, &params);
+    assert(params.result == S_OK && value.vt == VT_LPWSTR && value.pwszVal == path);
+}
+
+static void test_stable_paths(void)
+{
+    GUID guid = {0x01234567,0x89ab,0xcdef,{0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef}}, other;
+    struct pw_phys_device device = {.vendor = 0x054c, .product = 0x0ce6}, reconnected;
+    WCHAR expected[128], actual[128];
+    unsigned int bus, byte;
+
+    for (bus = DEVICE_BUS_UNKNOWN; bus <= DEVICE_BUS_PCI; ++bus)
+    {
+        device.bus = bus;
+        memset(expected, 0, sizeof(expected));
+        read_path(&device, &guid, expected, sizeof(expected));
+        reconnected = device;
+        /* The same endpoint on a different USB address keeps its devnode,
+         * even though the audio/HID container has a new connection identity. */
+        reconnected.container.Data2 = 7;
+        reconnected.container.Data3 = 23;
+        memset(actual, 0, sizeof(actual));
+        read_path(&reconnected, &guid, actual, sizeof(actual));
+        assert(!memcmp(expected, actual, sizeof(expected)));
+
+        for (byte = 0; byte < sizeof(guid); ++byte)
+        {
+            other = guid;
+            ((BYTE *)&other)[byte] ^= 1;
+            memset(actual, 0, sizeof(actual));
+            read_path(&device, &other, actual, sizeof(actual));
+            assert(memcmp(expected, actual, sizeof(expected)));
+        }
+    }
 }
 
 static void test_device_info(void)
@@ -203,6 +243,7 @@ int main(void)
 {
     test_container();
     test_properties();
+    test_stable_paths();
     test_device_info();
     test_missing_device_info();
     puts("PipeWire identity tests passed");
