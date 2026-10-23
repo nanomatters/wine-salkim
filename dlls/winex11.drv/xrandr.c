@@ -889,6 +889,7 @@ static BOOL get_gpu_properties_from_vulkan( struct x11drv_gpu *gpu, const XRRPro
             {
                 gpu->pci_id.vendor = devs[device_idx].properties2.properties.vendorID;
                 gpu->pci_id.device = devs[device_idx].properties2.properties.deviceID;
+                gpu->pci_id.revision = PCI_REVISION_UNKNOWN;
             }
             gpu->name = strdup( devs[device_idx].properties2.properties.deviceName );
 

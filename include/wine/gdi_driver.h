@@ -423,12 +423,14 @@ W32KAPI struct window_surface *window_surface_get( HWND hwnd );
 
 /* display manager interface, used to initialize display device registry data */
 
+#define PCI_REVISION_UNKNOWN 0xffff
+
 struct pci_id
 {
     UINT16 vendor;
     UINT16 device;
     UINT16 subsystem;
-    UINT16 revision;
+    UINT16 revision; /* PCI revision byte, or PCI_REVISION_UNKNOWN */
 };
 
 struct gdi_monitor

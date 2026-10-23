@@ -1884,6 +1884,7 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
     KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
     struct gpu_info *vulkan_gpu = NULL, *opengl_gpu = NULL;
     ULONGLONG memory = 0;
+    struct pci_id id;
     struct gpu *gpu, *temp;
     unsigned int i;
     HKEY hkey, subkey;
@@ -1911,6 +1912,14 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
 
     if (!pci_id->vendor && !pci_id->device && vulkan_gpu) pci_id = &vulkan_gpu->pci_id;
     if (!pci_id->vendor && !pci_id->device && opengl_gpu) pci_id = &opengl_gpu->pci_id;
+    if (pci_id->revision == PCI_REVISION_UNKNOWN && uuid && !IsEqualGUID( uuid, &empty_uuid ) && vulkan_gpu &&
+        IsEqualGUID( uuid, &vulkan_gpu->uuid ) && pci_id->vendor == vulkan_gpu->pci_id.vendor &&
+        pci_id->device == vulkan_gpu->pci_id.device)
+    {
+        id = *pci_id;
+        id.revision = vulkan_gpu->pci_id.revision;
+        pci_id = &id;
+    }
     fixup_device_id( &pci_id );
 
     name = gpu_device_name( pci_id->vendor, pci_id->device, name );
@@ -1918,6 +1927,13 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
     if (!strcmp( name, "Wine Adapter" ) && opengl_gpu) name = opengl_gpu->name;
     RtlUTF8ToUnicodeN( gpu->name, sizeof(gpu->name) - sizeof(WCHAR), &len, name, strlen( name ) );
 
+    /* Keep the unknown revision marker internal; registry PCI IDs use a byte. */
+    if (pci_id->revision == PCI_REVISION_UNKNOWN)
+    {
+        id = *pci_id;
+        id.revision = 0;
+        pci_id = &id;
+    }
     snprintf( gpu->path, sizeof(gpu->path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X\\%08X",
               pci_id->vendor, pci_id->device, pci_id->subsystem, pci_id->revision, gpu->index );
     if (!(hkey = reg_create_ascii_key( enum_key, gpu->path, 0, NULL ))) return;

@@ -2567,6 +2567,7 @@ struct vk_physdev_info
     VkPhysicalDeviceProperties2 properties2;
     VkPhysicalDeviceIDProperties id;
     VkPhysicalDeviceMemoryProperties mem_properties;
+    UINT16 revision;
 };
 
 static int compare_vulkan_physical_devices( const void *v1, const void *v2 )
@@ -2594,13 +2595,32 @@ BOOL get_vulkan_gpus( struct list *gpus )
     for (i = 0; i < instance->physical_device_count; ++i)
     {
         struct vulkan_physical_device *physical_device = instance->physical_devices + i;
+        VkPhysicalDevicePCIBusInfoPropertiesEXT pci = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
 
         devinfo[i].id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        if (physical_device->extensions.has_VK_EXT_pci_bus_info) devinfo[i].id.pNext = &pci;
         devinfo[i].properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
         devinfo[i].properties2.pNext = &devinfo[i].id;
 
         instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device, &devinfo[i].properties2 );
         instance->p_vkGetPhysicalDeviceMemoryProperties( physical_device->host.physical_device, &devinfo[i].mem_properties );
+        devinfo[i].id.pNext = NULL;
+
+        devinfo[i].revision = PCI_REVISION_UNKNOWN;
+        if (physical_device->extensions.has_VK_EXT_pci_bus_info)
+        {
+            char path[128], buffer[64], *end;
+            unsigned long revision;
+
+            snprintf( path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%u/revision",
+                      pci.pciDomain, pci.pciBus, pci.pciDevice, pci.pciFunction );
+            if (read_sysfs_line( path, buffer, sizeof(buffer) ))
+            {
+                errno = 0;
+                revision = strtoul( buffer, &end, 0 );
+                if (!errno && end != buffer && !*end && revision <= 0xff) devinfo[i].revision = revision;
+            }
+        }
     }
     qsort( devinfo, instance->physical_device_count, sizeof(*devinfo), compare_vulkan_physical_devices );
 
@@ -2616,6 +2636,7 @@ BOOL get_vulkan_gpus( struct list *gpus )
         gpu->name = strdup( devinfo[i].properties2.properties.deviceName );
         gpu->pci_id.vendor = devinfo[i].properties2.properties.vendorID;
         gpu->pci_id.device = devinfo[i].properties2.properties.deviceID;
+        gpu->pci_id.revision = devinfo[i].revision;
 
         for (j = 0; j < devinfo[i].mem_properties.memoryHeapCount; j++)
         {

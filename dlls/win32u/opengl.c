@@ -1660,11 +1660,16 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
 
     /* EGL does not provide a convenient way to get device / vendor ID, so we have to do it
      * manually through DRM. Otherwise fallback to value as for SoC devices in GLX */
+    egl->revision_id = PCI_REVISION_UNKNOWN;
     if (!has_extension( extensions, "EGL_EXT_device_drm" )) egl->vendor_id = egl->device_id = 0xffffffff;
     else if ((str = funcs->p_eglQueryDeviceStringEXT( egl->device, EGL_DRM_DEVICE_FILE_EXT )) && (str = strrchr( str, '/' )))
     {
+        UINT revision;
+
         egl->vendor_id = read_drm_device_prop( str, "vendor" );
         egl->device_id = read_drm_device_prop( str, "device" );
+        revision = read_drm_device_prop( str, "revision" );
+        if (revision <= 0xff) egl->revision_id = revision;
     }
     TRACE( "  - device_id: %#x\n", egl->device_id );
     TRACE( "  - vendor_id: %#x\n", egl->vendor_id );
@@ -4134,6 +4139,7 @@ BOOL get_opengl_gpus( struct list *gpus )
         gpu->name = strdup( egl->device_name );
         gpu->pci_id.vendor = egl->vendor_id;
         gpu->pci_id.device = egl->device_id;
+        gpu->pci_id.revision = egl->revision_id;
         gpu->memory = egl->video_memory;
         list_add_tail( gpus, &gpu->entry );
     }

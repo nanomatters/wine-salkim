@@ -225,6 +225,7 @@ struct egl_platform
     const char          *vendor_name;
     GUID                 device_uuid;
     GUID                 driver_uuid;
+    UINT                 revision_id;
 };
 
 static inline EGLConfig egl_config_for_format( const struct egl_platform *egl, int format, UINT *flags )

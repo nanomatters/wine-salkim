@@ -584,23 +584,28 @@ BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier)
 
 BOOL wayland_dmabuf_get_main_device_pci_id(struct pci_id *pci_id)
 {
-    *pci_id = (struct pci_id){0};
+    *pci_id = (struct pci_id){.revision = PCI_REVISION_UNKNOWN};
 
 #ifdef HAVE_XF86DRM_H
     struct wayland_dmabuf_feedback *feedback = &process_wayland.dmabuf_default_feedback;
+    uint32_t flags = DRM_DEVICE_GET_PCI_REVISION;
     drmDevicePtr device = NULL;
     BOOL ret = FALSE;
 
-    if (!feedback->has_main_device ||
-        drmGetDeviceFromDevId(feedback->main_device, 0, &device))
-        return FALSE;
+    if (!feedback->has_main_device) return FALSE;
+    if (drmGetDeviceFromDevId(feedback->main_device, flags, &device))
+    {
+        flags = 0;
+        if (drmGetDeviceFromDevId(feedback->main_device, flags, &device)) return FALSE;
+    }
 
     if (device->bustype == DRM_BUS_PCI && device->deviceinfo.pci)
     {
         pci_id->vendor = device->deviceinfo.pci->vendor_id;
         pci_id->device = device->deviceinfo.pci->device_id;
+        if (flags & DRM_DEVICE_GET_PCI_REVISION) pci_id->revision = device->deviceinfo.pci->revision_id;
         ret = TRUE;
-        TRACE("main device PCI ID %04x:%04x\n", pci_id->vendor, pci_id->device);
+        TRACE("main device PCI ID %04x:%04x revision %02x\n", pci_id->vendor, pci_id->device, pci_id->revision);
     }
 
     drmFreeDevice(&device);
