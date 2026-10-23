@@ -1493,8 +1493,49 @@ const char *gpu_device_name( UINT16 vendor, UINT16 device, UINT16 revision, cons
     case MAKELONG(0x1002, 0x6821): return "AMD Radeon R9 M370X";
     case MAKELONG(0x1002, 0x6647): return "AMD Radeon R9 M380";
     case MAKELONG(0x1002, 0x6920): return "AMD Radeon R9 M395X";
-    case MAKELONG(0x1002, 0x67ef): return "Radeon(TM) RX 460 Graphics";
-    case MAKELONG(0x1002, 0x67df): return "Radeon (TM) RX 480 Graphics";
+    case MAKELONG(0x1002, 0x67ef):
+        switch (revision)
+        {
+        case 0xc0:
+        case 0xc7: return "AMD Radeon RX Graphics";
+        case 0xc1:
+        case 0xc5:
+        case 0xcf:
+        case 0xff: return "AMD Radeon RX 460 Graphics";
+        case 0xc2: return "AMD Radeon Pro Series";
+        case 0xc3:
+        case 0xe1:
+        case 0xe3: return "AMD Radeon RX Series";
+        case 0xe0:
+        case 0xe5:
+        case 0xe7: return "AMD Radeon RX 560 Series";
+        case 0xe2: return "AMD Radeon RX 560X";
+        case 0xef: return "AMD Radeon 550 Series";
+        default:   return "Radeon(TM) RX 460 Graphics";
+        }
+    case MAKELONG(0x1002, 0x67df):
+        switch (revision)
+        {
+        case 0xc0:
+        case 0xeb: return "AMD Radeon Pro 580X";
+        case 0xc1:
+        case 0xc3:
+        case 0xe7: return "AMD Radeon RX 580 Series";
+        case 0xc2:
+        case 0xc6:
+        case 0xef: return "AMD Radeon RX 570 Series";
+        case 0xc4:
+        case 0xc7: return "AMD Radeon RX 480 Graphics";
+        case 0xc5:
+        case 0xcf:
+        case 0xd7: return "AMD Radeon RX 470 Graphics";
+        case 0xe0:
+        case 0xff: return "AMD Radeon RX 470 Series";
+        case 0xe1: return "AMD Radeon RX 590 Series";
+        case 0xe3: return "AMD Radeon RX Series";
+        case 0xf7: return "AMD Radeon RX P30PH";
+        default:   return "Radeon (TM) RX 480 Graphics";
+        }
     case MAKELONG(0x1002, 0x73df):
         switch (revision)
         {
@@ -1513,11 +1554,58 @@ const char *gpu_device_name( UINT16 vendor, UINT16 device, UINT16 revision, cons
     case MAKELONG(0x1002, 0x69af): return "Radeon Pro Vega 20";
     case MAKELONG(0x1002, 0x15dd): return "AMD Radeon(TM) Vega 10 Mobile Graphics";
     case MAKELONG(0x1002, 0x66af): return "Radeon RX Vega 20";
-    case MAKELONG(0x1002, 0x731f): return "Radeon RX 5700 / 5700 XT";
-    case MAKELONG(0x1002, 0x7340): return "Radeon RX 5500M";
-    case MAKELONG(0x1002, 0x73bf): return "Radeon RX 6800/6800 XT / 6900 XT";
-    case MAKELONG(0x1002, 0x7480): return "AMD Radeon RX 7600 XT";
-    case MAKELONG(0x1002, 0x7590): return "AMD Radeon RX 9060 XT";
+    case MAKELONG(0x1002, 0x731f):
+        switch (revision)
+        {
+        case 0xc0: return "AMD Radeon RX 5700 XT 50th Anniversary";
+        case 0xc1:
+        case 0xc5: return "AMD Radeon RX 5700 XT";
+        case 0xc2: return "AMD Radeon RX 5600M";
+        case 0xc3: return "AMD Radeon RX 5700M";
+        case 0xc4: return "AMD Radeon RX 5700";
+        case 0xca: return "AMD Radeon RX 5600 XT";
+        case 0xcb: return "AMD Radeon RX 5600 OEM";
+        default:   return "Radeon RX 5700 / 5700 XT";
+        }
+    case MAKELONG(0x1002, 0x7340):
+        switch (revision)
+        {
+        case 0xc1: return "AMD Radeon RX 5500M";
+        case 0xc3: return "AMD Radeon RX 5300M";
+        case 0xc5: return "AMD Radeon RX 5500 XT";
+        case 0xc7: return "AMD Radeon RX 5500";
+        case 0xc9: return "AMD Radeon RX 5500XTB";
+        case 0xcf: return "AMD Radeon RX 5300";
+        default:   return "Radeon RX 5500M";
+        }
+    case MAKELONG(0x1002, 0x73bf):
+        switch (revision)
+        {
+        case 0xc0: return "AMD Radeon RX 6900 XT";
+        case 0xc1: return "AMD Radeon RX 6800 XT";
+        case 0xc3: return "AMD Radeon RX 6800";
+        default:   return "Radeon RX 6800/6800 XT / 6900 XT";
+        }
+    case MAKELONG(0x1002, 0x7480):
+        switch (revision)
+        {
+        case 0x00: return "AMD Radeon Pro W7600";
+        case 0xc0: return "AMD Radeon RX 7600 XT";
+        case 0xc1: return "AMD Radeon RX 7700S";
+        case 0xc2: return "AMD Radeon RX 7650 GRE";
+        case 0xc3: return "AMD Radeon RX 7600S";
+        case 0xc7: return "AMD Radeon RX 7600M XT";
+        case 0xcf: return "AMD Radeon RX 7600";
+        default:   return "AMD Radeon RX 7600 XT";
+        }
+    case MAKELONG(0x1002, 0x7590):
+        switch (revision)
+        {
+        case 0xc0: return "AMD Radeon RX 9060 XT";
+        case 0xc1: return "AMD Radeon RX 9060 XT LP";
+        case 0xc7: return "AMD Radeon RX 9060";
+        default:   return "AMD Radeon RX 9060 XT";
+        }
     case MAKELONG(0x1002, 0x73a1): return "Radeon Pro V620";
     case MAKELONG(0x1002, 0x73ae): return "Radeon Pro V620 VF";
     case MAKELONG(0x1002, 0x163f): return "AMD VANGOGH";

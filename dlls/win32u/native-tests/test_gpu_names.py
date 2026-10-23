@@ -28,6 +28,71 @@ PCI_HEADER = (ROOT / "include/wine/gdi_driver.h").read_text()
 PCI_ID = re.search(r"^#define PCI_REVISION_UNKNOWN .*", PCI_HEADER, re.M).group() + "\n"
 PCI_ID += re.search(r"struct pci_id\n\{.*?^\};", PCI_HEADER, re.M | re.S).group()
 
+# Confirmed entries from libdrm data/amdgpu.ids (blob 978e5f746b66).
+AMD_REVISIONS = """
+67DF C0 AMD Radeon Pro 580X
+67DF C1 AMD Radeon RX 580 Series
+67DF C2 AMD Radeon RX 570 Series
+67DF C3 AMD Radeon RX 580 Series
+67DF C4 AMD Radeon RX 480 Graphics
+67DF C5 AMD Radeon RX 470 Graphics
+67DF C6 AMD Radeon RX 570 Series
+67DF C7 AMD Radeon RX 480 Graphics
+67DF CF AMD Radeon RX 470 Graphics
+67DF D7 AMD Radeon RX 470 Graphics
+67DF E0 AMD Radeon RX 470 Series
+67DF E1 AMD Radeon RX 590 Series
+67DF E3 AMD Radeon RX Series
+67DF E7 AMD Radeon RX 580 Series
+67DF EB AMD Radeon Pro 580X
+67DF EF AMD Radeon RX 570 Series
+67DF F7 AMD Radeon RX P30PH
+67DF FF AMD Radeon RX 470 Series
+67EF C0 AMD Radeon RX Graphics
+67EF C1 AMD Radeon RX 460 Graphics
+67EF C2 AMD Radeon Pro Series
+67EF C3 AMD Radeon RX Series
+67EF C5 AMD Radeon RX 460 Graphics
+67EF C7 AMD Radeon RX Graphics
+67EF CF AMD Radeon RX 460 Graphics
+67EF E0 AMD Radeon RX 560 Series
+67EF E1 AMD Radeon RX Series
+67EF E2 AMD Radeon RX 560X
+67EF E3 AMD Radeon RX Series
+67EF E5 AMD Radeon RX 560 Series
+67EF E7 AMD Radeon RX 560 Series
+67EF EF AMD Radeon 550 Series
+67EF FF AMD Radeon RX 460 Graphics
+731F C0 AMD Radeon RX 5700 XT 50th Anniversary
+731F C1 AMD Radeon RX 5700 XT
+731F C2 AMD Radeon RX 5600M
+731F C3 AMD Radeon RX 5700M
+731F C4 AMD Radeon RX 5700
+731F C5 AMD Radeon RX 5700 XT
+731F CA AMD Radeon RX 5600 XT
+731F CB AMD Radeon RX 5600 OEM
+7340 C1 AMD Radeon RX 5500M
+7340 C3 AMD Radeon RX 5300M
+7340 C5 AMD Radeon RX 5500 XT
+7340 C7 AMD Radeon RX 5500
+7340 C9 AMD Radeon RX 5500XTB
+7340 CF AMD Radeon RX 5300
+73BF C0 AMD Radeon RX 6900 XT
+73BF C1 AMD Radeon RX 6800 XT
+73BF C3 AMD Radeon RX 6800
+7480 00 AMD Radeon Pro W7600
+7480 C0 AMD Radeon RX 7600 XT
+7480 C1 AMD Radeon RX 7700S
+7480 C2 AMD Radeon RX 7650 GRE
+7480 C3 AMD Radeon RX 7600S
+7480 C7 AMD Radeon RX 7600M XT
+7480 CF AMD Radeon RX 7600
+7590 C0 AMD Radeon RX 9060 XT
+7590 C1 AMD Radeon RX 9060 XT LP
+7590 C7 AMD Radeon RX 9060
+"""
+
+
 def function(path, name):
     source = (ROOT / path).read_text()
     return re.search(r"^(?:const char \*|void |BOOL )" + name + r"\(.*?^\}", source, re.M | re.S).group()
@@ -91,6 +156,46 @@ int main(void)
 }
 """
         self.compile_and_run(harness)
+
+    def test_other_amd_revisions(self):
+        entries = []
+        for row in AMD_REVISIONS.splitlines():
+            if not row:
+                continue
+            device, revision, name = row.split(maxsplit=2)
+            entries.append(f'{{0x{device}, 0x{revision}, "{name}"}},')
+        self.compile_and_run(function("dlls/win32u/sysparams.c", "gpu_device_name") + r"""
+int main(void)
+{
+    static const struct { UINT16 device, revision; const char *name; } variants[] = {
+VARIANTS
+    };
+    static const struct { UINT16 device; const char *name; } fallbacks[] = {
+        {0x67df, "Radeon (TM) RX 480 Graphics"}, {0x67ef, "Radeon(TM) RX 460 Graphics"},
+        {0x731f, "Radeon RX 5700 / 5700 XT"}, {0x7340, "Radeon RX 5500M"},
+        {0x73bf, "Radeon RX 6800/6800 XT / 6900 XT"}, {0x73df, "AMD Radeon RX 6700 XT"},
+        {0x7480, "AMD Radeon RX 7600 XT"}, {0x7590, "AMD Radeon RX 9060 XT"},
+    };
+    static const UINT16 untouched[] = {0x744c, 0x747e, 0x7499, 0x7550};
+    const char supplied[] = "driver name";
+    size_t i;
+    for (i = 0; i < sizeof(variants) / sizeof(*variants); ++i)
+    {
+        assert(!strcmp(gpu_device_name(0x1002, variants[i].device, variants[i].revision, supplied), variants[i].name));
+        assert(!strcmp(gpu_device_name(0x1002, variants[i].device, variants[i].revision, NULL), variants[i].name));
+    }
+    for (i = 0; i < sizeof(fallbacks) / sizeof(*fallbacks); ++i)
+    {
+        assert(!strcmp(gpu_device_name(0x1002, fallbacks[i].device, PCI_REVISION_UNKNOWN, supplied), fallbacks[i].name));
+        assert(!strcmp(gpu_device_name(0x1002, fallbacks[i].device, 0x42, supplied), fallbacks[i].name));
+    }
+    for (i = 0; i < sizeof(untouched) / sizeof(*untouched); ++i)
+    {
+        assert(gpu_device_name(0x1002, untouched[i], 0xc0, supplied) == supplied);
+        assert(!strcmp(gpu_device_name(0x1002, untouched[i], 0xc0, NULL), "Wine Adapter"));
+    }
+}
+""".replace("VARIANTS", "\n".join(entries)))
 
     def test_wayland_revision_and_old_libdrm(self):
         harness = r"""
