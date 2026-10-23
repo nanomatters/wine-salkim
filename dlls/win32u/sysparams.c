@@ -1260,7 +1260,7 @@ static const char* driver_vendor_to_name( UINT16 vendor )
     }
 }
 
-const char *gpu_device_name( UINT16 vendor, UINT16 device, const char *default_name )
+const char *gpu_device_name( UINT16 vendor, UINT16 device, UINT16 revision, const char *default_name )
 {
     switch (MAKELONG(vendor, device))
     {
@@ -1495,7 +1495,20 @@ const char *gpu_device_name( UINT16 vendor, UINT16 device, const char *default_n
     case MAKELONG(0x1002, 0x6920): return "AMD Radeon R9 M395X";
     case MAKELONG(0x1002, 0x67ef): return "Radeon(TM) RX 460 Graphics";
     case MAKELONG(0x1002, 0x67df): return "Radeon (TM) RX 480 Graphics";
-    case MAKELONG(0x1002, 0x73df): return "AMD Radeon RX 6700 XT";
+    case MAKELONG(0x1002, 0x73df):
+        switch (revision)
+        {
+        case 0xc0: return "AMD Radeon RX 6750 XT";
+        case 0xc2:
+        case 0xc3: return "AMD Radeon RX 6800M";
+        case 0xcf: return "AMD Radeon RX 6700M";
+        case 0xd5:
+        case 0xe5: return "AMD Radeon RX 6750 GRE 12GB";
+        case 0xd7: return "AMD TDC-235";
+        case 0xdf:
+        case 0xff: return "AMD Radeon RX 6700";
+        default:   return "AMD Radeon RX 6700 XT";
+        }
     case MAKELONG(0x1002, 0x687f): return "Radeon RX Vega";
     case MAKELONG(0x1002, 0x69af): return "Radeon Pro Vega 20";
     case MAKELONG(0x1002, 0x15dd): return "AMD Radeon(TM) Vega 10 Mobile Graphics";
@@ -1922,7 +1935,7 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
     }
     fixup_device_id( &pci_id );
 
-    name = gpu_device_name( pci_id->vendor, pci_id->device, name );
+    name = gpu_device_name( pci_id->vendor, pci_id->device, pci_id->revision, name );
     if (!strcmp( name, "Wine Adapter" ) && vulkan_gpu) name = vulkan_gpu->name;
     if (!strcmp( name, "Wine Adapter" ) && opengl_gpu) name = opengl_gpu->name;
     RtlUTF8ToUnicodeN( gpu->name, sizeof(gpu->name) - sizeof(WCHAR), &len, name, strlen( name ) );

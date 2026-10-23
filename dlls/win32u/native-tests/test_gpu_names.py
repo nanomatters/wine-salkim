@@ -45,6 +45,53 @@ class GpuNameTests(unittest.TestCase):
             subprocess.run(command + [str(source), "-o", str(binary)], check=True, timeout=30)
             subprocess.run([str(binary)], check=True, timeout=30)
 
+    def test_names_and_spoofing(self):
+        harness = function("dlls/win32u/sysparams.c", "gpu_device_name") + r"""
+static const char *hidden_vendor;
+static char *mock_getenv(const char *name)
+{
+    return hidden_vendor && !strcmp(name, hidden_vendor) ? "1" : NULL;
+}
+#define getenv mock_getenv
+""" + function("dlls/win32u/sysparams.c", "fixup_device_id") + r"""
+int main(void)
+{
+    static const struct { UINT16 revision; const char *name; } variants[] = {
+        {0xc0, "AMD Radeon RX 6750 XT"}, {0xc1, "AMD Radeon RX 6700 XT"},
+        {0xc2, "AMD Radeon RX 6800M"}, {0xc3, "AMD Radeon RX 6800M"},
+        {0xc5, "AMD Radeon RX 6700 XT"}, {0xcf, "AMD Radeon RX 6700M"},
+        {0xd5, "AMD Radeon RX 6750 GRE 12GB"}, {0xd7, "AMD TDC-235"},
+        {0xdf, "AMD Radeon RX 6700"}, {0xe5, "AMD Radeon RX 6750 GRE 12GB"},
+        {0xff, "AMD Radeon RX 6700"}, {0, "AMD Radeon RX 6700 XT"},
+        {0x42, "AMD Radeon RX 6700 XT"}, {0x100, "AMD Radeon RX 6700 XT"},
+    };
+    const char supplied[] = "driver name";
+    const struct pci_id *id;
+    struct pci_id real = {0x10de, 0x2487, 0, 0xc0};
+    size_t i;
+    for (i = 0; i < sizeof(variants) / sizeof(*variants); ++i)
+        assert(!strcmp(gpu_device_name(0x1002, 0x73df, variants[i].revision, supplied), variants[i].name));
+    assert(!strcmp(gpu_device_name(0x1002, 0x73bf, PCI_REVISION_UNKNOWN, supplied), "Radeon RX 6800/6800 XT / 6900 XT"));
+    assert(!strcmp(gpu_device_name(0x10de, 0x0018, 0xc0, supplied), "NVIDIA RIVA 128"));
+    assert(gpu_device_name(0x1234, 0x73df, 0xc0, supplied) == supplied);
+    assert(!strcmp(gpu_device_name(0x1234, 0x73df, 0xc0, NULL), "Wine Adapter"));
+    id = &real;
+    fixup_device_id(&id);
+    assert(id == &real && id->revision == 0xc0);
+    hidden_vendor = "WINE_HIDE_NVIDIA_GPU";
+    fixup_device_id(&id);
+    assert(id != &real && id->vendor == 0x1002 && id->device == 0x73df && !id->revision);
+    assert(!strcmp(gpu_device_name(id->vendor, id->device, id->revision, NULL), "AMD Radeon RX 6700 XT"));
+    real.vendor = 0x8086;
+    id = &real;
+    hidden_vendor = "WINE_HIDE_INTEL_GPU";
+    fixup_device_id(&id);
+    assert(id != &real && id->vendor == 0x1002 && id->device == 0x73df && !id->revision);
+    assert(!strcmp(gpu_device_name(id->vendor, id->device, id->revision, NULL), "AMD Radeon RX 6700 XT"));
+}
+"""
+        self.compile_and_run(harness)
+
     def test_wayland_revision_and_old_libdrm(self):
         harness = r"""
 #define HAVE_XF86DRM_H 1

@@ -1719,7 +1719,7 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
         funcs->p_eglMakeCurrent( egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, context );
 
         renderer = strdup( (const char *)funcs->p_glGetString( GL_RENDERER ) );
-        egl->device_name = gpu_device_name( egl->vendor_id, egl->device_id, renderer );
+        egl->device_name = gpu_device_name( egl->vendor_id, egl->device_id, egl->revision_id, renderer );
         if (egl->device_name != renderer) free( renderer );
 
         vendor = strdup( (const char *)funcs->p_glGetString( GL_VENDOR ) );
