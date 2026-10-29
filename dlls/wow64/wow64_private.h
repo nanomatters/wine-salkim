@@ -197,6 +197,7 @@ static inline OBJECT_ATTRIBUTES *objattr_32to64_redirect( struct object_attr64 *
 
 static inline TOKEN_USER *token_user_32to64( TOKEN_USER *out, const TOKEN_USER32 *in )
 {
+    if (!in) return NULL;
     out->User.Sid = ULongToPtr( in->User.Sid );
     out->User.Attributes = in->User.Attributes;
     return out;
@@ -204,18 +205,21 @@ static inline TOKEN_USER *token_user_32to64( TOKEN_USER *out, const TOKEN_USER32
 
 static inline TOKEN_OWNER *token_owner_32to64( TOKEN_OWNER *out, const TOKEN_OWNER32 *in )
 {
+    if (!in) return NULL;
     out->Owner = ULongToPtr( in->Owner );
     return out;
 }
 
 static inline TOKEN_PRIMARY_GROUP *token_primary_group_32to64( TOKEN_PRIMARY_GROUP *out, const TOKEN_PRIMARY_GROUP32 *in )
 {
+    if (!in) return NULL;
     out->PrimaryGroup = ULongToPtr( in->PrimaryGroup );
     return out;
 }
 
 static inline TOKEN_DEFAULT_DACL *token_default_dacl_32to64( TOKEN_DEFAULT_DACL *out, const TOKEN_DEFAULT_DACL32 *in )
 {
+    if (!in) return NULL;
     out->DefaultDacl = ULongToPtr( in->DefaultDacl );
     return out;
 }
