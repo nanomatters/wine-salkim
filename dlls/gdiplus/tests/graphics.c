@@ -2283,6 +2283,12 @@ static void test_isempty(void)
     expect(InvalidParameter, status);
     status = GdipIsClipEmpty(NULL, &res);
     expect(InvalidParameter, status);
+    status = GdipIsVisibleClipEmpty(NULL, NULL);
+    expect(InvalidParameter, status);
+    status = GdipIsVisibleClipEmpty(graphics, NULL);
+    expect(InvalidParameter, status);
+    status = GdipIsVisibleClipEmpty(NULL, &res);
+    expect(InvalidParameter, status);
 
     /* default is infinite */
     res = TRUE;

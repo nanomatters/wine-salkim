@@ -8141,6 +8141,9 @@ GpStatus WINGDIPAPI GdipIsVisibleClipEmpty(GpGraphics *graphics, BOOL *res)
 
     TRACE("(%p, %p)\n", graphics, res);
 
+    if(!graphics || !res)
+        return InvalidParameter;
+
     if((stat = GdipCreateRegion(&rgn)) != Ok)
         return stat;
 
