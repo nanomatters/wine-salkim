@@ -306,6 +306,7 @@ static void test_full_packet(void)
         assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_OK);
         assert(b.length == 160 && buffer_releases == 1);
         assert(a.held_frames == 240 - i * 80);
+        assert(out.rtTimestamp == 100000 * (i + 1));
         assert(out.dwStatus == (i < 3 ? DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE : 0));
         check_bytes(b.data, 160, 0x33);
     }

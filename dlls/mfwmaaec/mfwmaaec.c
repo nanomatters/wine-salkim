@@ -879,6 +879,7 @@ static HRESULT WINAPI media_object_ProcessOutput(IMediaObject *iface, DWORD flag
         memcpy(data, aaec->held_buffer, size);
         curr_frame_size -= size;
         aaec->held_frames -= size / aaec->sample_size;
+        aaec->held_frames_start_time += (REFERENCE_TIME)size / aaec->sample_size * 10000000 / aaec->samples_per_sec;
         memmove(aaec->held_buffer, aaec->held_buffer + size, aaec->held_frames * aaec->sample_size);
         data += size;
 
