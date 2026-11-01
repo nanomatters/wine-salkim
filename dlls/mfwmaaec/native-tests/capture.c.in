@@ -1,0 +1,260 @@
+/*
+ * Deterministic tests for Voice Capture DSP buffering.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef int32_t HRESULT, LONG, BOOL;
+typedef uint32_t DWORD, UINT32;
+typedef uint64_t UINT64;
+typedef int64_t REFERENCE_TIME;
+typedef uint8_t BYTE;
+typedef uint16_t USHORT;
+typedef struct { int value; } GUID;
+typedef struct { int unused; } IUnknown, IMFTransform, IMediaObject, IPropertyStore;
+typedef struct { int unused; } IMMDeviceEnumerator, IMMDeviceCollection, IMMDevice;
+typedef struct { int unused; } IAudioClient, IAudioCaptureClient;
+typedef struct { USHORT wFormatTag, nChannels; DWORD nSamplesPerSec, nAvgBytesPerSec;
+    USHORT nBlockAlign, wBitsPerSample, cbSize; } WAVEFORMATEX;
+typedef struct { GUID majortype; BYTE *pbFormat; } DMO_MEDIA_TYPE;
+typedef struct { int unused; } MFT_OUTPUT_STREAM_INFO;
+struct media_buffer { BYTE *data; DWORD capacity, length; };
+typedef struct { struct media_buffer *pBuffer; DWORD dwStatus;
+    REFERENCE_TIME rtTimestamp, rtTimelength; } DMO_OUTPUT_DATA_BUFFER;
+
+#define WINAPI
+#define S_OK 0
+#define S_FALSE 1
+#define E_FAIL ((HRESULT)0x80004005)
+#define E_INVALIDARG ((HRESULT)0x80070057)
+#define E_OUTOFMEMORY ((HRESULT)0x8007000e)
+#define E_PROP_ID_UNSUPPORTED ((HRESULT)0x80070490)
+#define DMO_E_TYPE_NOT_SET ((HRESULT)0x80040203)
+#define FAILED(hr) ((hr) < 0)
+#define TRACE(...) ((void)0)
+#define FIXME(...) ((void)0)
+#define WARN(...) ((void)0)
+#define ERR(...) ((void)0)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define CONTAINING_RECORD(p, type, field) ((type *)((char *)(p) - offsetof(type, field)))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define WAVE_FORMAT_PCM 1
+#define CLSCTX_INPROC_SERVER 1
+#define DEVICE_STATE_ACTIVE 1
+#define AUDCLNT_SHAREMODE_SHARED 0
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000u
+#define AUDCLNT_STREAMFLAGS_RATEADJUST 0x00100000u
+#define AUDCLNT_BUFFERFLAGS_SILENT 2
+#define DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE 0x01000000u
+#define AEC_VAD_NORMAL 1
+#define AEC_VAD_FOR_AGC 2
+#define AEC_VAD_FOR_SILENCE_SUPPRESSION 3
+#define eCapture 1
+#define eCommunications 2
+static const GUID GUID_NULL = {0}, CLSID_MMDeviceEnumerator = {1};
+static const GUID IID_IMMDeviceEnumerator = {2}, IID_IAudioClient = {3}, IID_IAudioCaptureClient = {4};
+static int IsEqualGUID(const GUID *a, const GUID *b) { return a->value == b->value; }
+
+@DECLARATIONS@
+
+static IMMDeviceEnumerator enumerator;
+static IMMDevice device;
+static IAudioClient audio_client;
+static IAudioCaptureClient capture_client;
+static unsigned int device_refs, audio_refs, capture_refs, enumerator_refs, starts, stops;
+static HRESULT start_result;
+static int fail_allocation;
+static UINT32 capture_capacity;
+struct packet { BYTE *data; UINT32 frames; DWORD flags; UINT64 timestamp; };
+static struct packet packets[4];
+static unsigned int packet_count, packet_index, buffer_releases;
+static BYTE audio_data[640];
+
+static HRESULT CoCreateInstance(const GUID *clsid, void *outer, DWORD context, const GUID *iid, void **out)
+{
+    assert(IsEqualGUID(clsid, &CLSID_MMDeviceEnumerator));
+    assert(IsEqualGUID(iid, &IID_IMMDeviceEnumerator));
+    ++enumerator_refs;
+    *out = &enumerator;
+    return S_OK;
+}
+static HRESULT IMMDeviceEnumerator_GetDefaultAudioEndpoint(IMMDeviceEnumerator *mme, int flow, int role, IMMDevice **out)
+{
+    assert(mme == &enumerator && flow == eCapture && role == eCommunications);
+    ++device_refs;
+    *out = &device;
+    return S_OK;
+}
+static HRESULT IMMDeviceEnumerator_EnumAudioEndpoints(IMMDeviceEnumerator *mme, int flow, DWORD state, IMMDeviceCollection **out)
+{
+    assert(0);
+    return E_FAIL;
+}
+static HRESULT IMMDeviceCollection_Item(IMMDeviceCollection *col, unsigned int index, IMMDevice **out) { return E_FAIL; }
+static void IMMDeviceCollection_Release(IMMDeviceCollection *col) { assert(0); }
+static void IMMDevice_Release(IMMDevice *dev) { assert(dev == &device && device_refs); --device_refs; }
+static HRESULT IMMDevice_Activate(IMMDevice *dev, const GUID *iid, DWORD context, void *params, void **out)
+{
+    assert(dev == &device && IsEqualGUID(iid, &IID_IAudioClient));
+    ++audio_refs;
+    *out = &audio_client;
+    return S_OK;
+}
+static HRESULT IAudioClient_Initialize(IAudioClient *client, int mode, DWORD flags, REFERENCE_TIME duration,
+        REFERENCE_TIME period, const WAVEFORMATEX *format, void *session)
+{
+    assert(client == &audio_client && format->nSamplesPerSec == 8000 && format->nChannels == 1);
+    return S_OK;
+}
+static HRESULT IAudioClient_GetService(IAudioClient *client, const GUID *iid, void **out)
+{
+    assert(client == &audio_client && IsEqualGUID(iid, &IID_IAudioCaptureClient));
+    ++capture_refs;
+    *out = &capture_client;
+    return S_OK;
+}
+static HRESULT IAudioClient_GetBufferSize(IAudioClient *client, UINT32 *size) { *size = capture_capacity; return S_OK; }
+static HRESULT IAudioClient_Start(IAudioClient *client) { ++starts; return start_result; }
+static void IAudioClient_Stop(IAudioClient *client) { ++stops; }
+static void IAudioClient_Release(IAudioClient *client) { assert(audio_refs); --audio_refs; }
+static void IAudioCaptureClient_Release(IAudioCaptureClient *client) { assert(capture_refs); --capture_refs; }
+static HRESULT IAudioClient_GetCurrentPadding(IAudioClient *client, UINT32 *frames)
+{
+    unsigned int i;
+    *frames = 0;
+    for (i = packet_index; i < packet_count; ++i) *frames += packets[i].frames;
+    return S_OK;
+}
+static HRESULT IAudioCaptureClient_GetBuffer(IAudioCaptureClient *client, BYTE **data, UINT32 *frames,
+        DWORD *flags, UINT64 *position, UINT64 *timestamp)
+{
+    struct packet *p;
+    assert(packet_index < packet_count);
+    p = &packets[packet_index];
+    *data = p->data;
+    *frames = p->frames;
+    *flags = p->flags;
+    *position = 0;
+    *timestamp = p->timestamp;
+    return S_OK;
+}
+static HRESULT IAudioCaptureClient_ReleaseBuffer(IAudioCaptureClient *client, UINT32 frames)
+{
+    assert(frames == packets[packet_index].frames);
+    ++packet_index;
+    ++buffer_releases;
+    return S_OK;
+}
+static HRESULT IMediaBuffer_GetMaxLength(struct media_buffer *buffer, DWORD *length)
+{
+    *length = buffer->capacity;
+    return S_OK;
+}
+static HRESULT IMediaBuffer_GetBufferAndLength(struct media_buffer *buffer, BYTE **data, DWORD *length)
+{
+    *data = buffer->data;
+    *length = buffer->length;
+    return S_OK;
+}
+static HRESULT IMediaBuffer_SetLength(struct media_buffer *buffer, DWORD length)
+{
+    assert(length <= buffer->capacity);
+    buffer->length = length;
+    return S_OK;
+}
+static void *capture_alloc(size_t size) { return fail_allocation ? NULL : malloc(size); }
+
+#define malloc capture_alloc
+@FUNCTIONS@
+#undef malloc
+
+static void init_capture(struct aaec *a)
+{
+    memset(a, 0, sizeof(*a));
+    assert(!device_refs && !audio_refs && !capture_refs && !enumerator_refs);
+    packet_count = packet_index = buffer_releases = starts = stops = 0;
+    fail_allocation = 0;
+    start_result = S_OK;
+    capture_capacity = 320;
+    a->device_indexes = 0xffff;
+    a->output_type.majortype.value = 1;
+    a->output_type.pbFormat = (BYTE *)&default_output_format;
+    memset(audio_data, 0x33, sizeof(audio_data));
+}
+static void finish_capture(struct aaec *a)
+{
+    stop_audio_capture(a);
+    if (a->mme) { assert(enumerator_refs); --enumerator_refs; a->mme = NULL; }
+    assert(!a->held_buffer && !a->ac && !a->acc);
+    assert(!device_refs && !audio_refs && !capture_refs && !enumerator_refs);
+}
+static void add_packet(UINT32 frames, DWORD flags)
+{
+    assert(packet_count < ARRAY_SIZE(packets));
+    packets[packet_count++] = (struct packet){flags & AUDCLNT_BUFFERFLAGS_SILENT ? NULL : audio_data,
+            frames, flags, 100000};
+}
+static void check_bytes(const BYTE *data, size_t count, BYTE value)
+{
+    size_t i;
+    for (i = 0; i < count; ++i) assert(data[i] == value);
+}
+
+static void test_append(void)
+{
+    struct aaec a;
+    struct media_buffer b = {.capacity = 320, .length = 160};
+    DMO_OUTPUT_DATA_BUFFER out = {.pBuffer = &b, .rtTimestamp = 42, .rtTimelength = 100000};
+    DWORD status = 0xdeadbeef;
+    init_capture(&a);
+    b.data = malloc(b.capacity);
+    memset(b.data, 0x55, b.capacity);
+    add_packet(80, 0);
+    add_packet(80, 0);
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_OK);
+    assert(b.length == 320 && packet_index == 1 && buffer_releases == 1);
+    assert(status == 0 && out.dwStatus == DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE);
+    assert(out.rtTimestamp == 42 && out.rtTimelength == 200000);
+    check_bytes(b.data, 160, 0x55);
+    check_bytes(b.data + 160, 160, 0x33);
+    free(b.data);
+    finish_capture(&a);
+}
+
+static void test_capacity(void)
+{
+    struct aaec a;
+    struct media_buffer b = {.capacity = 320, .length = 161};
+    DMO_OUTPUT_DATA_BUFFER out = {.pBuffer = &b};
+    DWORD status;
+    init_capture(&a);
+    b.data = malloc(b.capacity);
+    memset(b.data, 0x55, b.capacity);
+    add_packet(80, 0);
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == E_FAIL);
+    assert(b.length == 161 && !buffer_releases);
+    b.length = 321;
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == E_INVALIDARG);
+    check_bytes(b.data, b.capacity, 0x55);
+    b.length = 0;
+    packet_count = 0;
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_FALSE);
+    assert(!b.length && !buffer_releases);
+    check_bytes(b.data, b.capacity, 0x55);
+    free(b.data);
+    finish_capture(&a);
+}
+
+int main(void)
+{
+    test_append();
+    test_capacity();
+    puts("Capture output capacity tests passed.");
+    return 0;
+}

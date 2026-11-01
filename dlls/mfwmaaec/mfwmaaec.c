@@ -854,6 +854,7 @@ static HRESULT WINAPI media_object_ProcessOutput(IMediaObject *iface, DWORD flag
     }
     if (initial_buffer_size > max_len) return E_INVALIDARG;
     if (max_len - initial_buffer_size < aaec->frame_size) return E_FAIL;
+    max_len -= initial_buffer_size;
     buffer_data += initial_buffer_size;
     if (FAILED(hr = IAudioClient_GetCurrentPadding(aaec->ac, &ac_rem_frames))) return hr;
     *output_status = 0;
