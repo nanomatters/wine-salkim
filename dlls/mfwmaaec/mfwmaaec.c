@@ -897,7 +897,7 @@ static HRESULT WINAPI media_object_ProcessOutput(IMediaObject *iface, DWORD flag
             if (ac_buffer_size > size)
             {
                 assert(!curr_frame_size);
-                assert(ac_buffer_size < aaec->max_held_frames * aaec->sample_size);
+                assert(ac_buffer_size <= aaec->max_held_frames * aaec->sample_size);
                 aaec->held_frames = (ac_buffer_size - size) / aaec->sample_size;
                 if (ac_flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(aaec->held_buffer, 0, ac_buffer_size - size);
                 else memcpy(aaec->held_buffer, ac_ptr + size, ac_buffer_size - size);

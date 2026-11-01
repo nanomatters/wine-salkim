@@ -287,11 +287,39 @@ static void test_silence(void)
     finish_capture(&a);
 }
 
+static void test_full_packet(void)
+{
+    struct aaec a;
+    struct media_buffer b = {.capacity = 160};
+    DMO_OUTPUT_DATA_BUFFER out = {.pBuffer = &b};
+    DWORD status;
+    unsigned int i;
+    init_capture(&a);
+    b.data = malloc(b.capacity);
+    add_packet(capture_capacity, 0);
+    for (i = 0; i < 4; ++i)
+    {
+        memset(b.data, 0x55, b.capacity);
+        b.length = 0;
+        assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_OK);
+        assert(b.length == 160 && buffer_releases == 1);
+        assert(a.held_frames == 240 - i * 80);
+        assert(out.dwStatus == (i < 3 ? DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE : 0));
+        check_bytes(b.data, 160, 0x33);
+    }
+    b.length = 0;
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_FALSE);
+    assert(!b.length && buffer_releases == 1);
+    free(b.data);
+    finish_capture(&a);
+}
+
 int main(void)
 {
     test_append();
     test_capacity();
     test_silence();
-    puts("Capture capacity and silence tests passed.");
+    test_full_packet();
+    puts("Capture packet tests passed.");
     return 0;
 }
