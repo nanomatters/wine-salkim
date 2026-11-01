@@ -1,0 +1,40 @@
+/* Copyright 2026 Erhan Bilgili. SPDX-License-Identifier: LGPL-2.1-or-later */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+
+typedef int32_t HRESULT;
+typedef unsigned int GUID;
+#define WINAPI
+#define S_OK 0
+#define E_FAIL ((HRESULT)0x80004005)
+#define FAILED(hr) ((hr) < 0)
+#define TRACE(...) ((void)0)
+static const GUID CLSID_CWMAudioAEC = 1, CLSID_CResamplerMediaObject = 2, DMOCATEGORY_AUDIO_EFFECT = 3;
+static unsigned int calls, fail_call;
+static HRESULT unregister_result(void) { return ++calls == fail_call ? E_FAIL : S_OK; }
+static HRESULT __wine_unregister_resources(void) { assert(!calls); return unregister_result(); }
+static HRESULT MFTUnregister(GUID clsid)
+{
+    assert(calls == 1 && clsid == CLSID_CWMAudioAEC);
+    return unregister_result();
+}
+static HRESULT DMOUnregister(const GUID *clsid, const GUID *category)
+{
+    assert(calls == 2 && *clsid == CLSID_CWMAudioAEC && *category == DMOCATEGORY_AUDIO_EFFECT);
+    return unregister_result();
+}
+
+@FUNCTIONS@
+
+int main(void)
+{
+    for (fail_call = 0; fail_call <= 3; ++fail_call)
+    {
+        calls = 0;
+        assert(DllUnregisterServer() == (fail_call ? E_FAIL : S_OK));
+        assert(calls == (fail_call ? fail_call : 3));
+    }
+    puts("DSP unregistration tests passed.");
+    return 0;
+}

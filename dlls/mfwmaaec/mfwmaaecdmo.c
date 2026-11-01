@@ -94,9 +94,9 @@ HRESULT WINAPI DllUnregisterServer(void)
 
     if (FAILED(hr = __wine_unregister_resources()))
         return hr;
-    if (FAILED(hr = MFTUnregister(CLSID_CResamplerMediaObject)))
+    if (FAILED(hr = MFTUnregister(CLSID_CWMAudioAEC)))
         return hr;
-    if (FAILED(hr = DMOUnregister(&CLSID_CResamplerMediaObject, &DMOCATEGORY_AUDIO_EFFECT)))
+    if (FAILED(hr = DMOUnregister(&CLSID_CWMAudioAEC, &DMOCATEGORY_AUDIO_EFFECT)))
         return hr;
 
     return S_OK;
