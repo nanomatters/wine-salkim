@@ -3127,7 +3127,7 @@ static void pipewire_read(struct pipewire_stream *stream)
     while (__atomic_load_n(&stream->cap_held_bytes, __ATOMIC_ACQUIRE) >= stream->period_bytes)
     {
         ACPacket *p;
-        LARGE_INTEGER stamp, freq;
+        LARGE_INTEGER stamp;
 
         if (!(p = (ACPacket *)list_head(&stream->packet_free_head)))
         {
@@ -3138,8 +3138,8 @@ static void pipewire_read(struct pipewire_stream *stream)
         {
             stream->held_bytes += stream->period_bytes;
         }
-        NtQueryPerformanceCounter(&stamp, &freq);
-        p->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+        NtQueryPerformanceCounter(&stamp, NULL);
+        p->qpcpos = stamp.QuadPart;
         p->devpos = stream->capture_written - stream->cap_held_bytes;
         list_remove(&p->entry);
         list_add_tail(&stream->packet_filled_head, &p->entry);
@@ -3887,9 +3887,9 @@ static NTSTATUS pipewire_get_position(void *args)
 
     if (params->qpctime)
     {
-        LARGE_INTEGER stamp, freq;
-        NtQueryPerformanceCounter(&stamp, &freq);
-        *params->qpctime = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+        LARGE_INTEGER stamp;
+        NtQueryPerformanceCounter(&stamp, NULL);
+        *params->qpctime = stamp.QuadPart;
     }
 
     params->result = S_OK;

@@ -1,0 +1,149 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "test.h"
+
+static volatile LONGLONG test_counter, test_frequency = 10000000;
+static unsigned int loop_depth, expected_qpc_depth, counter_calls;
+
+void pw_thread_loop_lock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global && !loop_depth++);
+}
+
+void pw_thread_loop_unlock(struct pw_thread_loop *loop)
+{
+    assert(loop == pw_loop_global && loop_depth-- == 1);
+}
+
+enum pw_stream_state pw_stream_get_state(struct pw_stream *stream, const char **error)
+{
+    assert(loop_depth == 1);
+    return PW_STREAM_STATE_PAUSED;
+}
+
+NTSTATUS WINAPI NtQueryPerformanceCounter(LARGE_INTEGER *counter, LARGE_INTEGER *frequency)
+{
+    assert(loop_depth == expected_qpc_depth);
+    ++counter_calls;
+    counter->QuadPart = test_counter;
+    if (frequency) frequency->QuadPart = test_frequency;
+    return STATUS_SUCCESS;
+}
+
+static void test_position_timestamp(LONGLONG timestamp)
+{
+    struct pipewire_stream stream = {0};
+    struct get_position_params params = {0};
+    UINT64 position, qpc;
+    unsigned int flow, device, share;
+
+    stream.pw = (void *)2;
+    stream.frame_size = 4;
+    stream.clock_written = stream.capture_written = 400;
+    params.stream = (UINT_PTR)&stream;
+    params.pos = &position;
+    params.qpctime = &qpc;
+    expected_qpc_depth = 0;
+    test_counter = timestamp;
+
+    for (flow = eRender; flow <= eCapture; ++flow)
+    {
+        stream.dataflow = flow;
+        for (share = AUDCLNT_SHAREMODE_SHARED; share <= AUDCLNT_SHAREMODE_EXCLUSIVE; ++share)
+        {
+            stream.share = share;
+            for (device = 0; device <= 1; ++device)
+            {
+                params.device = device;
+                stream.clock_lastpos = 0;
+                qpc = UINT64_MAX;
+                assert(pipewire_get_position(&params) == STATUS_SUCCESS);
+                assert(params.result == S_OK && !loop_depth);
+                assert(position == (share == AUDCLNT_SHAREMODE_EXCLUSIVE || device ? 100 : 400));
+                assert(qpc == (UINT64)timestamp);
+            }
+        }
+    }
+
+    params.qpctime = NULL;
+    counter_calls = 0;
+    assert(pipewire_get_position(&params) == STATUS_SUCCESS);
+    assert(params.result == S_OK && !counter_calls && !loop_depth);
+
+    stream.invalidated = TRUE;
+    params.qpctime = &qpc;
+    qpc = UINT64_MAX;
+    assert(pipewire_get_position(&params) == STATUS_SUCCESS);
+    assert(params.result == AUDCLNT_E_DEVICE_INVALIDATED);
+    assert(qpc == UINT64_MAX && !counter_calls && !loop_depth);
+}
+
+static void test_capture_timestamp(LONGLONG timestamp)
+{
+    struct pipewire_stream stream = {0};
+    struct get_capture_buffer_params params = {0};
+    BYTE ring[8] = {1, 2, 3, 4, 5, 6, 7, 8}, data[8], *buffer;
+    ACPacket packet = {.data = data};
+    UINT64 qpc = UINT64_MAX, position;
+    UINT32 frames;
+    UINT flags;
+
+    stream.pw = (void *)2;
+    stream.dataflow = eCapture;
+    stream.frame_size = 4;
+    stream.period_bytes = sizeof(ring);
+    stream.capture_ring = ring;
+    stream.capture_ring_size = stream.cap_held_bytes = stream.capture_written = sizeof(ring);
+    list_init(&stream.packet_free_head);
+    list_init(&stream.packet_filled_head);
+    list_add_tail(&stream.packet_free_head, &packet.entry);
+    expected_qpc_depth = 1;
+    test_counter = timestamp;
+    counter_calls = 0;
+    pw_thread_loop_lock(pw_loop_global);
+    pipewire_read(&stream);
+    pw_thread_loop_unlock(pw_loop_global);
+    assert(counter_calls == 1 && !loop_depth);
+    assert(packet.qpcpos == (UINT64)timestamp && !stream.cap_held_bytes);
+    assert(!memcmp(data, ring, sizeof(data)));
+
+    params.stream = (UINT_PTR)&stream;
+    params.data = &buffer;
+    params.frames = &frames;
+    params.flags = &flags;
+    params.devpos = &position;
+    params.qpcpos = &qpc;
+    assert(pipewire_get_capture_buffer(&params) == STATUS_SUCCESS);
+    assert(params.result == S_OK && frames == 2 && !flags);
+    assert(buffer == data && position == 0 && qpc == (UINT64)timestamp);
+    assert(counter_calls == 1 && !loop_depth);
+}
+
+int main(void)
+{
+    static const LONGLONG timestamps[] =
+    {
+        0, 1, 12345678,
+        INT64_MAX / 10000000 - 1,
+        INT64_MAX / 10000000,
+        INT64_MAX / 10000000 + 1,
+        27LL * 3600 * 10000000,
+        2LL * 86400 * 10000000,
+        7LL * 86400 * 10000000,
+        30LL * 86400 * 10000000,
+        365LL * 86400 * 10000000,
+        INT64_MAX - 1, INT64_MAX,
+    };
+    unsigned int i;
+
+    pw_loop_global = (void *)1;
+    for (i = 0; i < ARRAY_SIZE(timestamps); ++i)
+    {
+        test_position_timestamp(timestamps[i]);
+        test_capture_timestamp(timestamps[i]);
+    }
+    puts("timestamps: capture and clock uptime cases passed");
+    return 0;
+}
