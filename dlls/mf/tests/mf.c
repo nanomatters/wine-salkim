@@ -2022,11 +2022,9 @@ static HRESULT WINAPI test_source_Start(IMFMediaSource *iface, IMFPresentationDe
 
     for (i = 0; i < source->stream_count; ++i)
     {
-        if (!is_stream_selected(pd, i))
-        {
-            source->streams[i]->selected = FALSE;
+        source->streams[i]->selected = is_stream_selected(pd, i);
+        if (!source->streams[i]->selected)
             continue;
-        }
 
         var.vt = VT_UNKNOWN;
         var.punkVal = (IUnknown *)&source->streams[i]->IMFMediaStream_iface;
@@ -4465,7 +4463,7 @@ static IMFTopology *create_test_topology_unk_noshutdown_sd(IMFMediaSource *sourc
 static IMFTopology *create_test_topology_unk_noshutdown(IMFMediaSource *source, IUnknown *sink, IUnknown *mft,
         UINT64 *duration, UINT noshutdown_on_remove)
 {
-    return create_test_topology_unk_noshutdown_sd(source, (IUnknown*)sink, mft, duration, UINT_MAX, 0);
+    return create_test_topology_unk_noshutdown_sd(source, (IUnknown*)sink, mft, duration, noshutdown_on_remove, 0);
 }
 
 static IMFTopology *create_test_topology_unk(IMFMediaSource *source, IUnknown *sink, IUnknown *mft, UINT64 *duration)
@@ -9491,6 +9489,7 @@ static void test_media_session_unused_stream_selection(void)
 
     handler = create_test_handler();
     media_sink = create_test_media_sink(&handler->IMFMediaTypeHandler_iface);
+    IMFMediaTypeHandler_Release(&handler->IMFMediaTypeHandler_iface);
     media_sink->characteristics = MEDIASINK_FIXED_STREAMS;
     clock_sink.stream = media_sink->stream;
     stream_sink = impl_from_IMFStreamSink(media_sink->stream);
@@ -9507,6 +9506,7 @@ static void test_media_session_unused_stream_selection(void)
         hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(media_source->pd, i, &selected, &sd);
         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
         ok(selected, "Unexpected stream descriptor selection, index %i selected %u\n", i, selected);
+        IMFStreamDescriptor_Release(sd);
     }
 
     /* Create a topology which only covers the first stream */
@@ -9544,6 +9544,7 @@ static void test_media_session_unused_stream_selection(void)
         hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(media_source->pd, i, &selected, &sd);
         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
         ok(selected, "Unexpected stream descriptor selection, index %i selected: %1u\n", i, selected);
+        IMFStreamDescriptor_Release(sd);
     }
 
     hr = IMFMediaSession_GetClock(session, &clock);
@@ -9583,6 +9584,7 @@ static void test_media_session_unused_stream_selection(void)
         hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(media_source->pd, i, &selected, &sd);
         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
         todo_wine_if(i != active_stream_index) ok(i == active_stream_index ? selected : !selected, "Unexpected stream descriptor selection, index %i selected: %1u\n", i, selected);
+        IMFStreamDescriptor_Release(sd);
     }
 
     todo_wine

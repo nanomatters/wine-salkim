@@ -863,6 +863,7 @@ static void test_stream_selection(void)
 
     hr = IMFPresentationDescriptor_GetStreamDescriptorCount(pd, &count);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Unexpected stream count %lu.\n", count);
     for (i = 0; i < count; ++i)
     {
         IMFMediaTypeHandler *mt_handler;
@@ -910,6 +911,7 @@ static void test_stream_selection(void)
 
     hr = IMFPresentationDescriptor_GetStreamDescriptorCount(pd, &count);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Unexpected stream count %lu.\n", count);
     for (i = 0; i < count; ++i)
     {
         IMFMediaTypeHandler *mt_handler;
