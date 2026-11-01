@@ -1,0 +1,74 @@
+/* Copyright 2026 Erhan Bilgili. SPDX-License-Identifier: LGPL-2.1-or-later */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+
+typedef int32_t HRESULT;
+typedef uint32_t DWORD, UINT32, GUID;
+typedef struct { int unused; } IMFTransform;
+typedef struct { unsigned int refs; } IMFMediaType;
+typedef struct { uint16_t wFormatTag, nChannels; DWORD nSamplesPerSec, nAvgBytesPerSec;
+    uint16_t nBlockAlign, wBitsPerSample, cbSize; } WAVEFORMATEX;
+#define WINAPI
+#define TRACE(...) ((void)0)
+#define S_OK 0
+#define E_OUTOFMEMORY ((HRESULT)0x8007000e)
+#define MF_E_INVALIDSTREAMNUMBER ((HRESULT)0xc00d36b3)
+#define MF_E_NO_MORE_TYPES ((HRESULT)0xc00d36b9)
+#define FAILED(hr) ((hr) < 0)
+#define SUCCEEDED(hr) ((hr) >= 0)
+#define WAVE_FORMAT_PCM 1
+static const GUID MF_MT_MAJOR_TYPE = 1, MFMediaType_Audio = 2, MF_MT_SUBTYPE = 3, MFAudioFormat_PCM = 4;
+static const GUID MF_MT_AUDIO_NUM_CHANNELS = 5, MF_MT_AUDIO_SAMPLES_PER_SECOND = 6;
+static const GUID MF_MT_AUDIO_AVG_BYTES_PER_SECOND = 7, MF_MT_AUDIO_BITS_PER_SAMPLE = 8;
+static const GUID MF_MT_AUDIO_BLOCK_ALIGNMENT = 9, MF_MT_ALL_SAMPLES_INDEPENDENT = 10;
+static const GUID MF_MT_AUDIO_PREFER_WAVEFORMATEX = 11;
+static IMFMediaType media_type;
+static unsigned int calls, fail_call;
+static HRESULT result(void) { return calls++ == fail_call ? E_OUTOFMEMORY : S_OK; }
+static HRESULT MFCreateMediaType(IMFMediaType **out)
+{
+    HRESULT hr = result();
+    if (FAILED(hr)) return hr;
+    assert(!media_type.refs);
+    media_type.refs = 1;
+    *out = &media_type;
+    return S_OK;
+}
+static HRESULT IMFMediaType_SetGUID(IMFMediaType *type, const GUID *key, const GUID *value)
+{
+    assert(type == &media_type && type->refs == 1);
+    return result();
+}
+static HRESULT IMFMediaType_SetUINT32(IMFMediaType *type, const GUID *key, UINT32 value)
+{
+    assert(type == &media_type && type->refs == 1);
+    return result();
+}
+static void IMFMediaType_AddRef(IMFMediaType *type) { ++type->refs; }
+static void IMFMediaType_Release(IMFMediaType *type) { assert(type->refs); --type->refs; }
+
+@DECLARATIONS@
+@FUNCTIONS@
+
+int main(void)
+{
+    IMFMediaType *out;
+    for (fail_call = 0; fail_call < 10; ++fail_call)
+    {
+        calls = 0;
+        out = NULL;
+        assert(transform_GetOutputAvailableType(NULL, 0, 0, &out) == E_OUTOFMEMORY);
+        assert(!out && !media_type.refs && calls == fail_call + 1);
+    }
+    fail_call = UINT32_MAX;
+    calls = 0;
+    assert(transform_GetOutputAvailableType(NULL, 1, 0, &out) == MF_E_INVALIDSTREAMNUMBER);
+    assert(transform_GetOutputAvailableType(NULL, 0, 1, &out) == MF_E_NO_MORE_TYPES);
+    assert(!calls);
+    assert(transform_GetOutputAvailableType(NULL, 0, 0, &out) == S_OK);
+    assert(out == &media_type && out->refs == 1 && calls == 10);
+    IMFMediaType_Release(out);
+    puts("Output type failure tests passed.");
+    return 0;
+}

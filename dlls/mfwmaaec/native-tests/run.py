@@ -44,13 +44,17 @@ def main():
     subprocess.run([str(binary)], check=True)
 
     registration = (ROOT.parent / 'mfwmaaecdmo.c').read_text()
-    generated = (ROOT / 'unregister.c.in').read_text().replace('@FUNCTIONS@',
-            function(registration, 'HRESULT WINAPI DllUnregisterServer('))
-    path = args.output / 'unregister.c'
-    path.write_text(generated)
-    binary = args.output / 'unregister'
-    subprocess.run(command + [str(path), '-o', str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    default_format = source[source.index('static const WAVEFORMATEX default_output_format'):].split(';', 1)[0] + ';'
+    for name, body, signature in (
+            ('unregister', registration, 'HRESULT WINAPI DllUnregisterServer('),
+            ('types', source, 'static HRESULT WINAPI transform_GetOutputAvailableType(')):
+        generated = (ROOT / (name + '.c.in')).read_text().replace('@FUNCTIONS@', function(body, signature))
+        generated = generated.replace('@DECLARATIONS@', default_format)
+        path = args.output / (name + '.c')
+        path.write_text(generated)
+        binary = args.output / name
+        subprocess.run(command + [str(path), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
 
 
 if __name__ == '__main__':

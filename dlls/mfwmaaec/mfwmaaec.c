@@ -432,7 +432,7 @@ static HRESULT WINAPI transform_GetOutputAvailableType(IMFTransform *iface, DWOR
         IMFMediaType_AddRef((*type = media_type));
     IMFMediaType_Release(media_type);
 
-    return S_OK;
+    return hr;
 }
 
 static HRESULT WINAPI transform_SetInputType(IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags)
