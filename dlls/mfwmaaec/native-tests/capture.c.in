@@ -251,10 +251,47 @@ static void test_capacity(void)
     finish_capture(&a);
 }
 
+static void test_silence(void)
+{
+    struct aaec a;
+    struct media_buffer b = {.capacity = 160};
+    DMO_OUTPUT_DATA_BUFFER out = {.pBuffer = &b};
+    DWORD status;
+    init_capture(&a);
+    b.data = malloc(b.capacity);
+    memset(b.data, 0x55, b.capacity);
+    add_packet(160, AUDCLNT_BUFFERFLAGS_SILENT);
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_OK);
+    assert(b.length == 160 && buffer_releases == 1 && a.held_frames == 80);
+    check_bytes(b.data, 160, 0);
+    check_bytes(a.held_buffer, 160, 0);
+    memset(b.data, 0x55, b.capacity);
+    b.length = 0;
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_OK);
+    assert(b.length == 160 && buffer_releases == 1 && !a.held_frames);
+    assert(out.rtTimestamp == 200000);
+    check_bytes(b.data, 160, 0);
+    free(b.data);
+    finish_capture(&a);
+
+    init_capture(&a);
+    b.data = malloc(b.capacity);
+    b.length = 0;
+    add_packet(40, 0);
+    add_packet(40, AUDCLNT_BUFFERFLAGS_SILENT);
+    assert(media_object_ProcessOutput(&a.IMediaObject_iface, 0, 1, &out, &status) == S_OK);
+    assert(b.length == 160 && buffer_releases == 2);
+    check_bytes(b.data, 80, 0x33);
+    check_bytes(b.data + 80, 80, 0);
+    free(b.data);
+    finish_capture(&a);
+}
+
 int main(void)
 {
     test_append();
     test_capacity();
-    puts("Capture output capacity tests passed.");
+    test_silence();
+    puts("Capture capacity and silence tests passed.");
     return 0;
 }

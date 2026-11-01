@@ -890,7 +890,8 @@ static HRESULT WINAPI media_object_ProcessOutput(IMediaObject *iface, DWORD flag
             if (!initial_buffer_size && !output->rtTimestamp) output->rtTimestamp = qpc_pos;
             ac_buffer_size *= aaec->sample_size;
             size = min(curr_frame_size, ac_buffer_size);
-            memcpy(data, ac_ptr, size);
+            if (ac_flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(data, 0, size);
+            else memcpy(data, ac_ptr, size);
             data += size;
             curr_frame_size -= size;
             if (ac_buffer_size > size)
@@ -898,7 +899,8 @@ static HRESULT WINAPI media_object_ProcessOutput(IMediaObject *iface, DWORD flag
                 assert(!curr_frame_size);
                 assert(ac_buffer_size < aaec->max_held_frames * aaec->sample_size);
                 aaec->held_frames = (ac_buffer_size - size) / aaec->sample_size;
-                memcpy(aaec->held_buffer, ac_ptr + size, ac_buffer_size - size);
+                if (ac_flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(aaec->held_buffer, 0, ac_buffer_size - size);
+                else memcpy(aaec->held_buffer, ac_ptr + size, ac_buffer_size - size);
                 aaec->held_frames_start_time = qpc_pos + (REFERENCE_TIME)size / aaec->sample_size * 10000000 / aaec->samples_per_sec;
             }
             IAudioCaptureClient_ReleaseBuffer(aaec->acc, ac_buffer_size / aaec->sample_size);
