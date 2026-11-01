@@ -3009,7 +3009,8 @@ static DWORD read_reply( struct request *request )
         int lenW;
 
         buflen = MAX_REPLY_LEN;
-        if (read_line( request, &buflen )) return ERROR_SUCCESS;
+        if ((ret = read_line( request, &buflen )))
+            return ret == ERROR_WINHTTP_HEADER_SIZE_OVERFLOW ? ret : ERROR_SUCCESS;
         if (!*request->reply) buflen = 1;
 
         while (len - offset < buflen + crlf_len)

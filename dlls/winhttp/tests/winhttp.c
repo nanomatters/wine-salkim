@@ -2517,6 +2517,28 @@ static DWORD CALLBACK server_thread(LPVOID param)
     {
         if (c == -1) c = accept(s, NULL, NULL);
         server_receive_request(c, buffer, sizeof(buffer));
+        if (strstr(buffer, "GET /long_reply_header/"))
+        {
+            static const char path[] = "/long_reply_header/";
+            static const char prefix[] = "HTTP/1.1 200 OK\r\nX-Large: ";
+            static const char suffix[] = "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            unsigned int length = strtoul(strstr(buffer, path) + strlen(path), NULL, 10);
+            unsigned int total = sizeof(prefix) - 1 + length + sizeof(suffix) - 1, offset = 0;
+            char *reply = malloc(total);
+
+            ok(reply != NULL, "Failed to allocate response.\n");
+            if (!reply) break;
+            memcpy(reply, prefix, sizeof(prefix) - 1);
+            memset(reply + sizeof(prefix) - 1, 'a', length);
+            memcpy(reply + sizeof(prefix) - 1 + length, suffix, sizeof(suffix) - 1);
+            while (offset < total)
+            {
+                r = send(c, reply + offset, total - offset, 0);
+                if (r <= 0) break;
+                offset += r;
+            }
+            free(reply);
+        }
         if (strstr(buffer, "GET /basic"))
         {
             send(c, okmsg, sizeof okmsg - 1, 0);
@@ -2850,6 +2872,67 @@ static void test_basic_request(int port, const WCHAR *verb, const WCHAR *path)
     WinHttpCloseHandle(req);
     WinHttpCloseHandle(con);
     WinHttpCloseHandle(ses);
+}
+
+static void test_long_reply_headers(int port)
+{
+    static const DWORD lengths[] = {16000, 60000, 70000, 1};
+    HINTERNET session, connection, request;
+    unsigned int i;
+    DWORD size;
+    WCHAR path[64], *value;
+    BOOL ret;
+
+    session = WinHttpOpen(L"winetest", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+    ok(session != NULL, "Failed to open session: %lu.\n", GetLastError());
+    if (!session) return;
+    connection = WinHttpConnect(session, L"127.0.0.1", port, 0);
+    ok(connection != NULL, "Failed to connect: %lu.\n", GetLastError());
+    if (!connection) goto done;
+
+    for (i = 0; i < ARRAY_SIZE(lengths); ++i)
+    {
+        winetest_push_context("length %lu", lengths[i]);
+        swprintf(path, ARRAY_SIZE(path), L"/long_reply_header/%lu", lengths[i]);
+        request = WinHttpOpenRequest(connection, L"GET", path, NULL, NULL, NULL, 0);
+        ok(request != NULL, "Failed to open request: %lu.\n", GetLastError());
+        if (!request) goto next;
+        ret = WinHttpSendRequest(request, NULL, 0, NULL, 0, 0, 0);
+        ok(ret, "Failed to send request: %lu.\n", GetLastError());
+        if (!ret) goto close;
+        SetLastError(0xdeadbeef);
+        ret = WinHttpReceiveResponse(request, NULL);
+        if (lengths[i] > 65536)
+        {
+            ok(!ret && GetLastError() == ERROR_WINHTTP_HEADER_SIZE_OVERFLOW,
+               "Expected header overflow, got %u, error %lu.\n", ret, GetLastError());
+            goto close;
+        }
+        ok(ret, "Failed to receive response: %lu.\n", GetLastError());
+        if (!ret) goto close;
+        size = 0;
+        ret = WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"X-Large", NULL, &size, NULL);
+        ok(!ret && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+           "Expected buffer size, got %u, error %lu.\n", ret, GetLastError());
+        value = malloc(size);
+        ok(value != NULL, "Failed to allocate header buffer.\n");
+        if (!value) goto close;
+        ret = WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"X-Large", value, &size, NULL);
+        ok(ret, "Failed to query header: %lu.\n", GetLastError());
+        if (ret)
+        {
+            ok(lstrlenW(value) == lengths[i], "Unexpected length %u.\n", lstrlenW(value));
+            ok(wcsspn(value, L"a") == lengths[i], "Unexpected header contents.\n");
+        }
+        free(value);
+close:
+        WinHttpCloseHandle(request);
+next:
+        winetest_pop_context();
+    }
+    WinHttpCloseHandle(connection);
+done:
+    WinHttpCloseHandle(session);
 }
 
 static void test_chunked_request(int port)
@@ -6511,6 +6594,7 @@ START_TEST (winhttp)
 
     test_IWinHttpRequest(si.port);
     test_connection_info(si.port);
+    test_long_reply_headers(si.port);
     test_basic_request(si.port, NULL, L"/basic");
     test_basic_request(si.port, L"PUT", L"/test");
     test_chunked_request(si.port);
