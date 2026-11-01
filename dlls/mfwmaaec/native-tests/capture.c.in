@@ -70,6 +70,7 @@ static IAudioCaptureClient capture_client;
 static unsigned int device_refs, audio_refs, capture_refs, enumerator_refs, starts, stops;
 static HRESULT start_result;
 static int fail_allocation;
+static unsigned int allocations;
 static UINT32 capture_capacity;
 struct packet { BYTE *data; UINT32 frames; DWORD flags; UINT64 timestamp; };
 static struct packet packets[4];
@@ -168,7 +169,7 @@ static HRESULT IMediaBuffer_SetLength(struct media_buffer *buffer, DWORD length)
     buffer->length = length;
     return S_OK;
 }
-static void *capture_alloc(size_t size) { return fail_allocation ? NULL : malloc(size); }
+static void *capture_alloc(size_t size) { ++allocations; return fail_allocation ? NULL : malloc(size); }
 
 #define malloc capture_alloc
 @FUNCTIONS@
@@ -180,6 +181,7 @@ static void init_capture(struct aaec *a)
     assert(!device_refs && !audio_refs && !capture_refs && !enumerator_refs);
     packet_count = packet_index = buffer_releases = starts = stops = 0;
     fail_allocation = 0;
+    allocations = 0;
     start_result = S_OK;
     capture_capacity = 320;
     a->device_indexes = 0xffff;
@@ -314,12 +316,51 @@ static void test_full_packet(void)
     finish_capture(&a);
 }
 
+static void test_capture_failures(void)
+{
+    struct aaec a;
+    init_capture(&a);
+    fail_allocation = 1;
+    assert(start_audio_capture(&a) == E_OUTOFMEMORY);
+    assert(!a.ac && !a.acc && !a.held_buffer);
+    assert(!device_refs && !audio_refs && !capture_refs && !starts && !stops);
+
+    fail_allocation = 0;
+    assert(start_audio_capture(&a) == S_OK);
+    assert(a.ac && a.acc && a.held_buffer && starts == 1);
+    assert(start_audio_capture(&a) == S_OK);
+    assert(starts == 1);
+    stop_audio_capture(&a);
+    assert(!a.ac && !a.acc && !a.held_buffer && stops == 1);
+
+    start_result = E_FAIL;
+    assert(start_audio_capture(&a) == E_FAIL);
+    assert(!a.ac && !a.acc && !a.held_buffer);
+    assert(!device_refs && !audio_refs && !capture_refs);
+    assert(starts == 2 && stops == 1);
+    start_result = S_OK;
+    assert(start_audio_capture(&a) == S_OK);
+    assert(starts == 3);
+    finish_capture(&a);
+    assert(stops == 2);
+
+    if (SIZE_MAX == UINT32_MAX)
+    {
+        init_capture(&a);
+        capture_capacity = UINT32_MAX;
+        assert(start_audio_capture(&a) == E_OUTOFMEMORY);
+        assert(!allocations && !starts && !audio_refs && !capture_refs);
+        finish_capture(&a);
+    }
+}
+
 int main(void)
 {
     test_append();
     test_capacity();
     test_silence();
     test_full_packet();
-    puts("Capture packet tests passed.");
+    test_capture_failures();
+    puts("Capture packet and lifetime tests passed.");
     return 0;
 }

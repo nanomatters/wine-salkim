@@ -2,6 +2,7 @@
 """Run the production capture routines with deterministic WASAPI providers."""
 import argparse
 import os
+import shlex
 from pathlib import Path
 import subprocess
 
@@ -35,7 +36,7 @@ def main():
     path = args.output / 'capture.c'
     path.write_text(generated)
     binary = args.output / 'capture'
-    command = [os.environ.get('CC', 'cc'), '-std=c11', '-O1', '-g', '-Wall', '-Wextra',
+    command = shlex.split(os.environ.get('CC', 'cc')) + ['-std=c11', '-O1', '-g', '-Wall', '-Wextra',
                '-Werror', '-Wno-unused-parameter', '-Wno-unused-const-variable', '-UNDEBUG']
     if args.sanitize:
         command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']

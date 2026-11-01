@@ -17,6 +17,7 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <assert.h>
 
 #define COBJMACROS
@@ -179,20 +180,27 @@ static HRESULT start_audio_capture(struct aaec *aaec)
     if (FAILED(hr = IAudioClient_GetService(aaec->ac, &IID_IAudioCaptureClient, (void**)&aaec->acc))) goto done;
     if (FAILED(hr = IAudioClient_GetBufferSize(aaec->ac, &ac_buffer_len))) goto done;
 
-    if (FAILED(hr = IAudioClient_Start(aaec->ac))) goto done;
-
     aaec->held_frames = 0;
     aaec->samples_per_sec = wfx->nSamplesPerSec;
     aaec->sample_size = wfx->wBitsPerSample * wfx->nChannels / 8;
     aaec->frame_size = aaec->frame_length * aaec->sample_size;
     aaec->max_held_frames = ac_buffer_len;
-    aaec->held_buffer = malloc(aaec->max_held_frames * aaec->sample_size);
+    if (aaec->max_held_frames > SIZE_MAX / aaec->sample_size
+            || !(aaec->held_buffer = malloc((size_t)aaec->max_held_frames * aaec->sample_size)))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+
+    hr = IAudioClient_Start(aaec->ac);
 
 done:
     if (dev) IMMDevice_Release(dev);
     if (FAILED(hr))
     {
         WARN("Failed to start audio capture, hr %#lx.\n", hr);
+        free(aaec->held_buffer);
+        aaec->held_buffer = NULL;
         if (aaec->ac)
         {
             IAudioClient_Release(aaec->ac);
