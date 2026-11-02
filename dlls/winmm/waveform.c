@@ -1299,6 +1299,8 @@ static LRESULT WINMM_OpenDevice(WINMM_Device *device, WINMM_OpenInfo *info,
     return MMSYSERR_NOERROR;
 
 error:
+    free(device->orig_fmt);
+    device->orig_fmt = NULL;
     if(device->client){
         IAudioClient_Release(device->client);
         device->client = NULL;
@@ -1517,6 +1519,7 @@ static HRESULT WINMM_CloseDevice(WINMM_Device *device)
     device->clock = NULL;
 
     free(device->orig_fmt);
+    device->orig_fmt = NULL;
 
     return S_OK;
 }
