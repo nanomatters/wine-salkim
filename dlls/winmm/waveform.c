@@ -100,7 +100,7 @@ typedef struct _WINMM_Device {
     BOOL stopped;
     DWORD loop_counter;
     UINT32 bytes_per_frame, samples_per_sec, ofs_bytes, played_frames;
-    UINT32 remainder_frames; /* header chunk frames already played when a device switch occurred */
+    UINT32 remainder_frames; /* played or discarded frames carried over from previous devices */
 
     /* stored in frames of sample rate, *not* AC::GetFrequency */
     UINT64 last_clock_pos;
@@ -715,6 +715,7 @@ static HRESULT reroute_mapper_device(WINMM_Device *device, BOOL is_out)
     MMRESULT mr;
     HRESULT hr;
     UINT64 clock_freq, clock_pos;
+    UINT32 padding = 0;
 
     TRACE("rerouting device %p\n", device->handle);
 
@@ -768,7 +769,16 @@ static HRESULT reroute_mapper_device(WINMM_Device *device, BOOL is_out)
         return hr;
     }
 
-    device->remainder_frames = MulDiv(clock_pos, device->samples_per_sec, clock_freq) - device->last_clock_pos;
+    if(is_out && FAILED(hr = IAudioClient_GetCurrentPadding(device->client, &padding))){
+        WARN("GetCurrentPadding failed: %08lx\n", hr);
+        LeaveCriticalSection(&device->lock);
+        return hr;
+    }
+
+    /* Closing the old client also discards its unplayed frames. Account for
+     * them, including any carry from a reroute the worker has not handled yet. */
+    device->remainder_frames += (clock_pos * device->samples_per_sec) / clock_freq
+            - device->last_clock_pos + padding;
 
     info.handle = device->handle;
     info.flags = (device->cb_info.flags << 16) | WAVE_FORMAT_DIRECT;
@@ -1281,6 +1291,7 @@ static LRESULT WINMM_OpenDevice(WINMM_Device *device, WINMM_OpenInfo *info,
 
     if(info->reset){
         device->played_frames = 0;
+        device->remainder_frames = 0;
         device->ofs_bytes = 0;
         device->loop_counter = 0;
         device->first = device->last = device->playing = device->loop_start = NULL;
@@ -1690,9 +1701,11 @@ static WAVEHDR *WOD_MarkDoneHeaders(WINMM_Device *device)
             (queue_frames += WINMM_HeaderLenFrames(device, queue)) <=
                 clock_frames - device->last_clock_pos + device->remainder_frames){
         if(!nloops){
+            /* Frames carried from the old device do not advance this clock. */
+            UINT32 old_frames = min(queue_frames, device->remainder_frames);
             last = queue;
-            device->last_clock_pos += queue_frames;
-            device->remainder_frames = 0;
+            device->last_clock_pos += queue_frames - old_frames;
+            device->remainder_frames -= old_frames;
             queue_frames = 0;
             queue = device->first = queue->lpNext;
         }else{
@@ -1736,6 +1749,7 @@ static void WOD_PushData(WINMM_Device *device)
             goto exit;
         device->stopped = TRUE;
         device->last_clock_pos = 0;
+        device->remainder_frames = 0;
         IAudioClient_Stop(device->client);
         IAudioClient_Reset(device->client);
         goto exit;
@@ -2099,6 +2113,7 @@ static LRESULT WINMM_Reset(HWAVE hwave)
     device->first = device->last = device->playing = NULL;
     device->ofs_bytes = 0;
     device->played_frames = 0;
+    device->remainder_frames = 0;
     device->loop_counter = 0;
     device->last_clock_pos = 0;
     IAudioClient_Reset(device->client);
