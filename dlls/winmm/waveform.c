@@ -765,6 +765,8 @@ static HRESULT reroute_mapper_device(WINMM_Device *device, BOOL is_out)
     info.handle = device->handle;
     info.flags = (device->cb_info.flags << 16) | WAVE_FORMAT_DIRECT;
 
+    /* Keep the original format alive until the replacement stream copies it. */
+    device->orig_fmt = NULL;
     if(is_out){
         WOD_Close((HWAVEOUT)device->handle);
         device->parent = read_map(g_out_map, 0);
@@ -775,13 +777,13 @@ static HRESULT reroute_mapper_device(WINMM_Device *device, BOOL is_out)
         mr = WID_Open(&info);
     }
 
+    free(info.format);
+
     if(mr != MMSYSERR_NOERROR){
         ERR("Opening new default device failed! %u\n", mr);
         LeaveCriticalSection(&device->lock);
         return E_FAIL;
     }
-
-    free(info.format);
 
     if(!stopped){
         if(is_out)
