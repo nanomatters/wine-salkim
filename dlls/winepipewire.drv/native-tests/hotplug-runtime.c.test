@@ -63,8 +63,10 @@ static HRESULT WINAPI query_interface(IMMNotificationClient *iface, REFIID iid, 
     return S_OK;
 }
 
-static ULONG WINAPI add_ref(IMMNotificationClient *iface) { return InterlockedIncrement(&references); }
-static ULONG WINAPI release(IMMNotificationClient *iface) { return InterlockedDecrement(&references); }
+/* MMDevAPI must leave ownership of notification clients to the application,
+ * including while dispatching real endpoint and default-device changes. */
+static ULONG WINAPI add_ref(IMMNotificationClient *iface) { check(FALSE); return InterlockedIncrement(&references); }
+static ULONG WINAPI release(IMMNotificationClient *iface) { check(FALSE); return InterlockedDecrement(&references); }
 
 static void check_endpoint(const WCHAR *id)
 {
@@ -271,18 +273,9 @@ static void check_pnp_present(const WCHAR *id)
 
 static void release_enumerator(void)
 {
-    ULONGLONG deadline = GetTickCount64() + 10000;
-
     check(SUCCEEDED(IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(enumerator, &notification)));
-    /* Unregister excludes future snapshots but an already retained callback
-     * batch may finish afterwards. Keep its enumerator alive until the
-     * snapshot's reference to our client has been released. */
-    while (InterlockedCompareExchange(&references, 0, 0) != 1 && GetTickCount64() < deadline) Sleep(1);
-    if (InterlockedCompareExchange(&references, 0, 0) != 1)
-    {
-        fputs("Notification callbacks did not finish after unregister.\n", stderr);
-        ExitProcess(20);
-    }
+    /* Unregister drains active callbacks without taking client references. */
+    check(InterlockedCompareExchange(&references, 0, 0) == 1);
     drain_references();
     check(drained == InterlockedCompareExchange(&queued_count, 0, 0));
     IMMDeviceEnumerator_Release(enumerator);

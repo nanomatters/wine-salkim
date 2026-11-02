@@ -1920,6 +1920,14 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
 struct NotificationClientWrapper {
     IMMNotificationClient *client;
     struct list entry;
+    unsigned int refs;
+    struct list calls;
+};
+
+struct notification_call
+{
+    struct list entry;
+    DWORD thread_id;
 };
 
 static struct list g_notif_clients = LIST_INIT(g_notif_clients);
@@ -1937,11 +1945,12 @@ static CRITICAL_SECTION_DEBUG g_notif_lock_debug =
       0, 0, { (DWORD_PTR)(__FILE__ ": g_notif_lock") }
 };
 static CRITICAL_SECTION g_notif_lock = { &g_notif_lock_debug, -1, 0, 0, 0, 0 };
+static CONDITION_VARIABLE g_notif_cv;
 
-static IMMNotificationClient **snapshot_notification_clients(unsigned int *count)
+static struct NotificationClientWrapper **snapshot_notification_clients(unsigned int *count)
 {
     struct NotificationClientWrapper *wrapper;
-    IMMNotificationClient **clients;
+    struct NotificationClientWrapper **clients;
     unsigned int i = 0;
 
     EnterCriticalSection(&g_notif_lock);
@@ -1954,37 +1963,83 @@ static IMMNotificationClient **snapshot_notification_clients(unsigned int *count
     LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients,
             struct NotificationClientWrapper, entry)
     {
-        clients[i++] = wrapper->client;
-        IMMNotificationClient_AddRef(wrapper->client);
+        clients[i++] = wrapper;
+        ++wrapper->refs;
     }
     LeaveCriticalSection(&g_notif_lock);
     return clients;
 }
 
-static void release_notification_clients(IMMNotificationClient **clients, unsigned int count)
+static void release_notification_clients(struct NotificationClientWrapper **clients, unsigned int count)
 {
     unsigned int i;
 
-    for (i = 0; i < count; ++i) IMMNotificationClient_Release(clients[i]);
+    EnterCriticalSection(&g_notif_lock);
+    for (i = 0; i < count; ++i)
+        if (!--clients[i]->refs) free(clients[i]);
+    LeaveCriticalSection(&g_notif_lock);
     free(clients);
 }
 
-static void notify_default_clients(IMMNotificationClient **clients, unsigned int count,
+/* The application owns the client. Snapshots retain only our registration;
+ * unregister prevents new calls and drains calls already using the client. */
+static IMMNotificationClient *begin_notification(struct NotificationClientWrapper *wrapper,
+                                                 struct notification_call *call)
+{
+    IMMNotificationClient *client;
+
+    EnterCriticalSection(&g_notif_lock);
+    if ((client = wrapper->client))
+    {
+        call->thread_id = GetCurrentThreadId();
+        list_add_tail(&wrapper->calls, &call->entry);
+    }
+    LeaveCriticalSection(&g_notif_lock);
+    return client;
+}
+
+static void end_notification(struct notification_call *call)
+{
+    EnterCriticalSection(&g_notif_lock);
+    list_remove(&call->entry);
+    WakeAllConditionVariable(&g_notif_cv);
+    LeaveCriticalSection(&g_notif_lock);
+}
+
+static BOOL notification_in_progress(struct NotificationClientWrapper *wrapper)
+{
+    struct notification_call *call;
+
+    LIST_FOR_EACH_ENTRY(call, &wrapper->calls, struct notification_call, entry)
+        if (call->thread_id != GetCurrentThreadId()) return TRUE;
+    return FALSE;
+}
+
+static void notify_default_clients(struct NotificationClientWrapper **clients, unsigned int count,
                                    EDataFlow flow, ERole role, const WCHAR *id)
 {
+    struct notification_call call;
+    IMMNotificationClient *client;
     unsigned int i;
 
     for (i = 0; i < count; ++i)
     {
-        IMMNotificationClient_OnDefaultDeviceChanged(clients[i], flow, role, id);
-        if (role == eConsole)
-            IMMNotificationClient_OnDefaultDeviceChanged(clients[i], flow, eMultimedia, id);
+        if ((client = begin_notification(clients[i], &call)))
+        {
+            IMMNotificationClient_OnDefaultDeviceChanged(client, flow, role, id);
+            end_notification(&call);
+        }
+        if (role == eConsole && (client = begin_notification(clients[i], &call)))
+        {
+            IMMNotificationClient_OnDefaultDeviceChanged(client, flow, eMultimedia, id);
+            end_notification(&call);
+        }
     }
 }
 
 static void notify_clients(EDataFlow flow, ERole role, const WCHAR *id)
 {
-    IMMNotificationClient **clients;
+    struct NotificationClientWrapper **clients;
     unsigned int count;
 
     if (!(clients = snapshot_notification_clients(&count))) return;
@@ -2092,9 +2147,11 @@ static BOOL update_endpoint_format(MMDevice *device)
     return changed;
 }
 
-static void dispatch_endpoint_events(IMMNotificationClient **clients, unsigned int client_count,
+static void dispatch_endpoint_events(struct NotificationClientWrapper **clients, unsigned int client_count,
                                      struct endpoint_event *events, unsigned int count)
 {
+    struct notification_call call;
+    IMMNotificationClient *client;
     unsigned int i, j;
     WCHAR *id;
 
@@ -2102,21 +2159,25 @@ static void dispatch_endpoint_events(IMMNotificationClient **clients, unsigned i
     {
         if (FAILED(MMDevice_GetId(&events[i].device->IMMDevice_iface, &id))) continue;
         for (j = 0; j < client_count; ++j)
+        {
+            if (!(client = begin_notification(clients[j], &call))) continue;
             switch (events[i].type)
             {
             case ENDPOINT_ADDED:
-                IMMNotificationClient_OnDeviceAdded(clients[j], id);
+                IMMNotificationClient_OnDeviceAdded(client, id);
                 break;
             case ENDPOINT_REMOVED:
-                IMMNotificationClient_OnDeviceRemoved(clients[j], id);
+                IMMNotificationClient_OnDeviceRemoved(client, id);
                 break;
             case ENDPOINT_STATE:
-                IMMNotificationClient_OnDeviceStateChanged(clients[j], id, events[i].state);
+                IMMNotificationClient_OnDeviceStateChanged(client, id, events[i].state);
                 break;
             case ENDPOINT_PROPERTY:
-                IMMNotificationClient_OnPropertyValueChanged(clients[j], id, events[i].property);
+                IMMNotificationClient_OnPropertyValueChanged(client, id, events[i].property);
                 break;
             }
+            end_notification(&call);
+        }
         CoTaskMemFree(id);
     }
 }
@@ -2127,7 +2188,7 @@ static HRESULT refresh_endpoint_devices(unsigned int changes)
     struct get_endpoint_ids_params snapshots[2] = {{0}};
     struct endpoint_update *updates = NULL;
     struct endpoint_event *events = NULL;
-    IMMNotificationClient **clients = NULL;
+    struct NotificationClientWrapper **clients = NULL;
     IMMDevice *defaults[2][2] = {{0}}, *current;
     MMDevice *new_defaults[2] = {0};
     unsigned int client_count, count = 0, event_count = 0, old_count, i, j, role;
@@ -2668,6 +2729,8 @@ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEn
         return hr;
     }
     wrapper->client = client;
+    wrapper->refs = 1;
+    list_init(&wrapper->calls);
 
     endpoint_notifications_addref();
     EnterCriticalSection(&g_notif_lock);
@@ -2724,13 +2787,23 @@ static HRESULT WINAPI MMDevEnum_UnregisterEndpointNotificationCallback(IMMDevice
     if(!client)
         return E_POINTER;
 
+    /* Other threads have already been terminated. Their in-flight calls
+     * cannot finish, and their stack records must no longer be inspected. */
+    if (RtlDllShutdownInProgress()) return S_OK;
+
     EnterCriticalSection(&g_notif_lock);
 
     LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry){
         if(wrapper->client == client){
             list_remove(&wrapper->entry);
-            free(wrapper);
+            wrapper->client = NULL;
             if (list_empty(&g_notif_clients) && g_notif_thread) SetEvent(g_notif_thread->stop_event);
+            /* Release the list lock while waiting. A callback must be able
+             * to finish, and unrelated registrations must remain usable.
+             * Do not wait on our own stack if a callback unregisters itself. */
+            while (notification_in_progress(wrapper))
+                SleepConditionVariableCS(&g_notif_cv, &g_notif_lock, INFINITE);
+            if (!--wrapper->refs) free(wrapper);
             LeaveCriticalSection(&g_notif_lock);
             endpoint_notifications_release();
             return S_OK;

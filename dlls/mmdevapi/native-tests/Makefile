@@ -21,3 +21,4 @@ $(BUILD_DIR)/spatial: spatial.c.test $(SPATIAL_SOURCE) ../mmdevapi_private.h ../
 check: all
 	$(BUILD_DIR)/spatial
 	python3 endpoint-identity.py --build-dir $(BUILD_DIR)
+	python3 notification-lifetime.py --build-dir $(BUILD_DIR) --wine-build-dir $(WINE_BUILD_DIR)

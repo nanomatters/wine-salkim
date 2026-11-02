@@ -34,3 +34,17 @@ loading remembered endpoints does not claim another backend's registrations.
 It does not require Wine or a PipeWire server. The PipeWire private-runtime
 test separately checks real SetupAPI present-interface enumeration before
 and after hotplug.
+
+Notification-client lifetime:
+
+    python3 notification-lifetime.py --build-dir /tmp/mmdevapi-notification-tests \
+        --wine-build-dir /path/to/configured/wine/build
+
+This fixture extracts the registration, unregistration and both dispatch paths.
+It checks cancellation of saved snapshots, concurrent callback draining without
+holding the registration lock, duplicate registrations, self-unregistration,
+and shutdown with inaccessible callback records. Client IUnknown methods abort
+if called. It does not establish Windows behavior for blocking callbacks or
+cross-client unregistration inside callbacks; both violate the documented
+IMMNotificationClient contract. The private PipeWire runtime suite tests real
+endpoint/default events and rejects client AddRef/Release calls as well.

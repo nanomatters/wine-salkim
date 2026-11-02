@@ -1,0 +1,302 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+#include <assert.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#define COBJMACROS
+#include "windef.h"
+#include "winbase.h"
+#include "winternl.h"
+#include "mmdeviceapi.h"
+#include "wine/list.h"
+
+#undef GetCurrentThreadId
+DWORD WINAPI GetCurrentThreadId(void);
+DWORD WINAPI GetLastError(void);
+
+#define TRACE(...) do {} while (0)
+typedef struct { int unused; } MMDevEnumImpl;
+typedef struct { IMMDevice IMMDevice_iface; } MMDevice;
+static HRESULT WINAPI MMDevice_GetId(IMMDevice *device, WCHAR **id)
+{
+    static WCHAR name[] = {'e', 0};
+    *id = name;
+    return S_OK;
+}
+void WINAPI CoTaskMemFree(void *ptr) {}
+static MMDevEnumImpl *impl_from_IMMDeviceEnumerator(IMMDeviceEnumerator *iface) { return NULL; }
+static unsigned int users;
+static void endpoint_notifications_addref(void) { ++users; }
+static void endpoint_notifications_release(void) { assert(users); --users; }
+static DWORD WINAPI notif_thread_proc(void *arg) { return 0; }
+
+/* PRODUCTION */
+
+static pthread_mutex_t registration_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t registration_cv = PTHREAD_COND_INITIALIZER;
+static atomic_uint waiting, next_tid;
+static _Thread_local DWORD tid;
+static _Thread_local BOOL locked;
+static BOOL shutting_down;
+static unsigned int lock_entries;
+
+BOOLEAN WINAPI RtlDllShutdownInProgress(void) { return shutting_down; }
+
+void WINAPI EnterCriticalSection(CRITICAL_SECTION *cs)
+{
+    assert(cs == &g_notif_lock);
+    assert(!pthread_mutex_lock(&registration_lock));
+    ++lock_entries;
+    locked = TRUE;
+}
+void WINAPI LeaveCriticalSection(CRITICAL_SECTION *cs)
+{
+    assert(cs == &g_notif_lock);
+    locked = FALSE;
+    assert(!pthread_mutex_unlock(&registration_lock));
+}
+BOOL WINAPI SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD timeout)
+{
+    assert(cv == &g_notif_cv && cs == &g_notif_lock && timeout == INFINITE);
+    ++waiting;
+    assert(!pthread_cond_wait(&registration_cv, &registration_lock));
+    --waiting;
+    return TRUE;
+}
+void WINAPI WakeAllConditionVariable(CONDITION_VARIABLE *cv)
+{
+    assert(cv == &g_notif_cv);
+    assert(!pthread_cond_broadcast(&registration_cv));
+}
+DWORD WINAPI GetCurrentThreadId(void)
+{
+    if (!tid) tid = ++next_tid;
+    return tid;
+}
+DWORD WINAPI GetLastError(void) { return ERROR_NOT_ENOUGH_MEMORY; }
+BOOL WINAPI GetModuleHandleExW(DWORD flags, const WCHAR *name, HMODULE *module)
+{ *module = (HMODULE)1; return TRUE; }
+BOOL WINAPI FreeLibrary(HMODULE module) { return TRUE; }
+HANDLE WINAPI CreateEventW(SECURITY_ATTRIBUTES *attr, BOOL manual, BOOL state, const WCHAR *name)
+{ return (HANDLE)1; }
+BOOL WINAPI SetEvent(HANDLE event) { return TRUE; }
+BOOL WINAPI ResetEvent(HANDLE event) { return TRUE; }
+BOOL WINAPI CloseHandle(HANDLE handle) { return TRUE; }
+HANDLE WINAPI CreateThread(SECURITY_ATTRIBUTES *attr, SIZE_T size, LPTHREAD_START_ROUTINE proc,
+                            void *arg, DWORD flags, DWORD *id) { return (HANDLE)1; }
+
+static pthread_mutex_t callback_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t callback_cv = PTHREAD_COND_INITIALIZER;
+static unsigned int entered, permits;
+static atomic_uint callbacks, unregistered;
+static int mode;
+static unsigned int added, removed, states, properties;
+
+static HRESULT WINAPI query(IMMNotificationClient *iface, REFIID iid, void **out)
+{ abort(); }
+static ULONG WINAPI addref(IMMNotificationClient *iface) { abort(); }
+static ULONG WINAPI release(IMMNotificationClient *iface) { abort(); }
+static HRESULT WINAPI device_added(IMMNotificationClient *iface, const WCHAR *id)
+{
+    assert(!locked && id[0] == 'e');
+    ++added;
+    if (mode == 1) assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, iface) == S_OK);
+    return S_OK;
+}
+static HRESULT WINAPI device_removed(IMMNotificationClient *iface, const WCHAR *id)
+{ assert(!locked); ++removed; return S_OK; }
+static HRESULT WINAPI device_state(IMMNotificationClient *iface, const WCHAR *id, DWORD state)
+{ assert(!locked && state == DEVICE_STATE_ACTIVE); ++states; return S_OK; }
+static HRESULT WINAPI device_property(IMMNotificationClient *iface, const WCHAR *id, const PROPERTYKEY key)
+{ assert(!locked); ++properties; return S_OK; }
+static HRESULT WINAPI changed(IMMNotificationClient *iface, EDataFlow flow, ERole role, const WCHAR *id)
+{
+    /* Dispatch must never carry the registry lock into application code. */
+    assert(!locked);
+    ++callbacks;
+    if (mode == 1)
+        assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, iface) == S_OK);
+    else if (mode == 2)
+    {
+        pthread_mutex_lock(&callback_lock);
+        ++entered;
+        pthread_cond_broadcast(&callback_cv);
+        while (!permits) pthread_cond_wait(&callback_cv, &callback_lock);
+        --permits;
+        pthread_mutex_unlock(&callback_lock);
+    }
+    return S_OK;
+}
+static const IMMNotificationClientVtbl vtable = {
+    .QueryInterface = query, .AddRef = addref, .Release = release,
+    .OnDefaultDeviceChanged = changed,
+    .OnDeviceAdded = device_added, .OnDeviceRemoved = device_removed,
+    .OnDeviceStateChanged = device_state, .OnPropertyValueChanged = device_property,
+};
+static IMMNotificationClient client = {&vtable}, other = {&vtable};
+
+struct dispatch { struct NotificationClientWrapper **clients; unsigned int count; };
+
+static void *dispatch_thread(void *arg)
+{
+    struct dispatch *d = arg;
+    notify_default_clients(d->clients, d->count, eRender, eCommunications, NULL);
+    return NULL;
+}
+static void *unregister_thread(void *arg)
+{
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, arg) == S_OK);
+    ++unregistered;
+    return NULL;
+}
+static void allow_callbacks(unsigned int count)
+{
+    pthread_mutex_lock(&callback_lock);
+    permits += count;
+    pthread_cond_broadcast(&callback_cv);
+    pthread_mutex_unlock(&callback_lock);
+}
+
+static void test_snapshot_removal(void)
+{
+    struct dispatch d;
+    IMMNotificationClient *temporary = malloc(sizeof(*temporary));
+    unsigned int before = callbacks;
+
+    temporary->lpVtbl = &vtable;
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, temporary) == S_OK);
+    d.clients = snapshot_notification_clients(&d.count);
+    assert(d.count == 1);
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, temporary) == S_OK);
+    free(temporary);
+    notify_default_clients(d.clients, d.count, eRender, eConsole, NULL);
+    release_notification_clients(d.clients, d.count);
+    assert(callbacks == before && !users);
+}
+
+static void test_self_unregister(void)
+{
+    struct dispatch d;
+    unsigned int before = callbacks;
+
+    mode = 1;
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    d.clients = snapshot_notification_clients(&d.count);
+    notify_default_clients(d.clients, d.count, eRender, eConsole, NULL);
+    release_notification_clients(d.clients, d.count);
+    assert(callbacks == before + 1 && !users); /* No eMultimedia callback after unregister. */
+    mode = 0;
+}
+
+static void test_concurrent_unregister(void)
+{
+    struct dispatch d;
+    pthread_t a, b, unregister;
+    unsigned int before = callbacks;
+
+    mode = 2;
+    entered = permits = 0;
+    unregistered = 0;
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    d.clients = snapshot_notification_clients(&d.count);
+    assert(!pthread_create(&a, NULL, dispatch_thread, &d));
+    assert(!pthread_create(&b, NULL, dispatch_thread, &d));
+    pthread_mutex_lock(&callback_lock);
+    while (entered != 2) pthread_cond_wait(&callback_cv, &callback_lock);
+    pthread_mutex_unlock(&callback_lock);
+    assert(!pthread_create(&unregister, NULL, unregister_thread, &client));
+    while (!waiting) sched_yield();
+    assert(!unregistered);
+    /* Another client's lifetime must not depend on these blocked callbacks. */
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &other) == S_OK);
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, &other) == S_OK);
+    notify_default_clients(d.clients, d.count, eRender, eConsole, NULL);
+    assert(callbacks == before + 2);
+    allow_callbacks(2);
+    assert(!pthread_join(a, NULL) && !pthread_join(b, NULL));
+    assert(!pthread_join(unregister, NULL));
+    assert(unregistered && !waiting && !users);
+    release_notification_clients(d.clients, d.count);
+    mode = 0;
+}
+
+static void test_duplicates(void)
+{
+    struct dispatch d;
+    unsigned int before = callbacks;
+
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    d.clients = snapshot_notification_clients(&d.count);
+    assert(d.count == 2);
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    notify_default_clients(d.clients, d.count, eRender, eCommunications, NULL);
+    assert(callbacks == before + 1);
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, &client) == E_NOTFOUND);
+    release_notification_clients(d.clients, d.count);
+    assert(!users);
+}
+
+static void test_endpoint_dispatch(void)
+{
+    MMDevice device;
+    struct endpoint_event events[] = {
+        {ENDPOINT_ADDED, &device}, {ENDPOINT_STATE, &device, DEVICE_STATE_ACTIVE},
+        {ENDPOINT_PROPERTY, &device}, {ENDPOINT_REMOVED, &device},
+    };
+    struct dispatch d;
+
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    d.clients = snapshot_notification_clients(&d.count);
+    dispatch_endpoint_events(d.clients, d.count, events, 4);
+    assert(added == 1 && removed == 1 && states == 1 && properties == 1);
+    mode = 1;
+    dispatch_endpoint_events(d.clients, d.count, events, 4);
+    assert(added == 2 && removed == 1 && states == 1 && properties == 1);
+    mode = 0;
+    release_notification_clients(d.clients, d.count);
+    assert(!users);
+}
+
+static void test_process_shutdown(void)
+{
+    struct dispatch d;
+    unsigned int before;
+
+    assert(MMDevEnum_RegisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    d.clients = snapshot_notification_clients(&d.count);
+    /* Model an inaccessible callback stack after worker termination. */
+    d.clients[0]->calls.next = d.clients[0]->calls.prev = (void *)1;
+    before = lock_entries;
+    shutting_down = TRUE;
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    assert(lock_entries == before);
+    shutting_down = FALSE;
+    list_init(&d.clients[0]->calls);
+    assert(MMDevEnum_UnregisterEndpointNotificationCallback(NULL, &client) == S_OK);
+    release_notification_clients(d.clients, d.count);
+    assert(!users);
+}
+
+int main(void)
+{
+    unsigned int i;
+
+    alarm(25);
+    test_snapshot_removal();
+    test_self_unregister();
+    test_duplicates();
+    test_endpoint_dispatch();
+    test_process_shutdown();
+    for (i = 0; i < 100; ++i) test_concurrent_unregister();
+    assert(list_empty(&g_notif_clients));
+    free(g_notif_thread);
+    puts("notification lifetime: cancellation, endpoint dispatch, shutdown, self-unregister, duplicates and 100 concurrent drains passed");
+    return 0;
+}
