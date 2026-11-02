@@ -15,8 +15,45 @@ static void test_unregister_before_cleanup(void)
     assert(!live_locks && deleted_locks == 2);
 }
 
+static void *notify_thread(void *arg)
+{
+    assert(notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"endpoint") == S_OK);
+    return NULL;
+}
+
+static void drain_callback(void)
+{
+    pthread_t thread;
+
+    assert(!pthread_create(&thread, NULL, notify_thread, NULL));
+    assert(!pthread_join(thread, NULL));
+}
+
+static void *failed_init_thread(void *arg)
+{
+    assert(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL));
+    return NULL;
+}
+
+static void test_startup_failure_notification(void)
+{
+    pthread_t thread;
+
+    endpoint_result[eRender] = E_FAIL;
+    unregister_hook = drain_callback;
+    /* Match startup: the caller owns the devices lock and waits for init;
+     * failed init unregisters and drains a concurrent default callback. */
+    EnterCriticalSection(&g_devthread_lock);
+    assert(!pthread_create(&thread, NULL, failed_init_thread, NULL));
+    assert(!pthread_join(thread, NULL));
+    LeaveCriticalSection(&g_devthread_lock);
+    assert(!g_devenum && !registered_client && unregisters == 1);
+    assert(g_default_changes == (1 << eRender));
+}
+
 int main(void)
 {
     run_test(test_unregister_before_cleanup, "unregister before cleanup");
+    run_test(test_startup_failure_notification, "startup failure drains notification without lock inversion");
     return 0;
 }

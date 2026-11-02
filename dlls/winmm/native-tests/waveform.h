@@ -55,8 +55,12 @@ static unsigned int allocations, allocated, live_locks, deleted_locks;
 static void *allocation_ptrs[256];
 static HRESULT create_result = S_OK, register_result = S_OK, com_result = S_OK;
 static HRESULT endpoint_result[2] = {S_OK, S_OK};
+static HRESULT default_result = S_OK, id_result = S_OK;
 static IMMNotificationClient *registered_client;
 static BOOL require_unregistered_during_cleanup;
+static void (*unregister_hook)(void);
+static unsigned int posted_notifications;
+static const WCHAR *default_device_id = L"endpoint";
 static pthread_mutex_t once_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t once_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t callback_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -186,6 +190,13 @@ void WINAPI LeaveCriticalSection(CRITICAL_SECTION *cs)
 }
 
 BOOL WINAPI CloseHandle(HANDLE handle) { assert(!handle); return FALSE; }
+BOOL WINAPI PostMessageW(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    assert(hwnd == g_notification_hwnd && msg == WM_DEVICE_DEFAULT_CHANGED);
+    assert(!wparam && !lparam);
+    ++posted_notifications;
+    return TRUE;
+}
 HANDLE WINAPI CreateEventW(SECURITY_ATTRIBUTES *attr, BOOL manual, BOOL state, const WCHAR *name)
 { abort(); }
 INT WINAPI MulDiv(INT number, INT numerator, INT denominator) { abort(); }
@@ -217,6 +228,7 @@ static HRESULT WINAPI enum_endpoints(IMMDeviceEnumerator *iface, EDataFlow flow,
 static HRESULT WINAPI enum_default(IMMDeviceEnumerator *iface, EDataFlow flow,
                                     ERole role, IMMDevice **out)
 {
+    if (FAILED(default_result)) return default_result;
     *out = &mock_device;
     return S_OK;
 }
@@ -233,6 +245,7 @@ static HRESULT WINAPI enum_unregister(IMMDeviceEnumerator *iface, IMMNotificatio
 {
     ++unregisters;
     assert(!registered_client || registered_client == client);
+    if (unregister_hook) unregister_hook();
     registered_client = NULL;
     return S_OK;
 }
@@ -275,8 +288,12 @@ static HRESULT WINAPI device_props(IMMDevice *iface, DWORD access, IPropertyStor
 }
 static HRESULT WINAPI device_id(IMMDevice *iface, WCHAR **out)
 {
-    *out = test_malloc(sizeof(L"endpoint"));
-    memcpy(*out, L"endpoint", sizeof(L"endpoint"));
+    unsigned int size = 0;
+    if (FAILED(id_result)) return id_result;
+    while (default_device_id[size++]);
+    size *= sizeof(WCHAR);
+    *out = test_malloc(size);
+    memcpy(*out, default_device_id, size);
     return S_OK;
 }
 static IMMDeviceVtbl device_vtbl = {
@@ -309,6 +326,7 @@ static void run_test(void (*test)(void), const char *name)
     assert(child >= 0);
     if (!child)
     {
+        alarm(10);
         test();
         _exit(0);
     }

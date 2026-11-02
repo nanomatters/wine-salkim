@@ -37,10 +37,130 @@ static void test_default_remap(void)
     assert(map[0] == &endpoints[0] && map[1] == &endpoints[1]);
 }
 
+static void test_deferred_default(void)
+{
+    WINMM_MMDevice endpoints[] = {{.dev_id = L"first"}, {.dev_id = L"second"}};
+    WINMM_MMDevice *items[] = {&endpoints[0], &endpoints[1]};
+    WINMM_Device capture = {0};
+
+    g_devenum = &mock_enumerator;
+    g_out_map = items;
+    g_outmmdevices_count = 2;
+    default_device_id = L"second";
+    assert(notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"second") == S_OK);
+    assert(!posted_notifications && items[0] == &endpoints[0]);
+    /* Notifications received without a devices thread still affect queries. */
+    assert(read_map(g_out_map, 0) == &endpoints[1]);
+    assert(!g_default_changes && !allocated);
+    assert(g_mapper_changes == (1 << eRender));
+
+    g_notification_hwnd = (HWND)1;
+    default_device_id = L"first";
+    /* Touching this capture device's lock would fail the native fixture. */
+    g_in_mapper_devices[0] = &capture;
+    assert(notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"first") == S_OK);
+    assert(posted_notifications == 1 && items[0] == &endpoints[1]);
+    WINMM_DefaultDeviceChanged();
+    assert(items[0] == &endpoints[0] && !g_default_changes && !allocated);
+    assert(!g_mapper_changes);
+    assert(notif_OnDefaultDeviceChanged(&g_notif, eRender, eMultimedia, L"second") == S_OK);
+    assert(posted_notifications == 1 && !g_default_changes);
+}
+
+static void test_default_id_queries(void)
+{
+    WINMM_MMDevice endpoints[] = {{.dev_id = L"first"}, {.dev_id = L"second"}};
+    WINMM_MMDevice *items[] = {&endpoints[0], &endpoints[1]};
+    DWORD_PTR size;
+    WCHAR id[32];
+
+    init_once.Ptr = (void *)2;
+    g_devenum = &mock_enumerator;
+    g_out_map = items;
+    g_outmmdevices_count = 2;
+    default_device_id = L"second";
+    notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"second");
+    assert(WINMM_QueryInstanceIDSize(0, &size, TRUE) == MMSYSERR_NOERROR);
+    assert(size == sizeof(L"second") && !g_default_changes);
+
+    default_device_id = L"first";
+    notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"first");
+    assert(WINMM_QueryInstanceID(0, id, sizeof(id), TRUE) == MMSYSERR_NOERROR);
+    assert(!test_wcscmp(id, L"first") && !g_default_changes && !allocated);
+    assert(!posted_notifications);
+}
+
+static void test_failed_default_query(void)
+{
+    WINMM_MMDevice endpoints[] = {{.dev_id = L"first"}, {.dev_id = L"second"}};
+    WINMM_MMDevice *items[] = {&endpoints[0], &endpoints[1]};
+
+    g_devenum = &mock_enumerator;
+    g_out_map = items;
+    g_outmmdevices_count = 2;
+    default_device_id = L"second";
+    default_result = E_OUTOFMEMORY;
+    notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"second");
+    WINMM_DefaultDeviceChanged();
+    assert(g_default_changes == (1 << eRender) && items[0] == &endpoints[0]);
+    default_result = S_OK;
+    id_result = E_OUTOFMEMORY;
+    WINMM_DefaultDeviceChanged();
+    assert(g_default_changes == (1 << eRender) && items[0] == &endpoints[0]);
+    id_result = S_OK;
+    WINMM_DefaultDeviceChanged();
+    assert(!g_default_changes && !g_mapper_changes && items[0] == &endpoints[1]);
+    default_result = E_NOTFOUND;
+    notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, NULL);
+    WINMM_DefaultDeviceChanged();
+    assert(!g_default_changes && !g_mapper_changes && !allocated);
+}
+
+static void test_frozen_reroute_mapping(void)
+{
+    WINMM_MMDevice endpoints[] = {{.dev_id = L"first"}, {.dev_id = L"second"}};
+    WINMM_MMDevice *items[] = {&endpoints[0], &endpoints[1]};
+
+    g_devenum = &mock_enumerator;
+    g_out_map = items;
+    g_outmmdevices_count = 2;
+    default_device_id = L"second";
+    g_rerouting = TRUE;
+    assert(read_map(g_out_map, 0) == &endpoints[0]);
+    notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"second");
+    /* A callback between the format probe and reopen must not change it. */
+    assert(read_map(g_out_map, 0) == &endpoints[0]);
+    assert(g_default_changes == (1 << eRender));
+    WINMM_DefaultDeviceChanged();
+    assert(g_rerouting && g_default_changes == (1 << eRender));
+    g_rerouting = FALSE;
+    WINMM_DefaultDeviceChanged();
+    assert(items[0] == &endpoints[1] && !g_default_changes && !g_mapper_changes);
+}
+
+static void test_query_after_failed_init(void)
+{
+    DWORD_PTR size;
+    WCHAR id[32];
+
+    notif_OnDefaultDeviceChanged(&g_notif, eRender, eConsole, L"endpoint");
+    WINMM_UpdateDefaultMappings();
+    assert(g_default_changes == (1 << eRender));
+    create_result = E_FAIL;
+    assert(WINMM_QueryInstanceIDSize(0, &size, TRUE) == MMSYSERR_NODRIVER);
+    assert(WINMM_QueryInstanceID(0, id, sizeof(id), TRUE) == MMSYSERR_NODRIVER);
+    assert(!g_devenum);
+}
+
 int main(void)
 {
     run_test(test_empty_flow, "empty flow mapping");
     run_test(test_null_default, "absent default mapping");
     run_test(test_default_remap, "default remapping");
+    run_test(test_deferred_default, "default changes before and after devices thread startup");
+    run_test(test_default_id_queries, "default ID queries without a devices thread");
+    run_test(test_failed_default_query, "retry failed default and endpoint ID queries");
+    run_test(test_frozen_reroute_mapping, "keep reroute probe and reopen on the same device");
+    run_test(test_query_after_failed_init, "default ID query retries failed initialization");
     return 0;
 }

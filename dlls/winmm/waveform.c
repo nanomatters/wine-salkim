@@ -157,6 +157,12 @@ static LONG g_devthread_token;
 static HANDLE g_devices_thread;
 static HWND g_devices_hwnd;
 static HMODULE g_devthread_module;
+static HWND g_notification_hwnd;
+static LONG g_default_changes;
+static LONG g_mapper_changes;
+static BOOL g_rerouting;
+
+#define WM_DEVICE_DEFAULT_CHANGED (WM_APP + 1)
 
 static UINT g_devhandle_count;
 static HANDLE *g_device_handles;
@@ -191,6 +197,7 @@ static LRESULT WID_Open(WINMM_OpenInfo *info);
 static LRESULT WID_Close(HWAVEIN hwave);
 static MMRESULT WINMM_BeginPlaying(WINMM_Device *device);
 static void WOD_PushData(WINMM_Device *device);
+static void WINMM_UpdateDefaultMappings(void);
 
 static IMMNotificationClient g_notif;
 
@@ -279,6 +286,7 @@ static inline WINMM_MMDevice *read_map(WINMM_MMDevice **map, UINT index)
 {
     WINMM_MMDevice *ret;
     EnterCriticalSection(&g_devthread_lock);
+    WINMM_UpdateDefaultMappings();
     ret = map[index];
     LeaveCriticalSection(&g_devthread_lock);
     return ret;
@@ -796,30 +804,82 @@ static HRESULT reroute_mapper_device(WINMM_Device *device, BOOL is_out)
     return S_OK;
 }
 
+/* Called under g_devthread_lock, after device enumeration has completed.
+ * Refresh lazily too: capability queries do not start the devices thread. */
+static void WINMM_UpdateDefaultMappings(void)
+{
+    LONG changes;
+    EDataFlow flow;
+    IMMDevice *device;
+    WCHAR *id;
+    HRESULT hr;
+
+    /* Rerouting must probe and reopen against the same mapping. */
+    if (!g_devenum || g_rerouting) return;
+    changes = InterlockedExchange(&g_default_changes, 0);
+
+    for (flow = eRender; flow <= eCapture; ++flow)
+    {
+        if (!(changes & (1 << flow))) continue;
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(g_devenum, flow, eConsole, &device);
+        if (SUCCEEDED(hr))
+        {
+            if (SUCCEEDED(hr = IMMDevice_GetId(device, &id)))
+            {
+                if (flow == eRender) hr = update_mapping(&g_out_map, g_outmmdevices_count, id);
+                else hr = update_mapping(&g_in_map, g_inmmdevices_count, id);
+                if (hr == S_OK) g_mapper_changes |= 1 << flow;
+                CoTaskMemFree(id);
+            }
+            IMMDevice_Release(device);
+        }
+        /* No default is a settled state. Retry transient query failures. */
+        if (FAILED(hr) && hr != E_NOTFOUND) InterlockedOr(&g_default_changes, 1 << flow);
+    }
+}
+
+static void WINMM_DefaultDeviceChanged(void)
+{
+    LONG changes;
+    UINT i;
+
+    EnterCriticalSection(&g_devthread_lock);
+    if (g_rerouting)
+    {
+        LeaveCriticalSection(&g_devthread_lock);
+        return;
+    }
+    WINMM_UpdateDefaultMappings();
+    changes = g_mapper_changes;
+    g_mapper_changes = 0;
+    g_rerouting = TRUE;
+
+    if (changes & (1 << eRender))
+        for(i = 0; i < MAX_DEVICES && g_out_mapper_devices[i]; ++i)
+            reroute_mapper_device(g_out_mapper_devices[i], TRUE);
+
+    if (changes & (1 << eCapture))
+        for(i = 0; i < MAX_DEVICES && g_in_mapper_devices[i]; ++i)
+            reroute_mapper_device(g_in_mapper_devices[i], FALSE);
+
+    g_rerouting = FALSE;
+    LeaveCriticalSection(&g_devthread_lock);
+}
+
 static HRESULT WINAPI notif_OnDefaultDeviceChanged(IMMNotificationClient *iface,
         EDataFlow flow, ERole role, const WCHAR *device_id)
 {
-    UINT i;
+    HWND hwnd;
 
     TRACE("%u %u %s\n", flow, role, wine_dbgstr_w(device_id));
 
-    if(role != eConsole)
-        return S_OK;
+    if (role != eConsole || (flow != eRender && flow != eCapture)) return S_OK;
 
-    EnterCriticalSection(&g_devthread_lock);
-
-    if(flow == eRender)
-        update_mapping(&g_out_map, g_outmmdevices_count, device_id);
-    else
-        update_mapping(&g_in_map, g_inmmdevices_count, device_id);
-
-    for(i = 0; i < MAX_DEVICES && g_out_mapper_devices[i]; ++i)
-        reroute_mapper_device(g_out_mapper_devices[i], TRUE);
-
-    for(i = 0; i < MAX_DEVICES && g_in_mapper_devices[i]; ++i)
-        reroute_mapper_device(g_in_mapper_devices[i], FALSE);
-
-    LeaveCriticalSection(&g_devthread_lock);
+    /* Never wait for the devices thread here: its startup can unregister
+     * this client on failure while the starting thread holds its lock. */
+    InterlockedOr(&g_default_changes, 1 << flow);
+    if ((hwnd = InterlockedCompareExchangePointer((void **)&g_notification_hwnd, NULL, NULL)))
+        PostMessageW(hwnd, WM_DEVICE_DEFAULT_CHANGED, 0, 0);
 
     return S_OK;
 }
@@ -2417,6 +2477,9 @@ static LRESULT CALLBACK WINMM_DevicesMsgProc(HWND hwnd, UINT msg, WPARAM wparam,
         LPARAM lparam)
 {
     switch(msg){
+    case WM_DEVICE_DEFAULT_CHANGED:
+        WINMM_DefaultDeviceChanged();
+        return 0;
     case WODM_OPEN:
         return WOD_Open((WINMM_OpenInfo*)wparam);
     case WODM_CLOSE:
@@ -2454,6 +2517,7 @@ static BOOL WINMM_DevicesThreadDone(void)
         }
     }
 
+    InterlockedExchangePointer((void **)&g_notification_hwnd, NULL);
     DestroyWindow(g_devices_hwnd);
     g_devices_hwnd = NULL;
     CoUninitialize();
@@ -2466,6 +2530,7 @@ static BOOL WINMM_DevicesThreadDone(void)
 static DWORD WINAPI WINMM_DevicesThreadProc(void *arg)
 {
     HANDLE evt = arg;
+    ULONGLONG retry = 0;
     HRESULT hr;
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -2489,19 +2554,37 @@ static DWORD WINAPI WINMM_DevicesThreadProc(void *arg)
 
     SetWindowLongPtrW(g_devices_hwnd, GWLP_WNDPROC,
             (LONG_PTR)WINMM_DevicesMsgProc);
+    InterlockedExchangePointer((void **)&g_notification_hwnd, g_devices_hwnd);
 
     /* inform caller that the thread is ready to process messages */
     SetEvent(evt);
     evt = NULL; /* do not use after this point */
 
+    /* Include notifications received before there was a window to wake.
+     * The startup wait must be released before taking g_devthread_lock. */
+    WINMM_DefaultDeviceChanged();
+
     while(1){
-        DWORD wait;
+        DWORD wait, timeout = INFINITE;
+        if (InterlockedCompareExchange(&g_default_changes, 0, 0))
+        {
+            ULONGLONG now = GetTickCount64();
+            if (now >= retry)
+            {
+                WINMM_DefaultDeviceChanged();
+                retry = now + 250;
+            }
+            if (InterlockedCompareExchange(&g_default_changes, 0, 0)) timeout = retry - now;
+        }
         wait = MsgWaitForMultipleObjects(g_devhandle_count, g_device_handles,
-                FALSE, INFINITE, QS_ALLINPUT);
+                FALSE, timeout, QS_ALLINPUT);
         if(wait == g_devhandle_count + WAIT_OBJECT_0){
             MSG msg;
-            if(PeekMessageW(&msg, g_devices_hwnd, 0, 0, PM_REMOVE))
-                WARN("Unexpected message: 0x%x\n", msg.message);
+            while(PeekMessageW(&msg, g_devices_hwnd, 0, 0, PM_REMOVE))
+            {
+                if (msg.message == WM_DEVICE_DEFAULT_CHANGED) DispatchMessageW(&msg);
+                else WARN("Unexpected message: 0x%x\n", msg.message);
+            }
             if(!g_devices_hwnd)
                 break;
         }else if(wait < g_devhandle_count + WAIT_OBJECT_0){
@@ -2510,7 +2593,7 @@ static DWORD WINAPI WINMM_DevicesThreadProc(void *arg)
                 WOD_PushData(device);
             else
                 WID_PullData(device);
-        }else
+        }else if(wait != WAIT_TIMEOUT)
             WARN("Unexpected MsgWait result 0x%lx, GLE: %ld\n", wait,
                     GetLastError());
         if(WINMM_DevicesThreadDone()){
@@ -3193,6 +3276,9 @@ static UINT WINMM_QueryInstanceIDSize(UINT device, DWORD_PTR *len, BOOL is_out)
 
     TRACE("(%u, %p, %d)\n", device, len, is_out);
 
+    if(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL))
+        return MMSYSERR_NODRIVER;
+
     if(is_out){
         count = g_outmmdevices_count;
         devices = g_out_map;
@@ -3205,6 +3291,7 @@ static UINT WINMM_QueryInstanceIDSize(UINT device, DWORD_PTR *len, BOOL is_out)
         return MMSYSERR_INVALHANDLE;
 
     EnterCriticalSection(&g_devthread_lock);
+    WINMM_UpdateDefaultMappings();
     *len = (lstrlenW(devices[device]->dev_id) + 1) * sizeof(WCHAR);
     LeaveCriticalSection(&g_devthread_lock);
 
@@ -3219,6 +3306,9 @@ static UINT WINMM_QueryInstanceID(UINT device, WCHAR *str, DWORD_PTR len,
 
     TRACE("(%u, %p, %d)\n", device, str, is_out);
 
+    if(!InitOnceExecuteOnce(&init_once, WINMM_InitMMDevices, NULL, NULL))
+        return MMSYSERR_NODRIVER;
+
     if(is_out){
         count = g_outmmdevices_count;
         devices = g_out_map;
@@ -3231,6 +3321,7 @@ static UINT WINMM_QueryInstanceID(UINT device, WCHAR *str, DWORD_PTR len,
         return MMSYSERR_INVALHANDLE;
 
     EnterCriticalSection(&g_devthread_lock);
+    WINMM_UpdateDefaultMappings();
     id_len = (lstrlenW(devices[device]->dev_id) + 1) * sizeof(WCHAR);
     if(len < id_len){
         LeaveCriticalSection(&g_devthread_lock);
