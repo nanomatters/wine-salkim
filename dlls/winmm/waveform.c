@@ -196,7 +196,7 @@ static LRESULT WOD_Close(HWAVEOUT hwave);
 static LRESULT WID_Open(WINMM_OpenInfo *info);
 static LRESULT WID_Close(HWAVEIN hwave);
 static MMRESULT WINMM_BeginPlaying(WINMM_Device *device);
-static void WOD_PushData(WINMM_Device *device);
+static void WOD_PushData(WINMM_Device *device, BOOL complete_headers);
 static void WINMM_UpdateDefaultMappings(void);
 
 static IMMNotificationClient g_notif;
@@ -805,7 +805,7 @@ static HRESULT reroute_mapper_device(WINMM_Device *device, BOOL is_out)
 
     if(!stopped){
         if(is_out)
-            WOD_PushData(device);
+            WOD_PushData(device, FALSE);
         WINMM_BeginPlaying(device);
     }
 
@@ -1728,7 +1728,9 @@ static WAVEHDR *WOD_MarkDoneHeaders(WINMM_Device *device)
         return NULL;
 }
 
-static void WOD_PushData(WINMM_Device *device)
+/* Complete headers only from the normal devices-thread event handler. API
+ * calls and rerouting hold outer locks, so they only fill and wake the worker. */
+static void WOD_PushData(WINMM_Device *device, BOOL complete_headers)
 {
     WINMM_CBInfo cb_info;
     HRESULT hr;
@@ -1767,7 +1769,7 @@ static void WOD_PushData(WINMM_Device *device)
         goto exit;
     }
 
-    first = WOD_MarkDoneHeaders(device);
+    if (complete_headers) first = WOD_MarkDoneHeaders(device);
 
     /* determine which is larger between the available buffer size and
      * the amount of data left in the queue */
@@ -1861,6 +1863,9 @@ static void WOD_PushData(WINMM_Device *device)
 
 exit:
     cb_info = device->cb_info;
+    /* Start may fail without producing an audio event. Wake the worker even
+     * then, so headers which have already played can still be returned. */
+    if (!complete_headers) SetEvent(device->event);
 
     LeaveCriticalSection(&device->lock);
 
@@ -2612,7 +2617,7 @@ static DWORD WINAPI WINMM_DevicesThreadProc(void *arg)
         }else if(wait < g_devhandle_count + WAIT_OBJECT_0){
             WINMM_Device *device = g_handle_devices[wait - WAIT_OBJECT_0];
             if(device->render)
-                WOD_PushData(device);
+                WOD_PushData(device, TRUE);
             else
                 WID_PullData(device);
         }else if(wait != WAIT_TIMEOUT)
@@ -3009,7 +3014,7 @@ UINT WINAPI waveOutWrite(HWAVEOUT hWaveOut, WAVEHDR *header, UINT uSize)
     header->dwFlags |= WHDR_INQUEUE;
 
     if(device->stopped)
-        WOD_PushData(device);
+        WOD_PushData(device, FALSE);
 
     mr = WINMM_BeginPlaying(device);
 
@@ -3089,7 +3094,7 @@ UINT WINAPI waveOutRestart(HWAVEOUT hWaveOut)
     device->stopped = TRUE;
 
     if(device->render)
-        WOD_PushData(device);
+        WOD_PushData(device, FALSE);
 
     mr = WINMM_BeginPlaying(device);
 

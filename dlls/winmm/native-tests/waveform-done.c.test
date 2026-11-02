@@ -1,0 +1,628 @@
+/* Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "waveform.h"
+
+static struct
+{
+    CRITICAL_SECTION *cs;
+    pthread_mutex_t mutex;
+} locks[8];
+static unsigned int lock_count, starts, expected_starts, completions[2];
+static HRESULT start_result = S_OK;
+static HRESULT format_result = S_OK;
+static HRESULT padding_result = S_OK;
+static UINT64 clock_value = 2;
+static struct
+{
+    BOOL active;
+    UINT32 size;
+    UINT64 written, played;
+} playback;
+static unsigned int playback_completions;
+static pthread_t app_thread;
+static WINMM_Device streams[2];
+static WAVEHDR *headers[2][5];
+static BYTE samples[256];
+static BYTE playback_samples[400], render_buffer[4096];
+static WAVEFORMATEX format = {WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16};
+static WINMM_MMDevice endpoint = {.dev_id = L"endpoint"};
+static WINMM_MMDevice *map[] = {&endpoint};
+static IAudioClient client;
+static IAudioClock clock_iface;
+static IAudioRenderClient render;
+static IAudioStreamVolume volume;
+
+static void lock_section(CRITICAL_SECTION *cs, BOOL enter)
+{
+    unsigned int i;
+    for (i = 0; i < lock_count; ++i) if (locks[i].cs == cs) break;
+    if (i == lock_count)
+    {
+        pthread_mutexattr_t attr;
+        assert(enter && lock_count < ARRAY_SIZE(locks));
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        assert(!pthread_mutex_init(&locks[i].mutex, &attr));
+        pthread_mutexattr_destroy(&attr);
+        locks[i].cs = cs;
+        ++lock_count;
+    }
+    if (enter) assert(!pthread_mutex_lock(&locks[i].mutex));
+    else assert(!pthread_mutex_unlock(&locks[i].mutex));
+}
+
+static void *check_unlocked(void *arg)
+{
+    unsigned int i;
+    for (i = 0; i < lock_count; ++i)
+    {
+        /* A different thread detects even a recursive acquisition left by
+         * the caller. Fail immediately instead of hanging the test. */
+        assert(!pthread_mutex_trylock(&locks[i].mutex));
+        assert(!pthread_mutex_unlock(&locks[i].mutex));
+    }
+    return NULL;
+}
+
+static void CALLBACK completed(HDRVR handle, UINT message, DWORD_PTR user,
+                               DWORD_PTR param, DWORD_PTR unused)
+{
+    WAVEHDR *header = (WAVEHDR *)param;
+    unsigned int index = user - 100;
+    pthread_t thread;
+
+    assert(index < 2 && handle == (HDRVR)streams[index].handle);
+    assert(message == WOM_DONE && !unused);
+    assert(!pthread_equal(pthread_self(), app_thread));
+    assert(completions[index] < 2 && header == headers[index][completions[index]++]);
+    assert((header->dwFlags & (WHDR_DONE | WHDR_INQUEUE)) == WHDR_DONE);
+    assert(!pthread_create(&thread, NULL, check_unlocked, NULL));
+    assert(!pthread_join(thread, NULL));
+    assert(!g_rerouting && starts == expected_starts);
+
+    /* Client code may recycle the returned header and change the stream.
+     * No caller may restart it afterwards or reread callback information. */
+    memset(&streams[index].cb_info, 0, sizeof(streams[index].cb_info));
+    streams[index].client = NULL;
+    free(header);
+}
+
+static ULONG WINAPI client_release(IAudioClient *iface) { return 1; }
+/* Completion-only tests leave no room to write; playback tests consume frames. */
+static HRESULT WINAPI client_size(IAudioClient *iface, UINT32 *value)
+{ *value = playback.active ? playback.size : 0; return S_OK; }
+static HRESULT WINAPI client_padding(IAudioClient *iface, UINT32 *value)
+{
+    if (FAILED(padding_result)) return padding_result;
+    assert(playback.written >= playback.played);
+    *value = playback.active ? playback.written - playback.played : 0;
+    assert(!playback.active || *value <= playback.size);
+    return S_OK;
+}
+static HRESULT WINAPI client_start(IAudioClient *iface) { ++starts; return start_result; }
+static HRESULT WINAPI client_stop(IAudioClient *iface) { return S_OK; }
+static HRESULT WINAPI client_reset(IAudioClient *iface)
+{ playback.written = playback.played = 0; return S_OK; }
+static HRESULT WINAPI client_format(IAudioClient *iface, AUDCLNT_SHAREMODE mode,
+                                   const WAVEFORMATEX *fmt, WAVEFORMATEX **closest)
+{ *closest = NULL; return format_result; }
+static HRESULT WINAPI client_init(IAudioClient *iface, AUDCLNT_SHAREMODE mode, DWORD flags,
+                                 REFERENCE_TIME duration, REFERENCE_TIME period,
+                                 const WAVEFORMATEX *fmt, const GUID *session)
+{ playback.written = playback.played = 0; return S_OK; }
+static HRESULT WINAPI client_event(IAudioClient *iface, HANDLE event) { return S_OK; }
+static HRESULT WINAPI client_service(IAudioClient *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IAudioClock)) *out = &clock_iface;
+    else if (IsEqualGUID(iid, &IID_IAudioRenderClient)) *out = &render;
+    else if (IsEqualGUID(iid, &IID_IAudioStreamVolume)) *out = &volume;
+    else abort();
+    return S_OK;
+}
+static IAudioClientVtbl client_vtbl = {
+    .Release = client_release, .GetBufferSize = client_size, .GetCurrentPadding = client_padding,
+    .Start = client_start, .Stop = client_stop, .Reset = client_reset,
+    .IsFormatSupported = client_format, .Initialize = client_init,
+    .SetEventHandle = client_event, .GetService = client_service,
+};
+static IAudioClient client = {&client_vtbl};
+static ULONG WINAPI clock_release(IAudioClock *iface) { return 1; }
+static HRESULT WINAPI clock_frequency(IAudioClock *iface, UINT64 *value)
+{ *value = playback.active ? 192000 : 48000; return S_OK; }
+static HRESULT WINAPI clock_position(IAudioClock *iface, UINT64 *value, UINT64 *qpc)
+{ *value = playback.active ? playback.played * 4 : clock_value; return S_OK; }
+static IAudioClockVtbl clock_vtbl = {
+    .Release = clock_release, .GetFrequency = clock_frequency, .GetPosition = clock_position,
+};
+static IAudioClock clock_iface = {&clock_vtbl};
+static ULONG WINAPI render_release(IAudioRenderClient *iface) { return 1; }
+static HRESULT WINAPI render_get(IAudioRenderClient *iface, UINT32 frames, BYTE **data)
+{
+    assert(playback.active && frames * 4 <= sizeof(render_buffer));
+    assert(playback.written - playback.played + frames <= playback.size);
+    *data = render_buffer;
+    return S_OK;
+}
+static HRESULT WINAPI render_put(IAudioRenderClient *iface, UINT32 frames, DWORD flags)
+{
+    assert(!flags);
+    playback.written += frames;
+    return S_OK;
+}
+static IAudioRenderClientVtbl render_vtbl = {
+    .Release = render_release, .GetBuffer = render_get, .ReleaseBuffer = render_put,
+};
+static IAudioRenderClient render = {&render_vtbl};
+static ULONG WINAPI volume_release(IAudioStreamVolume *iface) { return 1; }
+static IAudioStreamVolumeVtbl volume_vtbl = {.Release = volume_release};
+static IAudioStreamVolume volume = {&volume_vtbl};
+
+MMRESULT WINAPI acmStreamConvert(HACMSTREAM stream, ACMSTREAMHEADER *header, DWORD flags) { abort(); }
+
+static void setup_stream(unsigned int index)
+{
+    WINMM_Device *device = &streams[index];
+    unsigned int i;
+
+    lock_hook = lock_section;
+    app_thread = pthread_self();
+    activated_client = &client;
+    g_devenum = &mock_enumerator;
+    g_out_map = map;
+    g_outmmdevices_count = 1;
+    g_out_mapper_devices[index] = device;
+    device->handle = WINMM_MakeHWAVE(MAPPER_INDEX, TRUE, index);
+    device->cb_info = (WINMM_CBInfo){(DWORD_PTR)completed, 100 + index, DCB_FUNCTION, device->handle};
+    device->open = device->stopped = TRUE;
+    device->device = &mock_device;
+    device->client = &client;
+    device->clock = &clock_iface;
+    device->render = &render;
+    device->volume = &volume;
+    device->parent = &endpoint;
+    device->event = (HANDLE)1;
+    device->orig_fmt = test_malloc(sizeof(format));
+    *device->orig_fmt = format;
+    device->bytes_per_frame = 4;
+    device->samples_per_sec = 48000;
+    for (i = 0; i < 3; ++i)
+    {
+        headers[index][i] = calloc(1, sizeof(WAVEHDR));
+        headers[index][i]->lpData = (char *)samples;
+        headers[index][i]->dwBufferLength = i < 2 ? 4 : sizeof(samples);
+        headers[index][i]->dwFlags = WHDR_PREPARED | WHDR_INQUEUE;
+        if (i) headers[index][i - 1]->lpNext = headers[index][i];
+    }
+    device->first = headers[index][0];
+    device->last = device->playing = headers[index][2];
+}
+
+static void check_completed(unsigned int index)
+{
+    assert(completions[index] == 2);
+    assert(streams[index].first == headers[index][2]);
+    assert(headers[index][2]->dwFlags & WHDR_INQUEUE);
+    free(headers[index][2]);
+    test_free(streams[index].orig_fmt);
+}
+
+static void *process_audio_event(void *arg)
+{
+    WOD_PushData(arg, TRUE);
+    return NULL;
+}
+
+static void run_worker(unsigned int index)
+{
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, process_audio_event, &streams[index]));
+    assert(!pthread_join(thread, NULL));
+}
+
+static void check_pending(unsigned int index)
+{
+    unsigned int i;
+    assert(!completions[index]);
+    assert(streams[index].first == headers[index][0]);
+    for (i = 0; i < 3; ++i)
+        assert((headers[index][i]->dwFlags & (WHDR_INQUEUE | WHDR_DONE)) == WHDR_INQUEUE);
+}
+
+static void test_playback(void)
+{
+    setup_stream(0);
+    run_worker(0);
+    check_completed(0);
+    assert(!signaled_events && !allocated);
+}
+
+static void test_write(void)
+{
+    setup_stream(0);
+    streams[0].last = streams[0].playing = headers[0][1];
+    headers[0][1]->lpNext = NULL;
+    headers[0][2]->dwFlags &= ~WHDR_INQUEUE;
+    expected_starts = 1;
+    assert(waveOutWrite((HWAVEOUT)streams[0].handle, headers[0][2], sizeof(WAVEHDR)) == MMSYSERR_NOERROR);
+    check_pending(0);
+    assert(signaled_events == 1);
+    run_worker(0);
+    check_completed(0);
+    assert(!allocated);
+}
+
+static void test_running_write(void)
+{
+    unsigned int i;
+    setup_stream(0);
+    streams[0].stopped = FALSE;
+    streams[0].last = streams[0].playing = headers[0][1];
+    headers[0][1]->lpNext = NULL;
+    headers[0][2]->dwFlags &= ~WHDR_INQUEUE;
+    assert(waveOutWrite((HWAVEOUT)streams[0].handle, headers[0][2], sizeof(WAVEHDR)) == MMSYSERR_NOERROR);
+    check_pending(0);
+    assert(streams[0].last == headers[0][2] && headers[0][1]->lpNext == headers[0][2]);
+    assert(!headers[0][2]->lpNext && !starts && !signaled_events);
+    for (i = 0; i < 3; ++i) free(headers[0][i]);
+    test_free(streams[0].orig_fmt);
+    assert(!allocated);
+}
+
+static void test_restart(void)
+{
+    setup_stream(0);
+    expected_starts = 1;
+    assert(waveOutRestart((HWAVEOUT)streams[0].handle) == hr2mmr(start_result));
+    check_pending(0);
+    assert(streams[0].stopped == FAILED(start_result));
+    assert(signaled_events == 1);
+    run_worker(0);
+    check_completed(0);
+    assert(starts == 1 && !allocated);
+}
+
+static void test_failed_start(void)
+{
+    start_result = E_FAIL;
+    test_restart();
+}
+
+static void test_reroute(void)
+{
+    unsigned int i;
+    for (i = 0; i < 2; ++i)
+    {
+        setup_stream(i);
+        streams[i].stopped = FALSE;
+    }
+    expected_starts = 2;
+    g_mapper_changes = 1 << eRender;
+    WINMM_DefaultDeviceChanged();
+    assert(signaled_events == 2);
+    clock_value = 0; /* The replacement clients have fresh clocks. */
+    for (i = 0; i < 2; ++i)
+    {
+        check_pending(i);
+        run_worker(i);
+        check_completed(i);
+    }
+    /* The real format probe allocated one unused mapper slot. */
+    DeleteCriticalSection(&g_out_mapper_devices[2]->lock);
+    test_free(g_out_mapper_devices[2]);
+    assert(!allocated);
+}
+
+static void test_repeated_reroute(void)
+{
+    unsigned int i;
+    setup_stream(0);
+    streams[0].stopped = FALSE;
+    clock_value = 1;
+    expected_starts = 2;
+    for (i = 0; i < 2; ++i)
+    {
+        g_mapper_changes = 1 << eRender;
+        WINMM_DefaultDeviceChanged();
+        check_pending(0);
+    }
+    assert(signaled_events == 2 && streams[0].remainder_frames == 2);
+    clock_value = 0;
+    run_worker(0);
+    check_completed(0);
+    DeleteCriticalSection(&g_out_mapper_devices[1]->lock);
+    test_free(g_out_mapper_devices[1]);
+    assert(!allocated);
+}
+
+static void test_query_cleanup(void)
+{
+    WINMM_OpenInfo info = {.req_device = WAVE_MAPPER, .format = &format,
+                          .flags = WAVE_FORMAT_DIRECT_QUERY};
+    unsigned int i;
+    setup_stream(0);
+    for (i = 0; i < 3; ++i)
+    {
+        format_result = i == 2 ? AUDCLNT_E_UNSUPPORTED_FORMAT : S_OK;
+        assert(WOD_Open(&info) == hr2mmr(format_result));
+        assert(!g_out_mapper_devices[1]->orig_fmt);
+        assert(allocated == 2); /* Stream format and the reusable query slot. */
+    }
+    DeleteCriticalSection(&g_out_mapper_devices[1]->lock);
+    test_free(g_out_mapper_devices[1]);
+    test_free(streams[0].orig_fmt);
+    for (i = 0; i < 3; ++i) free(headers[0][i]);
+    assert(!allocated);
+}
+
+static unsigned int lock_depth, reset_completions;
+static BOOL reset_on_unlock;
+
+static void CALLBACK reset_completed(HDRVR handle, UINT message, DWORD_PTR user,
+                                     DWORD_PTR param, DWORD_PTR unused)
+{
+    assert(message == WOM_DONE && reset_completions < 3);
+    assert((WAVEHDR *)param == headers[0][reset_completions++]);
+    assert((((WAVEHDR *)param)->dwFlags & (WHDR_DONE | WHDR_INQUEUE)) == WHDR_DONE);
+}
+
+static void *reset_stream(void *unused)
+{
+    assert(waveOutReset((HWAVEOUT)streams[0].handle) == MMSYSERR_NOERROR);
+    assert(reset_completions == 3);
+    return NULL;
+}
+
+static void reset_at_unlock(CRITICAL_SECTION *cs, BOOL enter)
+{
+    BOOL is_app = pthread_equal(pthread_self(), app_thread);
+    if (is_app && cs == &streams[0].lock && enter) ++lock_depth;
+    lock_section(cs, enter);
+    if (is_app && cs == &streams[0].lock && !enter)
+    {
+        assert(lock_depth);
+        if (!--lock_depth && reset_on_unlock)
+        {
+            pthread_t thread;
+            /* Force Reset between the API's outer unlock and its return. */
+            reset_on_unlock = FALSE;
+            assert(!pthread_create(&thread, NULL, reset_stream, NULL));
+            assert(!pthread_join(thread, NULL));
+        }
+    }
+}
+
+static void test_reset_race(BOOL write)
+{
+    unsigned int i;
+    setup_stream(0);
+    streams[0].cb_info.callback = (DWORD_PTR)reset_completed;
+    lock_hook = reset_at_unlock;
+    reset_on_unlock = TRUE;
+    if (write)
+    {
+        streams[0].last = streams[0].playing = headers[0][1];
+        headers[0][1]->lpNext = NULL;
+        headers[0][2]->dwFlags &= ~WHDR_INQUEUE;
+        assert(waveOutWrite((HWAVEOUT)streams[0].handle, headers[0][2], sizeof(WAVEHDR)) == MMSYSERR_NOERROR);
+    }
+    else assert(waveOutRestart((HWAVEOUT)streams[0].handle) == MMSYSERR_NOERROR);
+    assert(!reset_on_unlock && reset_completions == 3 && !streams[0].first);
+    /* Reset returned ownership of all headers; a queued worker wake must
+     * neither touch them nor issue a second completion. */
+    for (i = 0; i < 3; ++i) free(headers[0][i]);
+    run_worker(0);
+    assert(reset_completions == 3);
+    test_free(streams[0].orig_fmt);
+    assert(!allocated);
+}
+
+static void test_write_reset(void) { test_reset_race(TRUE); }
+static void test_restart_reset(void) { test_reset_race(FALSE); }
+
+static void test_reroute_reset(void)
+{
+    unsigned int i;
+    setup_stream(0);
+    streams[0].stopped = FALSE;
+    streams[0].cb_info.callback = (DWORD_PTR)reset_completed;
+    g_mapper_changes = 1 << eRender;
+    WINMM_DefaultDeviceChanged();
+    assert(streams[0].remainder_frames == 2 && !reset_completions);
+    clock_value = 0;
+    assert(waveOutReset((HWAVEOUT)streams[0].handle) == MMSYSERR_NOERROR);
+    assert(reset_completions == 3 && !streams[0].remainder_frames);
+    reset_completions = 0;
+    /* The old device's played frames must not complete a newly queued buffer. */
+    assert(waveOutWrite((HWAVEOUT)streams[0].handle, headers[0][0], sizeof(WAVEHDR)) == MMSYSERR_NOERROR);
+    run_worker(0);
+    assert(!reset_completions && streams[0].first == headers[0][0]);
+    assert(headers[0][0]->dwFlags & WHDR_INQUEUE);
+    for (i = 0; i < 3; ++i) free(headers[0][i]);
+    test_free(streams[0].orig_fmt);
+    DeleteCriticalSection(&g_out_mapper_devices[1]->lock);
+    test_free(g_out_mapper_devices[1]);
+    assert(!allocated);
+}
+
+static void CALLBACK playback_done(HDRVR handle, UINT message, DWORD_PTR user,
+                                   DWORD_PTR param, DWORD_PTR unused)
+{
+    WAVEHDR *header = (WAVEHDR *)param;
+    assert(message == WOM_DONE && handle == (HDRVR)streams[0].handle);
+    assert(!pthread_equal(pthread_self(), app_thread));
+    assert(playback_completions < ARRAY_SIZE(headers[0]));
+    assert(header == headers[0][playback_completions++]);
+    assert((header->dwFlags & (WHDR_DONE | WHDR_INQUEUE)) == WHDR_DONE);
+}
+
+static void setup_playback(unsigned int count, UINT32 size)
+{
+    unsigned int i;
+    setup_stream(0);
+    for (i = 0; i < 3; ++i) free(headers[0][i]);
+    playback.active = TRUE;
+    playback.size = size;
+    streams[0].stopped = FALSE;
+    streams[0].cb_info.callback = (DWORD_PTR)playback_done;
+    for (i = 0; i < count; ++i)
+    {
+        WAVEHDR *header = headers[0][i] = calloc(1, sizeof(*header));
+        header->lpData = (char *)playback_samples;
+        header->dwBufferLength = sizeof(playback_samples); /* 100 frames. */
+        header->dwFlags = WHDR_PREPARED | WHDR_INQUEUE;
+        if (i) headers[0][i - 1]->lpNext = header;
+    }
+    streams[0].first = streams[0].playing = headers[0][0];
+    streams[0].last = headers[0][count - 1];
+}
+
+static void finish_playback(unsigned int count)
+{
+    unsigned int i;
+    assert(!streams[0].first && playback_completions == count);
+    assert(WOD_Close((HWAVEOUT)streams[0].handle) == MMSYSERR_NOERROR);
+    for (i = 0; i < count; ++i) free(headers[0][i]);
+    if (g_out_mapper_devices[1])
+    {
+        DeleteCriticalSection(&g_out_mapper_devices[1]->lock);
+        test_free(g_out_mapper_devices[1]);
+    }
+    assert(!allocated);
+}
+
+static void play_frames(UINT32 frames)
+{
+    playback.played += min(frames, playback.written - playback.played);
+}
+
+static void test_reroute_tail(void)
+{
+    unsigned int i;
+    setup_playback(5, 150);
+    run_worker(0);
+    play_frames(100);
+    run_worker(0);
+    play_frames(20);
+    assert(playback_completions == 1 && playback.written == 250 && playback.played == 120);
+    assert(streams[0].playing == headers[0][2] && streams[0].ofs_bytes == 200);
+    assert(reroute_mapper_device(&streams[0], TRUE) == S_OK);
+    assert(streams[0].remainder_frames == 150); /* 20 played + 130 discarded. */
+    run_worker(0);
+    assert(playback_completions == 2 && streams[0].last_clock_pos == 0);
+    play_frames(40);
+    run_worker(0);
+    assert(playback_completions == 2); /* The split header still needs 10 frames. */
+    play_frames(10);
+    run_worker(0);
+    assert(playback_completions == 3 && streams[0].last_clock_pos == 50);
+    for (i = 0; i < 100 && streams[0].first; ++i)
+    {
+        play_frames(10);
+        run_worker(0);
+    }
+    finish_playback(5);
+}
+
+static void test_short_reroute(BOOL large_clock)
+{
+    setup_playback(2, 1000);
+    run_worker(0);
+    play_frames(120);
+    run_worker(0);
+    assert(playback_completions == 1 && !streams[0].playing);
+    if (large_clock)
+    {
+        /* Raw clock ticks exceed 32 bits, but only one header is outstanding. */
+        playback.written += (UINT64)1 << 30;
+        playback.played += (UINT64)1 << 30;
+        streams[0].last_clock_pos += (UINT64)1 << 30;
+    }
+    assert(reroute_mapper_device(&streams[0], TRUE) == S_OK);
+    assert(streams[0].remainder_frames == 100 && !playback.written);
+    run_worker(0); /* No new audio exists to advance the replacement clock. */
+    finish_playback(2);
+}
+
+static void test_short_queue(void) { test_short_reroute(FALSE); }
+static void test_large_clock(void) { test_short_reroute(TRUE); }
+
+static void test_padding_failure(void)
+{
+    WAVEFORMATEX *orig_fmt;
+    setup_playback(2, 1000);
+    run_worker(0);
+    play_frames(120);
+    run_worker(0);
+    orig_fmt = streams[0].orig_fmt;
+    padding_result = E_FAIL;
+    assert(reroute_mapper_device(&streams[0], TRUE) == E_FAIL);
+    assert(streams[0].orig_fmt == orig_fmt && !streams[0].remainder_frames);
+    assert(playback.written == 200 && playback.played == 120);
+    padding_result = S_OK;
+    assert(reroute_mapper_device(&streams[0], TRUE) == S_OK);
+    run_worker(0);
+    finish_playback(2);
+}
+
+static void test_drain_carry(void)
+{
+    setup_playback(1, 1000);
+    /* State left after returning a loop's header with unused carry. */
+    streams[0].first = streams[0].playing = streams[0].last = NULL;
+    streams[0].remainder_frames = 50;
+    run_worker(0);
+    assert(streams[0].stopped && !streams[0].remainder_frames);
+    headers[0][0]->dwFlags = WHDR_PREPARED;
+    headers[0][0]->dwBufferLength = 25 * 4;
+    assert(waveOutWrite((HWAVEOUT)streams[0].handle, headers[0][0], sizeof(WAVEHDR)) == MMSYSERR_NOERROR);
+    run_worker(0);
+    assert(!playback_completions); /* The old carry must not complete new audio. */
+    play_frames(25);
+    run_worker(0);
+    finish_playback(1);
+}
+
+static void test_close_reopen(void)
+{
+    WINMM_OpenInfo info = {.req_device = WAVE_MAPPER, .format = &format,
+                          .flags = WAVE_FORMAT_DIRECT, .reset = TRUE};
+    unsigned int i;
+    setup_stream(0);
+    for (i = 0; i < 3; ++i) free(headers[0][i]);
+    streams[0].first = streams[0].playing = streams[0].last = NULL;
+    assert(WOD_Close((HWAVEOUT)streams[0].handle) == MMSYSERR_NOERROR);
+    assert(!streams[0].orig_fmt && !allocated);
+    activated_client = NULL;
+    assert(WOD_Open(&info) != MMSYSERR_NOERROR); /* Fails before allocating a format. */
+    assert(!allocated); /* Must not free the old format a second time. */
+    activated_client = &client;
+    streams[0].remainder_frames = 50;
+    assert(WOD_Open(&info) == MMSYSERR_NOERROR);
+    assert(!streams[0].remainder_frames);
+    assert(WOD_Close((HWAVEOUT)streams[0].handle) == MMSYSERR_NOERROR);
+    assert(!allocated);
+}
+
+int main(void)
+{
+    run_test(test_playback, "playback completes headers outside locks");
+    run_test(test_write, "write finishes starting before callbacks");
+    run_test(test_running_write, "running write queues without callbacks or extra wakeups");
+    run_test(test_restart, "restart finishes starting before callbacks");
+    run_test(test_failed_start, "failed start still delivers completed headers");
+    run_test(test_reroute, "all mapper reroutes finish before unlocked callbacks");
+    run_test(test_repeated_reroute, "consecutive reroutes retain completed playback");
+    run_test(test_query_cleanup, "successful and failed format queries release their formats");
+    run_test(test_write_reset, "reset sees every header after write unlocks");
+    run_test(test_restart_reset, "reset sees every header after restart unlocks");
+    run_test(test_reroute_reset, "reset discards playback carried from the old device");
+    run_test(test_reroute_tail, "mid-header reroute completes the whole queue at the right times");
+    run_test(test_short_queue, "reroute returns a queue already written to the old client");
+    run_test(test_large_clock, "reroute keeps the full 64-bit clock position");
+    run_test(test_padding_failure, "failed padding query leaves the old client and carry intact");
+    run_test(test_drain_carry, "drain discards leftover carry before new playback");
+    run_test(test_close_reopen, "close and reopen release the format once and reset carry");
+    return 0;
+}

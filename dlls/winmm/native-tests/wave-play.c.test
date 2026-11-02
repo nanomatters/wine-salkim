@@ -1,0 +1,111 @@
+/* Silent playback through the real devices thread. Run with wave-play.py.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+#include <windows.h>
+#include <mmsystem.h>
+#include <stdio.h>
+
+#define BUFFERS 32
+#define FRAMES 4800
+
+static short pcm[BUFFERS][FRAMES * 2];
+static WAVEHDR headers[BUFFERS];
+static LONG done, errors, queued;
+static DWORD app_thread;
+static BOOL require_worker;
+static HANDLE all_done, playing;
+
+static void CALLBACK callback(HWAVEOUT wave, UINT message, DWORD_PTR user,
+                              DWORD_PTR param, DWORD_PTR unused)
+{
+    WAVEHDR *header = (WAVEHDR *)param;
+    LONG index;
+
+    if (message != WOM_DONE) return;
+    index = InterlockedIncrement(&done) - 1;
+    if (index >= queued || header != &headers[index] ||
+        (header->dwFlags & (WHDR_DONE | WHDR_INQUEUE)) != WHDR_DONE ||
+        (require_worker && GetCurrentThreadId() == app_thread))
+        InterlockedIncrement(&errors);
+    if (index == 1) SetEvent(playing);
+    if (index + 1 == queued) SetEvent(all_done);
+}
+
+static BOOL check(MMRESULT result, const char *operation)
+{
+    if (!result) return TRUE;
+    printf("FAIL: %s returned %u\n", operation, result);
+    return FALSE;
+}
+
+static BOOL run(const char *name, unsigned int count, DWORD reset_after, BOOL reroute)
+{
+    WAVEFORMATEX format = {WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16, 0};
+    HWAVEOUT wave;
+    DWORD start = GetTickCount(), wait;
+    unsigned int i;
+    char response[32];
+
+    done = errors = 0;
+    queued = count;
+    require_worker = !reset_after;
+    ResetEvent(all_done);
+    ResetEvent(playing);
+    if (!check(waveOutOpen(&wave, WAVE_MAPPER, &format, (DWORD_PTR)callback,
+                          0, CALLBACK_FUNCTION), "waveOutOpen")) return FALSE;
+    for (i = 0; i < count; ++i)
+    {
+        memset(&headers[i], 0, sizeof(headers[i]));
+        headers[i].lpData = (char *)pcm[i];
+        headers[i].dwBufferLength = sizeof(pcm[i]);
+        if (!check(waveOutPrepareHeader(wave, &headers[i], sizeof(headers[i])),
+                   "waveOutPrepareHeader")) return FALSE;
+        if (!check(waveOutWrite(wave, &headers[i], sizeof(headers[i])), "waveOutWrite")) return FALSE;
+    }
+    if (reset_after)
+    {
+        Sleep(reset_after);
+        if (!check(waveOutReset(wave), "waveOutReset")) return FALSE;
+    }
+    if (reroute)
+    {
+        if (WaitForSingleObject(playing, 5000) != WAIT_OBJECT_0) return FALSE;
+        puts("READY reroute");
+        /* The runner switches the private default and verifies a replacement
+         * stream linked to it while this same waveOut handle stays open. */
+        if (!fgets(response, sizeof(response), stdin) || strcmp(response, "switched\n")) return FALSE;
+        if (InterlockedCompareExchange(&done, 0, 0) >= queued)
+        {
+            puts("FAIL: playback ended before the reroute was verified");
+            return FALSE;
+        }
+    }
+    wait = WaitForSingleObject(all_done, 5000);
+    Sleep(50); /* Detect late duplicate completions before reusing the headers. */
+    printf("%s: %ld/%u WOM_DONE, %ld errors, %lu ms, wait=%lu\n",
+           name, done, count, errors, GetTickCount() - start, wait);
+    if (wait != WAIT_OBJECT_0 || done != queued || errors) return FALSE;
+    for (i = 0; i < count; ++i)
+        if (!check(waveOutUnprepareHeader(wave, &headers[i], sizeof(headers[i])),
+                   "waveOutUnprepareHeader")) return FALSE;
+    return check(waveOutClose(wave), "waveOutClose");
+}
+
+int main(void)
+{
+    BOOL ok;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    app_thread = GetCurrentThreadId();
+    all_done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    playing = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!all_done || !playing) return 1;
+    ok = run("playback", 8, 0, FALSE) &&
+         run("reset", 8, 250, FALSE) &&
+         run("reroute", BUFFERS, 0, TRUE) &&
+         run("play again", 8, 0, FALSE);
+    CloseHandle(playing);
+    CloseHandle(all_done);
+    puts(ok ? "PASS" : "FAIL");
+    return !ok;
+}

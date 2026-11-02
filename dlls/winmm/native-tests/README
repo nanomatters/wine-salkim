@@ -1,3 +1,41 @@
+Native waveform tests
+=====================
+
+With a configured Wine build, run from this directory:
+
+  make check WINE_BUILD_DIR=/path/to/wine-build BUILD_DIR=/tmp/winmm-tests
+
+These tests include the production waveform.c with mocked platform services.
+waveform-done checks unlocked worker callbacks, stopped and running writes,
+failed Start, consecutive reroutes, format-query cleanup, and Reset racing
+with Write or Restart. It also checks that Reset discards old-device playback
+before new buffers are queued. No audio hardware or Wine runtime is used.
+
+The frame-consuming mock also checks partially written headers and fully
+written queues across reroutes, large clock positions, padding-query failure,
+and drain/close/reopen cleanup. The Reset interleaving tests guard against the
+earlier uncommitted detached-header design; they also pass on HEAD and do not
+prove that the pre-existing playback/Reset race has been eliminated.
+
+Live playback and reroute test
+=============================
+
+  python3 wave-play.py --runtime /path/to/private/wine --arch x86_64
+
+Pass an installed runtime containing the changed winmm.dll, notification fixes,
+and winepipewire.drv (the files directory for a Proton layout). The runner needs
+Python 3, MinGW, PipeWire tools, WirePlumber with its policy profile, and
+dbus-run-session. It creates a private server, session manager, prefix and two
+virtual sinks; no desktop default or audio hardware is used. Use --work for a
+new output directory and --arch i386 to test a private 32-bit build.
+
+The probe plays silence through the real devices thread, checks completion
+order/flags, resets mid-stream, changes the default during playback, and plays
+again. Rerouting must create a replacement Wine stream actively linked to the
+second sink before playback finishes, and Wine must log reroute_mapper_device.
+Graph snapshots and Wine/probe logs are retained. Unlike the native fixture,
+this catches a devices-thread call that stops completing headers.
+
 Notification unload regression test
 ===================================
 

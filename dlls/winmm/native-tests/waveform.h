@@ -59,7 +59,10 @@ static HRESULT default_result = S_OK, id_result = S_OK;
 static IMMNotificationClient *registered_client;
 static BOOL require_unregistered_during_cleanup;
 static void (*unregister_hook)(void);
+static void (*lock_hook)(CRITICAL_SECTION *, BOOL);
+static IAudioClient *activated_client;
 static unsigned int posted_notifications;
+static unsigned int signaled_events;
 static const WCHAR *default_device_id = L"endpoint";
 static pthread_mutex_t once_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t once_cond = PTHREAD_COND_INITIALIZER;
@@ -179,17 +182,25 @@ void WINAPI DeleteCriticalSection(CRITICAL_SECTION *cs)
 
 void WINAPI EnterCriticalSection(CRITICAL_SECTION *cs)
 {
+    if (lock_hook) { lock_hook(cs, TRUE); return; }
     assert(cs == &g_devthread_lock);
     pthread_mutex_lock(&callback_mutex);
 }
 
 void WINAPI LeaveCriticalSection(CRITICAL_SECTION *cs)
 {
+    if (lock_hook) { lock_hook(cs, FALSE); return; }
     assert(cs == &g_devthread_lock);
     pthread_mutex_unlock(&callback_mutex);
 }
 
 BOOL WINAPI CloseHandle(HANDLE handle) { assert(!handle); return FALSE; }
+BOOL WINAPI SetEvent(HANDLE event)
+{
+    assert(event);
+    ++signaled_events;
+    return TRUE;
+}
 BOOL WINAPI PostMessageW(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     assert(hwnd == g_notification_hwnd && msg == WM_DEVICE_DEFAULT_CHANGED);
@@ -199,13 +210,22 @@ BOOL WINAPI PostMessageW(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 }
 HANDLE WINAPI CreateEventW(SECURITY_ATTRIBUTES *attr, BOOL manual, BOOL state, const WCHAR *name)
 { abort(); }
-INT WINAPI MulDiv(INT number, INT numerator, INT denominator) { abort(); }
+INT WINAPI MulDiv(INT number, INT numerator, INT denominator)
+{
+    assert(number >= 0 && numerator >= 0 && denominator > 0);
+    return ((LONGLONG)number * numerator + denominator / 2) / denominator;
+}
 MMRESULT WINAPI acmStreamOpen(PHACMSTREAM stream, HACMDRIVER driver, PWAVEFORMATEX source,
                              PWAVEFORMATEX dest, PWAVEFILTER filter, DWORD_PTR callback,
                              DWORD_PTR instance, DWORD flags) { abort(); }
 MMRESULT WINAPI acmStreamClose(HACMSTREAM stream, DWORD flags) { abort(); }
 BOOL WINAPI DriverCallback(DWORD_PTR callback, DWORD flags, HDRVR device, DWORD message,
-                           DWORD_PTR user, DWORD_PTR first, DWORD_PTR second) { abort(); }
+                           DWORD_PTR user, DWORD_PTR first, DWORD_PTR second)
+{
+    assert(callback && flags == DCB_FUNCTION && message == WOM_DONE);
+    ((LPWAVECALLBACK)callback)(device, message, user, first, second);
+    return TRUE;
+}
 HRESULT WINAPI PropVariantClear(PROPVARIANT *value)
 {
     assert(value->vt == VT_LPWSTR);
@@ -233,6 +253,12 @@ static HRESULT WINAPI enum_default(IMMDeviceEnumerator *iface, EDataFlow flow,
     return S_OK;
 }
 
+static HRESULT WINAPI enum_device(IMMDeviceEnumerator *iface, const WCHAR *id, IMMDevice **out)
+{
+    *out = &mock_device;
+    return S_OK;
+}
+
 static HRESULT WINAPI enum_register(IMMDeviceEnumerator *iface, IMMNotificationClient *client)
 {
     ++registers;
@@ -254,6 +280,7 @@ static IMMDeviceEnumeratorVtbl enum_vtbl = {
     .Release = enum_release,
     .EnumAudioEndpoints = enum_endpoints,
     .GetDefaultAudioEndpoint = enum_default,
+    .GetDevice = enum_device,
     .RegisterEndpointNotificationCallback = enum_register,
     .UnregisterEndpointNotificationCallback = enum_unregister,
 };
@@ -280,7 +307,11 @@ static IMMDeviceCollection mock_collection[2] = {{&collection_vtbl}, {&collectio
 
 static ULONG WINAPI device_release(IMMDevice *iface) { return 1; }
 static HRESULT WINAPI device_activate(IMMDevice *iface, REFIID iid, DWORD context,
-                                      PROPVARIANT *params, void **out) { return E_NOINTERFACE; }
+                                      PROPVARIANT *params, void **out)
+{
+    *out = activated_client;
+    return activated_client ? S_OK : E_NOINTERFACE;
+}
 static HRESULT WINAPI device_props(IMMDevice *iface, DWORD access, IPropertyStore **out)
 {
     *out = &mock_property_store;
