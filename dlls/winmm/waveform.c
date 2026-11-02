@@ -917,6 +917,10 @@ static BOOL WINAPI WINMM_InitMMDevices(INIT_ONCE *once, void *param, void **cont
     if(FAILED(hr))
         goto exit;
 
+    /* Unregister can drain this callback while DLL detach holds the loader
+     * lock. Resolve the debug string helper before the first notification. */
+    if (TRACE_ON(winmm)) wine_dbgstr_w(L"");
+
     hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(g_devenum, &g_notif);
     if(FAILED(hr))
         goto exit;

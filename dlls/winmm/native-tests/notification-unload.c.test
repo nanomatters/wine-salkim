@@ -1,0 +1,136 @@
+/* Run only in the private prefix and PipeWire graph created by the runner.
+ * Copyright 2026 Erhan Bilgili
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+#define COBJMACROS
+#define INITGUID
+#include <windows.h>
+#include <mmsystem.h>
+#include <mmdeviceapi.h>
+#include <propsys.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <wchar.h>
+
+static HMODULE module;
+static MMRESULT (WINAPI *get_caps)(UINT_PTR, WAVEOUTCAPSW *, UINT);
+
+static BOOL load_winmm(void)
+{
+    module = LoadLibraryW(L"winmm.dll");
+    if (module) get_caps = (void *)GetProcAddress(module, "waveOutGetDevCapsW");
+    return module && get_caps;
+}
+
+static WCHAR *find_endpoint(IMMDeviceEnumerator *enumerator, const WCHAR *name)
+{
+    IMMDeviceCollection *collection;
+    IPropertyStore *store;
+    IMMDevice *device;
+    PROPVARIANT value;
+    WCHAR *id = NULL;
+    UINT i, count = 0;
+
+    if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(enumerator, eRender,
+                                                     DEVICE_STATE_ACTIVE, &collection))) return NULL;
+    IMMDeviceCollection_GetCount(collection, &count);
+    for (i = 0; i < count && !id; ++i)
+    {
+        if (FAILED(IMMDeviceCollection_Item(collection, i, &device))) continue;
+        if (SUCCEEDED(IMMDevice_OpenPropertyStore(device, STGM_READ, &store)))
+        {
+            PropVariantInit(&value);
+            if (SUCCEEDED(IPropertyStore_GetValue(store, &PKEY_Device_FriendlyName, &value)) &&
+                value.vt == VT_LPWSTR && wcsstr(value.pwszVal, name))
+                IMMDevice_GetId(device, &id);
+            PropVariantClear(&value);
+            IPropertyStore_Release(store);
+        }
+        IMMDevice_Release(device);
+    }
+    IMMDeviceCollection_Release(collection);
+    return id;
+}
+
+static BOOL select_endpoint(const WCHAR *id)
+{
+    HKEY key;
+    LSTATUS ret;
+
+    if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\Drivers\\winepipewire.drv", &key)) return FALSE;
+    ret = RegSetValueExW(key, L"DefaultOutput", 0, REG_SZ,
+                        (const BYTE *)id, (wcslen(id) + 1) * sizeof(WCHAR));
+    RegCloseKey(key);
+    return !ret;
+}
+
+static BOOL wait_default(const WCHAR *name)
+{
+    ULONGLONG deadline = GetTickCount64() + 10000;
+    WAVEOUTCAPSW caps;
+
+    do
+    {
+        if (get_caps(0, &caps, sizeof(caps))) return FALSE;
+        if (wcsstr(caps.szPname, name)) return TRUE;
+        Sleep(10);
+    } while (GetTickCount64() < deadline);
+    return FALSE;
+}
+
+int main(int argc, char **argv)
+{
+    LONG (WINAPI *lock_loader)(ULONG, ULONG *, ULONG_PTR *);
+    LONG (WINAPI *unlock_loader)(ULONG, ULONG_PTR);
+    IMMDeviceEnumerator *enumerator = NULL;
+    const WCHAR *names[] = {L"WinmmFirst", L"WinmmSecond"};
+    WCHAR *ids[2] = {NULL, NULL};
+    ULONG_PTR cookie;
+    ULONG disposition;
+    BOOL delivered;
+    unsigned int i, cycles = argc > 1 ? strtoul(argv[1], NULL, 10) : 200;
+    int ret = 1;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (FAILED(CoInitialize(NULL))) return 1;
+    lock_loader = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrLockLoaderLock");
+    unlock_loader = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrUnlockLoaderLock");
+    if (!lock_loader || !unlock_loader) goto done;
+    if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IMMDeviceEnumerator, (void **)&enumerator))) goto done;
+    for (i = 0; i < 2; ++i)
+        if (!(ids[i] = find_endpoint(enumerator, names[i]))) goto done;
+    if (!select_endpoint(ids[0]) || !load_winmm() || !wait_default(names[0])) goto done;
+
+    /* Keep winmm loaded here. Its default mapping can change only after its
+     * callback gets past TRACE, which must not acquire this loader lock. */
+    if (lock_loader(0, &disposition, &cookie)) goto done;
+    delivered = select_endpoint(ids[1]) && wait_default(names[1]);
+    if (unlock_loader(0, cookie)) goto done;
+    if (!delivered)
+    {
+        fputs("FAIL: default notification blocked while the loader lock was held\n", stderr);
+        goto done;
+    }
+    puts("PASS: default notification progresses while the loader lock is held");
+
+    /* Supplementary stress: these cycles do not force callback/drain overlap. */
+    for (i = 0; i < cycles; ++i)
+    {
+        if (!select_endpoint(ids[i % 2])) goto done;
+        if (!FreeLibrary(module)) goto done;
+        module = NULL;
+        if (!load_winmm() || !wait_default(names[i % 2])) goto done;
+    }
+    printf("PASS: %u notification/unload/reload cycles\n", cycles);
+    ret = 0;
+
+done:
+    if (module) FreeLibrary(module);
+    for (i = 0; i < 2; ++i) CoTaskMemFree(ids[i]);
+    if (enumerator) IMMDeviceEnumerator_Release(enumerator);
+    CoUninitialize();
+    if (ret) fputs("FAIL: notification/unload probe\n", stderr);
+    return ret;
+}

@@ -1,0 +1,32 @@
+Notification unload regression test
+===================================
+
+Run against a private installed Wine runtime containing the winmm and mmdevapi
+changes and winepipewire.drv. The test needs Python 3, a MinGW compiler,
+PipeWire, pw-cli and pw-metadata. It builds its own PE probe, creates a new Wine
+prefix and starts a private PipeWire server with two virtual outputs. Desktop
+audio and existing prefixes are not touched.
+
+From this directory:
+
+  python3 notification-unload.py --runtime /path/to/private/wine --arch x86_64
+  python3 notification-unload.py --runtime /path/to/private/wine --arch i386
+
+Use --work /path/to/new/directory to retain logs at a chosen location, --cc to
+select the MinGW compiler, or --cycles to change the default 200 stress cycles.
+Wine loaders and Unix libraries must belong to this private runtime, rather
+than being symlinks which select a different installation.
+
+The focused check holds the loader lock on the application thread, changes
+the default output and waits for winmm's device mapping to follow it. Updating
+that mapping requires winmm's notification callback to get past its TRACE.
+Tracing is enabled deliberately: without the debug-helper initialization
+before registration, the callback's first string formatting can wait for the
+loader lock. The check fails with that initialization removed. It releases
+the lock even on failure so the callback can finish before DLL cleanup.
+
+The following unload/reload cycles are supplementary stress coverage. They do
+not force each unload to overlap an active callback. This test does not prove
+that arbitrary application callbacks can safely block or unregister clients.
+The runner fails on a nonzero exit or a timeout; logs remain in its printed
+output directory. The probe opens no audio stream and does not test WOM_DONE.
