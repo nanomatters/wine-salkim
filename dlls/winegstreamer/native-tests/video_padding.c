@@ -22,6 +22,20 @@
 
 GST_DEBUG_CATEGORY(wine);
 
+enum fill_action { FILL_RIGHT = 1, FILL_BOTTOM = 2 };
+
+static void fill_frame_padded_bits(GstBuffer *buffer, const GstVideoAlignment *align,
+        const GstVideoInfo *info, enum fill_action action)
+{
+    GstVideoFrame frame;
+
+    if (gst_video_frame_map(&frame, info, buffer, GST_MAP_WRITE))
+    {
+        gst_frame_replicate_edges(&frame, align);
+        gst_video_frame_unmap(&frame);
+    }
+}
+
 static void test_right_padding(GstVideoFormat format)
 {
     GstVideoInfo info;
@@ -125,6 +139,7 @@ static void test_aperture_padding(GstVideoFormat format, guint left, guint top, 
     guint plane, row, byte, width, height, left_bytes, top_rows, total_rows;
     gint comp[GST_VIDEO_MAX_COMPONENTS], stride, pixel_stride;
 
+    action = FILL_RIGHT | FILL_BOTTOM;
     assert(gst_video_info_set_format(&info, format, 3, visible_height));
     gst_video_alignment_reset(&align);
     align.padding_left = left;
@@ -199,7 +214,7 @@ static void test_bottom_padding(const char *game)
     sample.data = (UINT_PTR)data;
     sample.max_size = dst.size;
     assert(!setenv("SteamGameId", game, 1));
-    assert(read_transform_output_video(&sample, buffer, &src, &dst, &align) == STATUS_SUCCESS);
+    assert(read_transform_output_video(&sample, buffer, &src, &dst, &align, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS) == STATUS_SUCCESS);
     assert(sample.size == dst.size);
     for (i = 0; i < dst.size; ++i) assert(data[i] == (i < (guint)dst.stride[0] ? 0x17 : 0x23));
     free(data);
@@ -235,7 +250,8 @@ static void test_shared_buffer(const char *game, guint bottom, guint right, BOOL
     GST_BUFFER_DURATION(buffer) = 20000;
     if (game) assert(!setenv("SteamGameId", game, 1));
     else unsetenv("SteamGameId");
-    assert(read_transform_output_video(&sample, buffer, &info, &info, &align) == STATUS_SUCCESS);
+    assert(read_transform_output_video(&sample, buffer, &info, &info, &align,
+            fill ? WG_TRANSFORM_EDGE_REPLICATION_ALWAYS : WG_TRANSFORM_EDGE_REPLICATION_NEVER) == STATUS_SUCCESS);
     assert(sample.size == info.size && sample.pts == 100 && sample.duration == 200);
     assert((sample.flags & (WG_SAMPLE_FLAG_HAS_PTS | WG_SAMPLE_FLAG_HAS_DURATION))
             == (WG_SAMPLE_FLAG_HAS_PTS | WG_SAMPLE_FLAG_HAS_DURATION));
@@ -287,7 +303,7 @@ static void test_aperture_alias(GstVideoFormat format)
     buffer = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY, data, info.size, 0, info.size, NULL, NULL);
     extra_ref = gst_buffer_ref(buffer);
     assert(!setenv("SteamGameId", "536280", 1));
-    assert(read_transform_output_video(&sample, buffer, &info, &info, &align) == STATUS_SUCCESS);
+    assert(read_transform_output_video(&sample, buffer, &info, &info, &align, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS) == STATUS_SUCCESS);
     assert(sample.size == info.size && GST_MINI_OBJECT_REFCOUNT_VALUE(buffer) == 2);
     for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES(&info); ++plane)
     {
@@ -313,7 +329,8 @@ static void test_alias_validation(BOOL wrong_format)
 {
     GstVideoInfo src, dst;
     struct wg_sample sample = {0};
-    GstBuffer *buffer, *output = NULL;
+    GstBuffer *buffer;
+    GstVideoAlignment align = {0};
     BYTE *data;
     gsize total_size;
 
@@ -326,8 +343,8 @@ static void test_alias_validation(BOOL wrong_format)
     sample.data = (UINT_PTR)data;
     sample.max_size = dst.size;
     buffer = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY, data, dst.size, 0, dst.size, NULL, NULL);
-    assert(copy_video_buffer(buffer, &src, &dst, &sample, &total_size, &output) == STATUS_UNSUCCESSFUL);
-    assert(!output && GST_MINI_OBJECT_REFCOUNT_VALUE(buffer) == 1);
+    assert(copy_video_buffer(buffer, &src, &dst, &align, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS, &sample, &total_size) == STATUS_UNSUCCESSFUL);
+    assert(GST_MINI_OBJECT_REFCOUNT_VALUE(buffer) == 1);
     gst_buffer_unref(buffer);
     free(data);
 }
@@ -356,7 +373,7 @@ static void test_copy_failure(gsize source_size, gsize destination_size, NTSTATU
     sample.max_size = destination_size;
     sample.size = 123;
     assert(!setenv("SteamGameId", "1839950", 1));
-    assert(read_transform_output_video(&sample, buffer, &src, &dst, &align) == expected);
+    assert(read_transform_output_video(&sample, buffer, &src, &dst, &align, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS) == expected);
     assert(!sample.size && !sample.flags);
     assert(GST_MINI_OBJECT_REFCOUNT_VALUE(buffer) == 2);
     for (byte = 0; byte < dst.size + 16; ++byte) assert(data[byte] == 0xcc);
@@ -365,8 +382,207 @@ static void test_copy_failure(gsize source_size, gsize destination_size, NTSTATU
     free(data);
 }
 
+static void test_yuy2_padding(guint width, guint height, guint left, guint top)
+{
+    GstVideoInfo info;
+    GstVideoAlignment align;
+    GstBuffer *buffer;
+    BYTE *data, *expected, *row;
+    guint i, j, stride, row_bytes, pair, count;
+    BYTE y, u, v;
+
+    assert(gst_video_info_set_format(&info, GST_VIDEO_FORMAT_YUY2, width, height));
+    gst_video_alignment_reset(&align);
+    align.padding_left = left;
+    align.padding_top = top;
+    align.padding_right = align.padding_bottom = 1;
+    assert(gst_video_info_align(&info, &align));
+    data = malloc(info.size + 16);
+    expected = malloc(info.size + 16);
+    assert(data && expected);
+    memset(data, 0xcc, info.size + 16);
+    stride = info.stride[0];
+    row_bytes = width * 2;
+    pair = ((width - 1) / 2) * 4;
+    for (i = 0; i < height; i++)
+    {
+        row = data + info.offset[0] + i * stride;
+        for (j = 0; j < (row_bytes + 3) / 4 * 4; j++)
+            row[j] = i * 17 + j + 1;
+    }
+    memcpy(expected, data, info.size + 16);
+    for (i = 0; i < height; i++)
+    {
+        row = expected + info.offset[0] + i * stride;
+        y = row[row_bytes - 2];
+        u = row[pair + 1];
+        v = row[pair + 3];
+        for (j = row_bytes; j < stride - align.padding_left * 2; j++)
+            row[j] = j % 2 ? (j % 4 == 1 ? u : v) : y;
+    }
+    count = align.padding_bottom;
+    row = expected + info.offset[0] + height * stride - align.padding_left * 2;
+    for (i = 0; i < count; i++, row += stride)
+        memcpy(row, row - stride, stride);
+    buffer = gst_buffer_new_wrapped_full(0, data, info.size, 0, info.size, NULL, NULL);
+    fill_frame_padded_bits(buffer, &align, &info, FILL_RIGHT | FILL_BOTTOM);
+    assert(!memcmp(data, expected, info.size + 16));
+    gst_buffer_unref(buffer);
+    free(expected);
+    free(data);
+}
+
+static void test_policy(GstVideoFormat format, enum wg_transform_edge_replication mode, BOOL fill, BOOL alias)
+{
+    GstVideoInfo src, dst;
+    GstVideoAlignment align;
+    struct wg_sample sample = {0};
+    GstBuffer *buffer;
+    BYTE *data;
+    guint i;
+
+    assert(gst_video_info_set_format(&src, format, 8, 2));
+    dst = src;
+    gst_video_alignment_reset(&align);
+    align.padding_bottom = 2;
+    assert(gst_video_info_align(&dst, &align));
+    data = malloc(dst.size);
+    assert(data);
+    memset(data, 0xcc, dst.size);
+    sample.data = (UINT_PTR)data;
+    sample.max_size = dst.size;
+    if (alias)
+    {
+        src = dst;
+        guint plane, row;
+        gint comp[GST_VIDEO_MAX_COMPONENTS];
+
+        for (plane = 0; plane < GST_VIDEO_INFO_N_PLANES(&src); plane++)
+        {
+            gst_video_format_info_component(src.finfo, plane, comp);
+            for (row = 0; row < GST_VIDEO_INFO_COMP_HEIGHT(&src, comp[0]); row++)
+                memset(data + src.offset[plane] + row * src.stride[plane], 0x55,
+                        GST_VIDEO_INFO_COMP_WIDTH(&src, comp[0]) * src.finfo->pixel_stride[comp[0]]);
+        }
+        buffer = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY, data, src.size, 0, src.size, NULL, NULL);
+    }
+    else
+    {
+        GstMapInfo map;
+        buffer = gst_buffer_new_allocate(NULL, src.size, NULL);
+        assert(gst_buffer_map(buffer, &map, GST_MAP_WRITE));
+        memset(map.data, 0x55, map.size);
+        gst_buffer_unmap(buffer, &map);
+    }
+    assert(read_transform_output_video(&sample, buffer, &src, &dst, &align, mode) == STATUS_SUCCESS);
+    for (i = dst.offset[0] + 2 * dst.stride[0]; i < 4 * dst.stride[0]; i++)
+        assert(data[i] == (fill ? 0x55 : 0xcc));
+    assert(sample.size == dst.size);
+    gst_buffer_unref(buffer);
+    free(data);
+}
+
+static void test_alias_capacity(void)
+{
+    GstVideoInfo info;
+    GstVideoAlignment align = {0};
+    struct wg_sample sample = {0};
+    GstBuffer *buffer;
+    BYTE *data;
+    guint i;
+
+    assert(gst_video_info_set_format(&info, GST_VIDEO_FORMAT_NV12, 8, 4));
+    data = malloc(info.size);
+    assert(data);
+    memset(data, 0xcc, info.size);
+    buffer = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY, data, info.size, 0, info.size, NULL, NULL);
+    sample.data = (UINT_PTR)data;
+    sample.max_size = info.size - 1;
+    assert(read_transform_output_video(&sample, buffer, &info, &info, &align,
+            WG_TRANSFORM_EDGE_REPLICATION_ALWAYS) == STATUS_BUFFER_TOO_SMALL);
+    assert(!sample.size && !sample.flags && GST_MINI_OBJECT_REFCOUNT_VALUE(buffer) == 1);
+    for (i = 0; i < info.size; i++) assert(data[i] == 0xcc);
+    gst_buffer_unref(buffer);
+    free(data);
+}
+
+static void test_empty_alias(BOOL resize, BOOL has_pts)
+{
+    GstVideoInfo info;
+    GstVideoAlignment align = {0};
+    struct wg_sample sample = {0};
+    GstBuffer *buffer;
+    BYTE *data;
+    guint i;
+
+    assert(gst_video_info_set_format(&info, GST_VIDEO_FORMAT_NV12, 8, 4));
+    data = malloc(info.size);
+    assert(data);
+    memset(data, 0xcc, info.size);
+    buffer = gst_buffer_new_wrapped_full(0, data, info.size, 0, resize ? info.size : 0, NULL, NULL);
+    if (resize) gst_buffer_resize(buffer, 0, 0);
+    GST_BUFFER_PTS(buffer) = has_pts ? 10000 : GST_CLOCK_TIME_NONE;
+    GST_BUFFER_DURATION(buffer) = 20000;
+    sample.data = (UINT_PTR)data;
+    sample.max_size = info.size;
+    assert(read_transform_output_video(&sample, buffer, &info, &info, &align,
+            WG_TRANSFORM_EDGE_REPLICATION_ALWAYS) == STATUS_UNSUCCESSFUL);
+    assert(!sample.size && !sample.flags && GST_MINI_OBJECT_REFCOUNT_VALUE(buffer) == 1);
+    assert(GST_BUFFER_PTS(buffer) == (has_pts ? 10000 : GST_CLOCK_TIME_NONE));
+    assert(GST_BUFFER_DURATION(buffer) == 20000);
+    for (i = 0; i < info.size; i++) assert(data[i] == 0xcc);
+    gst_buffer_unref(buffer);
+    free(data);
+}
+
+static void test_invalid_frame(void)
+{
+    GstVideoInfo info;
+    GstVideoAlignment align = {0};
+    GstVideoFrame frame;
+    GstVideoFormatInfo invalid;
+    GstBuffer *buffer;
+    BYTE *data;
+    guint i;
+
+    assert(gst_video_info_set_format(&info, GST_VIDEO_FORMAT_NV12, 2, 2));
+    data = malloc(info.size + 16);
+    assert(data);
+    memset(data, 0xcc, info.size + 16);
+    buffer = gst_buffer_new_wrapped_full(0, data, info.size, 0, info.size, NULL, NULL);
+    assert(gst_video_frame_map(&frame, &info, buffer, GST_MAP_WRITE));
+    /* Padding must never spill into the next plane, even if the whole buffer fits. */
+    align.padding_bottom = 1;
+    gst_frame_replicate_edges(&frame, &align);
+    for (i = 0; i < info.size + 16; i++) assert(data[i] == 0xcc);
+    align.padding_bottom = G_MAXUINT;
+    gst_frame_replicate_edges(&frame, &align);
+    for (i = 0; i < info.size + 16; i++) assert(data[i] == 0xcc);
+    align.padding_bottom = 0;
+    invalid = *frame.info.finfo;
+    invalid.n_components = 0;
+    frame.info.finfo = &invalid;
+    gst_frame_replicate_edges(&frame, &align);
+    for (i = 0; i < info.size + 16; i++) assert(data[i] == 0xcc);
+    frame.info.finfo = info.finfo;
+    frame.info.width = 0;
+    gst_frame_replicate_edges(&frame, &align);
+    for (i = 0; i < info.size + 16; i++) assert(data[i] == 0xcc);
+    frame.info.width = info.width;
+    frame.map[0].size = 1;
+    gst_frame_replicate_edges(&frame, &align);
+    for (i = 0; i < info.size + 16; i++) assert(data[i] == 0xcc);
+    gst_video_frame_unmap(&frame);
+    gst_buffer_unref(buffer);
+    free(data);
+}
+
 int main(int argc, char **argv)
 {
+    const guint widths[] = {1, 2, 3, 4, 5, 16, 17};
+    const guint heights[] = {1, 2, 3, 7};
+    guint i, j, left, top;
+
     gst_init(&argc, &argv);
     GST_DEBUG_CATEGORY_INIT(wine, "wine-padding-test", 0, NULL);
     test_bottom_padding("1449280");
@@ -405,6 +621,32 @@ int main(int argc, char **argv)
     test_copy_failure(64, 127, STATUS_BUFFER_TOO_SMALL);
     test_copy_failure(63, 128, STATUS_UNSUCCESSFUL);
     test_copy_failure(0, 128, STATUS_UNSUCCESSFUL);
+    for (i = 0; i < ARRAY_SIZE(widths); i++)
+        for (j = 0; j < ARRAY_SIZE(heights); j++)
+            for (left = 0; left < 2; left++)
+                for (top = 0; top < 2; top++)
+                    test_yuy2_padding(widths[i], heights[j], left, top);
+    test_planar_padding(GST_VIDEO_FORMAT_YV12);
+    test_aperture_padding(GST_VIDEO_FORMAT_NV12, 1, 1, 1, FILL_RIGHT | FILL_BOTTOM);
+    test_aperture_padding(GST_VIDEO_FORMAT_I420, 1, 1, 1, FILL_RIGHT | FILL_BOTTOM);
+    test_aperture_padding(GST_VIDEO_FORMAT_YV12, 1, 1, 1, FILL_RIGHT | FILL_BOTTOM);
+    test_aperture_padding(GST_VIDEO_FORMAT_YV12, 1, 1, 3, FILL_RIGHT | FILL_BOTTOM);
+    test_aperture_alias(GST_VIDEO_FORMAT_YV12);
+    test_policy(GST_VIDEO_FORMAT_NV12, WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT, FALSE, FALSE);
+    test_policy(GST_VIDEO_FORMAT_NV12, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS, TRUE, FALSE);
+    test_policy(GST_VIDEO_FORMAT_NV12, WG_TRANSFORM_EDGE_REPLICATION_NEVER, FALSE, FALSE);
+    test_policy(GST_VIDEO_FORMAT_YUY2, WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT, TRUE, FALSE);
+    test_policy(GST_VIDEO_FORMAT_YUY2, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS, TRUE, FALSE);
+    test_policy(GST_VIDEO_FORMAT_YUY2, WG_TRANSFORM_EDGE_REPLICATION_NEVER, FALSE, FALSE);
+    test_policy(GST_VIDEO_FORMAT_NV12, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS, TRUE, TRUE);
+    test_policy(GST_VIDEO_FORMAT_NV12, WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT, FALSE, TRUE);
+    test_policy(GST_VIDEO_FORMAT_YUY2, WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT, TRUE, TRUE);
+    test_invalid_frame();
+    test_alias_capacity();
+    test_empty_alias(FALSE, FALSE);
+    test_empty_alias(FALSE, TRUE);
+    test_empty_alias(TRUE, FALSE);
+    test_empty_alias(TRUE, TRUE);
     unsetenv("SteamGameId");
     puts("Video padding tests passed.");
     gst_deinit();

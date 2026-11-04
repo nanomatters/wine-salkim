@@ -854,9 +854,25 @@ static HRESULT WINAPI transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_
 
         uninit_allocator(decoder);
         if (param)
+        {
             decoder->output_info.dwFlags |= MFT_OUTPUT_STREAM_PROVIDES_SAMPLES;
+            if (decoder->wg_transform_attrs.edge_replication != WG_TRANSFORM_EDGE_REPLICATION_NEVER)
+            {
+                decoder->wg_transform_attrs.edge_replication = WG_TRANSFORM_EDGE_REPLICATION_ALWAYS;
+                if (decoder->wg_transform)
+                    wg_transform_enable_edge_replication(decoder->wg_transform, WG_TRANSFORM_EDGE_REPLICATION_ALWAYS);
+            }
+        }
         else
+        {
             decoder->output_info.dwFlags &= ~MFT_OUTPUT_STREAM_PROVIDES_SAMPLES;
+            if (decoder->wg_transform_attrs.edge_replication != WG_TRANSFORM_EDGE_REPLICATION_NEVER)
+            {
+                decoder->wg_transform_attrs.edge_replication = WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT;
+                if (decoder->wg_transform)
+                    wg_transform_enable_edge_replication(decoder->wg_transform, WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT);
+            }
+        }
         return S_OK;
 
     case MFT_MESSAGE_COMMAND_DRAIN:
@@ -1778,6 +1794,7 @@ HRESULT h264_decoder_create(REFIID riid, void **out)
 
     decoder->wg_transform_attrs.output_plane_align = 15;
     decoder->wg_transform_attrs.allow_format_change = TRUE;
+    decoder->wg_transform_attrs.edge_replication = WG_TRANSFORM_EDGE_REPLICATION_BY_FORMAT;
 
     TRACE("Created h264 transform %p.\n", &decoder->IMFTransform_iface);
 
