@@ -152,7 +152,7 @@ struct context_data
                  unsigned char regs[80]; } i386_regs;
         struct { struct { unsigned __int64 low, high; } fpregs[32]; } x86_64_regs;
         struct { unsigned __int64 d[32]; unsigned int fpscr; } arm_regs;
-        struct { struct { unsigned __int64 low, high; } q[32]; unsigned int fpcr, fpsr; } arm64_regs;
+        struct { struct { unsigned __int64 low, high; } q[16]; unsigned int fpcr, fpsr; } arm64_regs;
     } fp;
     union
     {
@@ -172,6 +172,7 @@ struct context_data
     union
     {
         struct { struct { unsigned __int64 low, high; } ymm_high[16]; } ymm_regs;
+        struct { struct { unsigned __int64 low, high; } q16[16]; } arm64_regs;
     } vector;
     union
     {
@@ -7578,6 +7579,6 @@ union generic_reply
     struct set_process_layout_reply set_process_layout_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 952
+#define SERVER_PROTOCOL_VERSION 953
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
