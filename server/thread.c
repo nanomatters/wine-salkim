@@ -1647,6 +1647,7 @@ int thread_get_inflight_fd( struct thread *thread, int client )
             {
                 ret = thread->inflight[i].server;
                 thread->inflight[i].server = thread->inflight[i].client = -1;
+                clear_error();
                 return ret;
             }
         }
