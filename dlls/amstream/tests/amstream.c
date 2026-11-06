@@ -424,6 +424,9 @@ static void test_openfile(const WCHAR *test_avi_path)
     IMediaFilter *media_filter;
     IReferenceClock *clock;
     IGraphBuilder *graph;
+    IEnumFilters *enum_filters;
+    IBaseFilter *source_filters[16];
+    ULONG source_count, i;
     OAFilterState state;
     HRESULT hr;
     ULONG ref;
@@ -446,11 +449,22 @@ static void test_openfile(const WCHAR *test_avi_path)
     hr = IAMMultiMediaStream_GetFilterGraph(mmstream, &graph);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     ok(!!graph, "Expected non-NULL graph.\n");
+    hr = IGraphBuilder_EnumFilters(graph, &enum_filters);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IEnumFilters_Next(enum_filters, ARRAY_SIZE(source_filters), source_filters, &source_count);
+    ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
+    IEnumFilters_Release(enum_filters);
     IGraphBuilder_Release(graph);
     IMediaStreamFilter_Release(filter);
 
     ref = IAMMultiMediaStream_Release(mmstream);
     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+
+    for (i = 0; i < source_count; ++i)
+    {
+        ref = IBaseFilter_Release(source_filters[i]);
+        ok(!ref, "Filter %lu has outstanding refcount %lu.\n", i, ref);
+    }
 
     mmstream = create_ammultimediastream();
 
