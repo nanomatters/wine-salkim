@@ -985,6 +985,127 @@ done:
     SysFreeString( wql );
 }
 
+static void test_StdRegProv_EnumValues( IWbemServices *services, IWbemClassObject *reg )
+{
+    static const WCHAR *value_names[] = {L"", L"one", L"a longer registry value name"};
+    static const DWORD value_types[] = {REG_DWORD, REG_BINARY, REG_SZ};
+    static const unsigned int counts[] = {0, 1, 3, 0};
+    IWbemClassObject *sig_in, *in, *out;
+    BSTR class = SysAllocString( L"StdRegProv" ), method = SysAllocString( L"EnumValues" ), name;
+    VARIANT value, names, types;
+    WCHAR subkey[128];
+    unsigned int pass, j, seen;
+    LONG res, lower, upper, type_lower, type_upper, i, value_type;
+    HKEY key;
+    HRESULT hr;
+
+    swprintf( subkey, ARRAY_SIZE(subkey), L"Software\\Wine\\Test\\EnumValues_%08lx", GetCurrentProcessId() );
+    res = RegCreateKeyExW( HKEY_CURRENT_USER, subkey, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
+    ok( !res, "failed to create key %ld\n", res );
+    if (res) goto done;
+
+    hr = IWbemClassObject_GetMethod( reg, method, 0, &sig_in, NULL );
+    ok( hr == S_OK, "failed to get EnumValues method %#lx\n", hr );
+    if (FAILED(hr)) goto delete_key;
+    hr = IWbemClassObject_SpawnInstance( sig_in, 0, &in );
+    IWbemClassObject_Release( sig_in );
+    ok( hr == S_OK, "failed to spawn instance %#lx\n", hr );
+    if (FAILED(hr)) goto delete_key;
+
+    V_VT( &value ) = VT_I4;
+    V_I4( &value ) = 0x80000001;
+    hr = IWbemClassObject_Put( in, L"hDefKey", 0, &value, 0 );
+    ok( hr == S_OK, "failed to set root %#lx\n", hr );
+    V_VT( &value ) = VT_BSTR;
+    V_BSTR( &value ) = SysAllocString( subkey );
+    hr = IWbemClassObject_Put( in, L"sSubKeyName", 0, &value, 0 );
+    ok( hr == S_OK, "failed to set subkey %#lx\n", hr );
+    VariantClear( &value );
+
+    for (pass = 0; pass < ARRAY_SIZE(counts); pass++)
+    {
+        winetest_push_context( "count %u", counts[pass] );
+        for (j = 0; j < ARRAY_SIZE(value_names); j++)
+        {
+            if (j < counts[pass])
+            {
+                res = RegSetValueExW( key, value_names[j], 0, value_types[j], (const BYTE *)L"data",
+                                     value_types[j] == REG_DWORD ? sizeof(DWORD) : sizeof(L"data") );
+                ok( !res, "failed to set value %ld\n", res );
+            }
+            else RegDeleteValueW( key, value_names[j] );
+        }
+
+        out = NULL;
+        hr = IWbemServices_ExecMethod( services, class, method, 0, NULL, in, &out, NULL );
+        ok( hr == S_OK, "failed to execute method %#lx\n", hr );
+        if (FAILED(hr)) goto next;
+        VariantInit( &value );
+        hr = IWbemClassObject_Get( out, L"ReturnValue", 0, &value, NULL, NULL );
+        ok( hr == S_OK, "failed to get return value %#lx\n", hr );
+        ok( V_VT(&value) == VT_I4, "unexpected return type %#x\n", V_VT(&value) );
+        if (counts[pass])
+            ok( !V_I4(&value), "unexpected error %ld\n", V_I4(&value) );
+        else
+            ok( !V_I4(&value) || V_I4(&value) == ERROR_NO_MORE_ITEMS, "unexpected error %ld\n", V_I4(&value) );
+        VariantClear( &value );
+        if (!counts[pass]) goto release_out;
+
+        VariantInit( &names );
+        VariantInit( &types );
+        hr = IWbemClassObject_Get( out, L"sNames", 0, &names, NULL, NULL );
+        ok( hr == S_OK, "failed to get names %#lx\n", hr );
+        hr = IWbemClassObject_Get( out, L"Types", 0, &types, NULL, NULL );
+        ok( hr == S_OK, "failed to get types %#lx\n", hr );
+        ok( V_VT(&names) == (VT_BSTR | VT_ARRAY), "unexpected names type %#x\n", V_VT(&names) );
+        ok( V_VT(&types) == (VT_I4 | VT_ARRAY), "unexpected types type %#x\n", V_VT(&types) );
+        if (V_VT(&names) == (VT_BSTR | VT_ARRAY) && V_VT(&types) == (VT_I4 | VT_ARRAY))
+        {
+            SafeArrayGetLBound( V_ARRAY(&names), 1, &lower );
+            SafeArrayGetUBound( V_ARRAY(&names), 1, &upper );
+            SafeArrayGetLBound( V_ARRAY(&types), 1, &type_lower );
+            SafeArrayGetUBound( V_ARRAY(&types), 1, &type_upper );
+            ok( upper - lower + 1 == counts[pass], "unexpected name count %ld\n", upper - lower + 1 );
+            ok( lower == type_lower && upper == type_upper, "array bounds differ\n" );
+            seen = 0;
+            for (i = lower; i <= upper; i++)
+            {
+                name = NULL;
+                hr = SafeArrayGetElement( V_ARRAY(&names), &i, &name );
+                ok( hr == S_OK, "failed to get name %#lx\n", hr );
+                if (FAILED(hr)) continue;
+                value_type = 0xdeadbeef;
+                hr = SafeArrayGetElement( V_ARRAY(&types), &i, &value_type );
+                ok( hr == S_OK, "failed to get type %#lx\n", hr );
+                for (j = 0; j < counts[pass]; j++) if (!wcscmp( name, value_names[j] )) break;
+                ok( j < counts[pass], "unexpected name %s\n", wine_dbgstr_w(name) );
+                if (j < counts[pass])
+                {
+                    ok( !(seen & (1u << j)), "duplicate value %u\n", j );
+                    ok( value_type == value_types[j], "unexpected value type %ld\n", value_type );
+                    seen |= 1u << j;
+                }
+                SysFreeString( name );
+            }
+            ok( seen == (1u << counts[pass]) - 1, "missing values %#x\n", seen );
+        }
+        VariantClear( &names );
+        VariantClear( &types );
+release_out:
+        IWbemClassObject_Release( out );
+next:
+        winetest_pop_context();
+    }
+    IWbemClassObject_Release( in );
+delete_key:
+    RegCloseKey( key );
+    res = RegDeleteKeyW( HKEY_CURRENT_USER, subkey );
+    ok( !res, "failed to delete key %ld\n", res );
+done:
+    SysFreeString( method );
+    SysFreeString( class );
+}
+
 static void test_StdRegProv( IWbemServices *services )
 {
     BSTR class = SysAllocString( L"StdRegProv" ), method, name;
@@ -1000,6 +1121,8 @@ static void test_StdRegProv( IWbemServices *services )
         win_skip( "StdRegProv not available\n" );
         return;
     }
+
+    test_StdRegProv_EnumValues( services, reg );
 
     hr = IWbemClassObject_BeginMethodEnumeration( reg, 0 );
     ok( hr == S_OK, "got %#lx\n", hr );

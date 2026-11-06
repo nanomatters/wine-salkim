@@ -270,6 +270,7 @@ done:
 static HRESULT enum_values( HKEY root, const WCHAR *subkey, VARIANT *names, VARIANT *types, IWbemContext *context,
                             VARIANT *retval )
 {
+    const SIZE_T max_count = min( MAXLONG, ~(SIZE_T)0 / max( sizeof(BSTR), sizeof(DWORD) ) );
     HKEY hkey = NULL;
     HRESULT hr = S_OK;
     BSTR *value_names = NULL, *tmp_names;
@@ -284,7 +285,9 @@ static HRESULT enum_values( HKEY root, const WCHAR *subkey, VARIANT *names, VARI
         goto done;
 
     hr = E_OUTOFMEMORY;
-    if (!(buf = malloc( (buflen + 1) * sizeof(WCHAR) ))) goto done;
+    count = max( count, 1 );
+    if (count > max_count || buflen == MAXDWORD || buflen >= ~(SIZE_T)0 / sizeof(WCHAR)) goto done;
+    if (!(buf = malloc( ((SIZE_T)buflen + 1) * sizeof(WCHAR) ))) goto done;
     if (!(value_names = malloc( count * sizeof(BSTR) ))) goto done;
     if (!(value_types = malloc( count * sizeof(DWORD) ))) goto done;
 
@@ -293,6 +296,7 @@ static HRESULT enum_values( HKEY root, const WCHAR *subkey, VARIANT *names, VARI
     {
         if (i >= count)
         {
+            if (count > max_count / 2) { hr = E_OUTOFMEMORY; break; }
             count *= 2;
             if (!(tmp_names = realloc( value_names, count * sizeof(*tmp_names) ))) { hr = E_OUTOFMEMORY; break; }
             value_names = tmp_names;
@@ -309,7 +313,6 @@ static HRESULT enum_values( HKEY root, const WCHAR *subkey, VARIANT *names, VARI
         if (res) break;
         if (!(value_names[i] = SysAllocString( buf )))
         {
-            for (i--; i >= 0; i--) SysFreeString( value_names[i] );
             hr = E_OUTOFMEMORY;
             break;
         }
@@ -318,13 +321,13 @@ static HRESULT enum_values( HKEY root, const WCHAR *subkey, VARIANT *names, VARI
     if (hr == S_OK && !res)
     {
         hr = to_bstr_array( value_names, i, names );
-        free_bstr_array( value_names, i );
         if (hr == S_OK) hr = to_i4_array( value_types, i, types );
     }
 
 done:
     set_variant( VT_UI4, res, NULL, retval );
     RegCloseKey( hkey );
+    free_bstr_array( value_names, i );
     free( value_names );
     free( value_types );
     free( buf );
