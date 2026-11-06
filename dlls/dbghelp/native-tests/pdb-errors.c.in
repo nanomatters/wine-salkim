@@ -1,0 +1,259 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Stream reads and symbol registration are injected around the real record walkers. */
+
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "windef.h"
+#include "winbase.h"
+#include "oleauto.h"
+#include "dbghelp.h"
+#include "wine/mscvpdb.h"
+
+typedef uint32_t pdbsize_t;
+typedef ULONG_PTR symref_t;
+enum pdb_result
+{
+    R_PDB_SUCCESS, R_PDB_IOERROR, R_PDB_OUT_OF_MEMORY, R_PDB_INVALID_ARGUMENT,
+    R_PDB_INVALID_PDB_FILE, R_PDB_MISSING_INFORMATION, R_PDB_NOT_FOUND, R_PDB_BUFFER_TOO_SMALL
+};
+enum method_result {MR_SUCCESS, MR_FAILURE, MR_NOT_FOUND};
+enum pdb_action_type {action_type_field};
+struct pdb_reader_walker {unsigned stream_id, offset, last;};
+struct pdb_action_entry {unsigned action_length, stream_offset;};
+struct pdb_reader {void *module; struct pdb_reader_walker tpi_types_walker;};
+
+static unsigned allocated, freed, reported_id, action_calls, reader_calls;
+static BOOL fail_alloc, fail_action, fail_read, short_read;
+static unsigned char records[2][64];
+static size_t record_sizes[2];
+
+static enum pdb_result pdb_reader_alloc(struct pdb_reader *pdb, size_t size, void **ptr)
+{
+    if (fail_alloc) return R_PDB_OUT_OF_MEMORY;
+    *ptr = malloc(size);
+    assert(*ptr);
+    allocated++;
+    return R_PDB_SUCCESS;
+}
+
+static void pdb_reader_free(struct pdb_reader *pdb, void *ptr)
+{
+    assert(ptr && freed < allocated);
+    freed++;
+    free(ptr);
+}
+
+static enum pdb_result report_unexpected(const char *kind, unsigned id)
+{
+    assert(!reported_id);
+    reported_id = id;
+    return R_PDB_INVALID_PDB_FILE;
+}
+#define PDB_REPORT_UNEXPECTED(kind, id) report_unexpected(kind, id)
+
+static enum pdb_result pdb_reader_TPI_alloc_and_read_full_reftype(struct pdb_reader *pdb,
+    cv_typ_t type, union codeview_reftype **record, pdbsize_t *offset)
+{
+    enum pdb_result result;
+    if (type >= ARRAY_SIZE(records)) return R_PDB_IOERROR;
+    if ((result = pdb_reader_alloc(pdb, record_sizes[type], (void **)record))) return result;
+    memcpy(*record, records[type], record_sizes[type]);
+    *offset = 100 * type;
+    return R_PDB_SUCCESS;
+}
+
+static enum pdb_result pdb_reader_read_from_stream(struct pdb_reader *pdb,
+    struct pdb_reader_walker *walker, void *buffer, pdbsize_t length, pdbsize_t *num_read)
+{
+    reader_calls++;
+    if (fail_read) return R_PDB_IOERROR;
+    assert(length <= record_sizes[0]);
+    *num_read = length - !!short_read;
+    memcpy(buffer, records[0], *num_read);
+    return R_PDB_SUCCESS;
+}
+
+static unsigned codeview_leaf_as_variant(const unsigned char *ptr, VARIANT *value)
+{
+    /* Fixtures use an immediate zero numeric leaf. */
+    assert(!ptr[0] && !ptr[1]);
+    memset(value, 0, sizeof(*value));
+    return 2;
+}
+
+static enum pdb_result pdb_reader_push_action(struct pdb_reader *pdb, enum pdb_action_type type,
+    pdbsize_t offset, unsigned length, symref_t container, symref_t *symref)
+{
+    action_calls++;
+    if (fail_action) return R_PDB_OUT_OF_MEMORY;
+    *symref = 42;
+    return R_PDB_SUCCESS;
+}
+
+static DWORD symt_symref_to_index(void *module, symref_t symref) {return symref;}
+
+static enum method_result pdb_reader_TPI_enumerate_request(struct pdb_reader *pdb,
+    struct pdb_action_entry *entry, const union codeview_fieldtype *field,
+    IMAGEHLP_SYMBOL_TYPE_INFO request, void *data)
+{
+    return MR_SUCCESS;
+}
+
+static enum method_result pdb_reader_TPI_UDT_field_request(struct pdb_reader *pdb,
+    struct pdb_action_entry *entry, const union codeview_fieldtype *field,
+    IMAGEHLP_SYMBOL_TYPE_INFO request, void *data)
+{
+    return MR_SUCCESS;
+}
+
+@FUNCTIONS@
+
+static void make_record(unsigned index, unsigned id, unsigned field, unsigned next)
+{
+    union codeview_reftype *record = (void *)records[index];
+    union codeview_fieldtype *item = (void *)record->fieldlist.list;
+    unsigned length = 0;
+
+    memset(record, 0, sizeof(records[index]));
+    record->generic.id = id;
+    item->generic.id = field;
+    switch (field)
+    {
+    case 0:
+        break;
+    case LF_INDEX_V2:
+        item->index_v2.ref = next;
+        length = sizeof(item->index_v2);
+        break;
+    case LF_ENUMERATE_V3:
+        length = offsetof(union codeview_fieldtype, enumerate_v3.data) + 3;
+        break;
+    case LF_MEMBER_V3:
+        length = offsetof(union codeview_fieldtype, member_v3.data) + 3;
+        break;
+    default:
+        length = sizeof(item->generic);
+        break;
+    }
+    record->generic.len = sizeof(record->generic.id) + length;
+    record_sizes[index] = sizeof(record->generic) + length;
+}
+
+static const char *cases[] =
+{
+    "enum_bad_list", "udt_bad_list", "enum_bad_field", "udt_bad_field",
+    "enum_empty", "udt_empty", "enum_recursive_read_error", "udt_recursive_read_error",
+    "enum_recursive_bad_list", "udt_recursive_bad_list", "enum_recursive_valid", "udt_recursive_valid",
+    "enum_member", "udt_member", "enum_action_failure", "udt_action_failure",
+    "enum_short_buffer", "udt_short_buffer", "enum_alloc_failure", "udt_alloc_failure",
+    "udt_count_only", "field_read_error", "field_short_read", "field_alloc_failure",
+    "field_enum", "field_member", "field_bad_id"
+};
+
+int main(int argc, char **argv)
+{
+    struct pdb_reader pdb = {0};
+    TI_FINDCHILDREN_PARAMS children = {1, 0, {0}};
+    struct pdb_action_entry entry = {4, 0};
+    enum pdb_result expected = R_PDB_SUCCESS, result;
+    enum method_result method_expected = MR_FAILURE;
+    unsigned where = 0, expected_count = 0, expected_id = 0, expected_allocations = 1, i;
+    BOOL udt;
+    const char *name;
+
+    assert(argc == 2);
+    name = argv[1];
+    if (!strcmp(name, "list"))
+    {
+        for (i = 0; i < ARRAY_SIZE(cases); i++) puts(cases[i]);
+        return 0;
+    }
+    for (i = 0; i < ARRAY_SIZE(cases); i++) if (!strcmp(name, cases[i])) break;
+    assert(i < ARRAY_SIZE(cases));
+
+    if (!strncmp(name, "field_", 6))
+    {
+        union codeview_fieldtype *field = (void *)records[0];
+        record_sizes[0] = entry.action_length;
+        fail_read = !strcmp(name, "field_read_error");
+        short_read = !strcmp(name, "field_short_read");
+        fail_alloc = !strcmp(name, "field_alloc_failure");
+        if (!strcmp(name, "field_enum")) field->generic.id = LF_ENUMERATE_V3;
+        if (!strcmp(name, "field_member")) field->generic.id = LF_MEMBER_V3;
+        if (!strcmp(name, "field_bad_id")) field->generic.id = expected_id = 0x1234;
+        if (field->generic.id && !expected_id) method_expected = MR_SUCCESS;
+        assert(pdb_reader_TPI_field_request(&pdb, &entry, TI_GET_SYMTAG, NULL) == method_expected);
+        assert(reader_calls == !fail_alloc);
+    }
+    else
+    {
+        udt = !strncmp(name, "udt_", 4);
+        make_record(0, LF_FIELDLIST_V2, 0, 0);
+        make_record(1, LF_FIELDLIST_V2, 0, 0);
+        if (strstr(name, "bad_list"))
+        {
+            expected_id = LF_ARGLIST_V2;
+            expected = R_PDB_INVALID_PDB_FILE;
+            make_record(0, expected_id, 0, 0);
+        }
+        if (strstr(name, "bad_field"))
+        {
+            expected_id = 0x1234;
+            expected = R_PDB_INVALID_PDB_FILE;
+            make_record(0, LF_FIELDLIST_V2, expected_id, 0);
+        }
+        if (strstr(name, "recursive"))
+        {
+            expected_allocations = 2;
+            make_record(0, LF_FIELDLIST_V2, LF_INDEX_V2, 1);
+            if (strstr(name, "read_error"))
+            {
+                make_record(0, LF_FIELDLIST_V2, LF_INDEX_V2, 2);
+                expected = R_PDB_IOERROR;
+                expected_allocations = 1;
+            }
+            if (strstr(name, "bad_list")) make_record(1, expected_id, 0, 0);
+        }
+        if (strstr(name, "member") || strstr(name, "action_failure") ||
+            strstr(name, "short_buffer") || strstr(name, "count_only"))
+        {
+            make_record(0, LF_FIELDLIST_V2, udt ? LF_MEMBER_V3 : LF_ENUMERATE_V3, 0);
+            expected_count = 1;
+        }
+        if (strstr(name, "action_failure"))
+        {
+            fail_action = TRUE;
+            expected = R_PDB_OUT_OF_MEMORY;
+            expected_count = 0;
+        }
+        if (strstr(name, "short_buffer"))
+        {
+            children.Count = 0;
+            expected = R_PDB_BUFFER_TOO_SMALL;
+            expected_count = 0;
+        }
+        if (strstr(name, "alloc_failure"))
+        {
+            fail_alloc = TRUE;
+            expected = R_PDB_OUT_OF_MEMORY;
+        }
+        if (udt)
+            result = pdb_reader_TPI_fillin_UDTlist(&pdb, 0, 0, &where,
+                                                 strstr(name, "count_only") ? NULL : &children);
+        else
+            result = pdb_reader_TPI_fillin_enumlist(&pdb, 0, 0, &where, &children);
+        assert(result == expected);
+        assert(where == expected_count);
+        if (expected_count && !strstr(name, "count_only")) assert(children.ChildId[0] == 42);
+        if (strstr(name, "action_failure")) assert(action_calls == 1);
+    }
+    assert(reported_id == expected_id);
+    assert(allocated == (fail_alloc ? 0 : expected_allocations));
+    assert(allocated == freed);
+    printf("PASS: %s\n", name);
+    return 0;
+}
