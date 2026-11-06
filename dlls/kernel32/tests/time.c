@@ -641,9 +641,16 @@ static void test_TzSpecificLocalTimeToSystemTime(void)
 
 static void test_FileTimeToDosDateTime(void)
 {
+    static const ULONGLONG overflow_times[] =
+    {
+        0x7fffffffffffffffULL,
+        0x7fffffffffffffffULL / 10000000 * 10000000,
+        (0x7fffffffffffffffULL / 10000000 - 1) * 10000000 + 10000,
+    };
     FILETIME ft = { 0 };
     WORD fatdate, fattime;
     SYSTEMTIME systime;
+    unsigned int i;
     int min, sec;
     BOOL ret;
 
@@ -736,6 +743,28 @@ static void test_FileTimeToDosDateTime(void)
     ok(sec == 1, "Unexpected seconds field %d.\n", sec);
     min = (fattime >> 5) & 0x3f;
     ok(min == 20, "Unexpected minutes field %d.\n", min);
+
+    systime.wYear = 1999;
+    systime.wMonth = 12;
+    systime.wDay = 31;
+    systime.wHour = 23;
+    systime.wMinute = 59;
+    systime.wSecond = 59;
+    systime.wMilliseconds = 1;
+    ret = SystemTimeToFileTime(&systime, &ft);
+    ok(ret, "Unexpected return value %d.\n", ret);
+    ret = FileTimeToDosDateTime(&ft, &fatdate, &fattime);
+    ok(ret, "Unexpected return value %d.\n", ret);
+    ok(fatdate == ((2000 - 1980) << 9) + (1 << 5) + 1, "Unexpected date %#x.\n", fatdate);
+    ok(!fattime, "Unexpected time %#x.\n", fattime);
+
+    for (i = 0; i < ARRAY_SIZE(overflow_times); i++)
+    {
+        ft.dwLowDateTime = overflow_times[i];
+        ft.dwHighDateTime = overflow_times[i] >> 32;
+        ret = FileTimeToDosDateTime(&ft, &fatdate, &fattime);
+        ok(!ret, "Unexpected success for %08lx%08lx.\n", ft.dwHighDateTime, ft.dwLowDateTime);
+    }
 }
 
 static void test_GetCalendarInfo(void)

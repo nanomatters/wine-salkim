@@ -316,21 +316,27 @@ BOOL WINAPI FileTimeToDosDateTime( const FILETIME *ft, WORD *fatdate, WORD *fatt
 
     /* For non-zero msec round to next second. */
     if ((time.QuadPart % TICKSPERSEC) / TICKSPERMSEC)
+    {
+        if (time.QuadPart > MAXLONGLONG - TICKSPERSEC) goto invalid;
         time.QuadPart += TICKSPERSEC;
+    }
 
     /* For odd number of seconds round to next even. */
     if ((time.QuadPart / TICKSPERSEC) % 2)
+    {
+        if (time.QuadPart > MAXLONGLONG - TICKSPERSEC) goto invalid;
         time.QuadPart += TICKSPERSEC;
+    }
 
     RtlTimeToTimeFields( &time, &fields );
-    if (fields.Year < 1980)
-    {
-        SetLastError( ERROR_INVALID_PARAMETER );
-        return FALSE;
-    }
+    if (fields.Year < 1980) goto invalid;
     *fattime = (fields.Hour << 11) + (fields.Minute << 5) + (fields.Second / 2);
     *fatdate = ((fields.Year - 1980) << 9) + (fields.Month << 5) + fields.Day;
     return TRUE;
+
+invalid:
+    SetLastError( ERROR_INVALID_PARAMETER );
+    return FALSE;
 }
 
 
