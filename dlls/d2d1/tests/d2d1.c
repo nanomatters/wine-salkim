@@ -482,6 +482,7 @@ struct effect_impl
     ID2D1EffectContext *effect_context;
     ID2D1TransformGraph *transform_graph;
     ID2D1DrawInfo *draw_info;
+    HRESULT set_draw_info_hr;
     struct
     {
         BYTE *data;
@@ -16442,6 +16443,110 @@ static HRESULT create_custom_shader_effect(IUnknown **effect_impl, const GUID *p
     return S_OK;
 }
 
+static HRESULT STDMETHODCALLTYPE test_draw_transform_SetDrawInfo(ID2D1DrawTransform *iface, ID2D1DrawInfo *info)
+{
+    struct effect_impl *impl = impl_from_ID2D1DrawTransform(iface);
+
+    ok(!impl->draw_info, "Unexpected draw info %p.\n", impl->draw_info);
+    impl->draw_info = info;
+    ID2D1DrawInfo_AddRef(info);
+    return impl->set_draw_info_hr;
+}
+
+static void test_transform_graph_draw_info(BOOL d3d11)
+{
+    const D2D1_PROPERTY_BINDING bindings[] = {{L"Graph", NULL, effect_impl_get_graph}};
+    ID2D1DrawTransformVtbl vtbl = custom_shader_effect_draw_transform_vtbl;
+    struct d2d1_test_context ctx;
+    struct effect_impl *impl;
+    ID2D1TransformGraph *graph;
+    ID2D1TransformNode *node;
+    ID2D1Effect *effect;
+    IUnknown *object;
+    unsigned int i;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+    if (!ctx.factory1)
+    {
+        win_skip("ID2D1Factory1 is not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+
+    hr = ID2D1Factory1_RegisterEffectFromString(ctx.factory1, &CLSID_TestEffect,
+            effect_xml_c, bindings, ARRAY_SIZE(bindings), effect_impl_create);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = ID2D1DeviceContext_CreateEffect(ctx.context, &CLSID_TestEffect, &effect);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = ID2D1Effect_GetValueByName(effect, L"Graph", D2D1_PROPERTY_TYPE_IUNKNOWN,
+            (BYTE *)&graph, sizeof(graph));
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = create_custom_shader_effect(&object, NULL, NULL, NULL);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    impl = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)object);
+    vtbl.SetDrawInfo = test_draw_transform_SetDrawInfo;
+    impl->ID2D1DrawTransform_iface.lpVtbl = &vtbl;
+    node = (ID2D1TransformNode *)&impl->ID2D1DrawTransform_iface;
+
+    for (i = 0; i < 2; ++i)
+    {
+        winetest_push_context("%s", i ? "SetSingleTransformNode" : "AddNode");
+        impl->set_draw_info_hr = E_FAIL;
+        hr = i ? ID2D1TransformGraph_SetSingleTransformNode(graph, node)
+                : ID2D1TransformGraph_AddNode(graph, node);
+        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
+        refcount = get_refcount(object);
+        ok(refcount == 1, "Unexpected transform refcount %lu.\n", refcount);
+        hr = ID2D1TransformGraph_RemoveNode(graph, node);
+        ok(hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "Unexpected hr %#lx.\n", hr);
+        ok(!!impl->draw_info, "SetDrawInfo was not called.\n");
+        if (impl->draw_info)
+        {
+            refcount = ID2D1DrawInfo_Release(impl->draw_info);
+            ok(!refcount, "Leaked draw info with refcount %lu.\n", refcount);
+            impl->draw_info = NULL;
+        }
+
+        impl->set_draw_info_hr = S_OK;
+        hr = i ? ID2D1TransformGraph_SetSingleTransformNode(graph, node)
+                : ID2D1TransformGraph_AddNode(graph, node);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        refcount = get_refcount(object);
+        ok(refcount == 2, "Unexpected transform refcount %lu.\n", refcount);
+        hr = ID2D1TransformGraph_AddNode(graph, node);
+        ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
+        if (i)
+            ID2D1TransformGraph_Clear(graph);
+        else
+        {
+            hr = ID2D1TransformGraph_RemoveNode(graph, node);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        }
+        refcount = get_refcount(object);
+        ok(refcount == 1, "Unexpected transform refcount %lu.\n", refcount);
+        ok(!!impl->draw_info, "SetDrawInfo was not called.\n");
+        if (impl->draw_info)
+        {
+            refcount = ID2D1DrawInfo_Release(impl->draw_info);
+            ok(!refcount, "Leaked draw info with refcount %lu.\n", refcount);
+            impl->draw_info = NULL;
+        }
+        winetest_pop_context();
+    }
+
+    refcount = IUnknown_Release(object);
+    ok(!refcount, "Unexpected transform refcount %lu.\n", refcount);
+    ID2D1TransformGraph_Release(graph);
+    ID2D1Effect_Release(effect);
+    hr = ID2D1Factory1_UnregisterEffect(ctx.factory1, &CLSID_TestEffect);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    release_test_context(&ctx);
+}
+
 static HRESULT STDMETHODCALLTYPE custom_effect_impl_create(IUnknown **effect_impl)
 {
     return create_custom_shader_effect(effect_impl, &GUID_TestPixelShader, NULL, NULL);
@@ -18106,6 +18211,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_effect_saturation);
     queue_d3d10_test(test_effect_scale);
     queue_test(test_transform_graph);
+    queue_test(test_transform_graph_draw_info);
     queue_test(test_offset_transform);
     queue_test(test_blend_transform);
     queue_test(test_border_transform);

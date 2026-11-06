@@ -675,6 +675,8 @@ static HRESULT d2d_transform_graph_add_node(struct d2d_transform_graph *graph,
     else
     {
         ID2D1TransformNode_Release(node->object);
+        if (node->render_info)
+            ID2D1DrawInfo_Release(&node->render_info->ID2D1DrawInfo_iface);
         free(node->inputs);
         free(node);
     }
