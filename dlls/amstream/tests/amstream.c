@@ -703,6 +703,7 @@ struct teststream
     IFilterGraph *graph;
     FILTER_STATE state;
     HRESULT set_state_result;
+    HRESULT get_information_result;
 };
 
 static struct teststream *impl_from_IAMMediaStream(IAMMediaStream *iface)
@@ -891,6 +892,8 @@ static HRESULT WINAPI stream_GetInformation(IAMMediaStream *iface, MSPID *id, ST
 {
     struct teststream *stream = impl_from_IAMMediaStream(iface);
     if (winetest_debug > 1) trace("GetInformation(%p, %p)\n", id, type);
+    if (FAILED(stream->get_information_result))
+        return stream->get_information_result;
     if (id)
         *id = stream->mspid;
     if (type)
@@ -2712,6 +2715,7 @@ static void test_initialize(void)
 static void test_render(void)
 {
     IAMMultiMediaStream *mmstream = create_ammultimediastream();
+    struct teststream teststream;
     FILTER_INFO filter_info;
     IMediaStream *stream;
     IPin *pin, *pin_peer;
@@ -2836,11 +2840,28 @@ static void test_render(void)
     ok(hr == VFW_E_INVALID_DIRECTION, "Got hr %#lx.\n", hr);
 
     hr = IAMMultiMediaStream_Render(mmstream, AMMSF_NOCLOCK);
-    todo_wine
     ok(hr == VFW_E_INVALID_DIRECTION, "Got hr %#lx.\n", hr);
 
     ref = IAMMultiMediaStream_Release(mmstream);
     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+
+    /* A custom stream may fail to report its type. */
+    mmstream = create_ammultimediastream();
+    teststream_init(&teststream);
+    hr = IAMMultiMediaStream_Initialize(mmstream, STREAMTYPE_WRITE, 0, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IAMMultiMediaStream_AddMediaStream(mmstream, (IUnknown *)&teststream.IAMMediaStream_iface,
+            &teststream.mspid, 0, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    ref = get_refcount(&teststream.IAMMediaStream_iface);
+    teststream.get_information_result = E_FAIL;
+    hr = IAMMultiMediaStream_Render(mmstream, AMMSF_NOCLOCK);
+    ok(hr == E_FAIL, "Got hr %#lx.\n", hr);
+    ok(teststream.refcount == ref, "Got stream refcount %ld, expected %lu.\n", teststream.refcount, ref);
+    ref = IAMMultiMediaStream_Release(mmstream);
+    ok(!ref, "Got outstanding refcount %lu.\n", ref);
+    ok(teststream.refcount == 1, "Got outstanding stream refcount %ld.\n", teststream.refcount);
 }
 
 static IAMMultiMediaStream *mmstream_mmstream;
