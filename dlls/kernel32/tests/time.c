@@ -22,6 +22,7 @@
 #include "wine/test.h"
 #include "winbase.h"
 #include "winnls.h"
+#include "winreg.h"
 #include "winternl.h"
 
 static BOOL (WINAPI *pTzSpecificLocalTimeToSystemTime)(LPTIME_ZONE_INFORMATION, LPSYSTEMTIME, LPSYSTEMTIME);
@@ -1033,6 +1034,98 @@ static WORD day_of_month(const SYSTEMTIME* systemtime, WORD year)
     return result;
 }
 
+static void test_GetTimeZoneInformationForYear_boundaries(void)
+{
+    static const struct
+    {
+        DWORD first_type, first_size;
+        ULONGLONG first;
+        DWORD last_type, last_size;
+        ULONGLONG last;
+        USHORT year;
+        LONG bias;
+    } tests[] =
+    {
+        {REG_DWORD, 4, 2022, REG_DWORD, 4, 2024, 2020, 120},
+        {REG_DWORD, 4, 2022, REG_DWORD, 4, 2024, 2026, 180},
+        {REG_DWORD, 4, 2022, REG_QWORD, 8, 2024, 2020, 120},
+        {REG_QWORD, 8, 2022, REG_QWORD, 8, 2024, 2020, 60},
+        {REG_BINARY, 8, 2022, REG_BINARY, 8, 2024, 2020, 60},
+        {REG_DWORD, 2, 2022, REG_DWORD, 2, 2024, 2020, 60},
+        {REG_DWORD, 0, 2022, REG_DWORD, 0, 2024, 2020, 60},
+        {REG_BINARY, 4, 2022, REG_BINARY, 4, 2024, 2020, 60},
+        {REG_DWORD, 4, 2022, REG_QWORD, 8, 2024, 2026, 60},
+        {REG_QWORD, 8, 2022, REG_DWORD, 4, 2024, 2026, 180},
+    };
+    static const WCHAR std_name[] = L"Wine standard", dlt_name[] = L"Wine daylight";
+    struct
+    {
+        LONG bias, std_bias, dlt_bias;
+        SYSTEMTIME std_date, dlt_date;
+    } data = {0};
+    DYNAMIC_TIME_ZONE_INFORMATION dynamic = {0};
+    TIME_ZONE_INFORMATION info;
+    HKEY zone, dst;
+    WCHAR path[256];
+    DWORD disposition;
+    LSTATUS status;
+    unsigned int i;
+    BOOL ret;
+
+    if (!pGetTimeZoneInformationForYear)
+        return;
+
+    swprintf(dynamic.TimeZoneKeyName, ARRAY_SIZE(dynamic.TimeZoneKeyName), L"WineTest-%lu-%lu",
+            GetCurrentProcessId(), GetTickCount());
+    swprintf(path, ARRAY_SIZE(path), L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\%s",
+            dynamic.TimeZoneKeyName);
+    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &zone, &disposition);
+    if (status || disposition != REG_CREATED_NEW_KEY)
+    {
+        win_skip("Could not create isolated timezone key, status %ld.\n", status);
+        if (!status) RegCloseKey(zone);
+        return;
+    }
+    status = RegSetValueExW(zone, L"Std", 0, REG_SZ, (const BYTE *)std_name, sizeof(std_name));
+    ok(!status, "Got status %ld.\n", status);
+    status = RegSetValueExW(zone, L"Dlt", 0, REG_SZ, (const BYTE *)dlt_name, sizeof(dlt_name));
+    ok(!status, "Got status %ld.\n", status);
+    data.bias = 60;
+    status = RegSetValueExW(zone, L"TZI", 0, REG_BINARY, (const BYTE *)&data, sizeof(data));
+    ok(!status, "Got status %ld.\n", status);
+    status = RegCreateKeyExW(zone, L"Dynamic DST", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &dst, NULL);
+    ok(!status, "Got status %ld.\n", status);
+    if (!status)
+    {
+        data.bias = 120;
+        status = RegSetValueExW(dst, L"2022", 0, REG_BINARY, (const BYTE *)&data, sizeof(data));
+        ok(!status, "Got status %ld.\n", status);
+        data.bias = 180;
+        status = RegSetValueExW(dst, L"2024", 0, REG_BINARY, (const BYTE *)&data, sizeof(data));
+        ok(!status, "Got status %ld.\n", status);
+
+        for (i = 0; i < ARRAY_SIZE(tests); ++i)
+        {
+            winetest_push_context("test %u", i);
+            status = RegSetValueExW(dst, L"FirstEntry", 0, tests[i].first_type,
+                    (const BYTE *)&tests[i].first, tests[i].first_size);
+            ok(!status, "Got status %ld.\n", status);
+            status = RegSetValueExW(dst, L"LastEntry", 0, tests[i].last_type,
+                    (const BYTE *)&tests[i].last, tests[i].last_size);
+            ok(!status, "Got status %ld.\n", status);
+            memset(&info, 0xcc, sizeof(info));
+            ret = pGetTimeZoneInformationForYear(tests[i].year, &dynamic, &info);
+            ok(ret, "Got error %lu.\n", GetLastError());
+            if (ret) ok(info.Bias == tests[i].bias, "Got bias %ld, expected %ld.\n", info.Bias, tests[i].bias);
+            winetest_pop_context();
+        }
+        RegCloseKey(dst);
+    }
+    RegCloseKey(zone);
+    status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, path);
+    ok(!status, "Got status %ld.\n", status);
+}
+
 static void test_GetTimeZoneInformationForYear(void)
 {
     BOOL ret, broken_test = FALSE;
@@ -1064,6 +1157,10 @@ static void test_GetTimeZoneInformationForYear(void)
         { L"Altai Standard Time",         2017, -420, 0, -60,  0,  0, 0,  0 },
         { L"Altai Standard Time",         2018, -420, 0, -60,  0,  0, 0,  0 },
     };
+    WCHAR key_name[256];
+    DWORD first, last, size;
+    LSTATUS lstatus;
+    HKEY key;
 
     if (!pGetTimeZoneInformationForYear || !pGetDynamicTimeZoneInformation)
     {
@@ -1124,6 +1221,46 @@ static void test_GetTimeZoneInformationForYear(void)
     {
         win_skip("Old Windows version\n");
         return;
+    }
+
+    for (i = 0; !EnumDynamicTimeZoneInformation(i, &dyn_tzinfo); ++i)
+    {
+        winetest_push_context("tz %s", debugstr_w(dyn_tzinfo.TimeZoneKeyName));
+        swprintf(key_name, ARRAY_SIZE(key_name), L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\%s\\Dynamic DST",
+            dyn_tzinfo.TimeZoneKeyName);
+        lstatus = RegOpenKeyW(HKEY_LOCAL_MACHINE, key_name, &key);
+        ok(!lstatus || lstatus == ERROR_FILE_NOT_FOUND, "got %#lx.\n", lstatus);
+        if (lstatus)
+        {
+            winetest_pop_context();
+            continue;
+        }
+
+        size = sizeof(first);
+        lstatus = RegQueryValueExW(key, L"FirstEntry", NULL, NULL, (BYTE *)&first, &size);
+        ok(!lstatus, "got %#lx.\n", lstatus);
+        lstatus = RegQueryValueExW(key, L"LastEntry", NULL, NULL, (BYTE *)&last, &size);
+        ok(!lstatus, "got %#lx.\n", lstatus);
+
+        RegCloseKey(key);
+
+        memset(&tzinfo, 0, sizeof(tzinfo));
+        memset(&tzinfo2, 0, sizeof(tzinfo2));
+        ret = pGetTimeZoneInformationForYear(first, &dyn_tzinfo, &tzinfo);
+        ok(ret, "got error %lu.\n", GetLastError());
+
+        ret = pGetTimeZoneInformationForYear(first - 1, &dyn_tzinfo, &tzinfo2);
+        ok(ret, "got error %lu.\n", GetLastError());
+        ok(!memcmp(&tzinfo, &tzinfo2, sizeof(tzinfo)), "TZ info does not match, first %ld.\n", first);
+
+        memset(&tzinfo, 0, sizeof(tzinfo));
+        memset(&tzinfo2, 0, sizeof(tzinfo2));
+        ret = pGetTimeZoneInformationForYear(last, &dyn_tzinfo, &tzinfo);
+        ok(ret, "got error %lu.\n", GetLastError());
+        ret = pGetTimeZoneInformationForYear(last + 1, &dyn_tzinfo, &tzinfo2);
+        ok(ret, "got error %lu.\n", GetLastError());
+        ok(!memcmp(&tzinfo, &tzinfo2, sizeof(tzinfo)), "TZ info does not match, last %ld.\n", last);
+        winetest_pop_context();
     }
 
     for (i = 0; i < ARRAY_SIZE(test_data); i++)
@@ -1318,6 +1455,7 @@ START_TEST(time)
     test_GetSystemTimeAsFileTime();
     test_GetSystemTimePreciseAsFileTime();
     test_GetTimeZoneInformationForYear();
+    test_GetTimeZoneInformationForYear_boundaries();
     test_GetTickCount();
     test_QueryUnbiasedInterruptTime();
     test_processor_idle_cycle_time();
