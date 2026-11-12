@@ -218,6 +218,8 @@ struct d3dkmt_adapter
 {
     struct d3dkmt_object obj;
     struct vulkan_physical_device *physical_device;
+    D3DKMT_DEVICE_IDS device_ids;
+    BOOL device_ids_valid;
     VkPhysicalDevicePCIBusInfoPropertiesEXT telemetry_pci;
     UINT telemetry_vendor_id;
     char *telemetry_paths[D3DKMT_TELEMETRY_PATH_COUNT];
@@ -767,6 +769,8 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc 
     if (!(instance = get_d3dkmt_vulkan_instance())) WARN( "Vulkan is unavailable.\n" );
     else adapter->physical_device = get_vulkan_physical_device( instance, &desc->AdapterLuid );
     if (!adapter->physical_device) WARN( "Failed to find Vulkan physical device\n" );
+
+    adapter->device_ids_valid = get_gpu_device_ids_from_luid( &desc->AdapterLuid, &adapter->device_ids );
 
     if ((status = alloc_object_handle( &adapter->obj ))) goto failed;
     desc->hAdapter = adapter->obj.local;
@@ -2158,6 +2162,26 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
 
     switch (desc->Type)
     {
+    case KMTQAITYPE_PHYSICALADAPTERDEVICEIDS:
+    {
+        D3DKMT_QUERY_DEVICE_IDS *data = desc->pPrivateDriverData;
+        NTSTATUS status;
+
+        if (desc->PrivateDriverDataSize < sizeof(*data) || data->PhysicalAdapterIndex)
+            return STATUS_INVALID_PARAMETER;
+        pthread_mutex_lock( &d3dkmt_lock );
+        if (!(adapter = get_d3dkmt_object_locked( desc->hAdapter, D3DKMT_ADAPTER )))
+            status = STATUS_INVALID_PARAMETER;
+        else if (!adapter->device_ids_valid)
+            status = STATUS_NOT_SUPPORTED;
+        else
+        {
+            data->DeviceIds = adapter->device_ids;
+            status = STATUS_SUCCESS;
+        }
+        pthread_mutex_unlock( &d3dkmt_lock );
+        return status;
+    }
     case KMTQAITYPE_CHECKDRIVERUPDATESTATUS:
     {
         BOOL *value = desc->pPrivateDriverData;

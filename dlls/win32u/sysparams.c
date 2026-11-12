@@ -9037,6 +9037,35 @@ BOOL get_gpu_uuid_from_luid( const LUID *luid, GUID *uuid )
     return found;
 }
 
+/* Find the exposed PCI identity corresponding to a LUID. */
+BOOL get_gpu_device_ids_from_luid( const LUID *luid, D3DKMT_DEVICE_IDS *ids )
+{
+    unsigned int vendor, device, subsystem, revision;
+    BOOL found = FALSE;
+    struct gpu *gpu;
+    int len = 0;
+
+    if (!lock_display_devices( FALSE )) return FALSE;
+
+    LIST_FOR_EACH_ENTRY( gpu, &gpus, struct gpu, entry )
+    {
+        if (memcmp( &gpu->luid, luid, sizeof(*luid) )) continue;
+        if (sscanf( gpu->path, "PCI\\VEN_%4x&DEV_%4x&SUBSYS_%8x&REV_%2x\\%n",
+                    &vendor, &device, &subsystem, &revision, &len ) != 4 || !len) break;
+        ids->VendorID = vendor;
+        ids->DeviceID = device;
+        ids->SubVendorID = subsystem & 0xffff;
+        ids->SubSystemID = subsystem >> 16;
+        ids->RevisionID = revision;
+        ids->BusType = 5; /* PCIBus */
+        found = TRUE;
+        break;
+    }
+
+    unlock_display_devices();
+    return found;
+}
+
 /* Find the GPU LUID corresponding to a device UUID */
 BOOL get_gpu_info_from_uuid( const GUID *uuid, LUID *luid, UINT32 *node_mask, char *name )
 {
