@@ -1917,6 +1917,16 @@ NTSTATUS WINAPI RtlWow64SuspendThread( HANDLE thread, ULONG *count )
     return NtSuspendThread( thread, count );
 }
 
+/**********************************************************************
+ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
+ */
+ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
+{
+    if (!emulated_processor_features[PF_AVX_INSTRUCTIONS_AVAILABLE]) return 0;
+    return user_xstate_config->EnabledFeatures & feature_mask;
+}
+
+
 /*************************************************************************
  *		RtlWalkFrameChain (NTDLL.@)
  */

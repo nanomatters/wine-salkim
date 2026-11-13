@@ -766,6 +766,15 @@ err_close_proc:
     return pWow64SuspendLocalThread( thread, count );
 }
 
+/**********************************************************************
+ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
+ */
+ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
+{
+    return 0;
+}
+
+
 /*************************************************************************
  *		RtlWalkFrameChain (NTDLL.@)
  */
