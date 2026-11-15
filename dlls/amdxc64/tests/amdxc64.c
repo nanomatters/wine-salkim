@@ -103,18 +103,16 @@ static void test_upgrade_probe(void)
 {
     LONG queries = device.interop_queries;
     IAmdExtFfxApi *ffx;
-    char env[16];
     HRESULT hr;
 
     hr = pAmdExtD3DCreateInterface(&device.IUnknown_iface, &IID_IAmdExtFfxApi, (void **)&ffx);
     ok(hr == S_OK, "Create returned %#lx.\n", hr);
     if (FAILED(hr)) return;
-    /* The fake device has no Vulkan interop. Automatic selection probes it once. */
-    SetLastError(ERROR_SUCCESS);
-    if (GetEnvironmentVariableA("FSR4_UPGRADE", env, sizeof(env)) || GetLastError() != ERROR_ENVVAR_NOT_FOUND)
-        ok(device.interop_queries == queries, "Explicit setting queried Vulkan interop.\n");
+    /* The fake device has no Vulkan interop; only an enabled provider should probe it. */
+    if (GetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", NULL, 0) > 1)
+        ok(device.interop_queries == queries + 1, "Selected provider did not check the device.\n");
     else
-        ok(device.interop_queries == queries + 1, "Automatic selection did not query Vulkan interop.\n");
+        ok(device.interop_queries == queries, "Disabled provider queried Vulkan interop.\n");
     IAmdExtFfxApi_Release(ffx);
     ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
 }
@@ -346,15 +344,8 @@ static void test_disabled_provider(void)
 {
     IAmdExtFfxApi *ffx;
     HMODULE provider;
-    char env[16];
-    DWORD len;
     HRESULT hr;
     unsigned int data[32] = {0};
-
-    SetLastError(ERROR_SUCCESS);
-    len = GetEnvironmentVariableA("FSR4_UPGRADE", env, sizeof(env));
-    if ((!len && GetLastError() == ERROR_ENVVAR_NOT_FOUND) || (len == 1 && env[0] == '1'))
-        return;
 
     provider = GetModuleHandleA("amdxcffx64.dll");
     hr = pAmdExtD3DCreateInterface(&device.IUnknown_iface, &IID_IAmdExtFfxApi, (void **)&ffx);
@@ -378,6 +369,34 @@ static WCHAR *get_environment(const WCHAR *name)
     value = calloc(size + 1, sizeof(WCHAR));
     GetEnvironmentVariableW(name, value, size);
     return value;
+}
+
+static void test_provider_selection(void)
+{
+    static const WCHAR *paths[] = {NULL, L"", L"/shared/amdxcffx64.dll"};
+    static const WCHAR *old_flags[] = {NULL, L"0", L"1"};
+    WCHAR *path = get_environment(L"WINE_FSR4_PROVIDER");
+    WCHAR *flag = get_environment(L"FSR4_UPGRADE");
+    WCHAR *proton_flag = get_environment(L"PROTON_FSR4_UPGRADE");
+    unsigned int i, j;
+
+    for (i = 0; i < ARRAY_SIZE(paths); ++i)
+    {
+        SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", paths[i]);
+        for (j = 0; j < ARRAY_SIZE(old_flags); ++j)
+        {
+            SetEnvironmentVariableW(L"FSR4_UPGRADE", old_flags[j]);
+            SetEnvironmentVariableW(L"PROTON_FSR4_UPGRADE", old_flags[j]);
+            test_upgrade_probe();
+            test_disabled_provider();
+        }
+    }
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", path);
+    SetEnvironmentVariableW(L"FSR4_UPGRADE", flag);
+    SetEnvironmentVariableW(L"PROTON_FSR4_UPGRADE", proton_flag);
+    free(path);
+    free(flag);
+    free(proton_flag);
 }
 
 static void write_provider(const WCHAR *path)
@@ -584,8 +603,7 @@ START_TEST(amdxc64)
         FreeLibrary(module);
         return;
     }
-    test_disabled_provider();
-    test_upgrade_probe();
+    test_provider_selection();
     test_creation_errors();
     test_interfaces();
     test_intrinsics();

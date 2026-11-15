@@ -69,7 +69,7 @@ static void check_intrinsic_support(ID3D12Device *device, BOOL *fp8, BOOL *p_wmm
     ID3D12DeviceExt3_Release(ext);
 }
 
-static BOOL is_rdna2(ID3D12Device *device)
+static BOOL supports_fsr_provider(ID3D12Device *device)
 {
     ID3D12DXVKInteropDevice *interop;
     VkInstance instance;
@@ -91,9 +91,6 @@ static BOOL is_rdna2(ID3D12Device *device)
     vkGetPhysicalDeviceProperties2(phys_device, &prop);
 
     if (prop.properties.vendorID != 0x1002) goto fail;
-    /* Do not enable by default on iGPUs. They are not powerful enough.
-     * Still can be enabled manually through FSR4_UPGRADE=1. */
-    if (prop.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) goto fail;
 
     if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
         goto fail;
@@ -106,7 +103,8 @@ static BOOL is_rdna2(ID3D12Device *device)
 
     for (UINT i = 0; i < extension_count; i++)
     {
-        if (!strcmp("VK_KHR_fragment_shading_rate", extensions[i])) ret = TRUE;
+        if (!strcmp("VK_KHR_fragment_shading_rate", extensions[i]) ||
+            !strcmp("VK_EXT_shader_float8", extensions[i])) ret = TRUE;
     }
 
 fail:
@@ -120,7 +118,7 @@ struct AMDFSR4FFX
 {
     IAmdExtFfxApi IAmdExtFfxApi_iface;
     LONG ref;
-    BOOL fp8_supported, rdna2;
+    BOOL fp8_supported, provider_supported;
 };
 
 static struct AMDFSR4FFX* impl_from_IAmdExtFfxApi(IAmdExtFfxApi* iface)
@@ -172,7 +170,7 @@ enum upgrade_mode
 
 static INIT_ONCE config_once = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE provider_once = INIT_ONCE_STATIC_INIT;
-static enum upgrade_mode fsr4_upgrade, mlfg_upgrade;
+static enum upgrade_mode mlfg_upgrade;
 static updateffxapi_pfn_ex update_provider_ex;
 static updateffxapi_pfn update_provider;
 
@@ -180,8 +178,6 @@ static BOOL WINAPI init_upgrade_config(INIT_ONCE *once, void *param, void **cont
 {
     const char *env;
 
-    env = getenv("FSR4_UPGRADE");
-    fsr4_upgrade = !env ? UPGRADE_AUTO : !strcmp(env, "1") ? UPGRADE_ENABLED : UPGRADE_DISABLED;
     env = getenv("MLFG_UPGRADE");
     mlfg_upgrade = env && !strcmp(env, "1") ? UPGRADE_ENABLED :
                    env && !strcmp(env, "0") ? UPGRADE_DISABLED : UPGRADE_AUTO;
@@ -259,8 +255,7 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
     if (this->fp8_supported || mlfg_upgrade == UPGRADE_ENABLED)
         unk_data->unk[2] = mlfg_upgrade != UPGRADE_DISABLED;
 
-    if (fsr4_upgrade == UPGRADE_DISABLED ||
-        (fsr4_upgrade == UPGRADE_AUTO && !this->rdna2)) return E_NOTIMPL;
+    if (!this->provider_supported) return E_NOTIMPL;
 
     if (!InitOnceExecuteOnce(&provider_once, init_ffx_provider, NULL, NULL))
         return E_NOINTERFACE;
@@ -288,8 +283,6 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface, 
                 ERR("FSR4 not supported on this system!\n");
             return E_NOINTERFACE;
         }
-
-        if (fsr4_upgrade != UPGRADE_ENABLED) return E_NOINTERFACE;
 
         ret = update_provider(data, size);
 
@@ -723,8 +716,8 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
         if (!(ffx = calloc(1, sizeof(*ffx)))) return E_OUTOFMEMORY;
         ffx->IAmdExtFfxApi_iface.lpVtbl = &AMDFSR4FFX_vtable;
         ffx->ref = 1;
-        InitOnceExecuteOnce(&config_once, init_upgrade_config, NULL, NULL);
-        ffx->rdna2 = fsr4_upgrade == UPGRADE_AUTO && is_rdna2((ID3D12Device *)outer);
+        ffx->provider_supported = GetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", NULL, 0) > 1 &&
+                supports_fsr_provider((ID3D12Device *)outer);
         check_intrinsic_support((ID3D12Device *)outer, &ffx->fp8_supported, NULL, NULL);
         *obj = &ffx->IAmdExtFfxApi_iface;
         return S_OK;
