@@ -620,6 +620,7 @@ static unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, stru
 }
 
 static struct vulkan_instance *d3dkmt_vulkan_instance; /* Vulkan instance for D3DKMT functions */
+static BOOL fsr_lite;
 
 static void d3dkmt_init_vulkan(void)
 {
@@ -628,6 +629,11 @@ static void d3dkmt_init_vulkan(void)
         .has_VK_KHR_get_physical_device_properties2 = 1,
         .has_VK_KHR_external_memory_capabilities = 1,
     };
+    const char *lite, *provider;
+
+    provider = getenv( "WINE_FSR4_PROVIDER" );
+    lite = getenv( "WINE_FSR4_LITE" );
+    fsr_lite = provider && *provider && lite && !strcmp( lite, "1" );
 
     d3dkmt_vulkan_instance = vulkan_instance_create( &extensions );
     if (!d3dkmt_vulkan_instance) WARN( "Failed to create the vulkan instance\n" );
@@ -2311,7 +2317,14 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
         if (properties2.properties.vendorID == 0x1002 && desc->PrivateDriverDataSize == 0x260)
         {
             int *data = desc->pPrivateDriverData;
-            if (fp8_support && wmma)
+            if (fsr_lite)
+            {
+                /* Select the provider's Lite INT8 implementation. */
+                data[0xc] = 0x96;
+                data[0xd] = 0x1;
+                TRACE( "Using FSR Lite for adapter %#x.\n", desc->hAdapter );
+            }
+            else if (fp8_support && wmma)
             {
                 /* Navi4x 9070xt */
                 data[0xc] = 0x98; /* APU/GPU Family */
