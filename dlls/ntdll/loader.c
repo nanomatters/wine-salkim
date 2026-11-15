@@ -29,6 +29,7 @@
 #include "windef.h"
 #include "winnt.h"
 #include "winioctl.h"
+#include "winver.h"
 #include "winternl.h"
 #include "delayloadhandler.h"
 
@@ -3699,6 +3700,252 @@ BOOL load_dll_optiscaler_hack(LPCWSTR name, LPWSTR override, DWORD size)
 }
 
 
+/* A split SDK is selected through its loader, before any effect DLL is loaded. */
+static const struct
+{
+    const WCHAR *name;
+    const WCHAR *product;
+    unsigned int first, end;
+} ffx_libraries[] =
+{
+    { L"amd_fidelityfx_dx12.dll",                 L"AMD FidelityFX",                  0, 1 },
+    { L"amd_fidelityfx_vk.dll",                   L"AMD FidelityFX",                  1, 2 },
+    { L"amd_fidelityfx_loader_dx12.dll",          L"AMD FidelityFX",                  2, 7 },
+    { L"amd_fidelityfx_upscaler_dx12.dll",        L"AMD FidelityFX Upscaler",         2, 7 },
+    { L"amd_fidelityfx_framegeneration_dx12.dll", L"AMD FidelityFX Frame Generation", 2, 7 },
+    { L"amd_fidelityfx_denoiser_dx12.dll",        L"AMD FidelityFX Ray Regeneration", 2, 7 },
+    { L"amd_fidelityfx_radiancecache_dx12.dll",   L"AMD FidelityFX Radiance Cache",   2, 7 },
+    { L"amd_fidelityfx_loader_vk.dll",            L"AMD FidelityFX",                  7, 10 },
+    { L"amd_fidelityfx_upscaler_vk.dll",          L"AMD FidelityFX Upscaler",         7, 10 },
+    { L"amd_fidelityfx_framegeneration_vk.dll",   L"AMD FidelityFX Frame Generation", 7, 10 },
+};
+
+struct ffx_version_block
+{
+    WORD length, value_length, type;
+    WCHAR key[1];
+};
+
+static const struct ffx_version_block *ffx_version_child( const void *data, SIZE_T size,
+                                                         SIZE_T offset, const WCHAR *key )
+{
+    const struct ffx_version_block *block;
+    SIZE_T key_size = (wcslen(key) + 1) * sizeof(WCHAR);
+
+    for (offset = (offset + 3) & ~(SIZE_T)3; offset < size; offset = (offset + block->length + 3) & ~(SIZE_T)3)
+    {
+        if (size - offset < offsetof(struct ffx_version_block, key)) break;
+        block = (const void *)((const char *)data + offset);
+        if (block->length < offsetof(struct ffx_version_block, key) || block->length > size - offset) break;
+        if (block->length >= offsetof(struct ffx_version_block, key) + key_size &&
+            !memcmp( block->key, key, key_size )) return block;
+    }
+    return NULL;
+}
+
+static BOOL ffx_version_string( const struct ffx_version_block *table, const WCHAR *key, const WCHAR *value )
+{
+    const struct ffx_version_block *entry;
+    SIZE_T offset, size = (wcslen(value) + 1) * sizeof(WCHAR);
+
+    /* AMD's signed libraries use the English Unicode string table. */
+    entry = ffx_version_child( table, table->length, offsetof(struct ffx_version_block, key) + sizeof(L"040904b0"), key );
+    if (!entry || entry->type != 1 || entry->value_length != size / sizeof(WCHAR)) return FALSE;
+    offset = (offsetof(struct ffx_version_block, key) + (wcslen(key) + 1) * sizeof(WCHAR) + 3) & ~(SIZE_T)3;
+    return offset <= entry->length && size <= entry->length - offset &&
+           !memcmp( (const char *)entry + offset, value, size );
+}
+
+static BOOL get_ffx_image_version( void *base, SIZE_T size, unsigned int index, ULONGLONG *version )
+{
+    const LDR_RESOURCE_INFO info = { 16 /* RT_VERSION */, 1, 0 };
+    const IMAGE_RESOURCE_DATA_ENTRY *entry;
+    const struct ffx_version_block *root, *strings, *table;
+    const VS_FIXEDFILEINFO *fixed;
+    SIZE_T offset;
+    ULONG length;
+    BOOL valid = FALSE;
+    __TRY
+    {
+        if (LdrFindResource_U( base, &info, 3, &entry ) ||
+            LdrAccessResource( base, entry, (void **)&root, &length )) goto done;
+        if ((const char *)root < (const char *)base ||
+            (SIZE_T)((const char *)root - (const char *)base) > size ||
+            length > size - ((const char *)root - (const char *)base)) goto done;
+        offset = (offsetof(struct ffx_version_block, key) + sizeof(L"VS_VERSION_INFO") + 3) & ~(SIZE_T)3;
+        if (length < offset + sizeof(*fixed) || root->length > length ||
+            root->length < offset + sizeof(*fixed) || root->type || root->value_length != sizeof(*fixed) ||
+            memcmp( root->key, L"VS_VERSION_INFO", sizeof(L"VS_VERSION_INFO") )) goto done;
+        fixed = (const void *)((const char *)root + offset);
+        if (fixed->dwSignature != VS_FFI_SIGNATURE || fixed->dwStrucVersion != VS_FFI_STRUCVERSION ||
+            fixed->dwFileType != VFT_DLL || fixed->dwFileFlags ||
+            !(fixed->dwFileVersionMS | fixed->dwFileVersionLS)) goto done;
+        strings = ffx_version_child( root, root->length, offset + sizeof(*fixed), L"StringFileInfo" );
+        if (!strings || strings->value_length) goto done;
+        table = ffx_version_child( strings, strings->length, offsetof(struct ffx_version_block, key) + sizeof(L"StringFileInfo"), L"040904b0" );
+        if (!table || table->value_length ||
+            !ffx_version_string( table, L"CompanyName", L"Advanced Micro Devices, Inc." ) ||
+            !ffx_version_string( table, L"ProductName", ffx_libraries[index].product )) goto done;
+        *version = ((ULONGLONG)fixed->dwFileVersionMS << 32) | fixed->dwFileVersionLS;
+        valid = TRUE;
+    done:;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY;
+    return valid;
+}
+
+static BOOL get_ffx_version( HANDLE mapping, unsigned int index, ULONGLONG *version )
+{
+    SIZE_T size = 0;
+    void *base = NULL;
+    BOOL valid;
+    NTSTATUS status;
+
+    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &base, 0, 0, NULL, &size,
+                                 ViewUnmap, 0, PAGE_READONLY );
+    if (status && status != STATUS_IMAGE_NOT_AT_BASE) return FALSE;
+    valid = get_ffx_image_version( base, size, index, version );
+    NtUnmapViewOfSection( NtCurrentProcess(), base );
+    return valid;
+}
+
+static BOOL ffx_sibling_path( const UNICODE_STRING *path, const WCHAR *name, UNICODE_STRING *sibling )
+{
+    SIZE_T length, prefix = path->Length / sizeof(WCHAR);
+
+    while (prefix && path->Buffer[prefix - 1] != '\\') --prefix;
+    length = prefix + wcslen(name) + 1;
+    if (length > USHRT_MAX / sizeof(WCHAR) ||
+        !(sibling->Buffer = RtlAllocateHeap( GetProcessHeap(), 0, length * sizeof(WCHAR) ))) return FALSE;
+    memcpy( sibling->Buffer, path->Buffer, prefix * sizeof(WCHAR) );
+    wcscpy( sibling->Buffer + prefix, name );
+    sibling->Length = (length - 1) * sizeof(WCHAR);
+    sibling->MaximumLength = length * sizeof(WCHAR);
+    return TRUE;
+}
+
+static BOOL ffx_split_can_upgrade( const UNICODE_STRING *original, const UNICODE_STRING *provider,
+                                   unsigned int first )
+{
+    unsigned int i;
+    for (i = first + 1; i < ffx_libraries[first].end; ++i)
+    {
+        UNICODE_STRING old_path = {0}, new_path = {0};
+        SECTION_IMAGE_INFORMATION image_info;
+        struct file_id id;
+        HANDLE old_mapping = NULL, new_mapping = NULL;
+        ULONGLONG old_version, new_version;
+        WINE_MODREF *wm;
+        NTSTATUS status;
+        BOOL valid = FALSE;
+
+        if (find_basename_module( ffx_libraries[i].name )) return FALSE;
+        if (!ffx_sibling_path( original, ffx_libraries[i].name, &old_path ) ||
+            !ffx_sibling_path( provider, ffx_libraries[i].name, &new_path )) goto done;
+        status = open_dll_file( &old_path, &wm, &old_mapping, &image_info, &id );
+        if (status && status != STATUS_DLL_NOT_FOUND) goto done;
+        if (wm) goto done;
+        if (status != STATUS_DLL_NOT_FOUND && (image_info.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            !get_ffx_version( old_mapping, i, &old_version ))) goto done;
+        /* Check all replacement files before choosing the split loader. */
+        if (open_dll_file( &new_path, &wm, &new_mapping, &image_info, &id ) || wm ||
+            image_info.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            !get_ffx_version( new_mapping, i, &new_version )) goto done;
+        valid = status == STATUS_DLL_NOT_FOUND ||
+                (old_version >> 48 == new_version >> 48 && old_version <= new_version);
+    done:
+        if (old_mapping) NtClose( old_mapping );
+        if (new_mapping) NtClose( new_mapping );
+        RtlFreeUnicodeString( &old_path );
+        RtlFreeUnicodeString( &new_path );
+        if (!valid) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL find_ffx_provider( const UNICODE_STRING *original, HANDLE original_mapping,
+                               UNICODE_STRING *provider, HANDLE *mapping,
+                               SECTION_IMAGE_INFORMATION *image_info, struct file_id *id, WINE_MODREF **wm )
+{
+    static const WCHAR prefix[] = L"\\??\\unix";
+    const WCHAR *name = original->Buffer, *ptr;
+    UNICODE_STRING directory = {0};
+    ULONGLONG old_version, new_version;
+    SIZE_T length, i;
+    unsigned int index, first;
+    SIZE_T env_length;
+    BOOL valid = FALSE;
+
+    for (ptr = name; *ptr; ++ptr) if (*ptr == '\\') name = ptr + 1;
+    if (wcsnicmp( name, L"amd_fidelityfx_", 14 )) return FALSE;
+    for (index = 0; index < ARRAY_SIZE(ffx_libraries); ++index)
+        if (!wcsicmp( name, ffx_libraries[index].name )) break;
+    if (index == ARRAY_SIZE(ffx_libraries) ||
+        (RtlQueryEnvironmentVariable( NULL, L"WINE_OPTISCALER_NAME", wcslen(L"WINE_OPTISCALER_NAME"),
+                                      NULL, 0, &env_length ) == STATUS_BUFFER_TOO_SMALL && env_length))
+        return FALSE;
+    name = ffx_libraries[index].name;
+    if (get_env_var( L"WINE_FFX_PROVIDER", 0, &directory )) return FALSE;
+    length = directory.Length / sizeof(WCHAR);
+    if (!length || directory.Buffer[0] != '/' ||
+        length + ARRAY_SIZE(prefix) + wcslen(name) + 1 > USHRT_MAX / sizeof(WCHAR)) goto done;
+    while (length && directory.Buffer[length - 1] == '/') --length;
+    provider->MaximumLength = (ARRAY_SIZE(prefix) + length + wcslen(name) + 1) * sizeof(WCHAR);
+    if (!(provider->Buffer = RtlAllocateHeap( GetProcessHeap(), 0, provider->MaximumLength ))) goto done;
+    wcscpy( provider->Buffer, prefix );
+    memcpy( provider->Buffer + ARRAY_SIZE(prefix) - 1, directory.Buffer, length * sizeof(WCHAR) );
+    length += ARRAY_SIZE(prefix) - 1;
+    provider->Buffer[length++] = '\\';
+    wcscpy( provider->Buffer + length, name );
+    for (i = ARRAY_SIZE(prefix) - 1; i < length; ++i)
+        if (provider->Buffer[i] == '/') provider->Buffer[i] = '\\';
+    provider->Length = wcslen(provider->Buffer) * sizeof(WCHAR);
+    if (RtlEqualUnicodeString( original, provider, TRUE )) goto done;
+
+    first = ffx_libraries[index].first;
+    if (index != first)
+    {
+        UNICODE_STRING loader_path = {0};
+        WINE_MODREF *loader = find_basename_module( ffx_libraries[first].name );
+        if (!loader || !ffx_sibling_path( provider, ffx_libraries[first].name, &loader_path )) goto done;
+        valid = find_fullname_module( &loader_path ) == loader;
+        RtlFreeUnicodeString( &loader_path );
+        if (!valid) goto done;
+        valid = FALSE;
+    }
+    if (!get_ffx_version( original_mapping, index, &old_version ) ||
+        open_dll_file( provider, wm, mapping, image_info, id )) goto done;
+    if (*wm)
+    {
+        /* Do not create another instance when an absolute game path is used. */
+        valid = get_ffx_image_version( (*wm)->ldr.DllBase, (*wm)->ldr.SizeOfImage, index, &new_version ) &&
+                old_version >> 48 == new_version >> 48 && old_version <= new_version;
+        goto done;
+    }
+    if (image_info->Machine != IMAGE_FILE_MACHINE_AMD64 || !get_ffx_version( *mapping, index, &new_version ) ||
+        old_version >> 48 != new_version >> 48 || old_version > new_version ||
+        (old_version == new_version && index == first)) goto done;
+    if (ffx_libraries[index].end - first > 1 && index == first &&
+        !ffx_split_can_upgrade( original, provider, first )) goto done;
+    valid = TRUE;
+ done:
+    RtlFreeUnicodeString( &directory );
+    if (!valid)
+    {
+        if (*mapping) NtClose( *mapping );
+        *mapping = NULL;
+        *wm = NULL;
+        RtlFreeUnicodeString( provider );
+        provider->Buffer = NULL;
+    }
+    return valid;
+}
+
+
 /***********************************************************************
  *	load_dll  (internal)
  *
@@ -3743,6 +3990,39 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     }
 
     if (nts && nts != STATUS_INVALID_IMAGE_NOT_MZ) goto done;
+
+    if (!nts && !system && !redirected && image_info.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+        !(flags & LDR_DONT_RESOLVE_REFS))
+    {
+        UNICODE_STRING provider = {0};
+        SECTION_IMAGE_INFORMATION provider_info;
+        struct file_id provider_id;
+        HANDLE provider_mapping = NULL;
+        WINE_MODREF *provider_wm = NULL;
+
+        if (find_ffx_provider( &nt_name, mapping, &provider, &provider_mapping,
+                              &provider_info, &provider_id, &provider_wm ))
+        {
+            if (provider_wm)
+            {
+                if (provider_wm->ldr.LoadCount != -1) provider_wm->ldr.LoadCount++;
+                *pwm = provider_wm;
+                nts = STATUS_SUCCESS;
+            }
+            else
+                nts = load_native_dll( load_path, &provider, provider_mapping, &provider_info,
+                                       &provider_id, flags, FALSE, FALSE, pwm );
+            if (provider_mapping) NtClose( provider_mapping );
+            if (!nts)
+                TRACE_(loaddll)( "FFX SDK: %s -> %s\n", debugstr_us(&nt_name), debugstr_us(&provider) );
+            else
+                WARN_(loaddll)( "Cannot load FFX SDK %s (%lx), keeping %s\n",
+                               debugstr_us(&provider), nts, debugstr_us(&nt_name) );
+            RtlFreeUnicodeString( &provider );
+            if (!nts) goto done;
+            nts = STATUS_SUCCESS;
+        }
+    }
 
     prev = NtCurrentTeb()->Tib.ArbitraryUserPointer;
     NtCurrentTeb()->Tib.ArbitraryUserPointer = nt_name.Buffer + 4;

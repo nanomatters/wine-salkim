@@ -8,6 +8,7 @@ SOURCES = \
 	env.c \
 	error.c \
 	exception.c \
+	ffx.c \
 	file.c \
 	generated.c \
 	info.c \

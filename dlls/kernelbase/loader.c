@@ -620,22 +620,9 @@ BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
     WCHAR envW[64] = {0};
     UINT ret;
 
-    ret = GetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", envW, sizeof(envW));
+    ret = GetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", envW, ARRAY_SIZE(envW) );
     if ( !ret || ret >= ARRAY_SIZE(envW) ) return FALSE;
 
-    if ( wcsstr( envW, L"ffx3" ) )
-    {
-        /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR3 SDK upgrade */
-        if (wcsstr( name, L"amd_fidelityfx_vk.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_vk.dll" );
-        if (wcsstr( name, L"amd_fidelityfx_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_dx12.dll" );
-    }
-    if ( wcsstr( envW, L"ffx4" ) )
-    {
-        /* HACK: override amd_fidelityfx_*.dll path to a non-standard location for FSR4 SDK upgrade */
-        if (wcsstr( name, L"amd_fidelityfx_loader_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_loader_dx12.dll" );
-        if (wcsstr( name, L"amd_fidelityfx_upscaler_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_upscaler_dx12.dll" );
-        if (wcsstr( name, L"amd_fidelityfx_framegeneration_dx12.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\amd_fidelityfx_framegeneration_dx12.dll" );
-    }
     if ( wcsstr( envW, L"dlss" ) )
     {
         /* HACK: override nvngx_dlss*.dll paths to a non-standard location for DLSS upgrade */
