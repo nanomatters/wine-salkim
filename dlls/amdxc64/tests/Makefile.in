@@ -2,4 +2,6 @@ TESTDLL = amdxc64.dll
 PARENTSRC = ..
 
 SOURCES = \
-	amdxc64.c
+	amdxc64.c \
+	fsr_provider.c \
+	fsr_provider.spec

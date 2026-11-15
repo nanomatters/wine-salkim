@@ -20,6 +20,7 @@
  */
 
 #include <assert.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
 
@@ -642,6 +643,21 @@ static WINE_MODREF *find_basename_module( LPCWSTR name )
 }
 
 
+static BOOL match_module_fullname( const UNICODE_STRING *name, const UNICODE_STRING *fullname )
+{
+    static const WCHAR unix_prefix[] = L"\\\\?\\unix\\";
+    UNICODE_STRING normalized = *fullname;
+
+    if (normalized.Length >= sizeof(unix_prefix) - sizeof(WCHAR) &&
+        !memcmp(normalized.Buffer, unix_prefix, sizeof(unix_prefix) - sizeof(WCHAR)))
+    {
+        normalized.Length -= 4 * sizeof(WCHAR);
+        normalized.Buffer += 4;
+    }
+    return RtlEqualUnicodeString( name, &normalized, TRUE );
+}
+
+
 /**********************************************************************
  *	    find_fullname_module
  *
@@ -657,14 +673,14 @@ static WINE_MODREF *find_fullname_module( const UNICODE_STRING *nt_name )
     name.Length -= 4 * sizeof(WCHAR);  /* for \??\ prefix */
     name.Buffer += 4;
 
-    if (cached_modref && RtlEqualUnicodeString( &name, &cached_modref->ldr.FullDllName, TRUE ))
+    if (cached_modref && match_module_fullname( &name, &cached_modref->ldr.FullDllName ))
         return cached_modref;
 
     mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
     {
         LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-        if (RtlEqualUnicodeString( &name, &mod->FullDllName, TRUE ))
+        if (match_module_fullname( &name, &mod->FullDllName ))
         {
             cached_modref = CONTAINING_RECORD(mod, WINE_MODREF, ldr);
             return cached_modref;
@@ -1620,6 +1636,7 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
  */
 static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name, BOOL builtin )
 {
+    static const WCHAR unix_prefix[] = L"\\??\\unix\\";
     WCHAR *buffer;
     WINE_MODREF *wm;
     const WCHAR *p;
@@ -1635,7 +1652,7 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
     wm->CheckSum          = nt->OptionalHeader.CheckSum;
     wm->ldr.TimeDateStamp = nt->FileHeader.TimeDateStamp;
 
-    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, nt_name->Length - 3 * sizeof(WCHAR) )))
+    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, nt_name->Length + sizeof(WCHAR) )))
     {
         RtlFreeHeap( GetProcessHeap(), 0, wm );
         return NULL;
@@ -1655,6 +1672,13 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
         buffer[0] = '\\';
         memcpy( buffer + 1, nt_name->Buffer + 7 /* \??\UNC prefix */, nt_name->Length - 7 * sizeof(WCHAR) );
         buffer[nt_name->Length/sizeof(WCHAR) - 6] = 0;
+    }
+    else if (nt_name->Length >= sizeof(unix_prefix) - sizeof(WCHAR) &&
+             !memcmp(nt_name->Buffer, unix_prefix, sizeof(unix_prefix) - sizeof(WCHAR)))
+    {
+        memcpy( buffer, nt_name->Buffer, nt_name->Length );
+        buffer[1] = '\\';
+        buffer[nt_name->Length / sizeof(WCHAR)] = 0;
     }
     else
     {
@@ -3365,6 +3389,42 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
 }
 
 
+static NTSTATUS get_fsr_provider_path( const WCHAR *name, WCHAR **path )
+{
+    static const WCHAR prefix[] = L"\\\\?\\unix";
+    const WCHAR *basename = name;
+    UNICODE_STRING value;
+    NTSTATUS status;
+    SIZE_T len, i;
+
+    *path = NULL;
+    for (i = 0; name[i]; ++i)
+        if (name[i] == '\\' || name[i] == '/') basename = name + i + 1;
+    if (wcsicmp( basename, L"amdxcffx64.dll" )) return STATUS_SUCCESS;
+
+    status = get_env_var( L"WINE_FSR4_PROVIDER", ARRAY_SIZE(prefix) - 1, &value );
+    if (status == STATUS_VARIABLE_NOT_FOUND) return STATUS_SUCCESS;
+    if (status) return status;
+    if (!(len = wcslen(value.Buffer)))
+    {
+        RtlFreeUnicodeString( &value );
+        return STATUS_SUCCESS;
+    }
+    if (value.Buffer[0] != '/' || len + ARRAY_SIZE(prefix) > USHRT_MAX / sizeof(WCHAR))
+    {
+        RtlFreeUnicodeString( &value );
+        return STATUS_OBJECT_PATH_SYNTAX_BAD;
+    }
+
+    memmove( value.Buffer + ARRAY_SIZE(prefix) - 1, value.Buffer, (len + 1) * sizeof(WCHAR) );
+    memcpy( value.Buffer, prefix, sizeof(prefix) - sizeof(WCHAR) );
+    for (i = ARRAY_SIZE(prefix) - 1; value.Buffer[i]; ++i)
+        if (value.Buffer[i] == '/') value.Buffer[i] = '\\';
+    *path = value.Buffer;
+    return STATUS_SUCCESS;
+}
+
+
 /***********************************************************************
  *	find_builtin_without_file
  *
@@ -3801,19 +3861,23 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
     NTSTATUS nts;
     ULONG flags = 0;
     WCHAR *dllname = append_dll_ext( libname->Buffer );
-    WCHAR *path_name = NULL, *dummy;
+    const WCHAR *name = dllname ? dllname : libname->Buffer;
+    WCHAR *provider_path = NULL, *path_name = NULL, *dummy;
 
     if (load_flags) flags = *load_flags;
+    if ((nts = get_fsr_provider_path( name, &provider_path ))) goto done;
+    if (provider_path) name = provider_path;
     if (!search_path || ((ULONG_PTR)search_path & 1))
     {
-        if ((nts = LdrGetDllPath( libname->Buffer, (ULONG_PTR)search_path & load_library_search_flags, &path_name, &dummy )))
-            return nts;
+        if ((nts = LdrGetDllPath( provider_path ? provider_path : libname->Buffer,
+                                 (ULONG_PTR)search_path & load_library_search_flags, &path_name, &dummy )))
+            goto done;
     }
     else path_name = (WCHAR *)search_path;
 
     RtlEnterCriticalSection( &loader_section );
 
-    nts = load_dll( path_name, dllname ? dllname : libname->Buffer, flags, &wm, FALSE );
+    nts = load_dll( path_name, name, flags, &wm, FALSE );
 
     if (nts == STATUS_SUCCESS)
     {
@@ -3827,8 +3891,10 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
     if (wm) *hModule = wm->ldr.DllBase;
 
     RtlLeaveCriticalSection( &loader_section );
+done:
     RtlFreeHeap( GetProcessHeap(), 0, dllname );
-    if (path_name != search_path) RtlReleasePath( path_name );
+    RtlFreeHeap( GetProcessHeap(), 0, provider_path );
+    if (path_name && path_name != search_path) RtlReleasePath( path_name );
     return nts;
 }
 

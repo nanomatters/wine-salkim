@@ -15,7 +15,10 @@
  */
 
 #define COBJMACROS
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "initguid.h"
+#include "winternl.h"
 #include "../amdxc_interfaces.h"
 #include "../vkd3d_device_vkd3d_ext.h"
 #include "wine/test.h"
@@ -366,6 +369,205 @@ static void test_disabled_provider(void)
     ok(device.ref == 1, "Leaked device reference %ld.\n", device.ref);
 }
 
+static WCHAR *get_environment(const WCHAR *name)
+{
+    DWORD size = GetEnvironmentVariableW(name, NULL, 0);
+    WCHAR *value;
+
+    if (!size && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return NULL;
+    value = calloc(size + 1, sizeof(WCHAR));
+    GetEnvironmentVariableW(name, value, size);
+    return value;
+}
+
+static void write_provider(const WCHAR *path)
+{
+    HRSRC resource = FindResourceA(NULL, "fsr_provider.dll", "TESTDLL");
+    HANDLE file;
+    DWORD size, written;
+
+    ok(!!resource, "Provider resource is missing, error %lu.\n", GetLastError());
+    if (!resource) return;
+    size = SizeofResource(NULL, resource);
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    ok(file != INVALID_HANDLE_VALUE, "Cannot create %s, error %lu.\n", debugstr_w(path), GetLastError());
+    if (file == INVALID_HANDLE_VALUE) return;
+    ok(WriteFile(file, LockResource(LoadResource(NULL, resource)), size, &written, NULL) && written == size,
+            "Cannot write provider, error %lu.\n", GetLastError());
+    CloseHandle(file);
+}
+
+static void check_provider_module(HMODULE module, const WCHAR *expected)
+{
+    BY_HANDLE_FILE_INFORMATION actual_info, expected_info;
+    DWORD (WINAPI *marker)(void);
+    WCHAR filename[1024], moved[1030];
+    HANDLE actual, wanted;
+    HMODULE duplicate;
+    DWORD length, actual_error, wanted_error;
+    BOOL actual_ok, wanted_ok;
+
+    if (!module) return;
+    marker = (void *)GetProcAddress(module, "provider_marker");
+    ok(!!marker, "Unexpected provider module.\n");
+    if (marker) ok(marker() == 0x46535234, "Unexpected provider marker.\n");
+    length = GetModuleFileNameW(module, filename, ARRAY_SIZE(filename));
+    ok(length && length < ARRAY_SIZE(filename), "Cannot query provider module filename, length %lu, error %lu.\n",
+            length, GetLastError());
+    ok(GetModuleHandleW(filename) == module, "Cannot find provider by its reported filename %s.\n",
+            debugstr_w(filename));
+    duplicate = LoadLibraryW(filename);
+    ok(duplicate == module, "Loading the provider twice returned different modules %p and %p.\n",
+            module, duplicate);
+    if (duplicate) FreeLibrary(duplicate);
+    actual = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, 0, NULL);
+    actual_error = GetLastError();
+    wanted = CreateFileW(expected, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, 0, NULL);
+    wanted_error = GetLastError();
+    ok(actual != INVALID_HANDLE_VALUE && wanted != INVALID_HANDLE_VALUE,
+            "Cannot compare provider files: loaded %s, handle %p, error %lu; selected %s, handle %p, error %lu.\n",
+            debugstr_w(filename), actual, actual_error, debugstr_w(expected), wanted, wanted_error);
+    if (actual != INVALID_HANDLE_VALUE && wanted != INVALID_HANDLE_VALUE)
+    {
+        actual_ok = GetFileInformationByHandle(actual, &actual_info);
+        wanted_ok = GetFileInformationByHandle(wanted, &expected_info);
+        ok(actual_ok, "Cannot query loaded provider.\n");
+        ok(wanted_ok, "Cannot query selected provider.\n");
+        if (actual_ok && wanted_ok) ok(actual_info.dwVolumeSerialNumber == expected_info.dwVolumeSerialNumber &&
+                actual_info.nFileIndexHigh == expected_info.nFileIndexHigh &&
+                actual_info.nFileIndexLow == expected_info.nFileIndexLow,
+                "Loaded %s instead of %s.\n", debugstr_w(filename), debugstr_w(expected));
+    }
+    if (actual != INVALID_HANDLE_VALUE) CloseHandle(actual);
+    if (wanted != INVALID_HANDLE_VALUE) CloseHandle(wanted);
+    swprintf(moved, ARRAY_SIZE(moved), L"%s.moved", filename);
+    actual_ok = MoveFileW(filename, moved);
+    ok(actual_ok, "Cannot rename loaded provider %s, error %lu.\n", debugstr_w(filename), GetLastError());
+    if (actual_ok)
+    {
+        ok(GetModuleHandleW(filename) == module, "Lost the loaded provider after renaming its file.\n");
+        duplicate = LoadLibraryW(filename);
+        ok(duplicate == module, "Reloading a renamed provider lost its existing module.\n");
+        if (duplicate) FreeLibrary(duplicate);
+        ok(MoveFileW(moved, filename), "Cannot restore the provider filename, error %lu.\n", GetLastError());
+    }
+    FreeLibrary(module);
+}
+
+static void test_shared_provider(void)
+{
+    static const WCHAR *requests[] = {L"amdxcffx64", L"AMDXCFFX64.DLL", L"C:\\missing\\amdxcffx64.dll"};
+    char *(CDECL *get_unix_name)(const WCHAR *);
+    NTSTATUS (WINAPI *load_dll)(const WCHAR *, DWORD *, const UNICODE_STRING *, HMODULE *);
+    WCHAR directory[MAX_PATH], temporary[MAX_PATH], shared[MAX_PATH], fallback[MAX_PATH];
+    WCHAR *previous, *unix_name, *long_name, *dos_name;
+    char *unix_path;
+    UNICODE_STRING name;
+    HMODULE module;
+    NTSTATUS status;
+    unsigned int i;
+    DWORD size;
+    int len;
+
+    get_unix_name = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_unix_file_name");
+    if (!get_unix_name)
+    {
+        win_skip("Shared Unix providers are only available on Wine.\n");
+        return;
+    }
+    load_dll = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrLoadDll");
+    size = GetEnvironmentVariableW(L"WINETEST_FSR_SHARED_DIR", temporary, ARRAY_SIZE(temporary));
+    ok(size < ARRAY_SIZE(temporary), "Shared test directory is too long.\n");
+    if (size >= ARRAY_SIZE(temporary)) return;
+    if (!size) GetTempPathW(ARRAY_SIZE(temporary), temporary);
+    GetTempFileNameW(temporary, L"fsr", 0, directory);
+    DeleteFileW(directory);
+    ok(CreateDirectoryW(directory, NULL), "Cannot create provider directory.\n");
+    swprintf(shared, ARRAY_SIZE(shared), L"%s\\shared \x4e2d\x6587", directory);
+    ok(CreateDirectoryW(shared, NULL), "Cannot create shared directory.\n");
+    wcscat(shared, L"\\amdxcffx64.dll");
+    swprintf(fallback, ARRAY_SIZE(fallback), L"%s\\amdxcffx64.dll", directory);
+    write_provider(shared);
+    write_provider(fallback);
+    unix_path = get_unix_name(shared);
+    ok(!!unix_path, "Cannot resolve provider Unix path.\n");
+    if (!unix_path) goto cleanup;
+    len = MultiByteToWideChar(CP_UNIXCP, 0, unix_path, -1, NULL, 0);
+    unix_name = malloc(len * sizeof(WCHAR));
+    MultiByteToWideChar(CP_UNIXCP, 0, unix_path, -1, unix_name, len);
+    previous = get_environment(L"WINE_FSR4_PROVIDER");
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", unix_name);
+    for (i = 0; i < ARRAY_SIZE(requests); ++i)
+    {
+        module = LoadLibraryW(requests[i]);
+        ok(!!module, "LoadLibrary(%s) failed, error %lu.\n", debugstr_w(requests[i]), GetLastError());
+        check_provider_module(module, shared);
+        name.Buffer = (WCHAR *)requests[i];
+        name.Length = wcslen(name.Buffer) * sizeof(WCHAR);
+        name.MaximumLength = name.Length + sizeof(WCHAR);
+        module = NULL;
+        status = load_dll(NULL, NULL, &name, &module);
+        ok(!status, "LdrLoadDll(%s) returned %#lx.\n", debugstr_w(requests[i]), status);
+        check_provider_module(module, shared);
+    }
+    module = LoadLibraryW(L"not_amdxcffx64.dll");
+    ok(!module, "Unrelated DLL name was redirected.\n");
+    if (module) FreeLibrary(module);
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", L"relative/provider.dll");
+    module = LoadLibraryW(fallback);
+    ok(!module, "Invalid explicit provider fell back to another DLL.\n");
+    if (module) FreeLibrary(module);
+    name.Buffer = fallback;
+    name.Length = wcslen(fallback) * sizeof(WCHAR);
+    name.MaximumLength = name.Length + sizeof(WCHAR);
+    module = NULL;
+    status = load_dll(NULL, NULL, &name, &module);
+    ok(status != STATUS_SUCCESS && !module, "Invalid explicit LdrLoadDll fell back, status %#lx.\n", status);
+    if (module) FreeLibrary(module);
+    long_name = malloc(1536 * sizeof(WCHAR));
+    long_name[0] = '/';
+    for (i = 1; i < 1535; ++i) long_name[i] = 'x';
+    long_name[i] = 0;
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", long_name);
+    free(long_name);
+    module = LoadLibraryW(fallback);
+    ok(!module, "Long missing provider fell back to another DLL.\n");
+    if (module) FreeLibrary(module);
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", L"/nonexistent/proton-fsr-provider.dll");
+    module = LoadLibraryW(fallback);
+    ok(!module, "Missing explicit provider fell back to another DLL.\n");
+    if (module) FreeLibrary(module);
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", L"");
+    module = LoadLibraryW(fallback);
+    ok(!!module, "Empty setting did not preserve ordinary DLL loading.\n");
+    check_provider_module(module, fallback);
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", NULL);
+    module = LoadLibraryW(fallback);
+    ok(!!module, "Unset setting did not preserve ordinary DLL loading.\n");
+    check_provider_module(module, fallback);
+    dos_name = malloc((wcslen(unix_name) + ARRAY_SIZE(L"\\\\?\\unix")) * sizeof(WCHAR));
+    wcscpy(dos_name, L"\\\\?\\unix");
+    wcscat(dos_name, unix_name);
+    for (i = 0; dos_name[i]; ++i)
+        if (dos_name[i] == '/') dos_name[i] = '\\';
+    module = LoadLibraryW(dos_name);
+    ok(!!module, "Direct Unix namespace load failed, error %lu.\n", GetLastError());
+    check_provider_module(module, shared);
+    free(dos_name);
+    SetEnvironmentVariableW(L"WINE_FSR4_PROVIDER", previous);
+    free(previous);
+    free(unix_name);
+    HeapFree(GetProcessHeap(), 0, unix_path);
+cleanup:
+    DeleteFileW(fallback);
+    DeleteFileW(shared);
+    *wcsrchr(shared, '\\') = 0;
+    RemoveDirectoryW(shared);
+    RemoveDirectoryW(directory);
+}
+
 START_TEST(amdxc64)
 {
     HMODULE module = LoadLibraryA("amdxc64.dll");
@@ -389,5 +591,6 @@ START_TEST(amdxc64)
     test_intrinsics();
     test_wave_matrix();
     test_info_stubs();
+    test_shared_provider();
     FreeLibrary(module);
 }
