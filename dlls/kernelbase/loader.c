@@ -550,30 +550,6 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExA( LPCSTR name, HANDLE file, DWORD
 }
 
 
-/*
- * LoadLibraryExW upscaler hack
- */
-BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
-{
-    WCHAR envW[64] = {0};
-    UINT ret;
-
-    ret = GetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", envW, ARRAY_SIZE(envW) );
-    if ( !ret || ret >= ARRAY_SIZE(envW) ) return FALSE;
-
-    if ( wcsstr( envW, L"xess" ) )
-    {
-        /* HACK: override libxe*.dll paths to a non-standard location for XeSS upgrade */
-        if (wcsstr( name, L"libxess.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxess.dll" );
-        if (wcsstr( name, L"libxess_dx11.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxess_dx11.dll" );
-        if (wcsstr( name, L"libxell.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxell.dll" );
-        if (wcsstr( name, L"libxess_fg.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\libxess_fg.dll" );
-    }
-
-    return override[0] ? TRUE : FALSE;
-}
-
-
 /***********************************************************************
  *	LoadLibraryExW   (kernelbase.@)
  */
@@ -581,7 +557,6 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
 {
     UNICODE_STRING str;
     HMODULE module;
-    WCHAR overrideW[MAX_PATH] = {0};
 
     if (!name)
     {
@@ -596,14 +571,11 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
         flags = 0;
     }
 
-    if ( loaddll_upscaler_hack(name, overrideW) )
-        FIXME( "HACK: redirecting %s to %s\n", debugstr_w(name), debugstr_w(overrideW));
-
-    RtlInitUnicodeString( &str, overrideW[0] ? overrideW : name );
+    RtlInitUnicodeString( &str, name );
     if (str.Length && str.Buffer[str.Length/sizeof(WCHAR) - 1] != ' ') return load_library( &str, flags );
 
     /* library name has trailing spaces */
-    RtlCreateUnicodeString( &str, overrideW[0] ? overrideW : name );
+    RtlCreateUnicodeString( &str, name );
     while (str.Length > sizeof(WCHAR) && str.Buffer[str.Length/sizeof(WCHAR) - 1] == ' ')
         str.Length -= sizeof(WCHAR);
 

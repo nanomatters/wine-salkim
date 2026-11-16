@@ -96,7 +96,7 @@ static void make_dll( const WCHAR *directory, const WCHAR *name, DWORD ms, DWORD
     fixed.dwProductVersionMS = ms;
     fixed.dwProductVersionLS = ls;
     fixed.dwFileFlags = flags;
-    fixed.dwFileType = !wcscmp(company, L"NVIDIA") ? VFT_UNKNOWN : VFT_DLL;
+    fixed.dwFileType = !wcscmp(company, L"NVIDIA") || !wcscmp(company, L"Intel Corporation") ? VFT_UNKNOWN : VFT_DLL;
     memcpy( version_data + version_pos, &fixed, sizeof(fixed) );
     version_pos += sizeof(fixed);
     strings = begin_block( L"StringFileInfo", 0, 1 );
@@ -452,6 +452,195 @@ static void check_dlss(void)
     }
 }
 
+static const struct
+{
+    const WCHAR *name, *product;
+    DWORD old_ms, new_ms, new_ls;
+} xess[] =
+{
+    { L"libxess.dll",      L"XeSS SDK",                  0x10003, 0x20000, 0x20044 },
+    { L"libxess_dx11.dll", L"XeSS SDK",                  0x20000, 0x20000, 0x20044 },
+    { L"libxess_fg.dll",   L"XeSS Frame Generation SDK", 0x10002, 0x10003, 0x1004e },
+    { L"libxell.dll",      L"XeLL SDK",                  0x10002, 0x10003, 0x2000a },
+};
+
+static void make_xess_set(void)
+{
+    unsigned int i;
+    for (i = 0; i < ARRAY_SIZE(xess); ++i)
+    {
+        make_dll( game, xess[i].name, xess[i].old_ms, 1, L"Intel Corporation", xess[i].product, 0, FALSE );
+        make_dll( shared, xess[i].name, xess[i].new_ms, xess[i].new_ls,
+                  L"Intel Corporation", xess[i].product, 0, FALSE );
+    }
+}
+
+static void check_xess(void)
+{
+    const WCHAR *company = L"Intel Corporation";
+    HMODULE module, other;
+    WCHAR path[MAX_PATH], foreign[MAX_PATH];
+    unsigned int i;
+
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", unix_shared );
+    make_xess_set();
+    for (i = 0; i < ARRAY_SIZE(xess); ++i)
+    {
+        winetest_push_context("XeSS %u", i);
+        module = load_dll( game, xess[i].name, shared, 0 );
+        other = load_dll( game, xess[i].name, shared, 0 );
+        ok(module == other, "Created a duplicate XeSS replacement.\n");
+        if (other) FreeLibrary( other );
+        if (module) FreeLibrary( module );
+        make_dll( game, xess[i].name, xess[i].new_ms, xess[i].new_ls, company, xess[i].product, 0, FALSE );
+        module = load_dll( game, xess[i].name, game, 0 );
+        if (module) FreeLibrary( module );
+        make_dll( game, xess[i].name, xess[i].new_ms, xess[i].new_ls + 1, company, xess[i].product, 0, FALSE );
+        module = load_dll( game, xess[i].name, game, 0 );
+        if (module) FreeLibrary( module );
+        make_dll( game, xess[i].name, xess[i].old_ms, 1, company, xess[i].product, 0, FALSE );
+        module = load_dll( game, xess[i].name, game, DONT_RESOLVE_DLL_REFERENCES );
+        if (module) FreeLibrary( module );
+        SetEnvironmentVariableW( L"WINE_OPTISCALER_NAME", L"dxgi.dll" );
+        module = load_dll( game, xess[i].name, game, 0 );
+        if (module) FreeLibrary( module );
+        SetEnvironmentVariableW( L"WINE_OPTISCALER_NAME", NULL );
+        winetest_pop_context();
+    }
+    /* A pair can be loaded in either order, but never with an original already loaded. */
+    for (i = 0; i < ARRAY_SIZE(xess); ++i)
+    {
+        unsigned int sibling = i ^ 1;
+        module = load_dll( game, xess[i].name, shared, 0 );
+        other = load_dll( game, xess[sibling].name, shared, 0 );
+        if (other) FreeLibrary( other );
+        if (module) FreeLibrary( module );
+        SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", NULL );
+        module = load_dll( game, xess[i].name, game, 0 );
+        SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", unix_shared );
+        other = load_dll( game, xess[sibling].name, game, 0 );
+        if (other) FreeLibrary( other );
+        if (module) FreeLibrary( module );
+    }
+    /* An equal companion follows a selected bundle, preserving FG/XeLL coherence. */
+    make_dll( game, xess[3].name, xess[3].new_ms, xess[3].new_ls, company, xess[3].product, 0, FALSE );
+    module = load_dll( game, xess[2].name, shared, 0 );
+    other = load_dll( game, xess[3].name, shared, 0 );
+    if (other) FreeLibrary( other );
+    if (module) FreeLibrary( module );
+    module = load_dll( game, xess[3].name, game, 0 );
+    other = load_dll( game, xess[2].name, game, 0 );
+    if (other) FreeLibrary( other );
+    if (module) FreeLibrary( module );
+    make_dll( game, xess[3].name, xess[3].new_ms, xess[3].new_ls + 1, company, xess[3].product, 0, FALSE );
+    module = load_dll( game, xess[2].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( game, xess[3].name, xess[3].old_ms, 1, company, L"Custom XeLL", 0, FALSE );
+    module = load_dll( game, xess[2].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( game, xess[3].name, xess[3].old_ms, 1, company, xess[3].product, 0, FALSE );
+    /* XeLL can be used alone, but an FG library in another directory still matters. */
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", game, xess[2].name );
+    ok(DeleteFileW(path), "Cannot remove original FG fixture.\n");
+    module = load_dll( game, xess[3].name, shared, 0 );
+    if (module) FreeLibrary( module );
+    swprintf( foreign, ARRAY_SIZE(foreign), L"%s\\foreign", game );
+    ok(CreateDirectoryW(foreign, NULL), "Cannot create foreign FG directory.\n");
+    make_dll( foreign, xess[2].name, xess[2].old_ms, 1, company, xess[2].product, 0, FALSE );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", NULL );
+    module = load_dll( foreign, xess[2].name, foreign, 0 );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", unix_shared );
+    other = load_dll( game, xess[3].name, game, 0 );
+    if (other) FreeLibrary( other );
+    if (module) FreeLibrary( module );
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", foreign, xess[2].name );
+    DeleteFileW( path );
+    RemoveDirectoryW( foreign );
+    make_dll( game, xess[2].name, xess[2].new_ms, xess[2].new_ls + 1, company, xess[2].product, 0, FALSE );
+    module = load_dll( game, xess[3].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( game, xess[2].name, xess[2].old_ms, 1, company, xess[2].product, 0, FALSE );
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", shared, xess[3].name );
+    ok(DeleteFileW(path), "Cannot remove shared XeLL fixture.\n");
+    module = load_dll( game, xess[2].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( shared, xess[3].name, xess[3].new_ms, xess[3].new_ls, company, xess[3].product, 0, TRUE );
+    module = load_dll( game, xess[2].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( shared, xess[3].name, xess[3].new_ms, xess[3].new_ls, company, xess[3].product, 0, FALSE );
+    /* Validate the provider pair too, including manually supplied directories. */
+    make_dll( shared, xess[3].name, xess[3].old_ms, 1, company, xess[3].product, 0, FALSE );
+    module = load_dll( game, xess[2].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( shared, xess[3].name, xess[3].new_ms, xess[3].new_ls, company, xess[3].product, 0, FALSE );
+    make_dll( shared, xess[1].name, xess[1].new_ms, xess[1].new_ls + 1, company, xess[1].product, 0, FALSE );
+    module = load_dll( game, xess[0].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( shared, xess[1].name, xess[1].new_ms, xess[1].new_ls, company, xess[1].product, 0, FALSE );
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", game, xess[3].name );
+    ok(DeleteFileW(path), "Cannot remove original XeLL fixture.\n");
+    module = load_dll( game, xess[2].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( game, xess[3].name, xess[3].old_ms, 1, company, xess[3].product, 0, FALSE );
+    /* Older SR scaling semantics cannot be adapted by a DLL loader. */
+    make_dll( game, xess[0].name, 0x10002, 1, company, xess[0].product, 0, FALSE );
+    module = load_dll( game, xess[0].name, game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( game, xess[0].name, xess[0].old_ms, 1, company, xess[0].product, 0, FALSE );
+    for (i = 0; i < 5; ++i)
+    {
+        make_dll( game, xess[0].name, xess[0].old_ms, 1,
+                  i == 0 ? NULL : i == 1 ? L"OptiScaler" : company,
+                  i == 2 ? L"Custom library" : xess[0].product, i == 3 ? VS_FF_DEBUG : 0, i == 4 );
+        module = load_dll( game, xess[0].name, game, 0 );
+        if (module) FreeLibrary( module );
+    }
+    make_dll( game, xess[0].name, xess[0].old_ms, 1, company, xess[0].product, 0, FALSE );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", NULL );
+    SetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", L"xess" );
+    module = load_dll( game, xess[0].name, game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", NULL );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", L"relative" );
+    module = load_dll( game, xess[0].name, game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", L"/missing-xess-provider" );
+    module = load_dll( game, xess[0].name, game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", unix_shared );
+    /* Intel's driver implementation DLLs have different names and stay untouched. */
+    make_dll( game, L"igxess2.dll", xess[0].old_ms, 1, company, xess[0].product, 0, FALSE );
+    module = load_dll( game, L"igxess2.dll", game, 0 );
+    if (module) FreeLibrary( module );
+    swprintf( path, ARRAY_SIZE(path), L"%s\\igxess2.dll", game );
+    DeleteFileW( path );
+    /* Failed imports retain an image in Wine, so test this last for the bundle. */
+    break_import( shared, xess[0].name );
+    module = load_dll( game, xess[0].name, game, 0 );
+    if (module) FreeLibrary( module );
+    /* Once FG is selected, a failed XeLL load must not fall back to an older SDK. */
+    module = load_dll( game, xess[2].name, shared, 0 );
+    make_dll( game, xess[3].name, xess[3].old_ms, 1, company, L"Custom XeLL", 0, FALSE );
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", game, xess[3].name );
+    other = LoadLibraryW( path );
+    ok(!other, "Mixed a selected FG library with custom XeLL.\n");
+    if (other) FreeLibrary( other );
+    make_dll( game, xess[3].name, xess[3].old_ms, 1, company, xess[3].product, 0, FALSE );
+    break_import( shared, xess[3].name );
+    other = LoadLibraryW( path );
+    ok(!other, "Fell back to older XeLL after selecting shared FG.\n");
+    if (other) FreeLibrary( other );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_XESS_PROVIDER", NULL );
+    for (i = 0; i < ARRAY_SIZE(xess); ++i)
+    {
+        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", game, xess[i].name );
+        DeleteFileW( path );
+        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", shared, xess[i].name );
+        DeleteFileW( path );
+    }
+}
+
 START_TEST(upscaler)
 {
     WCHAR temp[MAX_PATH], root[MAX_PATH], path[MAX_PATH];
@@ -483,6 +672,7 @@ START_TEST(upscaler)
     check_combined();
     check_split();
     check_dlss();
+    check_xess();
     SetEnvironmentVariableW( L"WINE_FFX_PROVIDER", NULL );
     for (i = 0; i <= ARRAY_SIZE(split); ++i)
     {

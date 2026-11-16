@@ -3748,7 +3748,7 @@ static BOOL upscaler_version_string( const struct upscaler_version_block *table,
     const struct upscaler_version_block *entry;
     SIZE_T offset, size = (wcslen(value) + 1) * sizeof(WCHAR);
 
-    /* Both vendors use an eight-character English string table key. */
+    /* The supported libraries use eight-character English string table keys. */
     entry = upscaler_version_child( table, table->length, offsetof(struct upscaler_version_block, key) + sizeof(L"040904b0"), key );
     if (!entry || entry->type != 1 || entry->value_length != size / sizeof(WCHAR)) return FALSE;
     offset = (offsetof(struct upscaler_version_block, key) + (wcslen(key) + 1) * sizeof(WCHAR) + 3) & ~(SIZE_T)3;
@@ -3756,8 +3756,26 @@ static BOOL upscaler_version_string( const struct upscaler_version_block *table,
            !memcmp( (const char *)entry + offset, value, size );
 }
 
+enum upscaler_vendor
+{
+    UPSCALER_AMD,
+    UPSCALER_NVIDIA,
+    UPSCALER_INTEL,
+};
+
+static const struct
+{
+    const WCHAR *company, *string_table;
+    BOOL product_version, allow_unknown_type;
+} upscaler_formats[] =
+{
+    { L"Advanced Micro Devices, Inc.", L"040904b0", FALSE, FALSE },
+    { L"NVIDIA",                     L"040904e4", TRUE,  TRUE },
+    { L"Intel Corporation",          L"040904b0", FALSE, TRUE },
+};
+
 static BOOL get_upscaler_image_version( void *base, SIZE_T size, const WCHAR *product,
-                                        const WCHAR *alternative, BOOL nvidia, ULONGLONG *version )
+                                        const WCHAR *alternative, enum upscaler_vendor vendor, ULONGLONG *version )
 {
     const LDR_RESOURCE_INFO info = { 16 /* RT_VERSION */, 1, 0 };
     const IMAGE_RESOURCE_DATA_ENTRY *entry;
@@ -3779,20 +3797,20 @@ static BOOL get_upscaler_image_version( void *base, SIZE_T size, const WCHAR *pr
             memcmp( root->key, L"VS_VERSION_INFO", sizeof(L"VS_VERSION_INFO") )) goto done;
         fixed = (const void *)((const char *)root + offset);
         if (fixed->dwSignature != VS_FFI_SIGNATURE || fixed->dwStrucVersion != VS_FFI_STRUCVERSION ||
-            (fixed->dwFileType != VFT_DLL && !(nvidia && fixed->dwFileType == VFT_UNKNOWN)) ||
+            (fixed->dwFileType != VFT_DLL && !(upscaler_formats[vendor].allow_unknown_type && fixed->dwFileType == VFT_UNKNOWN)) ||
             fixed->dwFileFlags ||
-            !(nvidia ? fixed->dwProductVersionMS | fixed->dwProductVersionLS :
+            !(upscaler_formats[vendor].product_version ? fixed->dwProductVersionMS | fixed->dwProductVersionLS :
                         fixed->dwFileVersionMS | fixed->dwFileVersionLS)) goto done;
         strings = upscaler_version_child( root, root->length, offset + sizeof(*fixed), L"StringFileInfo" );
         if (!strings || strings->value_length) goto done;
         table = upscaler_version_child( strings, strings->length,
                                         offsetof(struct upscaler_version_block, key) + sizeof(L"StringFileInfo"),
-                                        nvidia ? L"040904e4" : L"040904b0" );
+                                        upscaler_formats[vendor].string_table );
         if (!table || table->value_length ||
-            !upscaler_version_string( table, L"CompanyName", nvidia ? L"NVIDIA" : L"Advanced Micro Devices, Inc." ) ||
+            !upscaler_version_string( table, L"CompanyName", upscaler_formats[vendor].company ) ||
             (!upscaler_version_string( table, L"ProductName", product ) &&
              !(alternative && upscaler_version_string( table, L"ProductName", alternative )))) goto done;
-        *version = nvidia ? ((ULONGLONG)fixed->dwProductVersionMS << 32) | fixed->dwProductVersionLS :
+        *version = upscaler_formats[vendor].product_version ? ((ULONGLONG)fixed->dwProductVersionMS << 32) | fixed->dwProductVersionLS :
                             ((ULONGLONG)fixed->dwFileVersionMS << 32) | fixed->dwFileVersionLS;
         valid = TRUE;
     done:;
@@ -3807,11 +3825,11 @@ static BOOL get_upscaler_image_version( void *base, SIZE_T size, const WCHAR *pr
 
 static BOOL get_ffx_image_version( void *base, SIZE_T size, unsigned int index, ULONGLONG *version )
 {
-    return get_upscaler_image_version( base, size, ffx_libraries[index].product, NULL, FALSE, version );
+    return get_upscaler_image_version( base, size, ffx_libraries[index].product, NULL, UPSCALER_AMD, version );
 }
 
 static BOOL get_upscaler_version( HANDLE mapping, const WCHAR *product, const WCHAR *alternative,
-                                  BOOL nvidia, ULONGLONG *version )
+                                  enum upscaler_vendor vendor, ULONGLONG *version )
 {
     SIZE_T size = 0;
     void *base = NULL;
@@ -3821,14 +3839,14 @@ static BOOL get_upscaler_version( HANDLE mapping, const WCHAR *product, const WC
     status = NtMapViewOfSection( mapping, NtCurrentProcess(), &base, 0, 0, NULL, &size,
                                  ViewUnmap, 0, PAGE_READONLY );
     if (status && status != STATUS_IMAGE_NOT_AT_BASE) return FALSE;
-    valid = get_upscaler_image_version( base, size, product, alternative, nvidia, version );
+    valid = get_upscaler_image_version( base, size, product, alternative, vendor, version );
     NtUnmapViewOfSection( NtCurrentProcess(), base );
     return valid;
 }
 
 static BOOL get_ffx_version( HANDLE mapping, unsigned int index, ULONGLONG *version )
 {
-    return get_upscaler_version( mapping, ffx_libraries[index].product, NULL, FALSE, version );
+    return get_upscaler_version( mapping, ffx_libraries[index].product, NULL, UPSCALER_AMD, version );
 }
 
 static BOOL get_upscaler_path( const WCHAR *variable, const WCHAR *name, UNICODE_STRING *path )
@@ -3859,7 +3877,7 @@ static BOOL get_upscaler_path( const WCHAR *variable, const WCHAR *name, UNICODE
     return valid;
 }
 
-static BOOL ffx_sibling_path( const UNICODE_STRING *path, const WCHAR *name, UNICODE_STRING *sibling )
+static BOOL upscaler_sibling_path( const UNICODE_STRING *path, const WCHAR *name, UNICODE_STRING *sibling )
 {
     SIZE_T length, prefix = path->Length / sizeof(WCHAR);
 
@@ -3890,8 +3908,8 @@ static BOOL ffx_split_can_upgrade( const UNICODE_STRING *original, const UNICODE
         BOOL valid = FALSE;
 
         if (find_basename_module( ffx_libraries[i].name )) return FALSE;
-        if (!ffx_sibling_path( original, ffx_libraries[i].name, &old_path ) ||
-            !ffx_sibling_path( provider, ffx_libraries[i].name, &new_path )) goto done;
+        if (!upscaler_sibling_path( original, ffx_libraries[i].name, &old_path ) ||
+            !upscaler_sibling_path( provider, ffx_libraries[i].name, &new_path )) goto done;
         status = open_dll_file( &old_path, &wm, &old_mapping, &image_info, &id );
         if (status && status != STATUS_DLL_NOT_FOUND) goto done;
         if (wm) goto done;
@@ -3940,7 +3958,7 @@ static BOOL find_ffx_provider( const UNICODE_STRING *original, HANDLE original_m
     {
         UNICODE_STRING loader_path = {0};
         WINE_MODREF *loader = find_basename_module( ffx_libraries[first].name );
-        if (!loader || !ffx_sibling_path( provider, ffx_libraries[first].name, &loader_path )) goto done;
+        if (!loader || !upscaler_sibling_path( provider, ffx_libraries[first].name, &loader_path )) goto done;
         valid = find_fullname_module( &loader_path ) == loader;
         RtlFreeUnicodeString( &loader_path );
         if (!valid) goto done;
@@ -4061,18 +4079,175 @@ static BOOL find_dlss_provider( const UNICODE_STRING *original, HANDLE original_
     if (!get_upscaler_path( L"WINE_DLSS_PROVIDER", dlss_libraries[index].name, provider )) return FALSE;
     if (RtlEqualUnicodeString( original, provider, TRUE )) goto done;
     if (!get_upscaler_version( original_mapping, dlss_libraries[index].product,
-                              dlss_libraries[index].alternative, TRUE, &old_version ) ||
+                              dlss_libraries[index].alternative, UPSCALER_NVIDIA, &old_version ) ||
         old_version >> 48 < dlss_libraries[index].minimum_major ||
         open_dll_file( provider, wm, mapping, image_info, id )) goto done;
     if (*wm)
         valid = get_upscaler_image_version( (*wm)->ldr.DllBase, (*wm)->ldr.SizeOfImage,
                                            dlss_libraries[index].product, dlss_libraries[index].alternative,
-                                           TRUE, &new_version );
+                                           UPSCALER_NVIDIA, &new_version );
     else
         valid = image_info->Machine == IMAGE_FILE_MACHINE_AMD64 &&
                 get_upscaler_version( *mapping, dlss_libraries[index].product,
-                                      dlss_libraries[index].alternative, TRUE, &new_version );
+                                      dlss_libraries[index].alternative, UPSCALER_NVIDIA, &new_version );
     valid = valid && old_version < new_version;
+ done:
+    if (!valid)
+    {
+        if (*mapping) NtClose( *mapping );
+        *mapping = NULL;
+        *wm = NULL;
+        RtlFreeUnicodeString( provider );
+        provider->Buffer = NULL;
+    }
+    return valid;
+}
+
+
+static const struct
+{
+    const WCHAR *name, *product;
+    unsigned int minimum_major, minimum_minor, first, end;
+} xess_libraries[] =
+{
+    /* SR 1.3 changed scaling ratios; older integrations need game changes. */
+    { L"libxess.dll",      L"XeSS SDK",                  1, 3, 0, 2 },
+    { L"libxess_dx11.dll", L"XeSS SDK",                  2, 0, 0, 2 },
+    { L"libxess_fg.dll",   L"XeSS Frame Generation SDK", 1, 0, 2, 4 },
+    { L"libxell.dll",      L"XeLL SDK",                  1, 0, 2, 4 },
+};
+
+#define UPSCALER_VERSION(major, minor) (((ULONGLONG)(major) << 48) | ((ULONGLONG)(minor) << 32))
+
+static BOOL xess_provider_in_use( const UNICODE_STRING *provider )
+{
+    const WCHAR *name = provider->Buffer, *ptr;
+    unsigned int index, i;
+    BOOL selected;
+
+    for (ptr = name; *ptr; ++ptr) if (is_path_separator(*ptr)) name = ptr + 1;
+    for (index = 0; index < ARRAY_SIZE(xess_libraries); ++index)
+        if (!wcsicmp( name, xess_libraries[index].name )) break;
+    if (index == ARRAY_SIZE(xess_libraries)) return FALSE;
+    for (i = xess_libraries[index].first; i < xess_libraries[index].end; ++i)
+    {
+        UNICODE_STRING path = {0};
+        WINE_MODREF *wm = find_basename_module( xess_libraries[i].name );
+        if (!wm || !upscaler_sibling_path( provider, xess_libraries[i].name, &path )) continue;
+        selected = find_fullname_module( &path ) == wm;
+        RtlFreeUnicodeString( &path );
+        if (selected) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL xess_versions_compatible( unsigned int index, ULONGLONG old_version, ULONGLONG new_version )
+{
+    ULONGLONG minimum = UPSCALER_VERSION(xess_libraries[index].minimum_major, xess_libraries[index].minimum_minor);
+
+    return old_version >= minimum && old_version <= new_version &&
+           ((old_version >> 48) == (new_version >> 48) ||
+            (index == 0 && (old_version >> 48) == 1 && (new_version >> 48) == 2));
+}
+
+static BOOL xess_group_can_upgrade( const UNICODE_STRING *original, const UNICODE_STRING *provider,
+                                    unsigned int index )
+{
+    unsigned int i;
+    ULONGLONG versions[2];
+    for (i = xess_libraries[index].first; i < xess_libraries[index].end; ++i)
+    {
+        UNICODE_STRING old_path = {0}, new_path = {0};
+        SECTION_IMAGE_INFORMATION image_info;
+        struct file_id id;
+        HANDLE old_mapping = NULL, new_mapping = NULL;
+        WINE_MODREF *old_wm = NULL, *new_wm = NULL, *loaded;
+        ULONGLONG old_version, new_version;
+        NTSTATUS status;
+        BOOL valid = FALSE;
+
+        if (!upscaler_sibling_path( original, xess_libraries[i].name, &old_path ) ||
+            !upscaler_sibling_path( provider, xess_libraries[i].name, &new_path )) goto done;
+        loaded = find_basename_module( xess_libraries[i].name );
+        if (loaded && find_fullname_module( &new_path ) != loaded) goto done;
+        if (open_dll_file( &new_path, &new_wm, &new_mapping, &image_info, &id )) goto done;
+        if (new_wm)
+            valid = get_upscaler_image_version( new_wm->ldr.DllBase, new_wm->ldr.SizeOfImage,
+                                                xess_libraries[i].product, NULL, UPSCALER_INTEL, &new_version );
+        else
+            valid = image_info.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                    get_upscaler_version( new_mapping, xess_libraries[i].product, NULL,
+                                          UPSCALER_INTEL, &new_version );
+        if (!valid || !xess_versions_compatible( i, new_version, new_version ))
+        {
+            valid = FALSE;
+            goto done;
+        }
+        versions[i - xess_libraries[index].first] = new_version;
+        valid = FALSE;
+        status = open_dll_file( &old_path, &old_wm, &old_mapping, &image_info, &id );
+        if (status == STATUS_DLL_NOT_FOUND)
+            valid = index < 2 || (index == 3 && i == 2); /* XeLL also works without FG. */
+        else if (!status)
+        {
+            if (old_wm)
+                valid = get_upscaler_image_version( old_wm->ldr.DllBase, old_wm->ldr.SizeOfImage,
+                                                    xess_libraries[i].product, NULL, UPSCALER_INTEL, &old_version );
+            else
+                valid = image_info.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                        get_upscaler_version( old_mapping, xess_libraries[i].product, NULL,
+                                              UPSCALER_INTEL, &old_version );
+            valid = valid && xess_versions_compatible( i, old_version, new_version );
+        }
+    done:
+        if (old_mapping) NtClose( old_mapping );
+        if (new_mapping) NtClose( new_mapping );
+        RtlFreeUnicodeString( &old_path );
+        RtlFreeUnicodeString( &new_path );
+        if (!valid) return FALSE;
+    }
+    if (index < 2) return versions[0] == versions[1];
+    /* XeSS FG 1.3 requires XeLL 1.3 or later. */
+    return versions[0] < UPSCALER_VERSION(1, 3) || versions[1] >= UPSCALER_VERSION(1, 3);
+}
+
+static BOOL find_xess_provider( const UNICODE_STRING *original, HANDLE original_mapping,
+                                UNICODE_STRING *provider, HANDLE *mapping,
+                                SECTION_IMAGE_INFORMATION *image_info, struct file_id *id, WINE_MODREF **wm, BOOL *blocked )
+{
+    const WCHAR *name = original->Buffer, *ptr;
+    ULONGLONG old_version, new_version;
+    SIZE_T env_length;
+    unsigned int index;
+    BOOL valid = FALSE, selected;
+
+    for (ptr = name; *ptr; ++ptr) if (is_path_separator(*ptr)) name = ptr + 1;
+    if (wcsnicmp( name, L"libxe", 5 )) return FALSE;
+    for (index = 0; index < ARRAY_SIZE(xess_libraries); ++index)
+        if (!wcsicmp( name, xess_libraries[index].name )) break;
+    if (index == ARRAY_SIZE(xess_libraries) ||
+        (RtlQueryEnvironmentVariable( NULL, L"WINE_OPTISCALER_NAME", wcslen(L"WINE_OPTISCALER_NAME"),
+                                      NULL, 0, &env_length ) == STATUS_BUFFER_TOO_SMALL && env_length)) return FALSE;
+    if (!get_upscaler_path( L"WINE_XESS_PROVIDER", xess_libraries[index].name, provider )) return FALSE;
+    if (RtlEqualUnicodeString( original, provider, TRUE )) goto done;
+    *blocked = selected = xess_provider_in_use( provider );
+    if (!get_upscaler_version( original_mapping, xess_libraries[index].product, NULL,
+                              UPSCALER_INTEL, &old_version ) ||
+        open_dll_file( provider, wm, mapping, image_info, id )) goto done;
+    if (*wm)
+        valid = get_upscaler_image_version( (*wm)->ldr.DllBase, (*wm)->ldr.SizeOfImage,
+                                           xess_libraries[index].product, NULL, UPSCALER_INTEL, &new_version );
+    else
+        valid = image_info->Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                get_upscaler_version( *mapping, xess_libraries[index].product, NULL,
+                                      UPSCALER_INTEL, &new_version );
+    if (!valid || !xess_versions_compatible( index, old_version, new_version ))
+    {
+        valid = FALSE;
+        goto done;
+    }
+    valid = xess_group_can_upgrade( original, provider, index ) &&
+            (old_version < new_version || selected);
  done:
     if (!valid)
     {
@@ -4139,11 +4314,14 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
         struct file_id provider_id;
         HANDLE provider_mapping = NULL;
         WINE_MODREF *provider_wm = NULL;
+        BOOL provider_blocked = FALSE;
 
         if (find_ffx_provider( &nt_name, mapping, &provider, &provider_mapping,
                               &provider_info, &provider_id, &provider_wm ) ||
             find_dlss_provider( &nt_name, mapping, &provider, &provider_mapping,
-                               &provider_info, &provider_id, &provider_wm ))
+                               &provider_info, &provider_id, &provider_wm ) ||
+            find_xess_provider( &nt_name, mapping, &provider, &provider_mapping,
+                               &provider_info, &provider_id, &provider_wm, &provider_blocked ))
         {
             if (provider_wm)
             {
@@ -4157,12 +4335,23 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
             if (provider_mapping) NtClose( provider_mapping );
             if (!nts)
                 TRACE_(loaddll)( "Upscaler DLL: %s -> %s\n", debugstr_us(&nt_name), debugstr_us(&provider) );
+            else if (xess_provider_in_use( &provider ))
+            {
+                WARN_(loaddll)( "Cannot load selected XeSS library %s (%lx)\n", debugstr_us(&provider), nts );
+                RtlFreeUnicodeString( &provider );
+                goto done;
+            }
             else
                 WARN_(loaddll)( "Cannot load upscaler DLL %s (%lx), keeping %s\n",
                                debugstr_us(&provider), nts, debugstr_us(&nt_name) );
             RtlFreeUnicodeString( &provider );
             if (!nts) goto done;
             nts = STATUS_SUCCESS;
+        }
+        else if (provider_blocked)
+        {
+            nts = STATUS_DLL_NOT_FOUND;
+            goto done;
         }
     }
 
