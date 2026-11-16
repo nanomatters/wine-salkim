@@ -15,7 +15,7 @@
  *
  */
 
-/* FidelityFX SDK loader tests. */
+/* Shared upscaler loader tests. */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -93,12 +93,14 @@ static void make_dll( const WCHAR *directory, const WCHAR *name, DWORD ms, DWORD
     root = begin_block( L"VS_VERSION_INFO", sizeof(fixed), 0 );
     fixed.dwFileVersionMS = ms;
     fixed.dwFileVersionLS = ls;
+    fixed.dwProductVersionMS = ms;
+    fixed.dwProductVersionLS = ls;
     fixed.dwFileFlags = flags;
-    fixed.dwFileType = VFT_DLL;
+    fixed.dwFileType = !wcscmp(company, L"NVIDIA") ? VFT_UNKNOWN : VFT_DLL;
     memcpy( version_data + version_pos, &fixed, sizeof(fixed) );
     version_pos += sizeof(fixed);
     strings = begin_block( L"StringFileInfo", 0, 1 );
-    table = begin_block( L"040904b0", 0, 1 );
+    table = begin_block( !wcscmp(company, L"NVIDIA") ? L"040904E4" : L"040904b0", 0, 1 );
     version_string( L"CompanyName", company );
     version_string( L"ProductName", product );
     end_block( table );
@@ -297,7 +299,160 @@ static void check_split(void)
     if (loader) FreeLibrary( loader );
 }
 
-START_TEST(ffx)
+static void check_dlss(void)
+{
+    static const WCHAR *names[] = { L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"nvngx_dlssg.dll" };
+    static const WCHAR *products[] = { L"NVIDIA Deep Learning SuperSampling",
+                                      L"NVIDIA DLSS Ray Reconstruction", L"NVIDIA DLSS-G" };
+    static const DWORD versions[] = { 0x20001, 0x30005, 0x10000 };
+    const WCHAR *company = L"NVIDIA";
+    WCHAR path[MAX_PATH], parent[MAX_PATH], driver[MAX_PATH], unix_driver[MAX_PATH], old_cwd[MAX_PATH];
+    char * (CDECL *get_unix_name)(const WCHAR *);
+    char *unix_name;
+    HMODULE module, again;
+    VS_FIXEDFILEINFO *fixed;
+    HANDLE update;
+    unsigned int i;
+
+    SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", unix_shared );
+    for (i = 0; i < ARRAY_SIZE(names); ++i)
+    {
+        winetest_push_context("DLSS %u", i);
+        make_dll( game, names[i], versions[i], 1, company, products[i], 0, FALSE );
+        make_dll( shared, names[i], 310 << 16 | 9, 16 << 16,
+                  company, i == 2 ? L"NVIDIA DLSS-G MFGLW" : products[i], 0, FALSE );
+        module = load_dll( game, names[i], shared, 0 );
+        again = load_dll( game, names[i], shared, 0 );
+        ok(module == again, "Created duplicate DLSS replacements.\n");
+        if (again) FreeLibrary( again );
+        if (module) FreeLibrary( module );
+        make_dll( game, names[i], 310 << 16 | 9, 16 << 16, company, products[i], 0, FALSE );
+        module = load_dll( game, names[i], game, 0 );
+        if (module) FreeLibrary( module );
+        make_dll( game, names[i], 310 << 16 | 9, 17 << 16, company, products[i], 0, FALSE );
+        module = load_dll( game, names[i], game, 0 );
+        if (module) FreeLibrary( module );
+        for (unsigned int j = 0; j < 5; ++j)
+        {
+            make_dll( game, names[i], versions[i], 1,
+                      j == 0 ? NULL : j == 1 ? L"OptiScaler" : company,
+                      j == 2 ? L"NGX" : products[i], j == 3 ? VS_FF_DEBUG : 0, j == 4 );
+            module = load_dll( game, names[i], game, 0 );
+            if (module) FreeLibrary( module );
+        }
+        make_dll( game, names[i], versions[i], 1, company, products[i], 0, FALSE );
+        module = load_dll( game, names[i], game, DONT_RESOLVE_DLL_REFERENCES );
+        if (module) FreeLibrary( module );
+        SetEnvironmentVariableW( L"WINE_OPTISCALER_NAME", L"dxgi.dll" );
+        module = load_dll( game, names[i], game, 0 );
+        if (module) FreeLibrary( module );
+        SetEnvironmentVariableW( L"WINE_OPTISCALER_NAME", NULL );
+        SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", NULL );
+        SetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", L"dlss" );
+        module = load_dll( game, names[i], game, 0 );
+        SetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", NULL );
+        SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", unix_shared );
+        again = load_dll( game, names[i], game, 0 );
+        ok(module == again, "Replaced a loaded original.\n");
+        if (again) FreeLibrary( again );
+        if (module) FreeLibrary( module );
+        winetest_pop_context();
+    }
+    /* DLSS 1.x SR is a different integration. FG 1.x above is supported. */
+    make_dll( game, names[0], 0x10000, 1, company, products[0], 0, FALSE );
+    module = load_dll( game, names[0], game, 0 );
+    if (module) FreeLibrary( module );
+    make_dll( game, names[0], 0x20001, 1, company, products[0], 0, FALSE );
+    /* NVIDIA's ProductVersion controls selection even if FileVersion differs. */
+    fixed = (void *)(version_data + ((6 + sizeof(L"VS_VERSION_INFO") + 3) & ~3));
+    fixed->dwFileVersionMS = 311 << 16;
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", game, names[0] );
+    update = BeginUpdateResourceW( path, FALSE );
+    ok(!!update, "Cannot update DLSS file version.\n");
+    ok(UpdateResourceW( update, (LPCWSTR)16, (LPCWSTR)1, 0x409, version_data, version_pos ),
+       "Cannot write DLSS file version.\n");
+    ok(EndUpdateResourceW( update, FALSE ), "Cannot finish DLSS file version.\n");
+    module = load_dll( game, names[0], shared, 0 );
+    if (module) FreeLibrary( module );
+    GetCurrentDirectoryW( ARRAY_SIZE(old_cwd), old_cwd );
+    SetCurrentDirectoryW( game );
+    module = LoadLibraryW( L"NVNGX_DLSS.DLL" );
+    again = load_dll( game, names[0], shared, 0 );
+    ok(module && module == again, "Uppercase DLSS request was not redirected.\n");
+    if (again) FreeLibrary( again );
+    if (module) FreeLibrary( module );
+    SetCurrentDirectoryW( old_cwd );
+    /* A newer absolute request must not reuse an older shared module. */
+    module = load_dll( game, names[0], shared, 0 );
+    make_dll( game, names[0], 311 << 16, 0, company, products[0], 0, FALSE );
+    again = load_dll( game, names[0], game, 0 );
+    if (again) FreeLibrary( again );
+    if (module) FreeLibrary( module );
+    make_dll( game, names[0], 0x20001, 1, company, products[0], 0, FALSE );
+    make_dll( shared, names[0], 310 << 16, 1, company, L"NGX", 0, FALSE );
+    module = load_dll( game, names[0], game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", L"/missing-dlss-provider" );
+    module = load_dll( game, names[0], game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", L"relative" );
+    module = load_dll( game, names[1], game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", unix_shared );
+    /* Driver paths must work with Windows and Unix separators and mixed case. */
+    swprintf( parent, ARRAY_SIZE(parent), L"%s\\NVIDIA", game );
+    swprintf( driver, ARRAY_SIZE(driver), L"%s\\WiNe", parent );
+    CreateDirectoryW( parent, NULL );
+    CreateDirectoryW( driver, NULL );
+    for (i = 0; i < ARRAY_SIZE(names); ++i)
+    {
+        make_dll( shared, names[i], 310 << 16, 1, company, products[i], 0, FALSE );
+        make_dll( driver, names[i], versions[i], 1, company, products[i], 0, FALSE );
+        module = load_dll( driver, names[i], driver, 0 );
+        if (module) FreeLibrary( module );
+        swprintf( path, ARRAY_SIZE(path), L"%s/%s", driver, names[i] );
+        for (WCHAR *p = path; *p; ++p) if (*p == '\\') *p = '/';
+        module = LoadLibraryW( path );
+        again = load_dll( driver, names[i], driver, 0 );
+        ok(module && module == again, "Slash-separated driver path was redirected.\n");
+        if (again) FreeLibrary( again );
+        if (module) FreeLibrary( module );
+        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", driver, names[i] );
+        DeleteFileW( path );
+    }
+    RemoveDirectoryW( driver );
+    RemoveDirectoryW( parent );
+    /* Also honour an explicit NVIDIA_WINE_DLL_DIR outside the usual suffix. */
+    swprintf( driver, ARRAY_SIZE(driver), L"%s\\custom-driver", game );
+    CreateDirectoryW( driver, NULL );
+    get_unix_name = (void *)GetProcAddress( GetModuleHandleW(L"kernel32.dll"), "wine_get_unix_file_name" );
+    unix_name = get_unix_name( driver );
+    MultiByteToWideChar( CP_UNIXCP, 0, unix_name, -1, unix_driver, ARRAY_SIZE(unix_driver) );
+    HeapFree( GetProcessHeap(), 0, unix_name );
+    SetEnvironmentVariableW( L"NVIDIA_WINE_DLL_DIR", unix_driver );
+    make_dll( driver, names[2], 0x10000, 1, company, products[2], 0, FALSE );
+    module = load_dll( driver, names[2], driver, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"NVIDIA_WINE_DLL_DIR", NULL );
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", driver, names[2] );
+    DeleteFileW( path );
+    RemoveDirectoryW( driver );
+    /* Wine retains failed import mappings, so run this after the reuse checks. */
+    make_dll( shared, names[0], 310 << 16, 1, company, products[0], 0, FALSE );
+    break_import( shared, names[0] );
+    module = load_dll( game, names[0], game, 0 );
+    if (module) FreeLibrary( module );
+    SetEnvironmentVariableW( L"WINE_DLSS_PROVIDER", NULL );
+    for (i = 0; i < ARRAY_SIZE(names); ++i)
+    {
+        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", game, names[i] );
+        DeleteFileW( path );
+        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", shared, names[i] );
+        DeleteFileW( path );
+    }
+}
+
+START_TEST(upscaler)
 {
     WCHAR temp[MAX_PATH], root[MAX_PATH], path[MAX_PATH];
     char * (CDECL *get_unix_name)(const WCHAR *);
@@ -306,7 +461,7 @@ START_TEST(ffx)
 
     if (strcmp(winetest_platform, "wine") || sizeof(void *) != 8)
     {
-        win_skip("FFX provider replacement requires 64-bit Wine.\n");
+        win_skip("Upscaler replacement requires 64-bit Wine.\n");
         return;
     }
     GetTempPathW( ARRAY_SIZE(temp), temp );
@@ -327,6 +482,7 @@ START_TEST(ffx)
     SetEnvironmentVariableW( L"WINE_FFX_PROVIDER", unix_shared );
     check_combined();
     check_split();
+    check_dlss();
     SetEnvironmentVariableW( L"WINE_FFX_PROVIDER", NULL );
     for (i = 0; i <= ARRAY_SIZE(split); ++i)
     {

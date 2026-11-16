@@ -551,68 +551,6 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExA( LPCSTR name, HANDLE file, DWORD
 
 
 /*
- * LoadLibraryExW redirect hack
- */
-BOOL loaddll_redirect(LPCWSTR name, LPWSTR override, DWORD size)
-{
-    WCHAR *entry, *next, *match, *token, *path, *stem;
-    WCHAR envW[MAX_PATH * 8] = {0}, nameW[MAX_PATH] = {0};
-    UINT ret;
-
-    if ( wcsstr( name, L"nvidia/wine/nvngx_dlssg.dll" ) )
-    {
-        TRACE("refusing to redirect %ls\n", name);
-        return FALSE;
-    }
-
-    ret = GetEnvironmentVariableW( L"WINE_LOADDLL_REDIRECT", envW, sizeof(envW));
-    if ( !ret ) return FALSE;
-    if ( ret >= ARRAY_SIZE(envW) )
-    {
-        ERR("WINE_LOADDLL_REDIRECT larger than %lu (%u)\n", (unsigned long)ARRAY_SIZE(envW), ret);
-        return FALSE;
-    }
-
-    wcscpy(nameW, name);
-    stem = wcspbrk( nameW, L"\\/" );
-    while (stem)
-    {
-        if ( !wcspbrk( stem + 1, L"\\/" ) )
-            break;
-        stem = wcspbrk( ++stem, L"\\/" );
-    }
-    if ( stem ) stem++;
-    else stem = nameW;
-
-    TRACE("looking for %ls redirect\n", stem);
-
-    entry = envW;
-    while (*entry)
-    {
-        while (*entry == L';') entry++;
-        if (!*entry) break;
-        next = wcschr( entry, L';' );
-        if (next) *next++ = 0;
-        else next = entry + wcslen(entry);
-        if ( (match = wcsstr( entry, stem)) )
-        {
-            path = wcschr( match, L'=' );
-            if (path) *path++ = 0;
-            else return FALSE;
-            token = wcschr( match, L',' );
-            if (token) *token = 0;
-            if ( wcsstr( path, match ) || !wcscmp ( path + wcslen(path) - 4, L".dll" ) )
-                wcscpy( override, path );
-            else
-                swprintf( override, size, L"%s\\%s", path, match );
-            return TRUE;
-        }
-        entry = next;
-    }
-    return FALSE;
-}
-
-/*
  * LoadLibraryExW upscaler hack
  */
 BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
@@ -623,14 +561,6 @@ BOOL loaddll_upscaler_hack(LPCWSTR name, LPWSTR override)
     ret = GetEnvironmentVariableW( L"WINE_UPSCALER_REPLACE", envW, ARRAY_SIZE(envW) );
     if ( !ret || ret >= ARRAY_SIZE(envW) ) return FALSE;
 
-    if ( wcsstr( envW, L"dlss" ) )
-    {
-        /* HACK: override nvngx_dlss*.dll paths to a non-standard location for DLSS upgrade */
-        if (wcsstr( name, L"nvngx_dlss.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\nvngx_dlss.dll" );
-        if (wcsstr( name, L"nvngx_dlssd.dll" )) wcscpy( override, L"c:\\windows\\system32\\umu\\nvngx_dlssd.dll" );
-        if (wcsstr( name, L"nvngx_dlssg.dll" ) && !wcsstr( name, L"nvidia/wine/nvngx_dlssg.dll" ))
-            wcscpy( override, L"c:\\windows\\system32\\umu\\nvngx_dlssg.dll" );
-    }
     if ( wcsstr( envW, L"xess" ) )
     {
         /* HACK: override libxe*.dll paths to a non-standard location for XeSS upgrade */

@@ -8,7 +8,6 @@ SOURCES = \
 	env.c \
 	error.c \
 	exception.c \
-	ffx.c \
 	file.c \
 	generated.c \
 	info.c \
@@ -30,5 +29,6 @@ SOURCES = \
 	threadpool.c \
 	time.c \
 	unwind.c \
+	upscaler.c \
 	virtual.c \
 	wow64.c

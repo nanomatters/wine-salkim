@@ -3720,47 +3720,48 @@ static const struct
     { L"amd_fidelityfx_framegeneration_vk.dll",   L"AMD FidelityFX Frame Generation", 7, 10 },
 };
 
-struct ffx_version_block
+struct upscaler_version_block
 {
     WORD length, value_length, type;
     WCHAR key[1];
 };
 
-static const struct ffx_version_block *ffx_version_child( const void *data, SIZE_T size,
-                                                         SIZE_T offset, const WCHAR *key )
+static const struct upscaler_version_block *upscaler_version_child( const void *data, SIZE_T size,
+                                                                  SIZE_T offset, const WCHAR *key )
 {
-    const struct ffx_version_block *block;
+    const struct upscaler_version_block *block;
     SIZE_T key_size = (wcslen(key) + 1) * sizeof(WCHAR);
 
     for (offset = (offset + 3) & ~(SIZE_T)3; offset < size; offset = (offset + block->length + 3) & ~(SIZE_T)3)
     {
-        if (size - offset < offsetof(struct ffx_version_block, key)) break;
+        if (size - offset < offsetof(struct upscaler_version_block, key)) break;
         block = (const void *)((const char *)data + offset);
-        if (block->length < offsetof(struct ffx_version_block, key) || block->length > size - offset) break;
-        if (block->length >= offsetof(struct ffx_version_block, key) + key_size &&
-            !memcmp( block->key, key, key_size )) return block;
+        if (block->length < offsetof(struct upscaler_version_block, key) || block->length > size - offset) break;
+        if (block->length >= offsetof(struct upscaler_version_block, key) + key_size &&
+            !wcsnicmp( block->key, key, key_size / sizeof(WCHAR) )) return block;
     }
     return NULL;
 }
 
-static BOOL ffx_version_string( const struct ffx_version_block *table, const WCHAR *key, const WCHAR *value )
+static BOOL upscaler_version_string( const struct upscaler_version_block *table, const WCHAR *key, const WCHAR *value )
 {
-    const struct ffx_version_block *entry;
+    const struct upscaler_version_block *entry;
     SIZE_T offset, size = (wcslen(value) + 1) * sizeof(WCHAR);
 
-    /* AMD's signed libraries use the English Unicode string table. */
-    entry = ffx_version_child( table, table->length, offsetof(struct ffx_version_block, key) + sizeof(L"040904b0"), key );
+    /* Both vendors use an eight-character English string table key. */
+    entry = upscaler_version_child( table, table->length, offsetof(struct upscaler_version_block, key) + sizeof(L"040904b0"), key );
     if (!entry || entry->type != 1 || entry->value_length != size / sizeof(WCHAR)) return FALSE;
-    offset = (offsetof(struct ffx_version_block, key) + (wcslen(key) + 1) * sizeof(WCHAR) + 3) & ~(SIZE_T)3;
+    offset = (offsetof(struct upscaler_version_block, key) + (wcslen(key) + 1) * sizeof(WCHAR) + 3) & ~(SIZE_T)3;
     return offset <= entry->length && size <= entry->length - offset &&
            !memcmp( (const char *)entry + offset, value, size );
 }
 
-static BOOL get_ffx_image_version( void *base, SIZE_T size, unsigned int index, ULONGLONG *version )
+static BOOL get_upscaler_image_version( void *base, SIZE_T size, const WCHAR *product,
+                                        const WCHAR *alternative, BOOL nvidia, ULONGLONG *version )
 {
     const LDR_RESOURCE_INFO info = { 16 /* RT_VERSION */, 1, 0 };
     const IMAGE_RESOURCE_DATA_ENTRY *entry;
-    const struct ffx_version_block *root, *strings, *table;
+    const struct upscaler_version_block *root, *strings, *table;
     const VS_FIXEDFILEINFO *fixed;
     SIZE_T offset;
     ULONG length;
@@ -3772,21 +3773,27 @@ static BOOL get_ffx_image_version( void *base, SIZE_T size, unsigned int index, 
         if ((const char *)root < (const char *)base ||
             (SIZE_T)((const char *)root - (const char *)base) > size ||
             length > size - ((const char *)root - (const char *)base)) goto done;
-        offset = (offsetof(struct ffx_version_block, key) + sizeof(L"VS_VERSION_INFO") + 3) & ~(SIZE_T)3;
+        offset = (offsetof(struct upscaler_version_block, key) + sizeof(L"VS_VERSION_INFO") + 3) & ~(SIZE_T)3;
         if (length < offset + sizeof(*fixed) || root->length > length ||
             root->length < offset + sizeof(*fixed) || root->type || root->value_length != sizeof(*fixed) ||
             memcmp( root->key, L"VS_VERSION_INFO", sizeof(L"VS_VERSION_INFO") )) goto done;
         fixed = (const void *)((const char *)root + offset);
         if (fixed->dwSignature != VS_FFI_SIGNATURE || fixed->dwStrucVersion != VS_FFI_STRUCVERSION ||
-            fixed->dwFileType != VFT_DLL || fixed->dwFileFlags ||
-            !(fixed->dwFileVersionMS | fixed->dwFileVersionLS)) goto done;
-        strings = ffx_version_child( root, root->length, offset + sizeof(*fixed), L"StringFileInfo" );
+            (fixed->dwFileType != VFT_DLL && !(nvidia && fixed->dwFileType == VFT_UNKNOWN)) ||
+            fixed->dwFileFlags ||
+            !(nvidia ? fixed->dwProductVersionMS | fixed->dwProductVersionLS :
+                        fixed->dwFileVersionMS | fixed->dwFileVersionLS)) goto done;
+        strings = upscaler_version_child( root, root->length, offset + sizeof(*fixed), L"StringFileInfo" );
         if (!strings || strings->value_length) goto done;
-        table = ffx_version_child( strings, strings->length, offsetof(struct ffx_version_block, key) + sizeof(L"StringFileInfo"), L"040904b0" );
+        table = upscaler_version_child( strings, strings->length,
+                                        offsetof(struct upscaler_version_block, key) + sizeof(L"StringFileInfo"),
+                                        nvidia ? L"040904e4" : L"040904b0" );
         if (!table || table->value_length ||
-            !ffx_version_string( table, L"CompanyName", L"Advanced Micro Devices, Inc." ) ||
-            !ffx_version_string( table, L"ProductName", ffx_libraries[index].product )) goto done;
-        *version = ((ULONGLONG)fixed->dwFileVersionMS << 32) | fixed->dwFileVersionLS;
+            !upscaler_version_string( table, L"CompanyName", nvidia ? L"NVIDIA" : L"Advanced Micro Devices, Inc." ) ||
+            (!upscaler_version_string( table, L"ProductName", product ) &&
+             !(alternative && upscaler_version_string( table, L"ProductName", alternative )))) goto done;
+        *version = nvidia ? ((ULONGLONG)fixed->dwProductVersionMS << 32) | fixed->dwProductVersionLS :
+                            ((ULONGLONG)fixed->dwFileVersionMS << 32) | fixed->dwFileVersionLS;
         valid = TRUE;
     done:;
     }
@@ -3798,7 +3805,13 @@ static BOOL get_ffx_image_version( void *base, SIZE_T size, unsigned int index, 
     return valid;
 }
 
-static BOOL get_ffx_version( HANDLE mapping, unsigned int index, ULONGLONG *version )
+static BOOL get_ffx_image_version( void *base, SIZE_T size, unsigned int index, ULONGLONG *version )
+{
+    return get_upscaler_image_version( base, size, ffx_libraries[index].product, NULL, FALSE, version );
+}
+
+static BOOL get_upscaler_version( HANDLE mapping, const WCHAR *product, const WCHAR *alternative,
+                                  BOOL nvidia, ULONGLONG *version )
 {
     SIZE_T size = 0;
     void *base = NULL;
@@ -3808,8 +3821,41 @@ static BOOL get_ffx_version( HANDLE mapping, unsigned int index, ULONGLONG *vers
     status = NtMapViewOfSection( mapping, NtCurrentProcess(), &base, 0, 0, NULL, &size,
                                  ViewUnmap, 0, PAGE_READONLY );
     if (status && status != STATUS_IMAGE_NOT_AT_BASE) return FALSE;
-    valid = get_ffx_image_version( base, size, index, version );
+    valid = get_upscaler_image_version( base, size, product, alternative, nvidia, version );
     NtUnmapViewOfSection( NtCurrentProcess(), base );
+    return valid;
+}
+
+static BOOL get_ffx_version( HANDLE mapping, unsigned int index, ULONGLONG *version )
+{
+    return get_upscaler_version( mapping, ffx_libraries[index].product, NULL, FALSE, version );
+}
+
+static BOOL get_upscaler_path( const WCHAR *variable, const WCHAR *name, UNICODE_STRING *path )
+{
+    static const WCHAR prefix[] = L"\\??\\unix";
+    UNICODE_STRING directory = {0};
+    SIZE_T length, i;
+    BOOL valid = FALSE;
+
+    if (get_env_var( variable, 0, &directory )) return FALSE;
+    length = directory.Length / sizeof(WCHAR);
+    if (!length || directory.Buffer[0] != '/' ||
+        length + ARRAY_SIZE(prefix) + wcslen(name) + 1 > USHRT_MAX / sizeof(WCHAR)) goto done;
+    while (length && directory.Buffer[length - 1] == '/') --length;
+    path->MaximumLength = (ARRAY_SIZE(prefix) + length + wcslen(name) + 1) * sizeof(WCHAR);
+    if (!(path->Buffer = RtlAllocateHeap( GetProcessHeap(), 0, path->MaximumLength ))) goto done;
+    wcscpy( path->Buffer, prefix );
+    memcpy( path->Buffer + ARRAY_SIZE(prefix) - 1, directory.Buffer, length * sizeof(WCHAR) );
+    length += ARRAY_SIZE(prefix) - 1;
+    path->Buffer[length++] = '\\';
+    wcscpy( path->Buffer + length, name );
+    for (i = ARRAY_SIZE(prefix) - 1; i < length; ++i)
+        if (path->Buffer[i] == '/') path->Buffer[i] = '\\';
+    path->Length = wcslen(path->Buffer) * sizeof(WCHAR);
+    valid = TRUE;
+ done:
+    RtlFreeUnicodeString( &directory );
     return valid;
 }
 
@@ -3871,11 +3917,8 @@ static BOOL find_ffx_provider( const UNICODE_STRING *original, HANDLE original_m
                                UNICODE_STRING *provider, HANDLE *mapping,
                                SECTION_IMAGE_INFORMATION *image_info, struct file_id *id, WINE_MODREF **wm )
 {
-    static const WCHAR prefix[] = L"\\??\\unix";
     const WCHAR *name = original->Buffer, *ptr;
-    UNICODE_STRING directory = {0};
     ULONGLONG old_version, new_version;
-    SIZE_T length, i;
     unsigned int index, first;
     SIZE_T env_length;
     BOOL valid = FALSE;
@@ -3889,21 +3932,7 @@ static BOOL find_ffx_provider( const UNICODE_STRING *original, HANDLE original_m
                                       NULL, 0, &env_length ) == STATUS_BUFFER_TOO_SMALL && env_length))
         return FALSE;
     name = ffx_libraries[index].name;
-    if (get_env_var( L"WINE_FFX_PROVIDER", 0, &directory )) return FALSE;
-    length = directory.Length / sizeof(WCHAR);
-    if (!length || directory.Buffer[0] != '/' ||
-        length + ARRAY_SIZE(prefix) + wcslen(name) + 1 > USHRT_MAX / sizeof(WCHAR)) goto done;
-    while (length && directory.Buffer[length - 1] == '/') --length;
-    provider->MaximumLength = (ARRAY_SIZE(prefix) + length + wcslen(name) + 1) * sizeof(WCHAR);
-    if (!(provider->Buffer = RtlAllocateHeap( GetProcessHeap(), 0, provider->MaximumLength ))) goto done;
-    wcscpy( provider->Buffer, prefix );
-    memcpy( provider->Buffer + ARRAY_SIZE(prefix) - 1, directory.Buffer, length * sizeof(WCHAR) );
-    length += ARRAY_SIZE(prefix) - 1;
-    provider->Buffer[length++] = '\\';
-    wcscpy( provider->Buffer + length, name );
-    for (i = ARRAY_SIZE(prefix) - 1; i < length; ++i)
-        if (provider->Buffer[i] == '/') provider->Buffer[i] = '\\';
-    provider->Length = wcslen(provider->Buffer) * sizeof(WCHAR);
+    if (!get_upscaler_path( L"WINE_FFX_PROVIDER", name, provider )) return FALSE;
     if (RtlEqualUnicodeString( original, provider, TRUE )) goto done;
 
     first = ffx_libraries[index].first;
@@ -3933,7 +3962,118 @@ static BOOL find_ffx_provider( const UNICODE_STRING *original, HANDLE original_m
         !ffx_split_can_upgrade( original, provider, first )) goto done;
     valid = TRUE;
  done:
-    RtlFreeUnicodeString( &directory );
+    if (!valid)
+    {
+        if (*mapping) NtClose( *mapping );
+        *mapping = NULL;
+        *wm = NULL;
+        RtlFreeUnicodeString( provider );
+        provider->Buffer = NULL;
+    }
+    return valid;
+}
+
+
+static const struct
+{
+    const WCHAR *name, *product, *alternative;
+    unsigned int minimum_major;
+} dlss_libraries[] =
+{
+    { L"nvngx_dlss.dll",  L"NVIDIA Deep Learning SuperSampling", NULL, 2 },
+    { L"nvngx_dlssd.dll", L"NVIDIA DLSS Ray Reconstruction",    NULL, 3 },
+    { L"nvngx_dlssg.dll", L"NVIDIA DLSS-G", L"NVIDIA DLSS-G MFGLW", 1 },
+};
+
+static BOOL is_path_separator( WCHAR c )
+{
+    return c == '\\' || c == '/';
+}
+
+static BOOL is_dlss_driver_path( const UNICODE_STRING *path, const WCHAR *name )
+{
+    static const WCHAR suffix[] = L"nvidia\\wine\\";
+    UNICODE_STRING driver_path = {0};
+    FILE_ID_INFORMATION original_id, driver_id;
+    OBJECT_ATTRIBUTES attr;
+    IO_STATUS_BLOCK io;
+    HANDLE original_file, driver_file;
+    BOOL driver = FALSE;
+    SIZE_T length = ARRAY_SIZE(suffix) - 1, i;
+    const WCHAR *tail;
+
+    /* The installed Linux driver has its own feature DLLs. */
+    if (name - path->Buffer >= length)
+    {
+        tail = name - length;
+        if (tail == path->Buffer || is_path_separator(tail[-1]))
+        {
+            for (i = 0; i < length; ++i)
+                if (suffix[i] == '\\' ? !is_path_separator(tail[i]) :
+                    RtlUpcaseUnicodeChar(tail[i]) != RtlUpcaseUnicodeChar(suffix[i])) break;
+            if (i == length) return TRUE;
+        }
+    }
+    if (!get_upscaler_path( L"NVIDIA_WINE_DLL_DIR", name, &driver_path )) return FALSE;
+    driver = RtlEqualUnicodeString( path, &driver_path, TRUE );
+    if (!driver)
+    {
+        InitializeObjectAttributes( &attr, &driver_path, OBJ_CASE_INSENSITIVE, 0, NULL );
+        if (!NtOpenFile( &driver_file, FILE_READ_ATTRIBUTES, &attr, &io,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE ))
+        {
+            InitializeObjectAttributes( &attr, path, OBJ_CASE_INSENSITIVE, 0, NULL );
+            if (!NtOpenFile( &original_file, FILE_READ_ATTRIBUTES, &attr, &io,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE ))
+            {
+                driver = !NtQueryInformationFile( original_file, &io, &original_id,
+                                                  sizeof(original_id), FileIdInformation ) &&
+                         !NtQueryInformationFile( driver_file, &io, &driver_id,
+                                                  sizeof(driver_id), FileIdInformation ) &&
+                         original_id.VolumeSerialNumber == driver_id.VolumeSerialNumber &&
+                         !memcmp( &original_id.FileId, &driver_id.FileId, sizeof(original_id.FileId) );
+                NtClose( original_file );
+            }
+            NtClose( driver_file );
+        }
+    }
+    RtlFreeUnicodeString( &driver_path );
+    return driver;
+}
+
+static BOOL find_dlss_provider( const UNICODE_STRING *original, HANDLE original_mapping,
+                                UNICODE_STRING *provider, HANDLE *mapping,
+                                SECTION_IMAGE_INFORMATION *image_info, struct file_id *id, WINE_MODREF **wm )
+{
+    const WCHAR *name = original->Buffer, *ptr;
+    ULONGLONG old_version, new_version;
+    SIZE_T env_length;
+    unsigned int index;
+    BOOL valid = FALSE;
+
+    for (ptr = name; *ptr; ++ptr) if (is_path_separator(*ptr)) name = ptr + 1;
+    if (wcsnicmp( name, L"nvngx_dlss", 10 )) return FALSE;
+    for (index = 0; index < ARRAY_SIZE(dlss_libraries); ++index)
+        if (!wcsicmp( name, dlss_libraries[index].name )) break;
+    if (index == ARRAY_SIZE(dlss_libraries) || is_dlss_driver_path( original, name ) ||
+        (RtlQueryEnvironmentVariable( NULL, L"WINE_OPTISCALER_NAME", wcslen(L"WINE_OPTISCALER_NAME"),
+                                      NULL, 0, &env_length ) == STATUS_BUFFER_TOO_SMALL && env_length)) return FALSE;
+    if (!get_upscaler_path( L"WINE_DLSS_PROVIDER", dlss_libraries[index].name, provider )) return FALSE;
+    if (RtlEqualUnicodeString( original, provider, TRUE )) goto done;
+    if (!get_upscaler_version( original_mapping, dlss_libraries[index].product,
+                              dlss_libraries[index].alternative, TRUE, &old_version ) ||
+        old_version >> 48 < dlss_libraries[index].minimum_major ||
+        open_dll_file( provider, wm, mapping, image_info, id )) goto done;
+    if (*wm)
+        valid = get_upscaler_image_version( (*wm)->ldr.DllBase, (*wm)->ldr.SizeOfImage,
+                                           dlss_libraries[index].product, dlss_libraries[index].alternative,
+                                           TRUE, &new_version );
+    else
+        valid = image_info->Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                get_upscaler_version( *mapping, dlss_libraries[index].product,
+                                      dlss_libraries[index].alternative, TRUE, &new_version );
+    valid = valid && old_version < new_version;
+ done:
     if (!valid)
     {
         if (*mapping) NtClose( *mapping );
@@ -4001,7 +4141,9 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
         WINE_MODREF *provider_wm = NULL;
 
         if (find_ffx_provider( &nt_name, mapping, &provider, &provider_mapping,
-                              &provider_info, &provider_id, &provider_wm ))
+                              &provider_info, &provider_id, &provider_wm ) ||
+            find_dlss_provider( &nt_name, mapping, &provider, &provider_mapping,
+                               &provider_info, &provider_id, &provider_wm ))
         {
             if (provider_wm)
             {
@@ -4014,9 +4156,9 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
                                        &provider_id, flags, FALSE, FALSE, pwm );
             if (provider_mapping) NtClose( provider_mapping );
             if (!nts)
-                TRACE_(loaddll)( "FFX SDK: %s -> %s\n", debugstr_us(&nt_name), debugstr_us(&provider) );
+                TRACE_(loaddll)( "Upscaler DLL: %s -> %s\n", debugstr_us(&nt_name), debugstr_us(&provider) );
             else
-                WARN_(loaddll)( "Cannot load FFX SDK %s (%lx), keeping %s\n",
+                WARN_(loaddll)( "Cannot load upscaler DLL %s (%lx), keeping %s\n",
                                debugstr_us(&provider), nts, debugstr_us(&nt_name) );
             RtlFreeUnicodeString( &provider );
             if (!nts) goto done;
