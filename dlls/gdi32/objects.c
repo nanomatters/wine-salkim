@@ -898,6 +898,15 @@ NTSTATUS WINAPI D3DKMTOpenAdapterFromGdiDisplayName( D3DKMT_OPENADAPTERFROMGDIDI
 }
 
 /***********************************************************************
+ *           D3DKMTSetProcessSchedulingPriorityClass    (GDI32.@)
+ */
+NTSTATUS WINAPI D3DKMTSetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS priority )
+{
+    FIXME( "(%p, %u): stub\n", process, priority );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+/***********************************************************************
  *           SetObjectOwner    (GDI32.@)
  */
 void WINAPI SetObjectOwner( HGDIOBJ handle, HANDLE owner )

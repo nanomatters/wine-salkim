@@ -143,6 +143,7 @@
 @ stdcall D3DKMTQueryVideoMemoryInfo(ptr) win32u.NtGdiDdDDIQueryVideoMemoryInfo
 @ stdcall D3DKMTReleaseKeyedMutex(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex
 @ stdcall D3DKMTReleaseKeyedMutex2(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex2
+@ stdcall D3DKMTSetProcessSchedulingPriorityClass(ptr long)
 @ stdcall D3DKMTSetQueuedLimit(ptr) win32u.NtGdiDdDDISetQueuedLimit
 @ stdcall D3DKMTSetVidPnSourceOwner(ptr) win32u.NtGdiDdDDISetVidPnSourceOwner
 @ stdcall D3DKMTShareObjects(long ptr ptr long ptr) win32u.NtGdiDdDDIShareObjects
