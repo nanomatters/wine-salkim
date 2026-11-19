@@ -119,6 +119,7 @@ struct color_buffer_state
 {
     GLfloat clear_color[4];
     GLenum  draw_buffers[MAX_DRAW_BUFFERS];
+    BOOL    draw_buffers_array;
 };
 
 struct hint_state
@@ -167,6 +168,7 @@ struct context
     struct enable_state enable;                 /* GL_ENABLE_BIT */
     struct color_buffer_state color_buffer;     /* GL_COLOR_BUFFER_BIT */
     struct hint_state hint;                     /* GL_HINT_BIT */
+    GLint native_draw_buffer;                   /* last scalar draw buffer set on the native framebuffer, or -1 */
     GLuint draw_fbo;                            /* currently bound draw FBO name */
     GLuint read_fbo;                            /* currently bound read FBO name */
     GLboolean has_viewport;                     /* whether viewport has been initialized */
@@ -400,6 +402,7 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
         funcs->p_glClearColor( floats[0], floats[1], floats[2], floats[3] );
     }
     dst->color_buffer = src->color_buffer;
+    dst->native_draw_buffer = -1;
     dst->pixel_mode = src->pixel_mode;
     if (mask & GL_DEPTH_BUFFER_BIT)
     {
@@ -552,6 +555,7 @@ static void update_handle_context( TEB *teb, HGLRC handle, struct wgl_handle *pt
     }
     destroy_context_dc( hwnd, hdc );
 
+    ctx->native_draw_buffer = -1;
     if (shared && shared->buffers)
     {
         release_buffers( funcs, ctx->buffers );
@@ -1975,6 +1979,7 @@ HGLRC wrap_wglCreateContextAttribsARB( TEB *teb, HDC hdc, HGLRC share, const int
     if ((context = calloc( 1, sizeof(*context) )))
     {
         context->hdc = hdc;
+        context->native_draw_buffer = -1;
         context->share = (HGLRC)-1; /* initial shared context */
         context->attribs = memdup_attribs( attribs );
         if (is_win64 && is_wow64())
@@ -2295,6 +2300,7 @@ void resolve_default_fbo( TEB *teb )
 static GLenum *set_default_fbo_draw_buffers( struct context *ctx, struct opengl_drawable *draw,
                                              GLsizei count, const GLenum *src, GLenum *dst )
 {
+    ctx->color_buffer.draw_buffers_array = TRUE;
     memset( ctx->color_buffer.draw_buffers, 0, sizeof(ctx->color_buffer.draw_buffers) );
 
     for (GLsizei i = 0; i < count; i++)
@@ -2336,8 +2342,16 @@ static void pop_default_fbo_buffers( TEB *teb )
         *func_ptr = funcs->p_wglGetProcAddress( "glReadBuffer" );
         if (!*func_ptr) ERR( "glReadBuffer not found.\n" );
     }
-    if (!ctx->draw_fbo)
+    if (!ctx->draw_fbo && !draw->draw_fbo && !ctx->color_buffer.draw_buffers_array)
     {
+        /* The context keeps its draw buffer until the drawable maps it differently. */
+        buf = drawable_buffer_from_buffer( draw, ctx->color_buffer.draw_buffers[0] );
+        if (buf != ctx->native_draw_buffer) funcs->p_glDrawBuffer( buf );
+        ctx->native_draw_buffer = buf;
+    }
+    else if (!ctx->draw_fbo)
+    {
+        ctx->native_draw_buffer = -1;
         funcs->p_glGetIntegerv( GL_MAX_DRAW_BUFFERS, (GLint *)&n );
         n = min( n, MAX_DRAW_BUFFERS );
         for (i = 0; i < n; ++i)
@@ -2400,6 +2414,8 @@ static GLenum set_default_fbo_draw_buffer( struct context *ctx, struct opengl_dr
         WARN( "Invalid draw buffer %#x for context %p\n", src, ctx );
         return src;
     }
+    ctx->color_buffer.draw_buffers_array = FALSE;
+    ctx->native_draw_buffer = draw->draw_fbo ? -1 : (GLint)dst;
     memset( ctx->color_buffer.draw_buffers, 0, sizeof(ctx->color_buffer.draw_buffers) );
     ctx->color_buffer.draw_buffers[0] = src;
     return dst;

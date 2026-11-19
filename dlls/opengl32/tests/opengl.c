@@ -1903,6 +1903,15 @@ static void test_bitmap_rendering( BOOL use_dib )
     else ok( (pixels[0] & 0xffffff) == 0x887766, "got %#x\n", pixels[0] );
     ok( (pixels2[0] & 0xffffff) == 0x667788, "got %#x\n", pixels2[0] );
 
+    glDrawBuffer( GL_NONE );
+    glPushAttrib( GL_COLOR_BUFFER_BIT );
+    glDrawBuffer( GL_FRONT );
+    glPopAttrib();
+    glClear( GL_COLOR_BUFFER_BIT );
+    glGetIntegerv( GL_DRAW_BUFFER, &object );
+    ok( object == GL_NONE, "got %#x\n", object );
+    ok_ret( GL_NO_ERROR, glGetError() );
+
     wglDeleteContext( hglrc2 );
     wglDeleteContext( hglrc );
 
