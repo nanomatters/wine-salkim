@@ -475,12 +475,83 @@ static void test_render_bounds(void)
     assert(params.result == S_OK && data == buffer + 6 && stream.locked == 4);
     assert(!loop_depth && allocation_calls == 1);
 
-    stream.pa_held_bytes = stream.real_bufsize_bytes - 1;
     release.written_frames = 1;
     pipewire_release_render_buffer(&release);
     assert(release.result == S_OK && !stream.locked && !loop_depth);
-    assert(stream.pa_held_bytes == stream.held_bytes && stream.held_bytes == 12);
-    assert(stream.pa_offs_bytes == stream.lcl_offs_bytes);
+    assert(stream.held_bytes == 12 && stream.pa_held_bytes == 12);
+}
+
+static void test_render_backpressure(void)
+{
+    BYTE ring[64], output[8], *samples;
+    struct spa_chunk chunk = {0};
+    struct spa_data data = {.data = output, .maxsize = sizeof(output), .chunk = &chunk};
+    struct spa_buffer buffer = {.n_datas = 1, .datas = &data};
+    struct pw_buffer pw_buffer = {.buffer = &buffer, .requested = 2};
+    struct pipewire_stream stream = {0};
+    struct get_render_buffer_params get = {0};
+    struct release_render_buffer_params release = {0};
+    struct get_current_padding_params padding = {0};
+    UINT32 frames, i;
+
+    pw_loop_global = (void *)1;
+    stream.pw = (void *)2;
+    stream.dataflow = eRender;
+    stream.info.format = SPA_AUDIO_FORMAT_S16_LE;
+    stream.info.channels = 2;
+    stream.vol[0] = stream.vol[1] = 1.0f;
+    stream.frame_size = 4;
+    stream.bufsize_frames = 8;
+    stream.local_buffer = ring;
+    stream.real_bufsize_bytes = sizeof(ring);
+    get.stream = release.stream = padding.stream = (UINT_PTR)&stream;
+    get.data = &samples;
+    padding.padding = &frames;
+
+    /* The timer retires two WASAPI buffers before the first process callback. */
+    for (i = 0; i < 2; ++i)
+    {
+        get.frames = release.written_frames = stream.bufsize_frames;
+        pipewire_get_render_buffer(&get);
+        assert(get.result == S_OK);
+        memset(samples, 0x41 + i, get.frames * stream.frame_size);
+        pipewire_release_render_buffer(&release);
+        assert(release.result == S_OK);
+        stream.lcl_offs_bytes = (stream.lcl_offs_bytes + stream.held_bytes) % sizeof(ring);
+        stream.held_bytes = 0;
+    }
+    pipewire_get_current_padding(&padding);
+    assert(padding.result == S_OK && frames == stream.bufsize_frames);
+    get.frames = 1;
+    pipewire_get_render_buffer(&get);
+    assert(get.result == AUDCLNT_E_BUFFER_TOO_LARGE && !stream.locked);
+
+    stream.started = TRUE;
+    process_buffer = &pw_buffer;
+    pw_thread_loop_lock(pw_loop_global);
+    on_stream_process(&stream);
+    pw_thread_loop_unlock(pw_loop_global);
+    assert(chunk.size == sizeof(output) && !memcmp(output, "AAAAAAAA", sizeof(output)));
+    pipewire_get_current_padding(&padding);
+    assert(padding.result == S_OK && frames == 6);
+    get.frames = 3;
+    pipewire_get_render_buffer(&get);
+    assert(get.result == AUDCLNT_E_BUFFER_TOO_LARGE);
+    get.frames = 2;
+    pipewire_get_render_buffer(&get);
+    assert(get.result == S_OK && samples == ring);
+    memset(samples, 'C', sizeof(output));
+
+    /* Playback can advance between GetBuffer and a partial ReleaseBuffer. */
+    pw_thread_loop_lock(pw_loop_global);
+    on_stream_process(&stream);
+    pw_thread_loop_unlock(pw_loop_global);
+    assert(!memcmp(output, "AAAAAAAA", sizeof(output)));
+    release.written_frames = 1;
+    pipewire_release_render_buffer(&release);
+    assert(release.result == S_OK && stream.pa_held_bytes == 52);
+    pipewire_get_current_padding(&padding);
+    assert(padding.result == S_OK && frames == 5 && !loop_depth);
 }
 
 static void test_capture_offset(void)
@@ -520,6 +591,7 @@ int main(int argc, char **argv)
     if (argc == 1 || !strcmp(argv[1], "alignment")) test_packet_alignment();
     if (argc == 1 || !strcmp(argv[1], "sizes")) test_buffer_sizes();
     if (argc == 1 || !strcmp(argv[1], "render")) test_render_bounds();
+    if (argc == 1 || !strcmp(argv[1], "backpressure")) test_render_backpressure();
     if (argc == 1 || !strcmp(argv[1], "capture")) test_capture_offset();
     puts("PipeWire stream tests passed");
     return 0;

@@ -3519,9 +3519,13 @@ static BOOL alloc_tmp_buffer(struct pipewire_stream *stream, SIZE_T bytes)
     return TRUE;
 }
 
-static UINT32 pipewire_render_padding(struct pipewire_stream *stream)
+static UINT32 pipewire_render_writable_frames(struct pipewire_stream *stream)
 {
-    return stream->held_bytes / stream->frame_size;
+    SIZE_T unread = __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE);
+
+    /* The WASAPI timer can advance before PipeWire reads the queued samples. */
+    return min(stream->bufsize_frames - stream->held_bytes / stream->frame_size,
+               (stream->real_bufsize_bytes - unread) / stream->frame_size);
 }
 
 static UINT32 pipewire_capture_padding(struct pipewire_stream *stream)
@@ -3567,8 +3571,7 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
         return STATUS_SUCCESS;
     }
 
-    if (params->frames > stream->bufsize_frames ||
-        stream->held_bytes / stream->frame_size > stream->bufsize_frames - params->frames)
+    if (params->frames > pipewire_render_writable_frames(stream))
     {
         pw_thread_loop_unlock(pw_loop_global);
         params->result = AUDCLNT_E_BUFFER_TOO_LARGE;
@@ -3656,13 +3659,7 @@ static NTSTATUS pipewire_release_render_buffer(void *args)
         pipewire_wrap_buffer(stream, buffer, written_bytes);
 
     stream->held_bytes += written_bytes;
-    if ((UINT64)__atomic_fetch_add(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE) +
-        written_bytes > stream->real_bufsize_bytes)
-    {
-        WARN("%p PipeWire buffer overflow.\n", stream);
-        stream->pa_offs_bytes = stream->lcl_offs_bytes;
-        __atomic_store_n(&stream->pa_held_bytes, stream->held_bytes, __ATOMIC_RELEASE);
-    }
+    __atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE);
     stream->clock_written += written_bytes;
     stream->locked = 0;
 
@@ -3766,7 +3763,7 @@ static NTSTATUS pipewire_get_current_padding(void *args)
     }
 
     if (stream->dataflow == eRender)
-        *params->padding = pipewire_render_padding(stream);
+        *params->padding = stream->bufsize_frames - pipewire_render_writable_frames(stream);
     else
         *params->padding = pipewire_capture_padding(stream);
     pw_thread_loop_unlock(pw_loop_global);
