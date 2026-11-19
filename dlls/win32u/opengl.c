@@ -2123,7 +2123,18 @@ static BOOL flush_memory_dc( struct wgl_context *context, HDC hdc, BOOL write, v
         if (!get_image_from_bitmap( bmp, info, &bits, &src ))
         {
             int width = info->bmiHeader.biWidth, height = info->bmiHeader.biSizeImage / 4 / width;
-            if (write) funcs->p_glDrawPixels( width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
+            if (write)
+            {
+                struct opengl_drawable *draw = context->draw;
+                GLint draw_buffer = GL_NONE;
+
+                /* A single-buffered bitmap can be backed by a double-buffered EGL window. */
+                if (draw && !draw->client && !draw->doublebuffer && !draw->draw_fbo)
+                    funcs->p_glGetIntegerv( GL_DRAW_BUFFER, &draw_buffer );
+                if (draw_buffer == GL_BACK) funcs->p_glDrawBuffer( GL_FRONT );
+                funcs->p_glDrawPixels( width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
+                if (draw_buffer == GL_BACK) funcs->p_glDrawBuffer( GL_BACK );
+            }
             else funcs->p_glReadPixels( 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
         }
         GDI_ReleaseObj( dc->hBitmap );
