@@ -817,6 +817,21 @@ static int test_pfd(const PIXELFORMATDESCRIPTOR *pfd, PIXELFORMATDESCRIPTOR *fmt
     return pf;
 }
 
+static void check_32bit_channel_layout(const PIXELFORMATDESCRIPTOR *fmt)
+{
+    unsigned int bits = fmt->cRedBits;
+
+    ok( bits == 8 || bits == 10, "Got %u red bits.\n", bits );
+    ok( fmt->cGreenBits == bits, "Got %u green bits.\n", fmt->cGreenBits );
+    ok( fmt->cBlueBits == bits, "Got %u blue bits.\n", fmt->cBlueBits );
+    ok( fmt->cGreenShift == bits, "Got green shift %u.\n", fmt->cGreenShift );
+    ok( (!fmt->cBlueShift && fmt->cRedShift == 2 * bits) ||
+        (bits == 10 && !fmt->cRedShift && fmt->cBlueShift == 2 * bits),
+        "Got red/blue shifts %u/%u.\n", fmt->cRedShift, fmt->cBlueShift );
+    ok( !fmt->cAlphaBits || 3 * bits + fmt->cAlphaBits == 32, "Got %u alpha bits.\n", fmt->cAlphaBits );
+    ok( fmt->cAlphaShift == (fmt->cAlphaBits ? 3 * bits : 0), "Got alpha shift %u.\n", fmt->cAlphaShift );
+}
+
 static void test_choosepixelformat(void)
 {
     PIXELFORMATDESCRIPTOR pfd = {
@@ -861,17 +876,7 @@ static void test_choosepixelformat(void)
     pfd.cColorBits = 32;
     ok( test_pfd(&pfd, &ret_fmt), "Simple pfd failed\n" );
     ok( ret_fmt.cColorBits == 32, "Got %u.\n", ret_fmt.cColorBits );
-    ok( !ret_fmt.cBlueShift, "Got %u.\n", ret_fmt.cBlueShift );
-    ok( ret_fmt.cBlueBits == 8, "Got %u.\n", ret_fmt.cBlueBits );
-    ok( ret_fmt.cRedBits == 8, "Got %u.\n", ret_fmt.cRedBits );
-    ok( ret_fmt.cGreenBits == 8, "Got %u.\n", ret_fmt.cGreenBits );
-    ok( ret_fmt.cGreenShift == 8, "Got %u.\n", ret_fmt.cGreenShift );
-    ok( ret_fmt.cRedShift == 16, "Got %u.\n", ret_fmt.cRedShift );
-    ok( !ret_fmt.cAlphaBits || ret_fmt.cAlphaBits == 8, "Got %u.\n", ret_fmt.cAlphaBits );
-    if (ret_fmt.cAlphaBits)
-        ok( ret_fmt.cAlphaShift == 24, "Got %u.\n", ret_fmt.cAlphaShift );
-    else
-        ok( !ret_fmt.cAlphaShift, "Got %u.\n", ret_fmt.cAlphaShift );
+    check_32bit_channel_layout( &ret_fmt );
     ok( ret_fmt.cDepthBits, "Got %u.\n", ret_fmt.cDepthBits );
 
     pfd.dwFlags |= PFD_DOUBLEBUFFER_DONTCARE;
@@ -884,7 +889,8 @@ static void test_choosepixelformat(void)
     pfd.cColorBits = 0;
 
     pfd.cAlphaBits = 8;
-    ok( test_pfd(&pfd, NULL), "Simple pfd failed\n" );
+    ok( test_pfd(&pfd, &ret_fmt), "Simple pfd failed\n" );
+    if (ret_fmt.cColorBits == 32) check_32bit_channel_layout( &ret_fmt );
     pfd.dwFlags |= PFD_DOUBLEBUFFER_DONTCARE;
     ok( test_pfd(&pfd, NULL), "PFD_DOUBLEBUFFER_DONTCARE failed\n" );
     pfd.dwFlags |= PFD_STEREO_DONTCARE;
