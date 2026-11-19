@@ -1051,7 +1051,20 @@ static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard
 
     InterlockedExchange(&process_wayland.input_serial, serial);
 
-    if (!wl_surface) return;
+    if (!wl_surface)
+    {
+        /* libwayland can deliver the leave after the surface proxy is gone.
+         * The key releases are still needed, even if teardown cleared focus. */
+        pthread_mutex_lock(&keyboard->mutex);
+        hwnd = keyboard->focused_hwnd;
+        keyboard->focused_hwnd = NULL;
+        pthread_mutex_unlock(&keyboard->mutex);
+
+        wayland_activation_clear_serial(WAYLAND_ACTIVATION_SERIAL_KEYBOARD_FOCUS, hwnd);
+        wayland_external_input_set_keyboard_focus(FALSE);
+        release_all_keys(hwnd);
+        return;
+    }
 
     /* The wl_surface user data remains valid and immutable for the whole
      * lifetime of the object, so it's safe to access without locking. */
