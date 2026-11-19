@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", required=True, type=Path)
     parser.add_argument("--cc", default="cc")
-    parser.add_argument("--cflags", default="-O2 -g -Wall -Wextra -Werror")
+    parser.add_argument("--cflags", default="-O2 -g -Wall -Wextra -Werror -Wno-unused-parameter")
     parser.add_argument("--bits", choices=("native", "32", "64", "all"), default="native")
     parser.add_argument("--sanitizers", action="store_true")
     args = parser.parse_args()
@@ -58,6 +58,9 @@ def main():
             "wayland_surface_has_pending_state", "wayland_surface_update_state_toplevel",
             "wayland_win_data_configure_surface_rect", "wayland_win_data_configure_window_rect",
             "wayland_configure_window")),
+        ("wayland_surface.c", (
+            "map_rect_to_surface", "map_rect_from_surface",
+            "wayland_toplevel_configure_rect", "xdg_toplevel_handle_configure")),
     )
     extracted = []
     hashes = {}

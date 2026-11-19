@@ -1980,6 +1980,24 @@ static const struct xdg_surface_listener xdg_surface_listener =
     xdg_surface_handle_configure
 };
 
+static RECT wayland_toplevel_configure_rect(struct wayland_win_data *data,
+                                           enum wayland_surface_config_state state, RECT rect)
+{
+    struct wayland_surface *surface = data->wayland_surface;
+    RECT output_rect, logical_rect;
+
+    if ((state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) && !surface->window.preserve_fullscreen_size &&
+        surface->window.scale > 1.0 && !IsRectEmpty(&rect) &&
+        wayland_win_data_get_fullscreen_rect(data, TRUE, &output_rect))
+    {
+        /* The logical fullscreen size can round back to a different pixel width or height. */
+        OffsetRect(&output_rect, -output_rect.left, -output_rect.top);
+        logical_rect = map_rect_to_surface(surface, output_rect);
+        if (EqualRect(&logical_rect, &rect)) return output_rect;
+    }
+    return map_rect_from_surface(surface, rect);
+}
+
 static void xdg_toplevel_handle_configure(void *private,
                                           struct xdg_toplevel *xdg_toplevel,
                                           int32_t width, int32_t height,
@@ -2028,7 +2046,7 @@ static void xdg_toplevel_handle_configure(void *private,
         surface->pending.surface_width = width;
         surface->pending.surface_height = height;
         surface->pending.scale = surface->window.scale;
-        surface->pending.rect = rect = map_rect_from_surface(surface, rect);
+        surface->pending.rect = rect = wayland_toplevel_configure_rect(data, config_state, rect);
         surface->pending.state = config_state;
         if (!surface->pending.decor)
             surface->pending.decor = surface->current.decor;
