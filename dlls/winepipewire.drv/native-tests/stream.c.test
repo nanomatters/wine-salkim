@@ -7,6 +7,7 @@
 #include "test.h"
 
 static unsigned int loop_depth, control_calls, flush_calls, allocation_calls;
+static BOOL fail_allocation, round_allocation;
 static int control_result;
 static float last_rate_ratio;
 static enum pw_stream_state test_stream_state = PW_STREAM_STATE_PAUSED;
@@ -62,6 +63,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE process, void **addr, ULONG_PTR b
                                         SIZE_T *size, ULONG type, ULONG protect)
 {
     allocation_calls++;
+    if (fail_allocation) return STATUS_NO_MEMORY;
+    if (round_allocation) *size = (*size + 4095) & ~(SIZE_T)4095;
     if (!(*addr = calloc(1, *size))) return STATUS_NO_MEMORY;
     return STATUS_SUCCESS;
 }
@@ -554,6 +557,168 @@ static void test_render_backpressure(void)
     assert(padding.result == S_OK && frames == 5 && !loop_depth);
 }
 
+static BYTE *get_render_frames(struct pipewire_stream *stream, UINT32 frames)
+{
+    BYTE *samples = NULL;
+    struct get_render_buffer_params params = {.stream = (UINT_PTR)stream, .frames = frames, .data = &samples};
+
+    pipewire_get_render_buffer(&params);
+    assert(params.result == S_OK && !loop_depth);
+    return samples;
+}
+
+static void release_render_frames(struct pipewire_stream *stream, UINT32 frames)
+{
+    struct release_render_buffer_params params = {.stream = (UINT_PTR)stream, .written_frames = frames};
+
+    pipewire_release_render_buffer(&params);
+    assert(params.result == S_OK && !loop_depth);
+}
+
+static void run_render_cycle(struct pipewire_stream *stream, UINT64 frames, BYTE *output, UINT32 maxsize)
+{
+    struct spa_chunk chunk = {0};
+    struct spa_data data = {.data = output, .maxsize = maxsize, .chunk = &chunk};
+    struct spa_buffer buffer = {.n_datas = 1, .datas = &data};
+    struct pw_buffer pw_buffer = {.buffer = &buffer, .requested = frames};
+
+    process_buffer = &pw_buffer;
+    pw_thread_loop_lock(pw_loop_global);
+    on_stream_process(stream);
+    pw_thread_loop_unlock(pw_loop_global);
+    process_buffer = NULL;
+    assert(chunk.size == pw_buffer.size * stream->frame_size && chunk.size <= maxsize);
+}
+
+static void init_render_stream(struct pipewire_stream *stream)
+{
+    pw_loop_global = (void *)1;
+    stream->pw = (void *)2;
+    stream->dataflow = eRender;
+    stream->info.format = SPA_AUDIO_FORMAT_S24_LE;
+    stream->info.channels = 1;
+    stream->vol[0] = 1.0f;
+    stream->bufsize_frames = 8;
+    stream->frame_size = 3;
+    stream->real_bufsize_bytes = 48;
+    stream->local_buffer = calloc(1, stream->real_bufsize_bytes);
+    assert(stream->local_buffer);
+}
+
+static void test_render_resize(UINT32 held, UINT32 unread)
+{
+    struct pipewire_stream stream = {0};
+    BYTE expected[24], output[52], *original, *samples;
+    UINT32 i, calls = allocation_calls;
+
+    init_render_stream(&stream);
+    original = stream.local_buffer;
+    /* Both queues end at frame 1, with unread samples on both sides of the wrap. */
+    stream.held_bytes = 3 * held;
+    stream.pa_held_bytes = 3 * unread;
+    stream.lcl_offs_bytes = 3 * (17 - held);
+    stream.pa_offs_bytes = 3 * (17 - unread);
+    for (i = 0; i < stream.pa_held_bytes; ++i)
+        original[(stream.pa_offs_bytes + i) % stream.real_bufsize_bytes] = expected[i] = i + 1;
+
+    samples = get_render_frames(&stream, 1);
+    assert(samples == original + 3);
+    run_render_cycle(&stream, 0, output, sizeof(output)); /* 17 complete frames. */
+    assert(stream.local_buffer == original && allocation_calls == calls);
+    memcpy(samples, "abc", 3);
+    release_render_frames(&stream, 1);
+
+    samples = get_render_frames(&stream, 1);
+    assert(stream.real_bufsize_bytes == (17 + 8) * 3 && allocation_calls == calls + 1);
+    assert(stream.bufsize_frames == 8 && samples == stream.local_buffer + 3 * (max(held, unread) + 1));
+    memcpy(samples, "def", 3);
+    release_render_frames(&stream, 1);
+
+    memcpy(expected + 3 * unread, "abcdef", 6);
+    stream.started = TRUE;
+    run_render_cycle(&stream, unread + 2, output, sizeof(output));
+    assert(!memcmp(output, expected, 3 * (unread + 2)));
+    assert(!stream.underrun_count && !stream.pa_held_bytes);
+    free(stream.local_buffer);
+}
+
+static void test_render_resize_limits(void)
+{
+    struct pipewire_stream stream = {0};
+    UINT32 frames, i, calls = allocation_calls;
+    struct get_current_padding_params padding = {.stream = (UINT_PTR)&stream, .padding = &frames};
+    struct reset_params reset = {.stream = (UINT_PTR)&stream};
+    BYTE output[97], *samples;
+
+    init_render_stream(&stream);
+    stream.started = TRUE;
+    samples = get_render_frames(&stream, 1);
+    run_render_cycle(&stream, UINT64_MAX, output, 80);
+    assert(samples == stream.local_buffer && allocation_calls == calls);
+    release_render_frames(&stream, 0);
+    stream.started = FALSE;
+    fail_allocation = TRUE;
+    for (i = 0; i < 4; ++i)
+    {
+        run_render_cycle(&stream, UINT64_MAX, output, i % 2 ? 97 : 80);
+        get_render_frames(&stream, 1);
+        release_render_frames(&stream, 0);
+        assert(allocation_calls == calls + 1 && stream.real_bufsize_bytes == 48);
+    }
+    fail_allocation = FALSE;
+
+    /* A smaller request can still grow the ring. Fill it as the timer advances. */
+    run_render_cycle(&stream, 24, output, sizeof(output));
+    for (i = 0; i < 3; ++i)
+    {
+        memset(get_render_frames(&stream, 8), 'A' + i, 24);
+        release_render_frames(&stream, 8);
+        stream.lcl_offs_bytes = (stream.lcl_offs_bytes + stream.held_bytes) % stream.real_bufsize_bytes;
+        stream.held_bytes = 0;
+    }
+    assert(allocation_calls == calls + 2 && stream.real_bufsize_bytes == 96);
+    pipewire_get_current_padding(&padding);
+    assert(padding.result == S_OK && !frames);
+
+    /* Keep the write already advertised when the graph switches to smaller callbacks. */
+    stream.started = TRUE;
+    run_render_cycle(&stream, 2, output, sizeof(output));
+    memset(get_render_frames(&stream, 8), 'D', 24);
+    release_render_frames(&stream, 8);
+    stream.lcl_offs_bytes = (stream.lcl_offs_bytes + stream.held_bytes) % stream.real_bufsize_bytes;
+    stream.held_bytes = 0;
+    pipewire_get_current_padding(&padding);
+    assert(padding.result == S_OK && frames == 8);
+
+    for (i = 0; i < 8; ++i)
+    {
+        run_render_cycle(&stream, 2, output, sizeof(output));
+        assert(output[0] == 'A' + (i + 1) / 4 && output[5] == output[0]);
+    }
+    pipewire_get_current_padding(&padding);
+    assert(padding.result == S_OK && frames == 6);
+    assert(stream.real_bufsize_bytes == 96 && allocation_calls == calls + 2);
+
+    stream.started = FALSE;
+    pipewire_reset(&reset);
+    assert(reset.result == S_OK);
+    run_render_cycle(&stream, UINT64_MAX, output, sizeof(output));
+    round_allocation = TRUE;
+    get_render_frames(&stream, 1);
+    round_allocation = FALSE;
+    release_render_frames(&stream, 0);
+    assert(stream.real_bufsize_bytes == 4095 && allocation_calls == calls + 3);
+
+    stream.last_render_request_bytes = UINT32_MAX - 24;
+    assert(render_ring_limit(&stream) == UINT32_MAX);
+    stream.last_render_request_bytes += 3;
+    assert(render_ring_limit(&stream) == UINT32_MAX);
+    stream.frame_size = 4;
+    stream.last_render_request_bytes = UINT32_MAX - 3;
+    assert(render_ring_limit(&stream) == UINT32_MAX - 3);
+    free(stream.local_buffer);
+}
+
 static void test_capture_offset(void)
 {
     BYTE ring[64] = {0}, input[] = {1, 2, 3, 4};
@@ -592,6 +757,12 @@ int main(int argc, char **argv)
     if (argc == 1 || !strcmp(argv[1], "sizes")) test_buffer_sizes();
     if (argc == 1 || !strcmp(argv[1], "render")) test_render_bounds();
     if (argc == 1 || !strcmp(argv[1], "backpressure")) test_render_backpressure();
+    if (argc == 1 || !strcmp(argv[1], "resize"))
+    {
+        test_render_resize(2, 5);
+        test_render_resize(6, 2);
+        test_render_resize_limits();
+    }
     if (argc == 1 || !strcmp(argv[1], "capture")) test_capture_offset();
     puts("PipeWire stream tests passed");
     return 0;

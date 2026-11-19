@@ -139,6 +139,7 @@ struct pipewire_stream
      * RT_PROCESS path returns.  pa_offs_bytes stays plain. */
     SIZE_T lcl_offs_bytes, pa_offs_bytes;
     SIZE_T tmp_buffer_bytes, held_bytes, pa_held_bytes;
+    UINT32 render_request_bytes, last_render_request_bytes, failed_render_capacity;
     BYTE *local_buffer, *tmp_buffer;
     void *locked_ptr;
     UINT64 mmdev_period_usec;
@@ -2610,6 +2611,7 @@ static void on_stream_process(void *data)
         else
             req_frames = (UINT32)b->requested;
         need_bytes = req_frames * stream->frame_size;
+        stream->render_request_bytes = need_bytes;
 
         if (stream->started)
         {
@@ -3468,6 +3470,8 @@ static NTSTATUS pipewire_reset(void *args)
         stream->clock_lastpos = stream->clock_written = 0;
         stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
         stream->held_bytes = 0;
+        stream->render_request_bytes = stream->last_render_request_bytes = 0;
+        stream->failed_render_capacity = 0;
         __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
     }
     else
@@ -3519,13 +3523,56 @@ static BOOL alloc_tmp_buffer(struct pipewire_stream *stream, SIZE_T bytes)
     return TRUE;
 }
 
+static SIZE_T render_ring_limit(const struct pipewire_stream *stream)
+{
+    SIZE_T app_bytes = stream->bufsize_frames * stream->frame_size;
+    SIZE_T quantum = stream->last_render_request_bytes;
+
+    /* Leave room for the next WASAPI write alongside one graph cycle. */
+    if (quantum > UINT32_MAX - app_bytes) return UINT32_MAX - UINT32_MAX % stream->frame_size;
+    return app_bytes + max(quantum, app_bytes);
+}
+
+static void update_render_ring_size(struct pipewire_stream *stream)
+{
+    SIZE_T capacity, size, unread, tail, release_size = 0;
+    BYTE *buffer = NULL;
+
+    if (stream->render_request_bytes == stream->last_render_request_bytes) return;
+    stream->last_render_request_bytes = stream->render_request_bytes;
+    capacity = render_ring_limit(stream);
+    if (capacity <= stream->real_bufsize_bytes) return;
+    if (stream->failed_render_capacity && capacity >= stream->failed_render_capacity) return;
+
+    size = capacity;
+    if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&buffer, zero_bits,
+                                &size, MEM_COMMIT, PAGE_READWRITE))
+    {
+        stream->failed_render_capacity = capacity;
+        return;
+    }
+
+    /* Both readers end at the same write position, even when one runs ahead. */
+    unread = __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE);
+    tail = max(unread, stream->held_bytes);
+    copy_from_ring(buffer + (tail - unread), stream->local_buffer, stream->real_bufsize_bytes,
+                   stream->pa_offs_bytes, unread);
+    stream->pa_offs_bytes = tail - unread;
+    stream->lcl_offs_bytes = tail - stream->held_bytes;
+    NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &release_size, MEM_RELEASE);
+    stream->local_buffer = buffer;
+    size = min(size, UINT32_MAX);
+    stream->real_bufsize_bytes = size - size % stream->frame_size;
+}
+
 static UINT32 pipewire_render_writable_frames(struct pipewire_stream *stream)
 {
     SIZE_T unread = __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE);
+    SIZE_T limit = min(render_ring_limit(stream), stream->real_bufsize_bytes);
 
     /* The WASAPI timer can advance before PipeWire reads the queued samples. */
     return min(stream->bufsize_frames - stream->held_bytes / stream->frame_size,
-               (stream->real_bufsize_bytes - unread) / stream->frame_size);
+               (limit - min(unread, limit)) / stream->frame_size);
 }
 
 static UINT32 pipewire_capture_padding(struct pipewire_stream *stream)
@@ -3578,6 +3625,8 @@ static NTSTATUS pipewire_get_render_buffer(void *args)
         return STATUS_SUCCESS;
     }
 
+    /* Honor the space already offered before applying a smaller graph quantum. */
+    update_render_ring_size(stream);
     bytes = (SIZE_T)params->frames * stream->frame_size;
     wri_offs_bytes = ((UINT64)stream->lcl_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
     if (bytes > stream->real_bufsize_bytes - wri_offs_bytes)
