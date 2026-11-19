@@ -58,6 +58,7 @@ struct key_repeat
     timeout_t            period;           /* auto-repeat period */
     union hw_input       input;            /* the input to repeat */
     unsigned int         flags;            /* the queue_keyboard_message flags */
+    unsigned int         vkey;             /* resolved virtual key */
     user_handle_t        win;              /* target window for input event */
     struct timeout_user *timeout;          /* timeout for repeat */
 };

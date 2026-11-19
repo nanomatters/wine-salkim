@@ -93,6 +93,7 @@ struct message
     unsigned int           unique_id; /* unique id for nested hw message waits */
     struct message_result *result;    /* result in sender queue */
     int                    not_mergeable; /* message can not be coalesced */
+    int                    key_repeat_target; /* keydown bound to a repeat window */
 };
 
 struct timer
@@ -2069,10 +2070,22 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
     desktop_shm_t *desktop_shm = desktop->shared;
     user_handle_t win;
     struct thread *thread;
-    struct thread_input *input;
+    struct thread_input *input = NULL;
     struct hardware_msg_data *msg_data = msg->data;
     unsigned int msg_code;
     int flags, msg_bit;
+
+    if (msg->key_repeat_target)
+    {
+        /* A low-level hook may return after the repeat's window was destroyed. */
+        if (!(thread = get_window_thread( msg->win )))
+        {
+            free_message( msg );
+            return;
+        }
+        input = thread->queue->input;
+        release_object( thread );
+    }
 
     update_desktop_key_state( desktop, msg->msg, msg->wparam );
     last_input_time = get_tick_count();
@@ -2103,12 +2116,12 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
     msg->x = desktop_shm->cursor.x;
     msg->y = desktop_shm->cursor.y;
 
-    if (msg->win && (thread = get_window_thread( msg->win )))
+    if (!input && msg->win && (thread = get_window_thread( msg->win )))
     {
         input = thread->queue->input;
         release_object( thread );
     }
-    else input = desktop->foreground_input;
+    if (!input) input = desktop->foreground_input;
 
     win = find_hardware_message_window( desktop, input, msg, &msg_code, &thread );
     flags = thread ? get_rawinput_device_flags( thread->process, msg ) : 0;
@@ -2533,7 +2546,16 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     lparam_t lparam = input->kbd.scan << 16;
     unsigned int flags = 0;
     BOOL unicode = input->kbd.flags & KEYEVENTF_UNICODE;
+    BOOL repeat_enabled = origin == IMO_HARDWARE && !(input->kbd.flags & KEYEVENTF_KEYUP) &&
+                          desktop->key_repeat.enable;
     int wait;
+
+    win = get_user_full_handle( win );
+    if (repeat_enabled && win && !repeat)
+    {
+        if (!(foreground = get_window_thread( win ))) return 0;
+        release_object( foreground );
+    }
 
     if (!(time = input->kbd.time)) time = get_tick_count();
 
@@ -2633,12 +2655,13 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
             stop_key_repeat( desktop );
         }
         /* if a key is down, start or continue auto-repeating */
-        if (!(input->kbd.flags & KEYEVENTF_KEYUP) && desktop->key_repeat.enable)
+        if (repeat_enabled)
         {
             timeout_t timeout = repeat ? desktop->key_repeat.period : desktop->key_repeat.delay;
             desktop->key_repeat.input = *input;
             desktop->key_repeat.flags = send_flags;
             desktop->key_repeat.input.kbd.time = 0;
+            desktop->key_repeat.vkey = vkey;
             desktop->key_repeat.win = win;
             if (desktop->key_repeat.timeout) remove_timeout_user( desktop->key_repeat.timeout );
             desktop->key_repeat.timeout = add_timeout_user( timeout, key_repeat_timeout, desktop );
@@ -2665,8 +2688,9 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     if (!(msg = alloc_hardware_message( input->kbd.info, source, time, 0 ))) return 0;
     msg_data = msg->data;
 
-    msg->win       = get_user_full_handle( win );
+    msg->win       = win;
     msg->msg       = message_code;
+    msg->key_repeat_target = repeat_enabled && win;
     if (origin == IMO_INJECTED) msg_data->flags = LLKHF_INJECTED;
 
     if (!unicode || input->kbd.vkey)
@@ -3106,10 +3130,22 @@ void inc_queue_paint_count( struct thread *thread, int incr )
 void queue_cleanup_window( struct thread *thread, user_handle_t win )
 {
     struct msg_queue *queue = thread->queue;
+    struct desktop *desktop;
     struct list *ptr;
     int i;
 
     if (!queue) return;
+
+    desktop = queue->input->desktop;
+    if (desktop->key_repeat.win == win)
+    {
+        unsigned int vkey = desktop->key_repeat.vkey;
+
+        /* The input driver may have missed the release during teardown. */
+        stop_key_repeat( desktop );
+        update_desktop_key_state( desktop, WM_KEYUP, vkey );
+        if (vkey == VK_LMENU || vkey == VK_RMENU) desktop->alt_pressed = 0;
+    }
 
     /* remove timers */
 
