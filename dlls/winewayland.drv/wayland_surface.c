@@ -7088,10 +7088,11 @@ void wayland_surface_delta_to_external_input(struct wayland_surface *surface,
 
 BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
                                                    double surface_x, double surface_y,
-                                                   POINT *screen, RECT *input_rect)
+                                                   POINT *screen, RECT *input_rect, BOOL floor_coords)
 {
     struct wayland_hwnd_dmabuf_surface *surface;
     RECT visible_rect = {0}, window_rect;
+    double x, y;
     int dest_width = 0, dest_height = 0;
     UINT dpi = 0;
     HWND hwnd = NULL;
@@ -7118,10 +7119,10 @@ BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
 
     *input_rect = visible_rect;
     OffsetRect(input_rect, window_rect.left, window_rect.top);
-    screen->x = input_rect->left + round(surface_x *
-            (visible_rect.right - visible_rect.left) / dest_width);
-    screen->y = input_rect->top + round(surface_y *
-            (visible_rect.bottom - visible_rect.top) / dest_height);
+    x = surface_x * (visible_rect.right - visible_rect.left) / dest_width;
+    y = surface_y * (visible_rect.bottom - visible_rect.top) / dest_height;
+    screen->x = input_rect->left + (floor_coords ? floor(x) : round(x));
+    screen->y = input_rect->top + (floor_coords ? floor(y) : round(y));
     if (screen->x >= input_rect->right) screen->x = input_rect->right - 1;
     else if (screen->x < input_rect->left) screen->x = input_rect->left;
     if (screen->y >= input_rect->bottom) screen->y = input_rect->bottom - 1;

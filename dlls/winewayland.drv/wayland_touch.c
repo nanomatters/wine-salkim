@@ -84,7 +84,7 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     {
         if (!wayland_hwnd_dmabuf_surface_coords_to_screen(
                     wl_surface, wl_fixed_to_double(x), wl_fixed_to_double(y),
-                    &screen, &input_rect))
+                    &screen, &input_rect, FALSE))
             goto err;
         touch_x = screen.x;
         touch_y = screen.y;
@@ -189,7 +189,7 @@ static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
     {
         if (!wayland_hwnd_dmabuf_surface_coords_to_screen(
                     point->focused_wl_surface, wl_fixed_to_double(x),
-                    wl_fixed_to_double(y), &screen, &input_rect))
+                    wl_fixed_to_double(y), &screen, &input_rect, FALSE))
             return;
         touch_x = screen.x;
         touch_y = screen.y;

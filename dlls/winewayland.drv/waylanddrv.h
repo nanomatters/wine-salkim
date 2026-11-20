@@ -852,7 +852,7 @@ void wayland_surface_delta_to_external_input(struct wayland_surface *surface,
                                              LONG *input_width, LONG *input_height);
 BOOL wayland_hwnd_dmabuf_surface_coords_to_screen(struct wl_surface *wl_surface,
                                                    double surface_x, double surface_y,
-                                                   POINT *screen, RECT *input_rect);
+                                                   POINT *screen, RECT *input_rect, BOOL floor_coords);
 void wayland_surface_coords_from_screen(struct wayland_surface *surface,
                                         const struct wayland_win_data *data,
                                         double screen_x, double screen_y,

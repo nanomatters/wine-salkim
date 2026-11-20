@@ -210,13 +210,14 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
                     &external_x, &external_y, &external_width, &external_height);
         wayland_surface_coords_to_screen(surface, data, wl_fixed_to_double(sx),
                                          wl_fixed_to_double(sy), &screen_x, &screen_y);
-        screen.x = round(screen_x);
-        screen.y = round(screen_y);
+        /* Hit-test the pixel containing the pointer. */
+        screen.x = floor(screen_x);
+        screen.y = floor(screen_y);
         wayland_win_data_release(data);
     }
     else if (!wayland_hwnd_dmabuf_surface_coords_to_screen(
-                     focused_wl_surface, wl_fixed_to_double(sx),
-                     wl_fixed_to_double(sy), &screen, &input_rect))
+                     focused_wl_surface, wl_fixed_to_double(sx), wl_fixed_to_double(sy),
+                     &screen, &input_rect, !external_input_active))
         return;
     else if (external_input_active)
     {
@@ -1621,7 +1622,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     BOOL commit_constraint_region, commit_position_hint = FALSE, covers_vscreen = FALSE;
     const RECT *confine_rect = NULL;
     RECT surface_clip;
-    POINT cursor_pos, warp;
+    POINT cursor_pos;
     double warp_x, warp_y;
 
     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
@@ -1650,10 +1651,9 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
          * host fullscreen classification used for presentation. */
         covers_vscreen = (data->virtual_desktop || wayland_win_data_is_fullscreen(data)) &&
                           wayland_win_data_covers_virtual_screen(data);
-        wayland_surface_coords_from_screen(surface, data, cursor_pos.x,
-                                           cursor_pos.y, &warp_x, &warp_y);
-        warp.x = round(warp_x);
-        warp.y = round(warp_y);
+        /* Center the warp within the pixel used for absolute pointer input. */
+        wayland_surface_coords_from_screen(surface, data, cursor_pos.x + 0.5,
+                                           cursor_pos.y + 0.5, &warp_x, &warp_y);
     }
     wayland_win_data_release(data);
 
@@ -1666,11 +1666,11 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
                     process_wayland.wp_pointer_warp_v1,
                     wl_surface,
                     pointer->wl_pointer,
-                    wl_fixed_from_int(warp.x),
-                    wl_fixed_from_int(warp.y),
+                    wl_fixed_from_double(warp_x),
+                    wl_fixed_from_double(warp_y),
                     pointer->enter_serial);
-            TRACE("warp_pointer hwnd=%p wayland_xy=%s screen_xy=%s\n",
-                    hwnd, wine_dbgstr_point(&warp), wine_dbgstr_point(&cursor_pos));
+            TRACE("warp_pointer hwnd=%p wayland_xy=%.2f,%.2f screen_xy=%s\n",
+                    hwnd, warp_x, warp_y, wine_dbgstr_point(&cursor_pos));
         }
         else
         {
@@ -1684,8 +1684,8 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     {
         zwp_locked_pointer_v1_set_cursor_position_hint(
                 pointer->zwp_locked_pointer_v1,
-                wl_fixed_from_int(warp.x),
-                wl_fixed_from_int(warp.y));
+                wl_fixed_from_double(warp_x),
+                wl_fixed_from_double(warp_y));
         commit_position_hint =
                 !wayland_pointer_needs_lock(pointer, wl_surface,
                                             confine_rect,
@@ -1696,8 +1696,8 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     if (commit_position_hint)
     {
         wayland_pointer_commit_surface_state(hwnd, wl_surface);
-        TRACE("position hint hwnd=%p wayland_xy=%s screen_xy=%s\n",
-                hwnd, wine_dbgstr_point(&warp), wine_dbgstr_point(&cursor_pos));
+        TRACE("position hint hwnd=%p wayland_xy=%.2f,%.2f screen_xy=%s\n",
+                hwnd, warp_x, warp_y, wine_dbgstr_point(&cursor_pos));
     }
 
     pthread_mutex_lock(&pointer->mutex);
