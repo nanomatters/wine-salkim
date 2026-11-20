@@ -438,14 +438,15 @@ static void test_processor_percentages( void )
     {
         "\\Processor Information(*)\\Processor Frequency",
         "\\Processor Information(*)\\% Processor Performance",
+        "\\Processor Information(*)\\% Processor Utility",
     };
     PDH_FMT_COUNTERVALUE_ITEM_A *items[ARRAY_SIZE(paths)] = {0};
     PDH_HCOUNTER counters[ARRAY_SIZE(paths)], total;
     PDH_RAW_COUNTER older = {PDH_CSTATUS_VALID_DATA, {1, 0}, 500, 20, 1};
     PDH_RAW_COUNTER newer = {PDH_CSTATUS_VALID_DATA, {2, 0}, 593, 22, 1};
     PDH_FMT_COUNTERVALUE value;
-    DWORD counts[ARRAY_SIZE(paths)], i, size;
-    BOOL measured = FALSE, positive = FALSE;
+    DWORD counts[ARRAY_SIZE(paths)], i, size, start;
+    BOOL measured = FALSE, positive = FALSE, have_utility = FALSE, busy_cpu = FALSE;
     PDH_HQUERY query;
     PDH_STATUS ret;
 
@@ -473,7 +474,9 @@ static void test_processor_percentages( void )
     ret = PdhCollectQueryData( query );
     ok(!ret, "First collection returned %#lx\n", ret);
     if (ret) goto done;
-    Sleep( 100 );
+    /* Give at least one logical processor work between samples. */
+    start = GetTickCount();
+    while (GetTickCount() - start < 100) YieldProcessor();
     ret = PdhCollectQueryData( query );
     ok(!ret, "Second collection returned %#lx\n", ret);
     if (ret) goto done;
@@ -500,8 +503,22 @@ static void test_processor_percentages( void )
         const char *name = items[0][i].szName;
         PDH_FMT_COUNTERVALUE *mhz = &items[0][i].FmtValue;
         PDH_FMT_COUNTERVALUE *perf = find_cpu_value( items[1], counts[1], name );
+        PDH_FMT_COUNTERVALUE *utility = find_cpu_value( items[2], counts[2], name );
 
         ok(perf != NULL, "Missing Performance instance %s\n", name);
+        ok(utility != NULL, "Missing Utility instance %s\n", name);
+        if (utility && utility->CStatus <= PDH_CSTATUS_NEW_DATA)
+        {
+            ok(utility->doubleValue >= 0, "%s: utility %g\n", name, utility->doubleValue);
+            if (!strstr( name, "_Total" ))
+            {
+                have_utility = TRUE;
+                if (utility->doubleValue > 0) busy_cpu = TRUE;
+                if (perf && perf->CStatus <= PDH_CSTATUS_NEW_DATA && perf->doubleValue > 0)
+                    ok(utility->doubleValue <= perf->doubleValue + 5.0, "%s: utility %g, performance %g\n",
+                       name, utility->doubleValue, perf->doubleValue);
+            }
+        }
         if (!perf || perf->CStatus > PDH_CSTATUS_NEW_DATA) continue;
         ok(perf->doubleValue >= 0, "%s: performance %g\n", name, perf->doubleValue);
         if (strstr( name, "_Total" ) || mhz->CStatus > PDH_CSTATUS_NEW_DATA || !mhz->doubleValue) continue;
@@ -510,6 +527,8 @@ static void test_processor_percentages( void )
     }
     if (measured) ok(positive, "Every logical processor reports zero effective MHz\n");
     else skip("No logical processor with frequency and performance data\n");
+    if (have_utility) ok(busy_cpu, "Every logical processor reports zero utility during busy work\n");
+    else skip("No logical processor with utility data\n");
 
 done:
     for (i = 0; i < ARRAY_SIZE(items); ++i) free( items[i] );

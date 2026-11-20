@@ -76,6 +76,7 @@ enum processor_metric
 {
     PROCESSOR_FREQUENCY,
     PROCESSOR_PERFORMANCE,
+    PROCESSOR_UTILITY,
     PROCESSOR_METRIC_COUNT,
 };
 
@@ -322,7 +323,7 @@ static double processor_performance( const SYSTEM_WINE_PROCESSOR_PERFORMANCE_INF
 static PDH_STATUS sample_processors( struct processor_data *data )
 {
     SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION *samples, *previous;
-    struct counter_instance *frequency, *performance;
+    struct counter_instance *frequency, *performance, *utility;
     BOOL have_samples, have_power = FALSE;
     unsigned int i, sample_size;
     PDH_STATUS ret;
@@ -330,6 +331,7 @@ static PDH_STATUS sample_processors( struct processor_data *data )
     if (!data->items && (ret = init_processor_data( data ))) return ret;
     frequency = processor_instances( data, PROCESSOR_FREQUENCY );
     performance = processor_instances( data, PROCESSOR_PERFORMANCE );
+    utility = processor_instances( data, PROCESSOR_UTILITY );
     samples = data->samples;
     previous = samples + data->cpu_count;
     sample_size = data->cpu_count * sizeof(*samples);
@@ -349,11 +351,13 @@ static PDH_STATUS sample_processors( struct processor_data *data )
         frequency[i].status = PDH_CSTATUS_VALID_DATA;
     }
     begin_processor_average( data, performance );
+    begin_processor_average( data, utility );
     for (i = 0; i < data->cpu_count; ++i)
     {
         const SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION *sample = &samples[i];
         ULONG mhz = have_samples ? (sample->NominalMhz ? sample->NominalMhz : sample->CurrentMhz) :
                                    data->power[i].CurrentMhz;
+        ULONGLONG ticks, idle;
         double percent;
 
         frequency[i].one.largevalue = mhz;
@@ -369,8 +373,15 @@ static PDH_STATUS sample_processors( struct processor_data *data )
         if (!have_samples || !data->have_previous || !previous[i].TotalTime ||
             sample->TotalTime <= previous[i].TotalTime) continue;
         percent = processor_performance( sample, &previous[i] );
-        if (percent >= 0.0)
-            add_processor_average( data, performance, i, sample->TotalTime - previous[i].TotalTime, percent );
+        if (percent < 0.0) continue;
+        ticks = sample->TotalTime - previous[i].TotalTime;
+        add_processor_average( data, performance, i, ticks, percent );
+
+        /* Linux's I/O wait accounting can decrease between reads. */
+        if (sample->IdleTime < previous[i].IdleTime) continue;
+        idle = sample->IdleTime - previous[i].IdleTime;
+        if (idle <= ticks)
+            add_processor_average( data, utility, i, ticks, percent * (ticks - idle) / ticks );
     }
     for (i = data->cpu_count; i < data->item_count; ++i)
         frequency[i].one.largevalue /= data->rows[i].cpu_count;
@@ -430,6 +441,8 @@ static const struct source counter_sources[] =
       PERF_COUNTER_RAWCOUNT, 0, 0, PROCESSOR_FREQUENCY },
     { 0, L"\\Processor Information(*)\\% Processor Performance", collect_processor_data,
       PERF_AVERAGE_BULK, 0, 0, PROCESSOR_PERFORMANCE },
+    { 0, L"\\Processor Information(*)\\% Processor Utility", collect_processor_data,
+      PERF_AVERAGE_BULK, 0, 0, PROCESSOR_UTILITY },
 };
 
 static BOOL is_local_machine( const WCHAR *name, DWORD len )
