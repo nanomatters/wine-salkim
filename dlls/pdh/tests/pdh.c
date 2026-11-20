@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "windows.h"
 
@@ -308,6 +309,118 @@ static void test_PdhAddEnglishCounterW( void )
 
     ret = PdhCloseQuery( query );
     ok(ret == ERROR_SUCCESS, "PdhCloseQuery failed 0x%08lx\n", ret);
+}
+
+static void test_processor_frequency( void )
+{
+    PDH_FMT_COUNTERVALUE_ITEM_A *items_a = NULL;
+    PDH_FMT_COUNTERVALUE_ITEM_W *items_w = NULL;
+    PDH_FMT_COUNTERVALUE value;
+    PDH_RAW_COUNTER raw;
+    PDH_HCOUNTER wildcard, total;
+    DWORD size, required, count_a, count_w, i;
+    BOOL found_cpu = FALSE, found_node = FALSE, found_total = FALSE;
+    double total_mhz = -1;
+    unsigned int node, cpu;
+    PDH_HQUERY query;
+    PDH_STATUS ret;
+    char extra;
+
+    ret = PdhOpenQueryA( NULL, 0, &query );
+    ok(!ret, "PdhOpenQueryA returned %#lx\n", ret);
+    if (ret) return;
+
+    ret = pPdhAddEnglishCounterA( query, "\\Processor Information(*)\\Processor Frequency", 0, &wildcard );
+    if (ret == PDH_CSTATUS_NO_COUNTER || ret == PDH_CSTATUS_NO_OBJECT)
+    {
+        win_skip("Processor Frequency unavailable\n");
+        goto done;
+    }
+    ok(!ret, "Adding wildcard counter returned %#lx\n", ret);
+    if (ret) goto done;
+    ret = pPdhAddEnglishCounterW( query, L"\\Processor Information(_Total)\\Processor Frequency", 0, &total );
+    ok(!ret, "Adding total counter returned %#lx\n", ret);
+    if (ret) goto done;
+    ret = PdhValidatePathW( L"\\Processor Information(_Total)\\Processor Frequency" );
+    ok(!ret, "Validating total counter returned %#lx\n", ret);
+    ret = PdhValidatePathW( L"\\Processor Information(no-such-cpu)\\Processor Frequency" );
+    ok(ret == PDH_CSTATUS_NO_INSTANCE, "Validating missing instance returned %#lx\n", ret);
+
+    ret = PdhCollectQueryData( query );
+    ok(!ret, "PdhCollectQueryData returned %#lx\n", ret);
+    if (ret) goto done;
+
+    size = count_a = 0;
+    ret = PdhGetFormattedCounterArrayA( wildcard, PDH_FMT_DOUBLE, &size, &count_a, NULL );
+    ok(ret == PDH_MORE_DATA, "Expected PDH_MORE_DATA, got %#lx\n", ret);
+    ok(size >= 2 * sizeof(*items_a), "Unexpected size %lu\n", size);
+    if (ret != PDH_MORE_DATA || size < 2 * sizeof(*items_a)) goto done;
+    required = size;
+    items_a = malloc( required );
+    size = 1;
+    ((BYTE *)items_a)[1] = 0xcd;
+    ret = PdhGetFormattedCounterArrayA( wildcard, PDH_FMT_DOUBLE, &size, &count_a, items_a );
+    ok(ret == PDH_MORE_DATA || ret == PDH_INVALID_ARGUMENT, "Undersized buffer returned %#lx\n", ret);
+    ok(((BYTE *)items_a)[1] == 0xcd, "Wrote past end of buffer\n");
+    size = required;
+    ret = PdhGetFormattedCounterArrayA( wildcard, PDH_FMT_DOUBLE, &size, &count_a, items_a );
+    ok(!ret, "Reading ANSI array returned %#lx\n", ret);
+    if (ret) goto done;
+    for (i = 0; i < count_a; i++)
+    {
+        const char *suffix = strchr( items_a[i].szName, ',' );
+
+        value = items_a[i].FmtValue;
+        ok(value.CStatus == PDH_CSTATUS_VALID_DATA || value.CStatus == PDH_CSTATUS_NEW_DATA,
+           "%s: status %#lx\n", items_a[i].szName, value.CStatus);
+        ok(value.doubleValue >= 0, "%s: frequency %g\n", items_a[i].szName, value.doubleValue);
+        if (!strcmp( items_a[i].szName, "_Total" )) total_mhz = value.doubleValue;
+        if (suffix && !strcmp( suffix, ",_Total" )) found_node = TRUE;
+        if (sscanf( items_a[i].szName, "%u,%u%c", &node, &cpu, &extra ) == 2) found_cpu = TRUE;
+    }
+    ok(total_mhz >= 0, "Missing _Total instance\n");
+    ok(found_node, "Missing NUMA node total\n");
+    ok(found_cpu, "Missing logical processor instance\n");
+
+    size = count_w = 0;
+    ret = PdhGetFormattedCounterArrayW( wildcard, PDH_FMT_LARGE, &size, &count_w, NULL );
+    ok(ret == PDH_MORE_DATA, "Expected PDH_MORE_DATA, got %#lx\n", ret);
+    if (ret != PDH_MORE_DATA || !size) goto done;
+    required = size;
+    size += 64;
+    items_w = malloc( size );
+    ret = PdhGetFormattedCounterArrayW( wildcard, PDH_FMT_LARGE | PDH_FMT_1000, &size, &count_w, items_w );
+    ok(!ret, "Reading Unicode array returned %#lx\n", ret);
+    if (ret) goto done;
+    ok(size >= count_w * sizeof(*items_w) && size <= required,
+       "Returned size %lu for required size %lu\n", size, required);
+    ok(count_w == count_a, "Got %lu Unicode and %lu ANSI items\n", count_w, count_a);
+    for (i = 0; i < count_w; i++)
+        if (!wcscmp( items_w[i].szName, L"_Total" ))
+        {
+            ok(items_w[i].FmtValue.largeValue == total_mhz * 1000, "Scaled frequency %s, expected %g\n",
+               wine_dbgstr_longlong(items_w[i].FmtValue.largeValue), total_mhz * 1000);
+            found_total = TRUE;
+        }
+    ok(found_total, "Missing Unicode _Total instance\n");
+
+    ret = PdhGetFormattedCounterValue( total, PDH_FMT_LONG, NULL, &value );
+    ok(!ret, "Reading total counter returned %#lx\n", ret);
+    if (ret) goto done;
+    ret = PdhGetRawCounterValue( total, NULL, &raw );
+    ok(!ret, "Reading raw total returned %#lx\n", ret);
+    if (ret) goto done;
+    ok(raw.FirstValue == value.longValue, "Raw frequency %s, formatted %ld\n",
+       wine_dbgstr_longlong(raw.FirstValue), value.longValue);
+    ret = PdhCalculateCounterFromRawValue( total, PDH_FMT_DOUBLE, &raw, NULL, &value );
+    ok(!ret, "Formatting raw total returned %#lx\n", ret);
+    if (!ret) ok(value.doubleValue == raw.FirstValue, "Frequency %g, expected %s\n",
+                 value.doubleValue, wine_dbgstr_longlong(raw.FirstValue));
+
+done:
+    free( items_w );
+    free( items_a );
+    PdhCloseQuery( query );
 }
 
 static void test_PdhCollectQueryDataWithTime( void )
@@ -1033,6 +1146,7 @@ START_TEST(pdh)
 
     if (pPdhAddEnglishCounterA) test_PdhAddEnglishCounterA();
     if (pPdhAddEnglishCounterW) test_PdhAddEnglishCounterW();
+    if (pPdhAddEnglishCounterA && pPdhAddEnglishCounterW) test_processor_frequency();
     if (pPdhCollectQueryDataWithTime) test_PdhCollectQueryDataWithTime();
 
     test_PdhGetFormattedCounterValue();

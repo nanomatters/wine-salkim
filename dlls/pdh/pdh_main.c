@@ -25,6 +25,7 @@
 
 #include "windef.h"
 #include "winbase.h"
+#include "winternl.h"
 
 #include "pdh.h"
 #include "pdhmsg.h"
@@ -63,6 +64,28 @@ union value
     LONGLONG largevalue;
 };
 
+struct counter_instance
+{
+    const WCHAR *name;
+    union value one, two;
+};
+
+struct processor_row
+{
+    WCHAR name[24];
+    unsigned int node_total, cpu_count;
+};
+
+struct processor_frequency
+{
+    PROCESSOR_POWER_INFORMATION *power;
+    struct processor_row *rows;
+    struct counter_instance *items;
+    unsigned int cpu_count, item_count;
+    BOOL collected;
+    PDH_STATUS status;
+};
+
 struct counter
 {
     DWORD           magic;                          /* signature */
@@ -79,6 +102,11 @@ struct counter
     void (CALLBACK *collect)( struct counter * );   /* collect callback */
     union value     one;                            /* first value */
     union value     two;                            /* second value */
+    struct processor_frequency *frequency;
+    const struct counter_instance *instances;
+    DWORD instance_count;
+    const WCHAR *instance;
+    BOOL wildcard;
 };
 
 #define PDH_MAGIC_COUNTER   0x50444831 /* 'PDH1' */
@@ -114,6 +142,7 @@ struct query
     HANDLE      wait;       /* wait event */
     HANDLE      stop;       /* stop event */
     struct list counters;   /* counter list */
+    struct processor_frequency frequency;
 };
 
 static struct query *create_query( void )
@@ -129,10 +158,18 @@ static struct query *create_query( void )
     return NULL;
 }
 
+static void free_processor_frequency( struct processor_frequency *freq )
+{
+    free( freq->power );
+    free( freq->rows );
+    free( freq->items );
+}
+
 static void destroy_query( struct query *query )
 {
     /* Ensure compiler doesn't optimize out the assignment with 0. */
     SecureZeroMemory( &query->magic, sizeof( query->magic ) );
+    free_processor_frequency( &query->frequency );
     free( query );
 }
 
@@ -158,6 +195,120 @@ static void CALLBACK collect_uptime( struct counter *counter )
     counter->status = PDH_CSTATUS_VALID_DATA;
 }
 
+static PDH_STATUS init_processor_frequency( struct processor_frequency *freq )
+{
+    struct processor_row *rows;
+    struct counter_instance *items;
+    PROCESSOR_POWER_INFORMATION *power;
+    SYSTEM_CPU_SET_INFORMATION *sets;
+    unsigned int nodes[256] = {0}, cpu_count, item_count, i, node, total;
+    ULONG size = 0;
+
+    GetSystemCpuSetInformation( NULL, 0, &size, NULL, 0 );
+    if (size < sizeof(*sets)) return PDH_NO_DATA;
+    if (!(sets = malloc( size ))) return PDH_MEMORY_ALLOCATION_FAILURE;
+    if (!GetSystemCpuSetInformation( sets, size, &size, NULL, 0 ))
+    {
+        free( sets );
+        return PDH_NO_DATA;
+    }
+
+    /* Wine returns one CPU set per entry in ProcessorInformation, in the same order. */
+    cpu_count = size / sizeof(*sets);
+    item_count = cpu_count;
+    for (i = 0; i < cpu_count; ++i)
+    {
+        node = sets[i].CpuSet.NumaNodeIndex;
+        if (!nodes[node]) nodes[node] = item_count++;
+    }
+    ++item_count; /* _Total */
+    rows = calloc( item_count, sizeof(*rows) );
+    items = calloc( item_count, sizeof(*items) );
+    power = malloc( cpu_count * sizeof(*power) );
+    if (!rows || !items || !power)
+    {
+        free( sets );
+        free( rows );
+        free( items );
+        free( power );
+        return PDH_MEMORY_ALLOCATION_FAILURE;
+    }
+    for (i = 0; i < cpu_count; ++i)
+    {
+        node = sets[i].CpuSet.NumaNodeIndex;
+        total = rows[i].node_total = nodes[node];
+        if (!rows[total].cpu_count)
+            swprintf( rows[total].name, ARRAY_SIZE(rows[total].name), L"%u,_Total", node );
+        swprintf( rows[i].name, ARRAY_SIZE(rows[i].name), L"%u,%u", node, rows[total].cpu_count++ );
+    }
+    free( sets );
+    wcscpy( rows[item_count - 1].name, L"_Total" );
+    rows[item_count - 1].cpu_count = cpu_count;
+    for (i = 0; i < item_count; ++i) items[i].name = rows[i].name;
+    freq->rows = rows;
+    freq->items = items;
+    freq->power = power;
+    freq->cpu_count = cpu_count;
+    freq->item_count = item_count;
+    return ERROR_SUCCESS;
+}
+
+static PDH_STATUS sample_processor_frequency( struct processor_frequency *freq )
+{
+    PDH_STATUS ret;
+    unsigned int i;
+
+    if (!freq->power && (ret = init_processor_frequency( freq ))) return ret;
+    if (NtPowerInformation( ProcessorInformation, NULL, 0, freq->power, freq->cpu_count * sizeof(*freq->power) ))
+        return PDH_NO_DATA;
+    for (i = freq->cpu_count; i < freq->item_count; ++i) freq->items[i].one.largevalue = 0;
+    for (i = 0; i < freq->cpu_count; ++i)
+    {
+        ULONG mhz = freq->power[i].CurrentMhz;
+        freq->items[i].one.largevalue = mhz;
+        freq->items[freq->rows[i].node_total].one.largevalue += mhz;
+        freq->items[freq->item_count - 1].one.largevalue += mhz;
+    }
+    for (i = freq->cpu_count; i < freq->item_count; ++i)
+        freq->items[i].one.largevalue /= freq->rows[i].cpu_count;
+    return ERROR_SUCCESS;
+}
+
+static const struct counter_instance *find_processor_instance( const struct processor_frequency *freq,
+                                                              const WCHAR *instance )
+{
+    size_t len = wcschr( instance, ')' ) - instance;
+    unsigned int i;
+
+    for (i = 0; i < freq->item_count; ++i)
+    {
+        const WCHAR *name = freq->items[i].name;
+        if (wcslen( name ) == len && !wcsnicmp( name, instance, len )) return &freq->items[i];
+    }
+    return NULL;
+}
+
+static void CALLBACK collect_processor_frequency( struct counter *counter )
+{
+    struct processor_frequency *freq = counter->frequency;
+    const struct counter_instance *item;
+
+    if (!freq->collected)
+    {
+        freq->status = sample_processor_frequency( freq );
+        freq->collected = TRUE;
+    }
+    if ((counter->status = freq->status)) return;
+    if (counter->wildcard)
+    {
+        counter->instances = freq->items;
+        counter->instance_count = freq->item_count;
+        return;
+    }
+    if ((item = find_processor_instance( freq, counter->instance ))) counter->one = item->one;
+    else counter->status = PDH_CSTATUS_NO_INSTANCE;
+}
+
 #define TYPE_PROCESSOR_TIME \
     (PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_RATE | PERF_TIMER_100NS | PERF_DELTA_COUNTER | \
      PERF_INVERSE_COUNTER | PERF_DISPLAY_PERCENT)
@@ -169,7 +320,8 @@ static void CALLBACK collect_uptime( struct counter *counter )
 static const struct source counter_sources[] =
 {
     { 6,   L"\\Processor(_Total)\\% Processor Time", collect_processor_time, TYPE_PROCESSOR_TIME, -5, 10000000 },
-    { 674, L"\\System\\System Up Time",              collect_uptime,         TYPE_UPTIME,         -3, 1000 }
+    { 674, L"\\System\\System Up Time",              collect_uptime,         TYPE_UPTIME,         -3, 1000 },
+    { 0, L"\\Processor Information(*)\\Processor Frequency", collect_processor_frequency, PERF_COUNTER_RAWCOUNT }
 };
 
 static BOOL is_local_machine( const WCHAR *name, DWORD len )
@@ -183,12 +335,20 @@ static BOOL is_local_machine( const WCHAR *name, DWORD len )
 
 static BOOL pdh_match_path( LPCWSTR fullpath, LPCWSTR path )
 {
-    const WCHAR *p;
+    const WCHAR *p, *star, *end;
 
     if (path[0] == '\\' && path[1] == '\\' && (p = wcschr( path + 2, '\\' )) &&
         is_local_machine( path + 2, p - path - 2 ))
     {
         path += p - path;
+    }
+    if ((star = wcschr( fullpath, '*' )))
+    {
+        size_t prefix = star - fullpath;
+        if (wcsnicmp( fullpath, path, prefix )) return FALSE;
+        p = path + prefix;
+        end = p + wcscspn( p, L"()\\" );
+        return end != p && !wcsicmp( star + 1, end );
     }
     if (wcschr( path, '\\' )) p = fullpath;
     else p = wcsrchr( fullpath, '\\' ) + 1;
@@ -245,13 +405,25 @@ PDH_STATUS WINAPI PdhAddCounterW( PDH_HQUERY hquery, LPCWSTR path,
         {
             if ((counter = create_counter()))
             {
-                counter->path         = wcsdup( counter_sources[i].path );
+                if (!(counter->path = wcsdup( path )))
+                {
+                    destroy_counter( counter );
+                    LeaveCriticalSection( &pdh_handle_cs );
+                    return PDH_MEMORY_ALLOCATION_FAILURE;
+                }
                 counter->collect      = counter_sources[i].collect;
                 counter->type         = counter_sources[i].type;
                 counter->defaultscale = counter_sources[i].scale;
                 counter->base         = counter_sources[i].base;
                 counter->queryuser    = query->user;
                 counter->user         = userdata;
+                if (counter->collect == collect_processor_frequency)
+                {
+                    counter->frequency = &query->frequency;
+                    counter->instance = wcsrchr( counter->path, '(' ) + 1;
+                    counter->wildcard = !wcsncmp( counter->instance, L"*)", 2 );
+                    counter->status = PDH_CSTATUS_ITEM_NOT_VALIDATED;
+                }
 
                 list_add_tail( &query->counters, &counter->entry );
                 *hcounter = counter;
@@ -294,11 +466,29 @@ PDH_STATUS WINAPI PdhAddEnglishCounterW( PDH_HQUERY query, LPCWSTR path,
 }
 
 /* caller must hold counter lock */
-static PDH_STATUS format_value( struct counter *counter, DWORD format, union value *raw1,
-                                union value *raw2, PDH_FMT_COUNTERVALUE *value )
+static PDH_STATUS format_raw_count( struct counter *counter, DWORD format, LONGLONG raw, PDH_FMT_COUNTERVALUE *value )
+{
+    double result = raw;
+
+    if (counter->scale && !(format & PDH_FMT_NOSCALE)) result *= pow( 10, counter->scale );
+    if (format & PDH_FMT_1000) result *= 1000;
+    switch (format & (PDH_FMT_LONG | PDH_FMT_LARGE | PDH_FMT_DOUBLE))
+    {
+    case PDH_FMT_LONG:   value->longValue = result; break;
+    case PDH_FMT_LARGE:  value->largeValue = result; break;
+    case PDH_FMT_DOUBLE: value->doubleValue = result; break;
+    default: return PDH_INVALID_ARGUMENT;
+    }
+    value->CStatus = PDH_CSTATUS_VALID_DATA;
+    return ERROR_SUCCESS;
+}
+
+static PDH_STATUS format_value( struct counter *counter, DWORD format, const union value *raw1,
+                                const union value *raw2, PDH_FMT_COUNTERVALUE *value )
 {
     LONG factor;
 
+    if (counter->type == PERF_COUNTER_RAWCOUNT) return format_raw_count( counter, format, raw1->largevalue, value );
     factor = counter->scale ? counter->scale : counter->defaultscale;
     if (format & PDH_FMT_LONG)
     {
@@ -344,8 +534,13 @@ PDH_STATUS WINAPI PdhCalculateCounterFromRawValue( PDH_HCOUNTER handle, DWORD fo
         return PDH_INVALID_HANDLE;
     }
 
-    ret = format_value( counter, format, (union value *)&raw1->SecondValue,
-                                         (union value *)&raw2->SecondValue, value );
+    if (counter->type == PERF_COUNTER_RAWCOUNT && raw1)
+        ret = format_raw_count( counter, format, raw1->FirstValue, value );
+    else if (!raw1 || !raw2)
+        ret = PDH_INVALID_ARGUMENT;
+    else
+        ret = format_value( counter, format, (union value *)&raw1->SecondValue,
+                                             (union value *)&raw2->SecondValue, value );
 
     LeaveCriticalSection( &pdh_handle_cs );
     return ret;
@@ -407,6 +602,7 @@ static void collect_query_data( struct query *query )
 {
     struct list *item;
 
+    query->frequency.collected = FALSE;
     LIST_FOR_EACH( item, &query->counters )
     {
         SYSTEMTIME time;
@@ -746,8 +942,9 @@ PDH_STATUS WINAPI PdhGetFormattedCounterValue( PDH_HCOUNTER handle, DWORD format
         LeaveCriticalSection( &pdh_handle_cs );
         return PDH_INVALID_HANDLE;
     }
-    if (counter->status)
+    if (counter->wildcard || counter->status)
     {
+        value->CStatus = counter->wildcard ? PDH_CSTATUS_INVALID_DATA : counter->status;
         LeaveCriticalSection( &pdh_handle_cs );
         return PDH_INVALID_DATA;
     }
@@ -780,6 +977,11 @@ PDH_STATUS WINAPI PdhGetRawCounterValue( PDH_HCOUNTER handle, LPDWORD type,
         return PDH_INVALID_HANDLE;
     }
 
+    if (counter->wildcard)
+    {
+        LeaveCriticalSection( &pdh_handle_cs );
+        return PDH_INVALID_DATA;
+    }
     value->CStatus                  = counter->status;
     value->TimeStamp.dwLowDateTime  = counter->stamp.dwLowDateTime;
     value->TimeStamp.dwHighDateTime = counter->stamp.dwHighDateTime;
@@ -793,24 +995,86 @@ PDH_STATUS WINAPI PdhGetRawCounterValue( PDH_HCOUNTER handle, LPDWORD type,
     return ERROR_SUCCESS;
 }
 
-PDH_STATUS WINAPI PdhGetFormattedCounterArrayW( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
-                                                PDH_FMT_COUNTERVALUE_ITEM_W *buffer)
+static PDH_STATUS get_formatted_array( struct counter *counter, DWORD format, DWORD *size, DWORD *count,
+                                       void *buffer, BOOL unicode )
 {
-    FIXME( "%p %lu %p %p %p stub.\n", handle, format, size, count, buffer );
+    PDH_FMT_COUNTERVALUE_ITEM_A *items_a = buffer;
+    PDH_FMT_COUNTERVALUE_ITEM_W *items_w = buffer;
+    unsigned int i;
+    size_t required;
+    PDH_STATUS ret;
+    char *names, *end;
 
-    *size = 0;
+    if (!size || !count || (!buffer && *size)) return PDH_INVALID_ARGUMENT;
     *count = 0;
+    if (!counter || counter->magic != PDH_MAGIC_COUNTER) return PDH_INVALID_HANDLE;
+    if (!counter->wildcard) return PDH_INVALID_ARGUMENT;
+    if (counter->status || !counter->instance_count) return PDH_NO_DATA;
+    switch (format & (PDH_FMT_LONG | PDH_FMT_LARGE | PDH_FMT_DOUBLE))
+    {
+    case PDH_FMT_LONG: case PDH_FMT_LARGE: case PDH_FMT_DOUBLE: break;
+    default: return PDH_INVALID_ARGUMENT;
+    }
+
+    required = (size_t)counter->instance_count * sizeof(*items_w);
+    for (i = 0; i < counter->instance_count; ++i)
+    {
+        const WCHAR *name = counter->instances[i].name;
+        required += unicode ? (wcslen( name ) + 1) * sizeof(WCHAR) :
+                              WideCharToMultiByte( CP_ACP, 0, name, -1, NULL, 0, NULL, NULL );
+    }
+    if (required > MAXDWORD) return PDH_MEMORY_ALLOCATION_FAILURE;
+    if (*size < required)
+    {
+        *size = required;
+        return PDH_MORE_DATA;
+    }
+    names = (char *)(items_w + counter->instance_count);
+    end = (char *)buffer + required;
+    for (i = 0; i < counter->instance_count; ++i)
+    {
+        const struct counter_instance *item = &counter->instances[i];
+        PDH_FMT_COUNTERVALUE *value;
+
+        if (unicode)
+        {
+            items_w[i].szName = (WCHAR *)names;
+            wcscpy( items_w[i].szName, item->name );
+            names += (wcslen( item->name ) + 1) * sizeof(WCHAR);
+            value = &items_w[i].FmtValue;
+        }
+        else
+        {
+            items_a[i].szName = names;
+            names += WideCharToMultiByte( CP_ACP, 0, item->name, -1, names, end - names, NULL, NULL );
+            value = &items_a[i].FmtValue;
+        }
+        if ((ret = format_value( counter, format, &item->one, &item->two, value ))) return ret;
+        value->CStatus = PDH_CSTATUS_VALID_DATA;
+    }
+    *size = required;
+    *count = counter->instance_count;
     return ERROR_SUCCESS;
 }
 
-PDH_STATUS WINAPI PdhGetFormattedCounterArrayA( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
-                                                PDH_FMT_COUNTERVALUE_ITEM_A *buffer)
+PDH_STATUS WINAPI PdhGetFormattedCounterArrayW( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
+                                                PDH_FMT_COUNTERVALUE_ITEM_W *buffer )
 {
-    FIXME( "%p %lu %p %p %p stub.\n", handle, format, size, count, buffer );
+    PDH_STATUS ret;
+    EnterCriticalSection( &pdh_handle_cs );
+    ret = get_formatted_array( handle, format, size, count, buffer, TRUE );
+    LeaveCriticalSection( &pdh_handle_cs );
+    return ret;
+}
 
-    *size = 0;
-    *count = 0;
-    return ERROR_SUCCESS;
+PDH_STATUS WINAPI PdhGetFormattedCounterArrayA( PDH_HCOUNTER handle, DWORD format, DWORD *size, DWORD *count,
+                                                PDH_FMT_COUNTERVALUE_ITEM_A *buffer )
+{
+    PDH_STATUS ret;
+    EnterCriticalSection( &pdh_handle_cs );
+    ret = get_formatted_array( handle, format, size, count, buffer, FALSE );
+    LeaveCriticalSection( &pdh_handle_cs );
+    return ret;
 }
 
 /***********************************************************************
@@ -856,7 +1120,7 @@ PDH_STATUS WINAPI PdhLookupPerfIndexByNameW( LPCWSTR machine, LPCWSTR name, LPDW
     }
     for (i = 0; i < ARRAY_SIZE(counter_sources); i++)
     {
-        if (pdh_match_path( counter_sources[i].path, name ))
+        if (counter_sources[i].index && pdh_match_path( counter_sources[i].path, name ))
         {
             *index = counter_sources[i].index;
             return ERROR_SUCCESS;
@@ -1065,7 +1329,19 @@ PDH_STATUS WINAPI PdhValidatePathW( LPCWSTR path )
     if ((ret = validate_path( path ))) return ret;
 
     for (i = 0; i < ARRAY_SIZE(counter_sources); i++)
-        if (pdh_match_path( counter_sources[i].path, path )) return ERROR_SUCCESS;
+    {
+        struct processor_frequency freq = {0};
+        const WCHAR *instance;
+
+        if (!pdh_match_path( counter_sources[i].path, path )) continue;
+        if (counter_sources[i].collect != collect_processor_frequency) return ERROR_SUCCESS;
+        instance = wcsrchr( path, '(' ) + 1;
+        if (!wcsncmp( instance, L"*)", 2 )) return ERROR_SUCCESS;
+        if ((ret = init_processor_frequency( &freq ))) return ret;
+        if (!find_processor_instance( &freq, instance )) ret = PDH_CSTATUS_NO_INSTANCE;
+        free_processor_frequency( &freq );
+        return ret;
+    }
 
     return PDH_CSTATUS_NO_COUNTER;
 }

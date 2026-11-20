@@ -4633,30 +4633,26 @@ NTSTATUS WINAPI NtShutdownSystem( SHUTDOWN_ACTION action )
 /* Fallback using /proc/cpuinfo for Linux systems without cpufreq. For
  * most distributions on recent enough hardware, this is only likely to
  * happen while running in virtualized environments such as QEMU. */
-static ULONG mhz_from_cpuinfo(void)
+static void fill_mhz_from_cpuinfo( PROCESSOR_POWER_INFORMATION *power, unsigned int count )
 {
     char line[512];
-    char *s, *value;
-    double cmz = 0;
-    FILE *f = fopen("/proc/cpuinfo", "r");
-    if(f)
+    unsigned int cpu = ~0u, i;
+    double mhz;
+    FILE *f;
+
+    if (!(f = fopen( "/proc/cpuinfo", "r" ))) return;
+    while (fgets( line, sizeof(line), f ))
     {
-        while (fgets(line, sizeof(line), f) != NULL)
+        if (sscanf( line, "processor : %u", &cpu ) == 1) continue;
+        if (sscanf( line, "cpu MHz : %lf", &mhz ) != 1) continue;
+        if (cpu_override.mapping.cpu_count)
         {
-            if (!(value = strchr(line,':'))) continue;
-            s = value - 1;
-            while ((s >= line) && (*s == ' ' || *s == '\t')) s--;
-            s[1] = 0;
-            value++;
-            if (!strcmp( line, "cpu MHz" ))
-            {
-                sscanf(value, " %lf", &cmz);
-                break;
-            }
+            for (i = 0; i < min( count, cpu_override.mapping.cpu_count ); i++)
+                if (cpu == cpu_override.mapping.host_cpu_id[i] && !power[i].CurrentMhz) power[i].CurrentMhz = mhz;
         }
-        fclose( f );
+        else if (cpu < count && !power[cpu].CurrentMhz) power[cpu].CurrentMhz = mhz;
     }
-    return cmz;
+    fclose( f );
 }
 
 static const char * get_sys_str(const char *dirname, const char *basename, char *s)
@@ -4991,45 +4987,29 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
         if ((out_size / sizeof(PROCESSOR_POWER_INFORMATION)) < out_cpus) return STATUS_BUFFER_TOO_SMALL;
 #if defined(linux)
         {
-            unsigned int val;
-            char filename[128];
-            FILE* f;
+            BOOL need_cpuinfo = FALSE;
+            char path[64];
 
-            for(i = 0; i < out_cpus; i++) {
-                snprintf(filename, sizeof(filename), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
-                f = fopen(filename, "r");
-                if (f && (fscanf(f, "%u", &val) == 1)) {
-                    cpu_power[i].MaxMhz = val / 1000;
-                    fclose(f);
-                    cpu_power[i].CurrentMhz = cpu_power[i].MaxMhz;
-                }
-                else {
-                    if(i == 0) {
-                        cpu_power[0].CurrentMhz = mhz_from_cpuinfo();
-                        if(cpu_power[0].CurrentMhz == 0)
-                            cpu_power[0].CurrentMhz = cannedMHz;
-                    }
-                    else
-                        cpu_power[i].CurrentMhz = cpu_power[0].CurrentMhz;
-                    cpu_power[i].MaxMhz = cpu_power[i].CurrentMhz;
-                    if(f) fclose(f);
-                }
+            for (i = 0; i < out_cpus; i++)
+            {
+                unsigned int cpu = i < cpu_override.mapping.cpu_count ? cpu_override.mapping.host_cpu_id[i] : i;
 
-                snprintf(filename, sizeof(filename), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", i);
-                f = fopen(filename, "r");
-                if(f && (fscanf(f, "%u", &val) == 1)) {
-                    cpu_power[i].MhzLimit = val / 1000;
-                    fclose(f);
-                }
-                else
-                {
-                    cpu_power[i].MhzLimit = cpu_power[i].MaxMhz;
-                    if(f) fclose(f);
-                }
+                snprintf( path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpufreq", cpu );
+                cpu_power[i].MaxMhz = get_sys_int( path, "cpuinfo_max_freq" ) / 1000;
+                cpu_power[i].CurrentMhz = cpu_power[i].MaxMhz;
+                if (!cpu_power[i].CurrentMhz) need_cpuinfo = TRUE;
+                cpu_power[i].MhzLimit = get_sys_int( path, "scaling_max_freq" ) / 1000;
 
                 cpu_power[i].Number = i;
                 cpu_power[i].MaxIdleState = 0;     /* FIXME */
                 cpu_power[i].CurrentIdleState = 0; /* FIXME */
+            }
+            if (need_cpuinfo) fill_mhz_from_cpuinfo( cpu_power, out_cpus );
+            for (i = 0; i < out_cpus; i++)
+            {
+                if (!cpu_power[i].CurrentMhz) cpu_power[i].CurrentMhz = cannedMHz;
+                if (!cpu_power[i].MaxMhz) cpu_power[i].MaxMhz = cpu_power[i].CurrentMhz;
+                if (!cpu_power[i].MhzLimit) cpu_power[i].MhzLimit = cpu_power[i].MaxMhz;
             }
         }
 #elif defined(__FreeBSD__) || defined (__FreeBSD_kernel__) || defined(__DragonFly__)
