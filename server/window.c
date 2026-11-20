@@ -3957,6 +3957,13 @@ DECL_HANDLER(get_update_region)
 }
 
 
+static bool is_window_owned_by( const struct window *win, const struct window *owner )
+{
+    for (; win && win->owner; win = get_user_object( win->owner, NTUSER_OBJ_WINDOW ))
+        if (win->owner == owner->handle) return true;
+    return false;
+}
+
 /* update the z order of a window so that a given rectangle is fully visible */
 DECL_HANDLER(update_window_zorder)
 {
@@ -3968,7 +3975,7 @@ DECL_HANDLER(update_window_zorder)
 
     if (req->raw)
     {
-        if (!is_desktop_window( win->parent ) || is_rect_empty( &rect )) return;
+        if (!win->is_linked || !is_desktop_window( win->parent ) || is_rect_empty( &rect )) return;
         /* Map inclusive corners so a single exposed pixel remains nonempty
          * when the emulated display mode is smaller than the host output. */
         --rect.right;
@@ -4001,6 +4008,20 @@ DECL_HANDLER(update_window_zorder)
         /* making sure to not violate the topmost rule */
         if (!(ptr->ex_style & WS_EX_TOPMOST) || (win->ex_style & WS_EX_TOPMOST))
         {
+            if (req->raw)
+            {
+                struct window *popup, *next;
+
+                if (is_window_owned_by( ptr, win )) return;
+                /* Raise crossed popups in their current order, including hidden ones. */
+                for (popup = get_next_window( ptr ); popup != win; popup = next)
+                {
+                    next = get_next_window( popup );
+                    if (!is_window_owned_by( popup, win )) continue;
+                    list_remove( &popup->entry );
+                    list_add_before( &ptr->entry, &popup->entry );
+                }
+            }
             list_remove( &win->entry );
             list_add_before( &ptr->entry, &win->entry );
             reply->changed = 1;
