@@ -2308,6 +2308,7 @@ typedef enum _SYSTEM_INFORMATION_CLASS {
     SystemHandleCountInformation = 253,
 #ifdef __WINESRC__
     SystemWineVersionInformation = 1000,
+    SystemWineProcessorPerformanceInformation = 1001,
 #endif
 } SYSTEM_INFORMATION_CLASS, *PSYSTEM_INFORMATION_CLASS;
 
@@ -3049,6 +3050,18 @@ typedef struct _SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION {
     LARGE_INTEGER Reserved1[2];
     ULONG Reserved2;
 } SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION, *PSYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
+
+#ifdef __WINESRC__
+/* Wine extension. Times are cumulative Linux USER_HZ ticks. CPPC cycles
+ * and performance levels are in their native units. Unavailable fields are zero. */
+typedef struct
+{
+    ULONGLONG IdleTime, TotalTime;
+    ULONGLONG ReferenceCycles, DeliveredCycles;
+    ULONG NominalMhz, CurrentMhz;
+    ULONG ReferencePerformance, NominalPerformance;
+} SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION;
+#endif
 
 /* System Information Class 0x0b */
 

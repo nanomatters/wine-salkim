@@ -336,6 +336,7 @@ NTSTATUS WINAPI wow64_NtQuerySystemInformation( UINT *args )
     case SystemProcessorBrandString:  /* char[] */
     case SystemProcessorFeaturesInformation:  /* SYSTEM_PROCESSOR_FEATURES_INFORMATION */
     case SystemWineVersionInformation:  /* char[] */
+    case SystemWineProcessorPerformanceInformation:  /* SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION[] */
         return NtQuerySystemInformation( class, ptr, len, retlen );
 
     case SystemCpuInformation:  /* SYSTEM_CPU_INFORMATION */

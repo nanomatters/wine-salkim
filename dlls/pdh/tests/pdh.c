@@ -423,6 +423,99 @@ done:
     PdhCloseQuery( query );
 }
 
+static PDH_FMT_COUNTERVALUE *find_cpu_value( PDH_FMT_COUNTERVALUE_ITEM_A *items, DWORD count, const char *name )
+{
+    DWORD i;
+
+    for (i = 0; i < count; ++i)
+        if (!strcmp( items[i].szName, name )) return &items[i].FmtValue;
+    return NULL;
+}
+
+static void test_processor_percentages( void )
+{
+    static const char *const paths[] =
+    {
+        "\\Processor Information(*)\\Processor Frequency",
+        "\\Processor Information(*)\\% Processor Performance",
+    };
+    PDH_FMT_COUNTERVALUE_ITEM_A *items[ARRAY_SIZE(paths)] = {0};
+    PDH_HCOUNTER counters[ARRAY_SIZE(paths)], total;
+    PDH_RAW_COUNTER older = {PDH_CSTATUS_VALID_DATA, {1, 0}, 500, 20, 1};
+    PDH_RAW_COUNTER newer = {PDH_CSTATUS_VALID_DATA, {2, 0}, 593, 22, 1};
+    PDH_FMT_COUNTERVALUE value;
+    DWORD counts[ARRAY_SIZE(paths)], i, size;
+    BOOL measured = FALSE, positive = FALSE;
+    PDH_HQUERY query;
+    PDH_STATUS ret;
+
+    ret = PdhOpenQueryA( NULL, 0, &query );
+    ok(!ret, "Opening query returned %#lx\n", ret);
+    if (ret) return;
+    for (i = 0; i < ARRAY_SIZE(paths); ++i)
+    {
+        ret = pPdhAddEnglishCounterA( query, paths[i], 0, &counters[i] );
+        if (ret == PDH_CSTATUS_NO_COUNTER || ret == PDH_CSTATUS_NO_OBJECT)
+        {
+            win_skip("%s unavailable\n", paths[i]);
+            goto done;
+        }
+        ok(!ret, "Adding %s returned %#lx\n", paths[i], ret);
+        if (ret) goto done;
+    }
+    ret = pPdhAddEnglishCounterA( query, "\\Processor Information(_Total)\\% Processor Performance", 0, &total );
+    ok(!ret, "Adding total Performance counter returned %#lx\n", ret);
+    if (ret) goto done;
+    ret = PdhCalculateCounterFromRawValue( total, PDH_FMT_DOUBLE | PDH_FMT_NOSCALE, &newer, &older, &value );
+    ok(!ret, "Formatting raw Performance samples returned %#lx\n", ret);
+    if (!ret) ok(value.doubleValue == 46.5, "Expected (593 - 500) / (22 - 20), got %g\n", value.doubleValue);
+
+    ret = PdhCollectQueryData( query );
+    ok(!ret, "First collection returned %#lx\n", ret);
+    if (ret) goto done;
+    Sleep( 100 );
+    ret = PdhCollectQueryData( query );
+    ok(!ret, "Second collection returned %#lx\n", ret);
+    if (ret) goto done;
+    for (i = 0; i < ARRAY_SIZE(paths); ++i)
+    {
+        size = counts[i] = 0;
+        ret = PdhGetFormattedCounterArrayA( counters[i], PDH_FMT_DOUBLE, &size, &counts[i], NULL );
+        if (ret == PDH_NO_DATA || ret == PDH_INVALID_DATA)
+        {
+            skip("No hardware data for %s\n", paths[i]);
+            goto done;
+        }
+        ok(ret == PDH_MORE_DATA && size, "Sizing %s returned %#lx, size %lu\n", paths[i], ret, size);
+        if (ret != PDH_MORE_DATA || !size) goto done;
+        items[i] = malloc( size );
+        ret = PdhGetFormattedCounterArrayA( counters[i], PDH_FMT_DOUBLE, &size, &counts[i], items[i] );
+        ok(!ret, "Reading %s returned %#lx\n", paths[i], ret);
+        if (ret) goto done;
+        ok(find_cpu_value( items[i], counts[i], "_Total" ) != NULL, "%s missing _Total\n", paths[i]);
+        ok(counts[i] == counts[0], "%s has %lu instances, expected %lu\n", paths[i], counts[i], counts[0]);
+    }
+    for (i = 0; i < counts[0]; ++i)
+    {
+        const char *name = items[0][i].szName;
+        PDH_FMT_COUNTERVALUE *mhz = &items[0][i].FmtValue;
+        PDH_FMT_COUNTERVALUE *perf = find_cpu_value( items[1], counts[1], name );
+
+        ok(perf != NULL, "Missing Performance instance %s\n", name);
+        if (!perf || perf->CStatus > PDH_CSTATUS_NEW_DATA) continue;
+        ok(perf->doubleValue >= 0, "%s: performance %g\n", name, perf->doubleValue);
+        if (strstr( name, "_Total" ) || mhz->CStatus > PDH_CSTATUS_NEW_DATA || !mhz->doubleValue) continue;
+        measured = TRUE;
+        if (mhz->doubleValue * perf->doubleValue / 100 > 0) positive = TRUE;
+    }
+    if (measured) ok(positive, "Every logical processor reports zero effective MHz\n");
+    else skip("No logical processor with frequency and performance data\n");
+
+done:
+    for (i = 0; i < ARRAY_SIZE(items); ++i) free( items[i] );
+    PdhCloseQuery( query );
+}
+
 static void test_PdhCollectQueryDataWithTime( void )
 {
     PDH_STATUS ret;
@@ -1147,6 +1240,7 @@ START_TEST(pdh)
     if (pPdhAddEnglishCounterA) test_PdhAddEnglishCounterA();
     if (pPdhAddEnglishCounterW) test_PdhAddEnglishCounterW();
     if (pPdhAddEnglishCounterA && pPdhAddEnglishCounterW) test_processor_frequency();
+    if (pPdhAddEnglishCounterA) test_processor_percentages();
     if (pPdhCollectQueryDataWithTime) test_PdhCollectQueryDataWithTime();
 
     test_PdhGetFormattedCounterValue();

@@ -3027,6 +3027,8 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
 
 #ifdef linux
 
+static void get_cpu_performance( SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION *info, unsigned int count );
+
 static void get_cpu_idle_cycle_times( ULONG64 *times )
 {
     unsigned int index, host_index, count;
@@ -4413,6 +4415,20 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
         break;
     }
 
+    case SystemWineProcessorPerformanceInformation:  /* 1001 */
+#ifdef linux
+    {
+        unsigned int count = peb->NumberOfProcessors;
+        len = count * sizeof(SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION);
+        if (size / sizeof(SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION) < count) ret = STATUS_INFO_LENGTH_MISMATCH;
+        else if (!info) ret = STATUS_ACCESS_VIOLATION;
+        else get_cpu_performance( info, count );
+    }
+#else
+        ret = STATUS_NOT_IMPLEMENTED;
+#endif
+        break;
+
     default:
 	FIXME( "(0x%08x,%p,0x%08x,%p) stub\n", class, info, size, ret_size );
 
@@ -4630,10 +4646,23 @@ NTSTATUS WINAPI NtShutdownSystem( SHUTDOWN_ACTION action )
 
 #ifdef linux
 
+static unsigned int host_processor_id( unsigned int i )
+{
+    return i < cpu_override.mapping.cpu_count ? cpu_override.mapping.host_cpu_id[i] : i;
+}
+
+/* A topology override can assign the same host CPU to multiple Wine CPUs. */
+static unsigned int find_processor( unsigned int host, unsigned int start, unsigned int count )
+{
+    if (!cpu_override.mapping.cpu_count) return host >= start && host < count ? host : count;
+    while (start < count && host_processor_id( start ) != host) ++start;
+    return start;
+}
+
 /* Fallback using /proc/cpuinfo for Linux systems without cpufreq. For
  * most distributions on recent enough hardware, this is only likely to
  * happen while running in virtualized environments such as QEMU. */
-static void fill_mhz_from_cpuinfo( PROCESSOR_POWER_INFORMATION *power, unsigned int count )
+static void fill_mhz_from_cpuinfo( ULONG *first, size_t stride, unsigned int count )
 {
     char line[512];
     unsigned int cpu = ~0u, i;
@@ -4645,12 +4674,11 @@ static void fill_mhz_from_cpuinfo( PROCESSOR_POWER_INFORMATION *power, unsigned 
     {
         if (sscanf( line, "processor : %u", &cpu ) == 1) continue;
         if (sscanf( line, "cpu MHz : %lf", &mhz ) != 1) continue;
-        if (cpu_override.mapping.cpu_count)
+        for (i = find_processor( cpu, 0, count ); i < count; i = find_processor( cpu, i + 1, count ))
         {
-            for (i = 0; i < min( count, cpu_override.mapping.cpu_count ); i++)
-                if (cpu == cpu_override.mapping.host_cpu_id[i] && !power[i].CurrentMhz) power[i].CurrentMhz = mhz;
+            ULONG *current = (ULONG *)((char *)first + i * stride);
+            if (!*current) *current = mhz;
         }
-        else if (cpu < count && !power[cpu].CurrentMhz) power[cpu].CurrentMhz = mhz;
     }
     fclose( f );
 }
@@ -4674,6 +4702,90 @@ static int get_sys_int(const char *dirname, const char *basename)
 {
     char s[16];
     return get_sys_str(dirname, basename, s) ? atoi(s) : 0;
+}
+
+static ULONG get_current_mhz( const char *cpufreq_path )
+{
+    ULONG mhz = get_sys_int( cpufreq_path, "scaling_cur_freq" ) / 1000;
+    return mhz ? mhz : get_sys_int( cpufreq_path, "cpuinfo_cur_freq" ) / 1000;
+}
+
+static SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION *cpu_perf_caps;
+static unsigned int cpu_perf_count;
+
+static void read_cpu_perf_caps( unsigned int cpu, SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION *info )
+{
+    char path[64];
+
+    snprintf( path, sizeof(path), "/sys/devices/system/cpu/cpu%u/acpi_cppc", cpu );
+    info->NominalMhz = get_sys_int( path, "nominal_freq" );
+    info->NominalPerformance = get_sys_int( path, "nominal_perf" );
+    info->ReferencePerformance = get_sys_int( path, "reference_perf" );
+    if (!info->NominalMhz)
+    {
+        snprintf( path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpufreq", cpu );
+        info->NominalMhz = get_sys_int( path, "base_frequency" ) / 1000;
+    }
+}
+
+static void init_cpu_perf_caps(void)
+{
+    unsigned int i, count = peb->NumberOfProcessors;
+
+    if (!(cpu_perf_caps = calloc( count, sizeof(*cpu_perf_caps) ))) return;
+    for (i = 0; i < count; i++) read_cpu_perf_caps( host_processor_id( i ), &cpu_perf_caps[i] );
+    cpu_perf_count = count;
+}
+
+static void get_cpu_performance( SYSTEM_WINE_PROCESSOR_PERFORMANCE_INFORMATION *info, unsigned int count )
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal, reference, delivered;
+    BOOL need_cpuinfo = FALSE;
+    unsigned int i, cpu;
+    char line[256], path[80];
+    FILE *f;
+
+    pthread_once( &once, init_cpu_perf_caps );
+    memset( info, 0, count * sizeof(*info) );
+    for (i = 0; i < count; i++)
+    {
+        cpu = host_processor_id( i );
+        if (i < cpu_perf_count) info[i] = cpu_perf_caps[i];
+        else read_cpu_perf_caps( cpu, &info[i] );
+        if (info[i].ReferencePerformance && info[i].NominalPerformance)
+        {
+            snprintf( path, sizeof(path), "/sys/devices/system/cpu/cpu%u/acpi_cppc/feedback_ctrs", cpu );
+            if ((f = fopen( path, "r" )))
+            {
+                if (fscanf( f, "ref:%llu del:%llu", &reference, &delivered ) == 2)
+                {
+                    info[i].ReferenceCycles = reference;
+                    info[i].DeliveredCycles = delivered;
+                }
+                fclose( f );
+            }
+        }
+        snprintf( path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpufreq", cpu );
+        info[i].CurrentMhz = get_current_mhz( path );
+        if (!info[i].CurrentMhz) need_cpuinfo = TRUE;
+    }
+    if (need_cpuinfo) fill_mhz_from_cpuinfo( &info[0].CurrentMhz, sizeof(*info), count );
+
+    if (!(f = fopen( "/proc/stat", "r" ))) return;
+    while (fgets( line, sizeof(line), f ) && !strncmp( line, "cpu", 3 ))
+    {
+        if (line[3] < '0' || line[3] > '9') continue; /* combined statistics */
+        if (sscanf( line + 3, "%u %llu %llu %llu %llu %llu %llu %llu %llu",
+                    &cpu, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal ) != 9) continue;
+        /* Guest ticks are already included in user/nice. Stolen time did no work in this VM. */
+        for (i = find_processor( cpu, 0, count ); i < count; i = find_processor( cpu, i + 1, count ))
+        {
+            info[i].IdleTime = idle + iowait + steal;
+            info[i].TotalTime = info[i].IdleTime + user + nice + system + irq + softirq;
+        }
+    }
+    fclose( f );
 }
 
 static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
@@ -4992,7 +5104,7 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
 
             for (i = 0; i < out_cpus; i++)
             {
-                unsigned int cpu = i < cpu_override.mapping.cpu_count ? cpu_override.mapping.host_cpu_id[i] : i;
+                unsigned int cpu = host_processor_id( i );
 
                 snprintf( path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpufreq", cpu );
                 cpu_power[i].MaxMhz = get_sys_int( path, "cpuinfo_max_freq" ) / 1000;
@@ -5004,7 +5116,7 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
                 cpu_power[i].MaxIdleState = 0;     /* FIXME */
                 cpu_power[i].CurrentIdleState = 0; /* FIXME */
             }
-            if (need_cpuinfo) fill_mhz_from_cpuinfo( cpu_power, out_cpus );
+            if (need_cpuinfo) fill_mhz_from_cpuinfo( &cpu_power[0].CurrentMhz, sizeof(*cpu_power), out_cpus );
             for (i = 0; i < out_cpus; i++)
             {
                 if (!cpu_power[i].CurrentMhz) cpu_power[i].CurrentMhz = cannedMHz;
