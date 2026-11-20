@@ -27,6 +27,11 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#endif
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
@@ -54,6 +59,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3dkmt);
 
 C_ASSERT( sizeof(D3DKMT_WINE_GPU_TELEMETRY) == D3DKMT_WINE_GPU_TELEMETRY_V1_SIZE );
+C_ASSERT( sizeof(D3DKMT_WINE_GPU_TELEMETRY_V2) == D3DKMT_WINE_GPU_TELEMETRY_V2_SIZE );
 C_ASSERT( sizeof(D3DKMT_WINE_CPU_TELEMETRY) == D3DKMT_WINE_CPU_TELEMETRY_V1_SIZE );
 
 /* D3DKMT runtime descriptors */
@@ -192,6 +198,7 @@ enum d3dkmt_telemetry_path
     D3DKMT_TELEMETRY_PATH_MEMORY_CLOCK,
     D3DKMT_TELEMETRY_PATH_VRAM_USED,
     D3DKMT_TELEMETRY_PATH_VRAM_TOTAL,
+    D3DKMT_TELEMETRY_PATH_GTT_USED,
     D3DKMT_TELEMETRY_PATH_PCIE_GENERATION,
     D3DKMT_TELEMETRY_PATH_PCIE_WIDTH,
     D3DKMT_TELEMETRY_PATH_PCIE_MAX_GENERATION,
@@ -227,6 +234,8 @@ struct d3dkmt_adapter
     ULONGLONG telemetry_energy_time;
     BOOL telemetry_power_is_energy;
     void *telemetry_nvml_device;
+    BOOL nvml_vram_saturated;
+    int nvml_cache_fd;
     pthread_mutex_t telemetry_lock;
     pthread_t telemetry_thread;
     int telemetry_event;
@@ -247,6 +256,7 @@ struct d3dkmt_adapter
     LONG volatile telemetry_memory_clock;
     LONG64 volatile telemetry_vram_used;
     LONG64 volatile telemetry_vram_total;
+    LONG64 volatile telemetry_shared_used;
     LONG volatile telemetry_pcie_generation;
     LONG volatile telemetry_pcie_width;
     LONG volatile telemetry_pcie_max_generation;
@@ -771,6 +781,7 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc 
     }
     else adapter->telemetry_lock_initialized = TRUE;
     adapter->telemetry_event = -1;
+    adapter->nvml_cache_fd = -2; /* opened lazily on the worker */
 
     if (!(instance = get_d3dkmt_vulkan_instance())) WARN( "Vulkan is unavailable.\n" );
     else adapter->physical_device = get_vulkan_physical_device( instance, &desc->AdapterLuid );
@@ -1314,6 +1325,8 @@ static BOOL init_adapter_telemetry_backend( struct d3dkmt_adapter *adapter )
                           &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_VRAM_USED] );
         cache_sysfs_path( pci_root, "mem_info_vram_total",
                           &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_VRAM_TOTAL] );
+        cache_sysfs_path( pci_root, "mem_info_gtt_used",
+                          &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_GTT_USED] );
         cache_sysfs_path( pci_root, "current_link_speed",
                           &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_PCIE_GENERATION] );
         cache_sysfs_path( pci_root, "current_link_width",
@@ -1682,12 +1695,18 @@ static BOOL query_adapter_vram( struct d3dkmt_adapter *adapter, ULONGLONG *used,
     struct nvml_memory nvml_value;
     LONGLONG used_value, total_value;
 
-    if (adapter->telemetry_nvml_device && p_nvmlDeviceGetMemoryInfo &&
+    if (adapter->telemetry_nvml_device && !adapter->nvml_vram_saturated && p_nvmlDeviceGetMemoryInfo &&
         !p_nvmlDeviceGetMemoryInfo( adapter->telemetry_nvml_device, &nvml_value ))
     {
-        *used = nvml_value.used;
-        *total = nvml_value.total;
-        return TRUE;
+        /* The native i386 library saturates total at UINT32_MAX on large
+         * cards and reports incorrect usage along with it. */
+        if (sizeof(void *) == 4 && nvml_value.total == UINT32_MAX) adapter->nvml_vram_saturated = TRUE;
+        else
+        {
+            *used = nvml_value.used;
+            *total = nvml_value.total;
+            return TRUE;
+        }
     }
 
     if (!adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_VRAM_USED] ||
@@ -1700,6 +1719,135 @@ static BOOL query_adapter_vram( struct d3dkmt_adapter *adapter, ULONGLONG *used,
     *used = used_value;
     *total = total_value;
     return TRUE;
+}
+
+#ifdef F_OFD_SETLK
+struct nvml_cache_record
+{
+    uint64_t utilization_ns, vram_ns;
+    uint64_t vram_used, vram_total;
+    uint32_t utilization, memory_utilization, valid, reserved;
+};
+C_ASSERT( sizeof(struct nvml_cache_record) == 48 );
+
+static int open_nvml_cache( const VkPhysicalDevicePCIBusInfoPropertiesEXT *pci )
+{
+    const char *runtime = getenv( "XDG_RUNTIME_DIR" );
+    struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    char name[64];
+    struct stat st;
+    int dir, fd = -1;
+
+    if (!runtime || runtime[0] != '/' ||
+        (dir = open( runtime, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC )) < 0) return -1;
+    if (!fstat( dir, &st ) && st.st_uid == geteuid() && !(st.st_mode & 077))
+    {
+        snprintf( name, sizeof(name), "wine-nvml-v1-%04x-%02x-%02x-%u", pci->pciDomain, pci->pciBus,
+                  pci->pciDevice, pci->pciFunction );
+        fd = openat( dir, name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600 );
+        if (fd >= 0 && (fstat( fd, &st ) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+                        st.st_uid != geteuid() || (st.st_mode & 077) || fcntl( fd, F_OFD_GETLK, &lock ) < 0))
+        {
+            close( fd );
+            fd = -1;
+        }
+    }
+    close( dir );
+    return fd;
+}
+#endif
+
+static BOOL sample_cached_nvml( struct d3dkmt_adapter *adapter, ULONG requests, D3DKMT_WINE_GPU_TELEMETRY *sample )
+{
+#ifdef F_OFD_SETLK
+    const ULONG utilization = D3DKMT_WINE_GPU_TELEMETRY_UTILIZATION | D3DKMT_WINE_GPU_TELEMETRY_MEMORY_UTIL;
+    const ULONG vram = D3DKMT_WINE_GPU_TELEMETRY_VRAM;
+    struct nvml_cache_record cache;
+    struct flock lock = { .l_type = F_RDLCK, .l_whence = SEEK_SET };
+    const ULONGLONG interval = (ULONGLONG)D3DKMT_TELEMETRY_INTERVAL_MS * 1000000;
+    ULONGLONG now, age;
+    BOOL locked, changed = FALSE;
+    int fd;
+
+    if (!adapter->telemetry_nvml_device || !(requests & (utilization | vram))) return FALSE;
+    if (adapter->nvml_cache_fd == -2) adapter->nvml_cache_fd = open_nvml_cache( &adapter->telemetry_pci );
+    if ((fd = adapter->nvml_cache_fd) < 0) return FALSE;
+
+    /* Each metric can be requested by a different process. Keep the last
+     * completed sample readable while the writer is in an NVML call. */
+    locked = !flock( fd, LOCK_EX | LOCK_NB );
+    if (!locked && errno != EWOULDBLOCK) return FALSE;
+    /* flock elects a sampler. The independent OFD lock covers the short
+     * file operation only; readers never wait for the driver. */
+    if (!locked && fcntl( fd, F_OFD_SETLK, &lock ) < 0) return TRUE;
+    if (pread( fd, &cache, sizeof(cache), 0 ) != sizeof(cache)) memset( &cache, 0, sizeof(cache) );
+    if (!locked)
+    {
+        lock.l_type = F_UNLCK;
+        fcntl( fd, F_OFD_SETLK, &lock );
+    }
+    if (!(now = monotonic_time_ns()))
+    {
+        if (locked) flock( fd, LOCK_UN );
+        return FALSE;
+    }
+    age = interval * (locked ? 1 : 2);
+    if (requests & utilization)
+    {
+        if (!cache.utilization_ns || cache.utilization_ns > now || now - cache.utilization_ns >= age)
+        {
+            cache.valid &= ~utilization;
+            if (locked)
+            {
+                cache.valid |= query_adapter_utilization( adapter, utilization, &sample->UtilizationPercent,
+                                                          &sample->MemoryUtilizationPercent );
+                cache.utilization = sample->UtilizationPercent;
+                cache.memory_utilization = sample->MemoryUtilizationPercent;
+                cache.utilization_ns = now;
+                changed = TRUE;
+            }
+        }
+        sample->Valid |= cache.valid & requests & utilization;
+        sample->UtilizationPercent = cache.utilization;
+        sample->MemoryUtilizationPercent = cache.memory_utilization;
+    }
+    if (requests & vram)
+    {
+        if (locked && !adapter->nvml_vram_saturated &&
+            (!cache.vram_ns || cache.vram_ns > now || now - cache.vram_ns >= interval))
+        {
+            BOOL valid = query_adapter_vram( adapter, &sample->VramUsedBytes, &sample->VramTotalBytes );
+            if (valid || !adapter->nvml_vram_saturated)
+            {
+                cache.valid = (cache.valid & ~vram) | (valid ? vram : 0);
+                cache.vram_used = sample->VramUsedBytes;
+                cache.vram_total = sample->VramTotalBytes;
+                cache.vram_ns = now;
+                changed = TRUE;
+            }
+        }
+        if (cache.vram_ns && cache.vram_ns <= now && now - cache.vram_ns < age)
+        {
+            sample->Valid |= cache.valid & vram;
+            sample->VramUsedBytes = cache.vram_used;
+            sample->VramTotalBytes = cache.vram_total;
+        }
+    }
+    if (changed)
+    {
+        lock.l_type = F_WRLCK;
+        if (!fcntl( fd, F_OFD_SETLK, &lock ))
+        {
+            if (pwrite( fd, &cache, sizeof(cache), 0 ) != sizeof(cache)) ftruncate( fd, 0 );
+            lock.l_type = F_UNLCK;
+            fcntl( fd, F_OFD_SETLK, &lock );
+        }
+    }
+    if (locked) flock( fd, LOCK_UN );
+    return TRUE;
+#else
+    return FALSE;
+#endif
 }
 
 static BOOL read_sysfs_pcie_generation( const char *path, ULONG *generation )
@@ -1771,6 +1919,7 @@ static void free_adapter_telemetry_paths( struct d3dkmt_adapter *adapter )
 {
     UINT i;
 
+    if (adapter->nvml_cache_fd >= 0) close( adapter->nvml_cache_fd );
     for (i = 0; i < ARRAY_SIZE(adapter->telemetry_paths); ++i)
         free( adapter->telemetry_paths[i] );
     for (i = 0; i < adapter->cpu_energy_path_count; ++i)
@@ -1806,7 +1955,7 @@ static ULONGLONG telemetry_read64( LONG64 volatile *source )
 }
 
 static void publish_adapter_telemetry( struct d3dkmt_adapter *adapter,
-                                       const D3DKMT_WINE_GPU_TELEMETRY *sample )
+                                       const D3DKMT_WINE_GPU_TELEMETRY *sample, ULONGLONG shared_used )
 {
     InterlockedIncrement( &adapter->telemetry_sequence );
     telemetry_write64( &adapter->telemetry_power, sample->PowerMicrowatts );
@@ -1819,6 +1968,7 @@ static void publish_adapter_telemetry( struct d3dkmt_adapter *adapter,
     InterlockedExchange( &adapter->telemetry_memory_clock, sample->MemoryClockKHz );
     telemetry_write64( &adapter->telemetry_vram_used, sample->VramUsedBytes );
     telemetry_write64( &adapter->telemetry_vram_total, sample->VramTotalBytes );
+    telemetry_write64( &adapter->telemetry_shared_used, shared_used );
     InterlockedExchange( &adapter->telemetry_pcie_generation, sample->PcieGeneration );
     InterlockedExchange( &adapter->telemetry_pcie_width, sample->PcieWidth );
     InterlockedExchange( &adapter->telemetry_pcie_max_generation, sample->PcieMaxGeneration );
@@ -1845,6 +1995,7 @@ static void sample_adapter_telemetry( struct d3dkmt_adapter *adapter )
 {
     ULONG requests = ReadAcquire( &adapter->telemetry_requests );
     D3DKMT_WINE_GPU_TELEMETRY sample = {0};
+    LONGLONG shared_used = 0;
 
     if ((requests & D3DKMT_WINE_GPU_TELEMETRY_POWER) &&
         query_adapter_power( adapter, &sample.PowerMicrowatts ))
@@ -1860,19 +2011,26 @@ static void sample_adapter_telemetry( struct d3dkmt_adapter *adapter )
                                     &sample.JunctionTemperatureDeciCelsius ))
         sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_JUNCTION_TEMPERATURE;
 
-    sample.Valid |= query_adapter_utilization( adapter, requests, &sample.UtilizationPercent,
-                                                &sample.MemoryUtilizationPercent );
+    if (!sample_cached_nvml( adapter, requests, &sample ))
+    {
+        sample.Valid |= query_adapter_utilization( adapter, requests, &sample.UtilizationPercent,
+                                                   &sample.MemoryUtilizationPercent );
+        if ((requests & D3DKMT_WINE_GPU_TELEMETRY_VRAM) &&
+            query_adapter_vram( adapter, &sample.VramUsedBytes, &sample.VramTotalBytes ))
+            sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_VRAM;
+    }
     sample.Valid |= query_adapter_clocks( adapter, requests, &sample.GraphicsClockKHz,
                                           &sample.MemoryClockKHz );
-    if ((requests & D3DKMT_WINE_GPU_TELEMETRY_VRAM) &&
-        query_adapter_vram( adapter, &sample.VramUsedBytes, &sample.VramTotalBytes ))
-        sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_VRAM;
+    if ((requests & D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY) &&
+        adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_GTT_USED] &&
+        read_sysfs_value( adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_GTT_USED], &shared_used ) && shared_used >= 0)
+        sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY;
     if ((requests & D3DKMT_WINE_GPU_TELEMETRY_PCIE) &&
         query_adapter_pcie( adapter, &sample.PcieGeneration, &sample.PcieWidth,
                             &sample.PcieMaxGeneration, &sample.PcieMaxWidth ))
         sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_PCIE;
 
-    publish_adapter_telemetry( adapter, &sample );
+    publish_adapter_telemetry( adapter, &sample, shared_used );
 }
 
 static void sample_cpu_telemetry( struct d3dkmt_adapter *adapter )
@@ -1952,7 +2110,7 @@ static void *adapter_telemetry_thread( void *arg )
     {
         D3DKMT_WINE_GPU_TELEMETRY gpu_sample = {0};
         D3DKMT_WINE_CPU_TELEMETRY cpu_sample = {0};
-        publish_adapter_telemetry( adapter, &gpu_sample );
+        publish_adapter_telemetry( adapter, &gpu_sample, 0 );
         publish_cpu_telemetry( adapter, &cpu_sample );
     }
     return NULL;
@@ -2017,12 +2175,14 @@ static void stop_adapter_telemetry( struct d3dkmt_adapter *adapter )
     pthread_mutex_unlock( &adapter->telemetry_lock );
 }
 
-static void read_adapter_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_GPU_TELEMETRY *data )
+static void read_adapter_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_GPU_TELEMETRY *data,
+                                    ULONGLONG *shared_used )
 {
     D3DKMT_WINE_GPU_TELEMETRY sample = {0};
     UINT requested = data->Requested;
     UINT index = data->PhysicalAdapterIndex;
     ULONG sequence;
+    ULONGLONG shared;
     UINT i;
 
     for (i = 0; i < 3; ++i)
@@ -2040,6 +2200,7 @@ static void read_adapter_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_
         sample.MemoryClockKHz = ReadAcquire( &adapter->telemetry_memory_clock );
         sample.VramUsedBytes = telemetry_read64( &adapter->telemetry_vram_used );
         sample.VramTotalBytes = telemetry_read64( &adapter->telemetry_vram_total );
+        if (shared_used) shared = telemetry_read64( &adapter->telemetry_shared_used );
         sample.PcieGeneration = ReadAcquire( &adapter->telemetry_pcie_generation );
         sample.PcieWidth = ReadAcquire( &adapter->telemetry_pcie_width );
         sample.PcieMaxGeneration = ReadAcquire( &adapter->telemetry_pcie_max_generation );
@@ -2049,6 +2210,8 @@ static void read_adapter_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_
             sample.PhysicalAdapterIndex = index;
             sample.Requested = requested;
             sample.Valid &= requested;
+            if (!shared_used) sample.Valid &= ~D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY;
+            else if (sample.Valid & D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY) *shared_used = shared;
             *data = sample;
             return;
         }
@@ -2064,7 +2227,7 @@ static void report_telemetry_thread_error( struct d3dkmt_adapter *adapter )
 }
 
 static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
-                                          D3DKMT_WINE_GPU_TELEMETRY *data )
+                                          D3DKMT_WINE_GPU_TELEMETRY *data, ULONGLONG *shared_used )
 {
     UINT requested = data->Requested;
     UINT index = data->PhysicalAdapterIndex;
@@ -2078,12 +2241,17 @@ static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
     memset( data, 0, sizeof(*data) );
     data->PhysicalAdapterIndex = index;
     data->Requested = requested;
+    if (shared_used)
+    {
+        *shared_used = 0;
+        supported |= D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY;
+    }
 
     if (requested & supported)
     {
         InterlockedOr( &adapter->telemetry_requests, requested & supported );
         start_adapter_telemetry( adapter );
-        read_adapter_telemetry( adapter, data );
+        read_adapter_telemetry( adapter, data, shared_used );
     }
 
     report_telemetry_thread_error( adapter );
@@ -2210,7 +2378,7 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
     }
     case KMTQAITYPE_WINE_GPU_TELEMETRY:
     {
-        D3DKMT_WINE_GPU_TELEMETRY *data = desc->pPrivateDriverData;
+        D3DKMT_WINE_GPU_TELEMETRY_V2 *data = desc->pPrivateDriverData;
         NTSTATUS status;
 
         if (desc->PrivateDriverDataSize < D3DKMT_WINE_GPU_TELEMETRY_V1_SIZE)
@@ -2218,7 +2386,8 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
         pthread_mutex_lock( &d3dkmt_lock );
         if (!(adapter = get_d3dkmt_object_locked( desc->hAdapter, D3DKMT_ADAPTER )))
             status = STATUS_INVALID_PARAMETER;
-        else status = query_wine_gpu_telemetry( adapter, data );
+        else status = query_wine_gpu_telemetry( adapter, &data->V1, desc->PrivateDriverDataSize >= sizeof(*data) ?
+                                                &data->SharedMemoryUsedBytes : NULL );
         pthread_mutex_unlock( &d3dkmt_lock );
         return status;
     }

@@ -1,6 +1,7 @@
 MODULE    = pdh.dll
 IMPORTLIB = pdh
 IMPORTS   = ntdll
+DELAYIMPORTS = gdi32
 
 EXTRADLLFLAGS = -Wb,--prefer-native
 

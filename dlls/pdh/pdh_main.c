@@ -25,7 +25,9 @@
 
 #include "windef.h"
 #include "winbase.h"
+#include "wingdi.h"
 #include "winternl.h"
+#include "ddk/d3dkmthk.h"
 
 #include "pdh.h"
 #include "pdhmsg.h"
@@ -97,6 +99,30 @@ struct processor_data
     PDH_STATUS status;
 };
 
+enum gpu_metric
+{
+    GPU_RUNNING_TIME,
+    GPU_DEDICATED_USAGE,
+    GPU_SHARED_USAGE,
+    GPU_METRIC_COUNT,
+};
+
+struct gpu_adapter
+{
+    D3DKMT_HANDLE handle;
+    WCHAR engine_name[72], memory_name[40];
+};
+
+struct gpu_data
+{
+    struct gpu_adapter *adapters;
+    struct counter_instance *items;
+    unsigned int count, users, requests;
+    ULONGLONG stamp;
+    BOOL collected;
+    PDH_STATUS status;
+};
+
 struct counter
 {
     DWORD           magic;                          /* signature */
@@ -114,7 +140,8 @@ struct counter
     union value     one;                            /* first value */
     union value     two;                            /* second value */
     struct processor_data *processor;
-    enum processor_metric metric;
+    struct gpu_data *gpu;
+    unsigned int metric;
     const struct counter_instance *instances;
     DWORD instance_count;
     const WCHAR *instance;
@@ -155,6 +182,7 @@ struct query
     HANDLE      stop;       /* stop event */
     struct list counters;   /* counter list */
     struct processor_data processor;
+    struct gpu_data gpu;
 };
 
 static struct query *create_query( void )
@@ -178,11 +206,23 @@ static void free_processor_data( struct processor_data *data )
     free( data->items );
 }
 
+static void free_gpu_data( struct gpu_data *data )
+{
+    unsigned int i;
+
+    for (i = 0; i < data->count; ++i)
+    {
+        D3DKMT_CLOSEADAPTER close = {data->adapters[i].handle};
+        D3DKMTCloseAdapter( &close );
+    }
+    free( data->items );
+    free( data->adapters );
+}
+
 static void destroy_query( struct query *query )
 {
-    /* Ensure compiler doesn't optimize out the assignment with 0. */
-    SecureZeroMemory( &query->magic, sizeof( query->magic ) );
     free_processor_data( &query->processor );
+    free_gpu_data( &query->gpu );
     free( query );
 }
 
@@ -194,7 +234,7 @@ struct source
     DWORD           type;                           /* counter type */
     LONG            scale;                          /* default scale factor */
     LONGLONG        base;                           /* samples per second */
-    enum processor_metric metric;
+    unsigned int metric;
 };
 
 static void CALLBACK collect_processor_time( struct counter *counter )
@@ -390,19 +430,30 @@ static PDH_STATUS sample_processors( struct processor_data *data )
     return ERROR_SUCCESS;
 }
 
-static const struct counter_instance *find_processor_instance( const struct processor_data *data,
-                                                              enum processor_metric metric, const WCHAR *instance )
+static const struct counter_instance *find_counter_instance( const struct counter_instance *items, unsigned int count,
+                                                             const WCHAR *instance )
 {
-    const struct counter_instance *items = processor_instances( data, metric );
     size_t len = wcschr( instance, ')' ) - instance;
     unsigned int i;
 
-    for (i = 0; i < data->item_count; ++i)
+    for (i = 0; i < count; ++i)
     {
         const WCHAR *name = items[i].name;
         if (wcslen( name ) == len && !wcsnicmp( name, instance, len )) return &items[i];
     }
     return NULL;
+}
+
+static void collect_instances( struct counter *counter, const struct counter_instance *items, unsigned int count )
+{
+    if (counter->wildcard)
+    {
+        counter->instances = items;
+        counter->instance_count = count;
+        return;
+    }
+    counter->instances = find_counter_instance( items, count, counter->instance );
+    counter->status = counter->instances ? counter->instances->status : PDH_CSTATUS_NO_INSTANCE;
 }
 
 static void CALLBACK collect_processor_data( struct counter *counter )
@@ -415,14 +466,123 @@ static void CALLBACK collect_processor_data( struct counter *counter )
         data->collected = TRUE;
     }
     if ((counter->status = data->status)) return;
-    if (counter->wildcard)
+    collect_instances( counter, processor_instances( data, counter->metric ), data->item_count );
+}
+
+static const unsigned int gpu_requests[GPU_METRIC_COUNT] =
+{
+    D3DKMT_WINE_GPU_TELEMETRY_UTILIZATION,
+    D3DKMT_WINE_GPU_TELEMETRY_VRAM,
+    D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY,
+};
+
+static struct counter_instance *gpu_instances( const struct gpu_data *data, enum gpu_metric metric )
+{
+    return data->items + metric * data->count;
+}
+
+static PDH_STATUS init_gpu_data( struct gpu_data *data )
+{
+    D3DKMT_ENUMADAPTERS2 desc = {0};
+    struct gpu_adapter *adapters;
+    struct counter_instance *items;
+    unsigned int i, metric;
+    PDH_STATUS ret = ERROR_SUCCESS;
+
+    if (D3DKMTEnumAdapters2( &desc ) || !desc.NumAdapters) return PDH_NO_DATA;
+    desc.pAdapters = calloc( desc.NumAdapters, sizeof(*desc.pAdapters) );
+    adapters = calloc( desc.NumAdapters, sizeof(*adapters) );
+    items = calloc( desc.NumAdapters, GPU_METRIC_COUNT * sizeof(*items) );
+    if (!desc.pAdapters || !adapters || !items) ret = PDH_MEMORY_ALLOCATION_FAILURE;
+    else if (D3DKMTEnumAdapters2( &desc ) || !desc.NumAdapters) ret = PDH_NO_DATA;
+    if (ret)
     {
-        counter->instances = processor_instances( data, counter->metric );
-        counter->instance_count = data->item_count;
-        return;
+        free( desc.pAdapters );
+        free( adapters );
+        free( items );
+        return ret;
     }
-    counter->instances = find_processor_instance( data, counter->metric, counter->instance );
-    counter->status = counter->instances ? counter->instances->status : PDH_CSTATUS_NO_INSTANCE;
+    for (i = 0; i < desc.NumAdapters; ++i)
+    {
+        const D3DKMT_ADAPTERINFO *adapter = &desc.pAdapters[i];
+        UINT high = adapter->AdapterLuid.HighPart, low = adapter->AdapterLuid.LowPart;
+
+        adapters[i].handle = adapter->hAdapter;
+        swprintf( adapters[i].memory_name, ARRAY_SIZE(adapters[i].memory_name),
+                  L"luid_0x%08X_0x%08X_phys_0", high, low );
+        /* Linux exposes device-wide busy time here, with no PID or engine attribution. */
+        swprintf( adapters[i].engine_name, ARRAY_SIZE(adapters[i].engine_name),
+                  L"adapter_%ls_eng_0_engtype_GPU", adapters[i].memory_name );
+        for (metric = 0; metric < GPU_METRIC_COUNT; ++metric)
+        {
+            struct counter_instance *item = &items[metric * desc.NumAdapters + i];
+
+            item->name = metric == GPU_RUNNING_TIME ? adapters[i].engine_name : adapters[i].memory_name;
+            item->status = PDH_CSTATUS_INVALID_DATA;
+        }
+    }
+    free( desc.pAdapters );
+    data->adapters = adapters;
+    data->items = items;
+    data->count = desc.NumAdapters;
+    return ERROR_SUCCESS;
+}
+
+static PDH_STATUS sample_gpus( struct gpu_data *data )
+{
+    ULONGLONG now = 0, elapsed;
+    unsigned int i;
+    PDH_STATUS ret;
+
+    if (!data->items && (ret = init_gpu_data( data ))) return ret;
+    RtlQueryUnbiasedInterruptTime( &now );
+    elapsed = data->stamp && now > data->stamp ? now - data->stamp : 0;
+
+    for (i = 0; i < data->count; ++i)
+    {
+        struct counter_instance *engine = &gpu_instances( data, GPU_RUNNING_TIME )[i];
+        struct counter_instance *dedicated = &gpu_instances( data, GPU_DEDICATED_USAGE )[i];
+        struct counter_instance *shared = &gpu_instances( data, GPU_SHARED_USAGE )[i];
+        D3DKMT_WINE_GPU_TELEMETRY_V2 sample = {.V1.Requested = data->requests};
+        D3DKMT_QUERYADAPTERINFO desc = {data->adapters[i].handle, KMTQAITYPE_WINE_GPU_TELEMETRY,
+                                       &sample, sizeof(sample)};
+        unsigned int valid;
+
+        valid = D3DKMTQueryAdapterInfo( &desc ) ? 0 : sample.V1.Valid;
+        /* Keep the last valid values visible across missed samples.
+         * Some consumers use these counters without checking the item status. */
+        if (valid & D3DKMT_WINE_GPU_TELEMETRY_UTILIZATION)
+        {
+            /* Integrate sampled utilization over the PDH interval in 100 ns units. */
+            if (!engine->status) engine->one.largevalue += elapsed * min( sample.V1.UtilizationPercent, 100 ) / 100;
+            engine->status = PDH_CSTATUS_VALID_DATA;
+        }
+        if (valid & D3DKMT_WINE_GPU_TELEMETRY_VRAM)
+        {
+            dedicated->one.largevalue = sample.V1.VramUsedBytes;
+            dedicated->status = PDH_CSTATUS_VALID_DATA;
+        }
+        if (valid & D3DKMT_WINE_GPU_TELEMETRY_SHARED_MEMORY)
+        {
+            shared->one.largevalue = sample.SharedMemoryUsedBytes;
+            shared->status = PDH_CSTATUS_VALID_DATA;
+        }
+    }
+    data->stamp = now;
+    return ERROR_SUCCESS;
+}
+
+static void CALLBACK collect_gpu_data( struct counter *counter )
+{
+    struct gpu_data *data = counter->gpu;
+
+    if (!data->collected)
+    {
+        data->status = sample_gpus( data );
+        data->collected = TRUE;
+    }
+    if ((counter->status = data->status)) return;
+    collect_instances( counter, gpu_instances( data, counter->metric ), data->count );
 }
 
 #define TYPE_PROCESSOR_TIME \
@@ -443,6 +603,12 @@ static const struct source counter_sources[] =
       PERF_AVERAGE_BULK, 0, 0, PROCESSOR_PERFORMANCE },
     { 0, L"\\Processor Information(*)\\% Processor Utility", collect_processor_data,
       PERF_AVERAGE_BULK, 0, 0, PROCESSOR_UTILITY },
+    { 0, L"\\GPU Engine(*)\\Running Time", collect_gpu_data,
+      PERF_COUNTER_LARGE_RAWCOUNT, 0, 10000000, GPU_RUNNING_TIME },
+    { 0, L"\\GPU Adapter Memory(*)\\Dedicated Usage", collect_gpu_data,
+      PERF_COUNTER_LARGE_RAWCOUNT, 0, 0, GPU_DEDICATED_USAGE },
+    { 0, L"\\GPU Adapter Memory(*)\\Shared Usage", collect_gpu_data,
+      PERF_COUNTER_LARGE_RAWCOUNT, 0, 0, GPU_SHARED_USAGE },
 };
 
 static BOOL is_local_machine( const WCHAR *name, DWORD len )
@@ -538,13 +704,19 @@ PDH_STATUS WINAPI PdhAddCounterW( PDH_HQUERY hquery, LPCWSTR path,
                 counter->base         = counter_sources[i].base;
                 counter->queryuser    = query->user;
                 counter->user         = userdata;
-                if (counter->collect == collect_processor_data)
+                if (counter->collect == collect_processor_data || counter->collect == collect_gpu_data)
                 {
-                    counter->processor = &query->processor;
                     counter->metric = counter_sources[i].metric;
                     counter->instance = wcsrchr( counter->path, '(' ) + 1;
                     counter->wildcard = !wcsncmp( counter->instance, L"*)", 2 );
                     counter->status = PDH_CSTATUS_ITEM_NOT_VALIDATED;
+                    if (counter->collect == collect_processor_data) counter->processor = &query->processor;
+                    else
+                    {
+                        counter->gpu = &query->gpu;
+                        query->gpu.requests |= gpu_requests[counter->metric];
+                        ++query->gpu.users;
+                    }
                 }
 
                 list_add_tail( &query->counters, &counter->entry );
@@ -608,7 +780,8 @@ static PDH_STATUS format_value( struct counter *counter, DWORD format, const uni
 {
     LONG factor;
 
-    if (counter->type == PERF_COUNTER_RAWCOUNT) return format_number( counter, format, raw1->largevalue, value );
+    if (counter->type == PERF_COUNTER_RAWCOUNT || counter->type == PERF_COUNTER_LARGE_RAWCOUNT)
+        return format_number( counter, format, raw1->largevalue, value );
     factor = counter->scale ? counter->scale : counter->defaultscale;
     if (format & PDH_FMT_LONG)
     {
@@ -663,7 +836,7 @@ PDH_STATUS WINAPI PdhCalculateCounterFromRawValue( PDH_HCOUNTER handle, DWORD fo
         return PDH_INVALID_HANDLE;
     }
 
-    if (counter->type == PERF_COUNTER_RAWCOUNT && raw1)
+    if ((counter->type == PERF_COUNTER_RAWCOUNT || counter->type == PERF_COUNTER_LARGE_RAWCOUNT) && raw1)
         ret = format_number( counter, format, raw1->FirstValue, value );
     else if (!raw1 || !raw2)
         ret = PDH_INVALID_ARGUMENT;
@@ -729,9 +902,10 @@ PDH_STATUS WINAPI PdhCloseQuery( PDH_HQUERY handle )
         destroy_counter( counter );
     }
 
-    destroy_query( query );
-
+    /* Closing an adapter can wait for its telemetry worker. */
+    SecureZeroMemory( &query->magic, sizeof(query->magic) );
     LeaveCriticalSection( &pdh_handle_cs );
+    destroy_query( query );
     return ERROR_SUCCESS;
 }
 
@@ -741,6 +915,7 @@ static void collect_query_data( struct query *query )
     struct list *item;
 
     query->processor.collected = FALSE;
+    query->gpu.collected = FALSE;
     LIST_FOR_EACH( item, &query->counters )
     {
         SYSTEMTIME time;
@@ -1387,6 +1562,7 @@ PDH_STATUS WINAPI PdhOpenQueryW( LPCWSTR source, DWORD_PTR userdata, PDH_HQUERY 
 PDH_STATUS WINAPI PdhRemoveCounter( PDH_HCOUNTER handle )
 {
     struct counter *counter = handle;
+    struct gpu_data gpu = {0};
 
     TRACE("%p\n", handle);
 
@@ -1397,10 +1573,16 @@ PDH_STATUS WINAPI PdhRemoveCounter( PDH_HCOUNTER handle )
         return PDH_INVALID_HANDLE;
     }
 
+    if (counter->gpu && !--counter->gpu->users)
+    {
+        gpu = *counter->gpu;
+        memset( counter->gpu, 0, sizeof(*counter->gpu) );
+    }
     list_remove( &counter->entry );
     destroy_counter( counter );
 
     LeaveCriticalSection( &pdh_handle_cs );
+    free_gpu_data( &gpu );
     return ERROR_SUCCESS;
 }
 
@@ -1471,16 +1653,31 @@ PDH_STATUS WINAPI PdhValidatePathW( LPCWSTR path )
 
     for (i = 0; i < ARRAY_SIZE(counter_sources); i++)
     {
-        struct processor_data data = {0};
+        const struct source *source = &counter_sources[i];
         const WCHAR *instance;
 
-        if (!pdh_match_path( counter_sources[i].path, path )) continue;
-        if (counter_sources[i].collect != collect_processor_data) return ERROR_SUCCESS;
+        if (!pdh_match_path( source->path, path )) continue;
+        if (source->collect != collect_processor_data && source->collect != collect_gpu_data) return ERROR_SUCCESS;
         instance = wcsrchr( path, '(' ) + 1;
         if (!wcsncmp( instance, L"*)", 2 )) return ERROR_SUCCESS;
-        if ((ret = init_processor_data( &data ))) return ret;
-        if (!find_processor_instance( &data, counter_sources[i].metric, instance )) ret = PDH_CSTATUS_NO_INSTANCE;
-        free_processor_data( &data );
+        if (source->collect == collect_processor_data)
+        {
+            struct processor_data data = {0};
+
+            if ((ret = init_processor_data( &data ))) return ret;
+            if (!find_counter_instance( processor_instances( &data, source->metric ), data.item_count, instance ))
+                ret = PDH_CSTATUS_NO_INSTANCE;
+            free_processor_data( &data );
+        }
+        else
+        {
+            struct gpu_data data = {0};
+
+            if ((ret = init_gpu_data( &data ))) return ret;
+            if (!find_counter_instance( gpu_instances( &data, source->metric ), data.count, instance ))
+                ret = PDH_CSTATUS_NO_INSTANCE;
+            free_gpu_data( &data );
+        }
         return ret;
     }
 

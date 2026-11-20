@@ -423,7 +423,7 @@ done:
     PdhCloseQuery( query );
 }
 
-static PDH_FMT_COUNTERVALUE *find_cpu_value( PDH_FMT_COUNTERVALUE_ITEM_A *items, DWORD count, const char *name )
+static PDH_FMT_COUNTERVALUE *find_instance_value( PDH_FMT_COUNTERVALUE_ITEM_A *items, DWORD count, const char *name )
 {
     DWORD i;
 
@@ -495,15 +495,15 @@ static void test_processor_percentages( void )
         ret = PdhGetFormattedCounterArrayA( counters[i], PDH_FMT_DOUBLE, &size, &counts[i], items[i] );
         ok(!ret, "Reading %s returned %#lx\n", paths[i], ret);
         if (ret) goto done;
-        ok(find_cpu_value( items[i], counts[i], "_Total" ) != NULL, "%s missing _Total\n", paths[i]);
+        ok(find_instance_value( items[i], counts[i], "_Total" ) != NULL, "%s missing _Total\n", paths[i]);
         ok(counts[i] == counts[0], "%s has %lu instances, expected %lu\n", paths[i], counts[i], counts[0]);
     }
     for (i = 0; i < counts[0]; ++i)
     {
         const char *name = items[0][i].szName;
         PDH_FMT_COUNTERVALUE *mhz = &items[0][i].FmtValue;
-        PDH_FMT_COUNTERVALUE *perf = find_cpu_value( items[1], counts[1], name );
-        PDH_FMT_COUNTERVALUE *utility = find_cpu_value( items[2], counts[2], name );
+        PDH_FMT_COUNTERVALUE *perf = find_instance_value( items[1], counts[1], name );
+        PDH_FMT_COUNTERVALUE *utility = find_instance_value( items[2], counts[2], name );
 
         ok(perf != NULL, "Missing Performance instance %s\n", name);
         ok(utility != NULL, "Missing Utility instance %s\n", name);
@@ -532,6 +532,120 @@ static void test_processor_percentages( void )
 
 done:
     for (i = 0; i < ARRAY_SIZE(items); ++i) free( items[i] );
+    PdhCloseQuery( query );
+}
+
+static PDH_FMT_COUNTERVALUE_ITEM_A *read_gpu_array( PDH_HCOUNTER counter, DWORD format, DWORD *count )
+{
+    PDH_FMT_COUNTERVALUE_ITEM_A *items;
+    DWORD size = 0;
+    PDH_STATUS ret;
+
+    *count = 0;
+    /* Steam sizes every array as DOUBLE, even when it reads Running Time as LARGE. */
+    ret = PdhGetFormattedCounterArrayA( counter, PDH_FMT_DOUBLE, &size, count, NULL );
+    if (ret == PDH_NO_DATA || ret == PDH_INVALID_DATA || ret == PDH_CSTATUS_NO_INSTANCE ||
+        (!ret && !size)) return NULL;
+    ok(ret == PDH_MORE_DATA && size, "Sizing array returned %#lx, size %lu\n", ret, size);
+    if (ret != PDH_MORE_DATA || !size) return NULL;
+    items = malloc( size );
+    ret = PdhGetFormattedCounterArrayA( counter, format, &size, count, items );
+    ok(!ret, "Reading array returned %#lx\n", ret);
+    if (!ret) return items;
+    free( items );
+    return NULL;
+}
+
+static void test_gpu_counters( void )
+{
+    static const char *const paths[] =
+    {
+        "\\GPU Adapter Memory(*)\\Dedicated Usage", "\\GPU Adapter Memory(*)\\Shared Usage",
+        "\\GPU Engine(*)\\Running Time",
+    };
+    PDH_FMT_COUNTERVALUE_ITEM_A *items[3] = {0}, *previous = NULL;
+    PDH_HCOUNTER counters[3];
+    DWORD counts[3] = {0}, old_count = 0, i, j;
+    ULONGLONG start, elapsed;
+    PDH_HQUERY query;
+    PDH_STATUS ret;
+
+    ret = PdhOpenQueryA( NULL, 0, &query );
+    ok(!ret, "Opening query returned %#lx\n", ret);
+    if (ret) return;
+    for (i = 0; i < ARRAY_SIZE(paths); ++i)
+    {
+        ret = pPdhAddEnglishCounterA( query, paths[i], 0, &counters[i] );
+        if (ret == PDH_CSTATUS_NO_COUNTER || ret == PDH_CSTATUS_NO_OBJECT)
+        {
+            win_skip("%s unavailable\n", paths[i]);
+            goto done;
+        }
+        ok(!ret, "Adding %s returned %#lx\n", paths[i], ret);
+        if (ret) goto done;
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        if (i) Sleep( 100 );
+        if (i == 1) start = GetTickCount64();
+        ret = PdhCollectQueryData( query );
+        if (ret == PDH_NO_DATA) { skip("No GPU data\n"); goto done; }
+        ok(!ret, "Collection %lu returned %#lx\n", i, ret);
+        if (ret) goto done;
+        if (i == 1) previous = read_gpu_array( counters[2], PDH_FMT_LARGE, &old_count );
+    }
+    elapsed = (GetTickCount64() - start + 16) * 10000; /* Allow for GetTickCount64 granularity. */
+    for (i = 0; i < ARRAY_SIZE(paths); ++i)
+        items[i] = read_gpu_array( counters[i], i == 2 ? PDH_FMT_LARGE : PDH_FMT_DOUBLE, &counts[i] );
+
+    for (i = 0; i < 2; ++i)
+        for (j = 0; items[i] && j < counts[i]; ++j)
+        {
+            const char *name = items[i][j].szName;
+            PDH_FMT_COUNTERVALUE value = items[i][j].FmtValue;
+            unsigned int high, low, phys;
+            char extra;
+
+            ok(sscanf( name, "luid_0x%x_0x%x_phys_%u%c", &high, &low, &phys, &extra ) == 3,
+               "Unexpected adapter instance %s\n", name);
+            if (items[1 - i])
+                ok(find_instance_value( items[1 - i], counts[1 - i], name ) != NULL, "Missing adapter %s\n", name);
+            if (value.CStatus <= PDH_CSTATUS_NEW_DATA)
+                ok(value.doubleValue >= 0, "%s: memory usage %g\n", name, value.doubleValue);
+        }
+    for (i = 0; items[2] && i < counts[2]; ++i)
+    {
+        const char *name = items[2][i].szName, *luid = strstr( name, "_luid_" );
+        const char *engine = luid ? strstr( luid, "_eng_" ) : NULL;
+        PDH_FMT_COUNTERVALUE value = items[2][i].FmtValue, *old;
+        char adapter[64];
+        size_t len;
+
+        ok(engine && strstr( engine, "_engtype_" ), "Unexpected engine instance %s\n", name);
+        if (!engine) continue;
+        if (!strncmp( name, "adapter_", 8 ))
+            ok(!strcmp( engine, "_eng_0_engtype_GPU" ), "Unexpected adapter-wide engine %s\n", name);
+        ++luid;
+        len = engine - luid;
+        ok(len < sizeof(adapter), "Unexpected adapter name length in %s\n", name);
+        if (len >= sizeof(adapter)) continue;
+        memcpy( adapter, luid, len );
+        adapter[len] = 0;
+        if (items[0]) ok(find_instance_value( items[0], counts[0], adapter ) != NULL,
+                         "%s: missing adapter %s\n", name, adapter);
+        if (value.CStatus > PDH_CSTATUS_NEW_DATA) continue;
+        ok(value.largeValue >= 0, "%s: running time %s\n", name, wine_dbgstr_longlong(value.largeValue));
+        if (!previous || !(old = find_instance_value( previous, old_count, name )) ||
+            old->CStatus > PDH_CSTATUS_NEW_DATA) continue;
+        ok(value.largeValue >= old->largeValue, "%s: running time went backwards\n", name);
+        if (!strncmp( name, "adapter_", 8 ))
+            ok((ULONGLONG)(value.largeValue - old->largeValue) <= elapsed,
+               "%s: GPU time exceeded wall time\n", name);
+    }
+
+done:
+    for (i = 0; i < ARRAY_SIZE(items); ++i) free( items[i] );
+    free( previous );
     PdhCloseQuery( query );
 }
 
@@ -1260,6 +1374,7 @@ START_TEST(pdh)
     if (pPdhAddEnglishCounterW) test_PdhAddEnglishCounterW();
     if (pPdhAddEnglishCounterA && pPdhAddEnglishCounterW) test_processor_frequency();
     if (pPdhAddEnglishCounterA) test_processor_percentages();
+    if (pPdhAddEnglishCounterA) test_gpu_counters();
     if (pPdhCollectQueryDataWithTime) test_PdhCollectQueryDataWithTime();
 
     test_PdhGetFormattedCounterValue();
