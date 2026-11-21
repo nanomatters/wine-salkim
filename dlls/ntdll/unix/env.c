@@ -1861,6 +1861,24 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
 }
 
 
+static void preserve_unix_env_var( const RTL_USER_PROCESS_PARAMETERS *params, const WCHAR *nameW,
+                                   SIZE_T name_len, const char *name )
+{
+    const WCHAR *var;
+    char value[128];
+    SIZE_T len;
+    int ret;
+
+    if (!(var = find_env_var( params->Environment, params->EnvironmentSize / sizeof(WCHAR), nameW, name_len )))
+        return;
+    var += name_len + 1;
+    if ((len = wcslen( var )) >= sizeof(value) / 4) return;
+    if ((ret = ntdll_wcstoumbs( var, len, value, sizeof(value) - 1, TRUE )) < 0) return;
+    value[ret] = 0;
+    setenv( name, value, 1 );
+}
+
+
 /*************************************************************************
  *		init_peb
  */
@@ -1868,17 +1886,25 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
 {
     static const WCHAR eos_processW[] = {'P','R','O','T','O','N','_','E','A','C','_','E','O','S','_',
                                         'P','R','O','C','E','S','S'};
+    static const WCHAR appidW[] = {'S','t','e','a','m','A','p','p','I','d'};
+    static const WCHAR gameidW[] = {'S','t','e','a','m','G','a','m','e','I','d'};
+    static const WCHAR overlayidW[] = {'S','t','e','a','m','O','v','e','r','l','a','y','G','a','m','e','I','d'};
     const WCHAR *eos;
 
     /* EOS also starts native children without CreateProcess. Preserve the child-only
      * marker in the Unix environment, including for a 32-bit bootstrapper. */
     eos = find_env_var( params->Environment, params->EnvironmentSize / sizeof(WCHAR),
                         eos_processW, ARRAY_SIZE(eos_processW) );
-    if (eos && eos[ARRAY_SIZE(eos_processW) + 1] == '1' && !eos[ARRAY_SIZE(eos_processW) + 2] &&
-        setenv( "PROTON_EAC_EOS_PROCESS", "1", 1 ))
+    if (eos && eos[ARRAY_SIZE(eos_processW) + 1] == '1' && !eos[ARRAY_SIZE(eos_processW) + 2])
     {
-        MESSAGE( "wine: could not preserve EOS process environment: %s\n", strerror(errno) );
-        exit(1);
+        if (setenv( "PROTON_EAC_EOS_PROCESS", "1", 1 ))
+        {
+            MESSAGE( "wine: could not preserve EOS process environment: %s\n", strerror(errno) );
+            exit(1);
+        }
+        preserve_unix_env_var( params, appidW, ARRAY_SIZE(appidW), "SteamAppId" );
+        preserve_unix_env_var( params, gameidW, ARRAY_SIZE(gameidW), "SteamGameId" );
+        preserve_unix_env_var( params, overlayidW, ARRAY_SIZE(overlayidW), "SteamOverlayGameId" );
     }
 
     peb->ImageBaseAddress           = module;
