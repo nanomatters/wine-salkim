@@ -2809,7 +2809,7 @@ static BOOL is_fullscreen( const MONITORINFO *info, const RECT *rect )
  * Backend implementation of SetWindowPos.
  */
 static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, struct window_surface *new_surface,
-                              const struct window_rects *new_rects, const RECT *valid_rects )
+                              const struct window_rects *new_rects, const RECT *valid_rects, UINT driver_flags )
 {
     struct window_rects monitor_rects;
     WND *win;
@@ -3011,6 +3011,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             owner_hint = window_from_point_excluding_root( hwnd, pt );
         }
 
+        swp_flags = (swp_flags & ~WINE_SWP_STACKED_AFTER) | driver_flags;
         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
                                         get_driver_window_surface( new_surface, raw_dpi ) );
         update_client_surfaces( toplevel );
@@ -3269,7 +3270,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
         window_surface_set_layered( surface, key, -1, 0xff000000 );
     }
-    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
+    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL, 0 );
     if (!surface) return FALSE;
 
     if (!hdc_src || surface == &dummy_surface)
@@ -4507,7 +4508,8 @@ static UINT calc_ncsize( WINDOWPOS *winpos, const struct window_rects *old_rects
 }
 
 /* fix redundant flags and values in the WINDOWPOS structure */
-static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int parent_x, int parent_y )
+static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int parent_x, int parent_y,
+                             HWND *stacked_after )
 {
     HWND parent;
     WND *win = get_win_ptr( winpos->hwnd );
@@ -4586,9 +4588,13 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
     }
     else
     {
-        if ((winpos->hwnd == winpos->hwndInsertAfter) ||
-            (winpos->hwnd == get_window_relative( winpos->hwndInsertAfter, GW_HWNDNEXT )))
+        if (winpos->hwnd == winpos->hwndInsertAfter)
             winpos->flags |= SWP_NOZORDER;
+        else if (winpos->hwnd == get_window_relative( winpos->hwndInsertAfter, GW_HWNDNEXT ))
+        {
+            *stacked_after = winpos->hwndInsertAfter;
+            winpos->flags |= SWP_NOZORDER;
+        }
     }
  done:
     release_win_ptr( win );
@@ -4684,7 +4690,8 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     RECT valid_rects[2], surface_rect;
     struct window_surface *surface;
     struct window_rects old_rects, new_rects;
-    UINT orig_flags, context;
+    UINT orig_flags, context, driver_flags = 0;
+    HWND stacked_after = NULL;
     BOOL ret = FALSE;
 
     orig_flags = winpos->flags;
@@ -4733,7 +4740,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if (!calc_winpos( winpos, &old_rects, &new_rects )) goto done;
 
     /* Fix redundant flags */
-    if (!fixup_swp_flags( winpos, &old_rects.window, parent_x, parent_y )) goto done;
+    if (!fixup_swp_flags( winpos, &old_rects.window, parent_x, parent_y, &stacked_after )) goto done;
 
     if((winpos->flags & (SWP_NOZORDER | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) != SWP_NOZORDER)
     {
@@ -4746,8 +4753,9 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     calc_ncsize( winpos, &old_rects, &new_rects, valid_rects, parent_x, parent_y );
 
     surface = get_window_surface( winpos->hwnd, winpos->flags, FALSE, &new_rects, &surface_rect );
+    if (stacked_after && stacked_after == winpos->hwndInsertAfter) driver_flags |= WINE_SWP_STACKED_AFTER;
     if (!apply_window_pos( winpos->hwnd, winpos->hwndInsertAfter, winpos->flags, surface,
-                           &new_rects, valid_rects ))
+                           &new_rects, valid_rects, driver_flags ))
     {
         if (surface) window_surface_release( surface );
         goto done;
@@ -5555,7 +5563,7 @@ void update_window_state( HWND hwnd )
     valid_rects[0] = valid_rects[1] = new_rects.client;
 
     surface = get_window_surface( hwnd, swp_flags, FALSE, &new_rects, &surface_rect );
-    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, valid_rects );
+    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, valid_rects, 0 );
     if (surface) window_surface_release( surface );
 
     set_thread_dpi_awareness_context( context );
@@ -6751,7 +6759,7 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     new_rects.client = new_rects.window;
 
     surface = get_window_surface( hwnd, SWP_NOZORDER | SWP_NOACTIVATE, FALSE, &new_rects, &surface_rect );
-    if (!apply_window_pos( hwnd, 0, SWP_NOZORDER | SWP_NOACTIVATE, surface, &new_rects, NULL ))
+    if (!apply_window_pos( hwnd, 0, SWP_NOZORDER | SWP_NOACTIVATE, surface, &new_rects, NULL, 0 ))
     {
         if (surface) window_surface_release( surface );
         goto failed;
@@ -6790,7 +6798,7 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
         map_window_points( 0, parent, (POINT *)&new_rects.client, 2, win_dpi );
 
         surface = get_window_surface( hwnd, SWP_NOACTIVATE, FALSE, &new_rects, &surface_rect );
-        apply_window_pos( hwnd, insert_after, SWP_NOACTIVATE, surface, &new_rects, NULL );
+        apply_window_pos( hwnd, insert_after, SWP_NOACTIVATE, surface, &new_rects, NULL, 0 );
         if (surface) window_surface_release( surface );
     }
     else goto failed;

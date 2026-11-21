@@ -33,6 +33,7 @@ def main():
     repo = here.parents[2]
     args.build_dir.mkdir(parents=True, exist_ok=True)
     names = (
+        ("waylanddrv.h", ("intersect_rect",)),
         ("wayland_surface.c", (
             "wayland_surface_get_output", "wayland_surface_reset_presentation_output",
             "wayland_surface_clear_outputs", "wayland_surface_queue_output_update",
@@ -40,6 +41,8 @@ def main():
             "wayland_client_surface_get_fullscreen_rect",
             "wayland_client_surface_refresh_fullscreen_targets",
             "wayland_client_surface_update_fullscreen_target",
+            "map_point_to_surface", "set_subsurface_position", "wayland_surface_get_surface_size",
+            "wayland_surface_get_rect_in_monitor", "wayland_surface_reconfigure_geometry",
             "wayland_surface_config_is_compatible", "wayland_surface_reconfigure_xdg")),
         ("window.c", (
             "WAYLAND_WindowPosChanging",
@@ -51,7 +54,8 @@ def main():
             "wayland_win_data_get_presentation_rect", "wayland_win_data_is_fullscreen",
             "wayland_win_data_retargets_fullscreen",
             "wayland_win_data_get_shm_source", "map_virtual_overlay_rect",
-            "should_keep_toplevel_mapped",
+            "wayland_win_data_get_mapped_backdrop", "get_fullscreen_backdrop_rect",
+            "get_backdrop_parent", "should_keep_toplevel_mapped",
             "wayland_win_data_get_config", "wayland_win_data_refresh_output_targets",
             "wayland_win_data_update_presentation_output",
             "wayland_window_update_output",
@@ -85,8 +89,8 @@ def main():
     visibility = create[create.index("    keep_toplevel_mapped ="):
                         create.index("    /* If the toplevel has no observable area")]
     changed = function(source, "WAYLAND_WindowPosChanged")
-    fullscreen = changed[changed.index("    if ((data = wayland_win_data_get(hwnd)))"):
-                         changed.index("    /* Infer application fullscreen")]
+    start = changed.index("        updating_output = data->updating_output;")
+    fullscreen = changed[start:changed.index("        wayland_win_data_release(data);", start)]
     target = changed[changed.index("    if (!preserve_fullscreen)\n"):
                      changed.index("    data->rects = *new_rects;")]
     client_target = changed[changed.index("    if (data->client_surface", changed.index("    data->rects = *new_rects;")):

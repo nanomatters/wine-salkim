@@ -565,6 +565,38 @@ static RECT map_virtual_overlay_rect(const struct wayland_win_data *data,
     return rect;
 }
 
+/* Caller holds win_data_mutex. A recreated root has a new surface serial,
+ * even if it still represents the same HWND. */
+struct wayland_win_data *wayland_win_data_get_mapped_backdrop(const struct wayland_win_data *host)
+{
+    struct wayland_win_data *backdrop;
+    struct wayland_surface *surface;
+
+    if (!host || !host->fullscreen_backdrop || !host->wayland_surface) return NULL;
+    if (!(backdrop = wayland_win_data_get_nolock(host->fullscreen_backdrop))) return NULL;
+    surface = backdrop->wayland_surface;
+    if (!surface || surface->role != WAYLAND_SURFACE_ROLE_SUBSURFACE || !surface->wl_subsurface ||
+        !surface->window.visible || surface->toplevel_hwnd != host->hwnd ||
+        surface->parent_serial != host->wayland_surface->serial)
+        return NULL;
+    return backdrop;
+}
+
+static RECT get_fullscreen_backdrop_rect(const struct wayland_win_data *data, const RECT *root_rect)
+{
+    struct wayland_win_data *backdrop;
+    RECT output, intersection;
+
+    if (!(data->style & (WS_MINIMIZE | WS_CAPTION | WS_THICKFRAME)) &&
+        (backdrop = wayland_win_data_get_mapped_backdrop(data)) &&
+        wayland_win_data_get_fullscreen_rect(backdrop, TRUE, &output) &&
+        EqualRect(&backdrop->wayland_surface->window.rect, &output) &&
+        intersect_rect(&intersection, &output, root_rect) && EqualRect(&intersection, root_rect))
+        return output;
+
+    return (RECT){0};
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
@@ -631,6 +663,8 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     TRACE("window=%s shm_source=%s style=%#x exstyle=%#x\n",
           wine_dbgstr_rect(&conf->rect), wine_dbgstr_rect(&conf->shm_source), style, exstyle);
 
+    conf->backdrop_rect = get_fullscreen_backdrop_rect(data, &conf->rect);
+    fullscreen |= !IsRectEmpty(&conf->backdrop_rect);
     if (conf->minimized)
     {
         window_state = 0;
@@ -650,7 +684,8 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     conf->resizeable = (style & WS_THICKFRAME) && !fullscreen;
     conf->state = window_state;
     conf->managed = data->managed;
-    conf->preserve_fullscreen_size = wayland_win_data_has_fixed_fullscreen_size(data, TRUE);
+    conf->preserve_fullscreen_size = !IsRectEmpty(&conf->backdrop_rect) ||
+                                     wayland_win_data_has_fixed_fullscreen_size(data, TRUE);
     conf->virtual_size.cx = conf->virtual_size.cy = 0;
     if (data->virtual_desktop && !conf->minimized &&
         (parent || (has_presentation_rect && (window_state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))) &&
@@ -1115,6 +1150,8 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
              * turn into another fullscreen request and fight compositor policy. */
             if (wayland_win_data_get_requested_fullscreen_rect(data, TRUE, &requested_rect))
                 output = wayland_output_for_rect(&requested_rect, NULL, NULL);
+            else if (!IsRectEmpty(&window->backdrop_rect))
+                output = wayland_output_for_rect(&window->backdrop_rect, NULL, NULL);
             else if (surface->presentation_output && surface->fullscreen_requested)
                 wl_output = (struct wl_output *)surface->requested_output;
             else
@@ -1195,6 +1232,18 @@ void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data)
         refresh_subsurface_windows(data->hwnd, FALSE);
         wl_display_flush(process_wayland.wl_display);
     }
+}
+
+static void refresh_backdrop_host(struct wayland_win_data *host)
+{
+    struct wayland_surface *surface = host->wayland_surface;
+    RECT rect;
+
+    if (!surface || !wayland_surface_is_toplevel(surface)) return;
+    rect = get_fullscreen_backdrop_rect(host, &surface->window.rect);
+    if (EqualRect(&rect, &surface->window.backdrop_rect)) return;
+    wayland_win_data_refresh_fullscreen(host);
+    if (wayland_surface_reconfigure(surface)) wayland_surface_commit_pending_state(surface);
 }
 
 static BOOL is_managed(HWND hwnd)
@@ -1492,6 +1541,25 @@ static HWND get_popup_owner(HWND hwnd, HWND owner_hint)
     return owner;
 }
 
+/* SetWindowPos can explicitly stack an unowned tool window under its host.
+ * Retain that relationship across position-only updates while they are still
+ * adjacent. An application may pass any hWndInsertAfter with SWP_NOZORDER. */
+static HWND get_backdrop_parent(HWND hwnd, HWND insert_after, UINT flags, HWND previous)
+{
+    struct wayland_win_data *host;
+    HWND parent = previous;
+
+    if (!(flags & SWP_NOZORDER) || (flags & WINE_SWP_STACKED_AFTER)) parent = insert_after;
+    if (!parent || NtUserGetWindowRelative(hwnd, GW_HWNDPREV) != parent) return NULL;
+    if (!(host = wayland_win_data_get(parent))) return NULL;
+    if (host->toplevel != parent || host->subsurface_parent || host->external_host ||
+        host->virtual_desktop || (host->style & WS_CHILD) || (host->exstyle & WS_EX_TOOLWINDOW) ||
+        ((host->style & WS_DISABLED) && parent != previous))
+        parent = NULL;
+    wayland_win_data_release(host);
+    return parent;
+}
+
 /* Caller holds win_data_mutex. A host can move across an inferred popup in
  * Z-order without a position notification for that popup. NOZORDER updates
  * do not schedule this again. Include hints which were previously rejected. */
@@ -1665,13 +1733,19 @@ BOOL wayland_window_get_effective_alpha(HWND hwnd, BYTE *alpha)
  */
 void WAYLAND_DestroyWindow(HWND hwnd)
 {
-    struct wayland_win_data *data;
+    struct wayland_win_data *data, *parent;
     HWND host;
 
     TRACE("%p\n", hwnd);
 
     wayland_clipboard_destroy_window(hwnd);
     if (!(data = wayland_win_data_get(hwnd))) return;
+    if (data->subsurface_below_parent && (parent = wayland_win_data_get_nolock(data->subsurface_parent)) &&
+        parent->fullscreen_backdrop == hwnd)
+    {
+        parent->fullscreen_backdrop = NULL;
+        refresh_backdrop_host(parent);
+    }
     queue_subsurface_updates(hwnd);
     queue_inferred_popup_updates(hwnd);
     host = data->external_host;
@@ -1729,6 +1803,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     HWND previous_host = NULL;
     HWND external_host = NULL;
     HWND subsurface_parent = NULL;
+    HWND backdrop_parent = NULL, previous_backdrop_parent = NULL;
     BOOL subsurface_below_parent = FALSE;
     BOOL externally_hosted = wayland_window_is_externally_hosted(hwnd, &external_host);
     RECT present_rect = {0};
@@ -1743,6 +1818,11 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if ((data = wayland_win_data_get(hwnd)))
     {
+        if (data->subsurface_below_parent && (owner_data = wayland_win_data_get_nolock(data->subsurface_parent)) &&
+            owner_data->fullscreen_backdrop == hwnd)
+            previous_backdrop_parent = data->subsurface_parent;
+        /* A corner hit on the backdrop must not turn the host into its popup. */
+        if (owner_hint == data->fullscreen_backdrop) owner_hint = NULL;
         updating_output = data->updating_output;
         preserve_fullscreen = wayland_win_data_preserves_fullscreen(data, new_rects, style, swp_flags);
         /* The waiver belongs to this driver position update, not application
@@ -1778,7 +1858,17 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * before considering popup owners or positional hints. */
     if (root == hwnd)
     {
-        HWND popup_owner = get_popup_owner(hwnd, owner_hint);
+        HWND popup_owner;
+
+        if (!window_owner && (style & WS_DISABLED) && (exstyle & WS_EX_TOOLWINDOW) &&
+            is_menu_popup_candidate_style(style, exstyle) &&
+            (fullscreen || (previous_backdrop_parent && !(style & WS_VISIBLE))))
+        {
+            backdrop_parent = get_backdrop_parent(hwnd, insert_after, swp_flags, previous_backdrop_parent);
+            subsurface_parent = backdrop_parent;
+            subsurface_below_parent = !!backdrop_parent;
+        }
+        popup_owner = backdrop_parent ? NULL : get_popup_owner(hwnd, owner_hint);
 
         /* xdg_popups always stack above their parent. Preserve the actual
          * Win32 order for inferred background helpers with a subsurface.
@@ -1868,6 +1958,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         }
         subsurface_parent = NULL;
         subsurface_below_parent = FALSE;
+        backdrop_parent = NULL;
     }
 
     /* Keep explicit hide intent across later position-only updates. */
@@ -1984,6 +2075,18 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         if (!initial_state_committed) wayland_win_data_update_wayland_state(data);
     }
 
+    if (previous_backdrop_parent && previous_backdrop_parent != backdrop_parent &&
+        (owner_data = wayland_win_data_get_nolock(previous_backdrop_parent)) &&
+        owner_data->fullscreen_backdrop == hwnd)
+    {
+        owner_data->fullscreen_backdrop = NULL;
+        refresh_backdrop_host(owner_data);
+    }
+    if (backdrop_parent && toplevel_data)
+    {
+        toplevel_data->fullscreen_backdrop = hwnd;
+        refresh_backdrop_host(toplevel_data);
+    }
     if (subsurface_parent) refresh_subsurface_windows(subsurface_parent, FALSE);
     refresh_subsurface_windows(hwnd, TRUE);
     if (update_inferred) queue_inferred_popup_updates(hwnd);
@@ -2262,9 +2365,10 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_FRAMECHANGED;
     }
 
-    /* Explicit presentation modes and virtual desktops own their render extent.
+    /* Explicit presentation modes, virtual desktops and windows with a
+     * separate fullscreen backdrop own their render extent.
      * Ordinary xdg fullscreen follows the compositor extent as a Win32 resize. */
-    if (wayland_win_data_has_fixed_fullscreen_size(data, TRUE) &&
+    if ((!IsRectEmpty(&surface->window.backdrop_rect) || wayland_win_data_has_fixed_fullscreen_size(data, TRUE)) &&
         (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
         (surface->window.state & managed_state) == (state & managed_state))
     {
@@ -2645,11 +2749,15 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
     {
         data->style = style->styleNew;
         refresh_overlay = changed & (WS_POPUP | WS_CAPTION | WS_SYSMENU);
+        if (data->fullscreen_backdrop || data->subsurface_below_parent)
+            refresh_overlay |= changed & (WS_DISABLED | WS_CHILD | WS_THICKFRAME);
     }
     else if (offset == GWL_EXSTYLE)
     {
         data->exstyle = style->styleNew;
         refresh_overlay = changed & (WS_EX_LAYERED | WS_EX_APPWINDOW);
+        if (data->fullscreen_backdrop || data->subsurface_below_parent)
+            refresh_overlay |= changed & WS_EX_TOOLWINDOW;
     }
 
     /* Changing WS_EX_LAYERED resets attributes */

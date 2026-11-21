@@ -525,6 +525,7 @@ struct wayland_visual_constraint
 struct wayland_window_config
 {
     RECT rect;
+    RECT backdrop_rect; /* Fullscreen subsurface in screen coordinates, if present. */
     RECT window_rect;
     RECT client_rect;
     /* Window-surface buffer pixels presented by the parent wl_surface. */
@@ -694,6 +695,7 @@ struct wayland_surface
             struct wl_subsurface *wl_subsurface;
             HWND toplevel_hwnd;
             unsigned int parent_serial;
+            POINT subsurface_position;
         };
         struct
         {
@@ -987,6 +989,7 @@ struct wayland_win_data
     /* Presentation parent, independent of Win32 ownership. */
     HWND subsurface_parent;
     BOOL subsurface_below_parent;
+    HWND fullscreen_backdrop;
     HWND external_host;
     WCHAR *window_text;
     BOOL visible;
@@ -1035,6 +1038,7 @@ struct wayland_win_data
 };
 
 struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+struct wayland_win_data *wayland_win_data_get_mapped_backdrop(const struct wayland_win_data *host);
 void wayland_win_data_lock(void);
 void wayland_win_data_unlock(void);
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);

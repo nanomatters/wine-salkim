@@ -459,6 +459,7 @@ struct gdi_device_manager
 #define WINE_SWP_FULLSCREEN 0x80000000
 #define WINE_SWP_RESIZABLE  0x40000000
 #define WINE_SWP_TRAY_MENU  0x20000000
+#define WINE_SWP_STACKED_AFTER 0x10000000 /* The requested sibling was already immediately above. */
 
 /* CPU transports for GDI targeting a window owned by another process. */
 #define WINE_GDI_FOREIGN_SURFACE_SHM 0x00000001

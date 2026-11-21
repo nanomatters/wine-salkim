@@ -2707,6 +2707,7 @@ BOOL wayland_surface_make_subsurface(struct wayland_surface *surface,
     wayland_surface_sync_alpha(surface);
     surface->toplevel_hwnd = parent->hwnd;
     surface->parent_serial = parent->serial;
+    surface->subsurface_position = (POINT){0};
 
     /* Present contents independently of the parent surface. */
     wl_subsurface_set_desync(surface->wl_subsurface);
@@ -2827,22 +2828,23 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
                                 struct wayland_surface *owner)
 {
     struct xdg_positioner *xdg_positioner = NULL;
-    RECT rect = surface->window.rect;
+    RECT rect = surface->window.rect, current;
     uint32_t grab_serial = 0;
-
-    OffsetRect(&rect, -owner->window.rect.left, -owner->window.rect.top);
 
     assert(owner->xdg_surface);
     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_POPUP);
 
+    OffsetRect(&rect, -owner->window.rect.left, -owner->window.rect.top);
     if (surface->xdg_popup && surface->owner_hwnd == owner->hwnd)
     {
         if (!surface->current.serial) return;
 
         rect = map_rect_to_surface(surface, rect);
+        OffsetRect(&rect, -owner->geometry.left, -owner->geometry.top);
 
         /* reposition the popup if needed */
-        if (EqualRect(&surface->current.rect, &rect)) return;
+        current = map_rect_to_surface(surface, surface->current.rect);
+        if (EqualRect(&current, &rect)) return;
 
         xdg_positioner = create_xdg_positioner(rect);
         if (!xdg_positioner)
@@ -2865,6 +2867,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
 
     wayland_surface_init_fractional_scale(surface, owner->window.scale);
     rect = map_rect_to_surface(surface, rect);
+    OffsetRect(&rect, -owner->geometry.left, -owner->geometry.top);
 
     surface->xdg_surface = xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base,
                                                        surface->wl_surface);
@@ -3805,6 +3808,13 @@ static void wayland_surface_get_surface_size(struct wayland_surface *surface, RE
         *height = config->surface_height;
 }
 
+static void set_subsurface_position(struct wayland_surface *surface, POINT pos)
+{
+    if (pos.x == surface->subsurface_position.x && pos.y == surface->subsurface_position.y) return;
+    wl_subsurface_set_position(surface->wl_subsurface, pos.x, pos.y);
+    surface->subsurface_position = pos;
+}
+
 /**********************************************************************
  *          wayland_surface_reconfigure_geometry
  *
@@ -3813,7 +3823,24 @@ static void wayland_surface_get_surface_size(struct wayland_surface *surface, RE
 static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface, RECT rect)
 {
     const RECT *current = &surface->current.rect;
+    POINT origin = {0};
     int width, height;
+
+    if (!IsRectEmpty(&surface->window.backdrop_rect))
+    {
+        struct wayland_win_data *host = wayland_win_data_get_nolock(surface->hwnd);
+        struct wayland_win_data *backdrop = wayland_win_data_get_mapped_backdrop(host);
+
+        /* The geometry and subsurface position both latch on the root commit. */
+        if (backdrop)
+        {
+            origin.x = rect.left - surface->window.rect.left;
+            origin.y = rect.top - surface->window.rect.top;
+            origin = map_point_to_surface(surface, origin);
+            set_subsurface_position(backdrop->wayland_surface, origin);
+        }
+        else rect = surface->window.rect;
+    }
     /* If the window size is bigger than the current state accepts, use the
      * largest visible (from Windows' perspective) subregion of the window. */
     if ((surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
@@ -3821,7 +3848,8 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
         (rect.right - rect.left > current->right - current->left ||
          rect.bottom - rect.top > current->bottom - current->top))
     {
-        wayland_surface_get_rect_in_monitor(surface, &rect);
+        if (IsRectEmpty(&surface->window.backdrop_rect))
+            wayland_surface_get_rect_in_monitor(surface, &rect);
 
         /* If the window rect in the monitor is smaller than required,
          * fall back to an appropriately sized rect at the top-left. */
@@ -3841,15 +3869,13 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
     }
 
     wayland_surface_get_surface_size(surface, rect, &width, &height);
-    rect = map_rect_to_surface(surface, rect);
-    rect.right = rect.left + width;
-    rect.bottom = rect.top + height;
+    SetRect(&rect, origin.x, origin.y, origin.x + width, origin.y + height);
 
     TRACE("hwnd=%p geometry=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
 
     if (width > 0 && height > 0)
     {
-        xdg_surface_set_window_geometry(surface->xdg_surface, 0, 0, width, height);
+        xdg_surface_set_window_geometry(surface->xdg_surface, origin.x, origin.y, width, height);
         wayland_surface_mark_pending_commit(surface);
         surface->geometry = rect;
         /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
@@ -6414,6 +6440,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     struct wayland_window_config *window = &surface->window;
     BOOL configure_acked = FALSE;
 
+    if (!IsRectEmpty(&window->backdrop_rect)) rect = window->backdrop_rect;
     /* Acknowledge any compatible processed config. */
     if (surface->processing.serial && surface->processing.processed &&
         wayland_surface_config_is_compatible(&surface->processing, rect,
@@ -6523,10 +6550,14 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
 
     point.x = surface->window.rect.left - toplevel_surface->window.rect.left;
     point.y = surface->window.rect.top - toplevel_surface->window.rect.top;
-    point = map_point_to_surface(surface, point);
-
-    TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, point.x, point.y);
-    wl_subsurface_set_position(surface->wl_subsurface, point.x, point.y);
+    if (toplevel_data->fullscreen_backdrop == surface->hwnd &&
+        !IsRectEmpty(&toplevel_surface->window.backdrop_rect) && wayland_surface_is_toplevel(toplevel_surface))
+    {
+        point = map_point_to_surface(toplevel_surface, point);
+        if (point.x != surface->subsurface_position.x || point.y != surface->subsurface_position.y)
+            wayland_surface_reconfigure_xdg(toplevel_surface, toplevel_surface->window.rect);
+    }
+    else set_subsurface_position(surface, map_point_to_surface(surface, point));
 
     /* Inferred background windows stack below all parent content. Other
      * attached windows retain their above-parent placement. */

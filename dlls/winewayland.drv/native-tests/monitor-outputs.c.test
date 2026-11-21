@@ -16,6 +16,7 @@ typedef int INT;
 typedef uint64_t UINT64;
 typedef void *HWND;
 typedef struct { int left, top, right, bottom; } RECT;
+typedef struct { int x, y; } POINT;
 typedef struct { int cx, cy; } SIZE;
 struct window_rects { RECT window, client, visible; };
 #define TRUE 1
@@ -31,6 +32,9 @@ static const char *wine_dbgstr_longlong(uint64_t value) { (void)value; return "o
 #define WS_MINIMIZE 0x20000000u
 #define WS_VISIBLE 0x10000000u
 #define WS_POPUP 0x80000000u
+#define WS_DISABLED 0x08000000u
+#define WS_CHILD 0x40000000u
+#define WS_EX_TOOLWINDOW 0x80u
 #define WS_MAXIMIZE 0x01000000u
 #define WS_CAPTION 0x00c00000u
 #define WS_THICKFRAME 0x00040000u
@@ -45,6 +49,8 @@ static const char *wine_dbgstr_longlong(uint64_t value) { (void)value; return "o
 #define SWP_FRAMECHANGED 0x20u
 #define SWP_HIDEWINDOW 0x80u
 #define WINE_SWP_FULLSCREEN 0x80000000u
+#define WINE_SWP_STACKED_AFTER 0x10000000u
+#define GW_HWNDPREV 3
 #define GWL_STYLE (-16)
 #define SC_MAXIMIZE 0xf030u
 #define SC_RESTORE 0xf120u
@@ -52,6 +58,7 @@ static const char *wine_dbgstr_longlong(uint64_t value) { (void)value; return "o
 #define WM_EXITSIZEMOVE 0x232u
 #define WM_WINE_WINDOW_STATE_CHANGED 0x9011u
 #define WAYLAND_SURFACE_ROLE_TOPLEVEL 1
+#define WAYLAND_SURFACE_ROLE_SUBSURFACE 2
 #define WAYLAND_SURFACE_ROLE_POPUP 3
 #define WAYLAND_SURFACE_WM_CAPS_MINIMIZE 0x10u
 #define VULKAN_SURFACE_FULLSCREEN_TARGET_FIXED 0
@@ -76,9 +83,9 @@ enum wayland_surface_config_state
 };
 struct wayland_window_config
 {
-    RECT rect, window_rect, client_rect, shm_source;
+    RECT rect, window_rect, client_rect, shm_source, backdrop_rect;
     unsigned int state;
-    BOOL minimized, resizeable, managed, preserve_fullscreen_size;
+    BOOL minimized, resizeable, managed, preserve_fullscreen_size, visible;
     SIZE virtual_size;
     double scale;
 };
@@ -113,6 +120,11 @@ struct wayland_surface
     BOOL fullscreen_requested;
     void *xdg_toplevel;
     void *xdg_surface;
+    void *wl_subsurface;
+    HWND toplevel_hwnd;
+    unsigned int serial, parent_serial;
+    POINT subsurface_position;
+    RECT geometry;
     BOOL resizing;
     struct wayland_window_config window, comitted;
     struct wayland_surface_config current, processing, queued, pending;
@@ -146,7 +158,7 @@ struct wayland_win_data
     RECT application_fullscreen_rect;
     struct wayland_output *application_fullscreen_output;
     unsigned int configure_state_serial;
-    HWND subsurface_parent;
+    HWND toplevel, subsurface_parent, external_host, fullscreen_backdrop;
     BOOL client_rect_in_toplevel_valid, restore_rect_valid, managed;
     RECT client_rect_in_toplevel, restore_rect, present_rect;
 };
@@ -154,8 +166,11 @@ struct wayland_win_data
 static struct wl_output proxies[] = {{1}, {2}, {3}};
 static struct wl_surface proxy = {1}, retired_proxy = {2};
 static struct wayland_output outputs[3];
-static struct wayland_surface surface;
-static struct wayland_win_data window;
+static struct wayland_surface surface, backdrop_surface;
+static struct wayland_win_data window, backdrop;
+static HWND preceding_sibling;
+static RECT protocol_geometry;
+static POINT protocol_backdrop_position;
 static struct wayland_client_surface client;
 static struct wayland_fullscreen_request request;
 static unsigned int posts, raw_positions, position_changes, size_changes, refreshes, exposes;
@@ -208,6 +223,7 @@ static void SetRect(RECT *rect, int left, int top, int right, int bottom)
 {
     *rect = (RECT){left, top, right, bottom};
 }
+static void SetRectEmpty(RECT *rect) { *rect = (RECT){0}; }
 static void OffsetRect(RECT *rect, int x, int y)
 {
     rect->left += x; rect->right += x;
@@ -293,7 +309,13 @@ static struct wayland_win_data *wayland_win_data_get(HWND hwnd)
 static struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd)
 {
     assert(lock_depth == 1);
+    if (backdrop.hwnd && hwnd == backdrop.hwnd) return &backdrop;
     return hwnd == window.hwnd ? &window : NULL;
+}
+static HWND NtUserGetWindowRelative(HWND hwnd, UINT relation)
+{
+    assert(hwnd == backdrop.hwnd && relation == GW_HWNDPREV);
+    return preceding_sibling;
 }
 static void wayland_win_data_release(struct wayland_win_data *data)
 {
@@ -362,10 +384,19 @@ static void xdg_surface_ack_configure(void *value, unsigned int serial)
     ++acknowledgements;
     last_acknowledged = serial;
 }
-static void wayland_surface_reconfigure_geometry(struct wayland_surface *value, RECT rect)
+static void xdg_surface_set_window_geometry(void *value, int x, int y, int width, int height)
 {
-    assert(value == &surface);
-    assert(EqualRect(&rect, &surface.window.rect));
+    assert(value == surface.xdg_surface && width > 0 && height > 0);
+    SetRect(&protocol_geometry, x, y, x + width, y + height);
+}
+static void wl_subsurface_set_position(void *value, int x, int y)
+{
+    assert(value == backdrop_surface.wl_subsurface);
+    protocol_backdrop_position = (POINT){x, y};
+}
+static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *value, int width, int height)
+{
+    assert(value == &surface && width > 0 && height > 0);
 }
 static void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data)
 {
@@ -452,6 +483,7 @@ static void NtUserSetRawWindowPos(HWND hwnd, RECT rect, UINT flags, BOOL interna
     if (disappear_on_move) window.hwnd = NULL;
 }
 void wayland_surface_reset_presentation_output(struct wayland_surface *value);
+struct wayland_win_data *wayland_win_data_get_mapped_backdrop(const struct wayland_win_data *host);
 
 /* MONITOR_PRODUCTION_FUNCTIONS */
 
@@ -488,7 +520,11 @@ static struct fullscreen_decision windowpos_fullscreen_decision(const struct win
     BOOL preserve_fullscreen = FALSE, application_fullscreen = FALSE, updating_output = FALSE;
     RECT application_fullscreen_rect = {0};
 
-    /* MONITOR_PRODUCTION_FULLSCREEN_DECISION */
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        /* MONITOR_PRODUCTION_FULLSCREEN_DECISION */
+        wayland_win_data_release(data);
+    }
     return (struct fullscreen_decision){!!fullscreen, preserve_fullscreen,
                                        application_fullscreen, updating_output, application_fullscreen_rect};
 }
@@ -544,6 +580,11 @@ static void init(void)
     unsigned int i;
     memset(&surface, 0, sizeof(surface));
     memset(&window, 0, sizeof(window));
+    memset(&backdrop, 0, sizeof(backdrop));
+    memset(&backdrop_surface, 0, sizeof(backdrop_surface));
+    preceding_sibling = NULL;
+    protocol_geometry = (RECT){0};
+    protocol_backdrop_position = (POINT){0};
     memset(&client, 0, sizeof(client));
     memset(&request, 0, sizeof(request));
     for (i = 0; i < 3; ++i)
@@ -1141,6 +1182,83 @@ static void accept_configure(int width, int height, unsigned int serial)
     assert(!window.updating_output);
 }
 
+static void test_backdrop_stacking(void)
+{
+    init();
+    backdrop.hwnd = (HWND)(uintptr_t)0x5678;
+    preceding_sibling = window.toplevel = window.hwnd;
+    assert(get_backdrop_parent(backdrop.hwnd, window.hwnd, 0, NULL) == window.hwnd);
+    assert(!get_backdrop_parent(backdrop.hwnd, window.hwnd, SWP_NOZORDER, NULL));
+    assert(get_backdrop_parent(backdrop.hwnd, window.hwnd, SWP_NOZORDER | WINE_SWP_STACKED_AFTER, NULL)
+           == window.hwnd);
+    assert(get_backdrop_parent(backdrop.hwnd, NULL, SWP_NOZORDER, window.hwnd) == window.hwnd);
+    assert(!get_backdrop_parent(backdrop.hwnd, NULL, 0, window.hwnd));
+    preceding_sibling = NULL;
+    assert(!get_backdrop_parent(backdrop.hwnd, window.hwnd, SWP_NOZORDER, window.hwnd));
+    cleanup();
+}
+
+static void test_fullscreen_backdrop(void)
+{
+    RECT content, output;
+
+    init();
+    output = outputs[1].rect; /* Output above and left of the primary. */
+    content = output;
+    content.left += 17;
+    content.top += 13;
+    content.bottom -= 14;
+    window.style = WS_POPUP | WS_VISIBLE;
+    window.rects.window = window.rects.client = window.rects.visible = content;
+    window.fullscreen_backdrop = backdrop.hwnd = (HWND)(uintptr_t)0x5678;
+    backdrop.style = WS_POPUP | WS_DISABLED | WS_VISIBLE;
+    backdrop.is_fullscreen = TRUE;
+    backdrop.application_fullscreen_output = &outputs[1];
+    backdrop.wayland_surface = &backdrop_surface;
+    backdrop_surface.role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    backdrop_surface.wl_subsurface = &proxy;
+    backdrop_surface.toplevel_hwnd = window.hwnd;
+    backdrop_surface.parent_serial = surface.serial = 10;
+    backdrop_surface.window.visible = TRUE;
+    backdrop_surface.window.rect = output;
+    surface.xdg_surface = &proxy;
+    reconfigure_accepted_contents();
+    assert(EqualRect(&surface.window.backdrop_rect, &output));
+    assert(EqualRect(&surface.window.rect, &content) && EqualRect(&surface.window.client_rect, &content));
+    assert(surface.window.state == WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
+    assert(surface.window.preserve_fullscreen_size);
+    /* MONITOR_TOPLEVEL_CALL */;
+    assert(fullscreen_sets == 1 && last_fullscreen_output == &proxies[1]);
+    contents_observer = reconfigure_accepted_contents;
+    configure_rawpos = TRUE;
+    configure_expected_guard = TRUE;
+    accept_configure(output.right - output.left, output.bottom - output.top, 2);
+    assert(!position_changes && !size_changes && EqualRect(&window.rects.client, &content));
+    assert(EqualRect(&protocol_geometry, &(RECT){-17, -13, 2560 - 17, 1440 - 13}));
+    assert(protocol_backdrop_position.x == -17 && protocol_backdrop_position.y == -13);
+    surface.window.scale = 1.25;
+    reconfigure_accepted_contents();
+    assert(EqualRect(&protocol_geometry, &(RECT){-14, -10, 2048 - 14, 1152 - 10}));
+    assert(protocol_backdrop_position.x == -14 && protocol_backdrop_position.y == -10);
+
+    backdrop_surface.window.visible = FALSE;
+    reconfigure_accepted_contents();
+    assert(IsRectEmpty(&surface.window.backdrop_rect) && !surface.window.state);
+    backdrop_surface.window.visible = TRUE;
+    ++backdrop_surface.parent_serial; /* The parent role was replaced. */
+    reconfigure_accepted_contents();
+    assert(IsRectEmpty(&surface.window.backdrop_rect));
+    backdrop_surface.parent_serial = surface.serial;
+    ++backdrop_surface.window.rect.left;
+    reconfigure_accepted_contents();
+    assert(IsRectEmpty(&surface.window.backdrop_rect));
+    backdrop_surface.window.rect = output;
+    window.rects.visible.left = output.left - 1;
+    reconfigure_accepted_contents();
+    assert(IsRectEmpty(&surface.window.backdrop_rect));
+    cleanup();
+}
+
 static void test_fractional_fullscreen_configure(void)
 {
     setup_configure_sequence();
@@ -1363,6 +1481,10 @@ static void test_fullscreen_mapping_guards(void)
 
     init();
     window.style = WS_VISIBLE | WS_POPUP;
+    assert(root_toplevel_visible());
+    window.style &= ~WS_VISIBLE; /* SetWindowLong(GWL_STYLE), without SWP_HIDEWINDOW. */
+    assert(root_toplevel_visible());
+    window.style |= WS_VISIBLE;
     window.rects.window = window.rects.client = window.rects.visible =
         (RECT){10000, 10000, 13840, 11600};
     assert(!root_toplevel_visible());
@@ -1383,6 +1505,9 @@ static void test_fullscreen_mapping_guards(void)
         window.explicitly_hidden = TRUE;
         assert(!root_toplevel_visible());
         window.explicitly_hidden = FALSE;
+        window.style &= ~WS_VISIBLE;
+        assert(root_toplevel_visible());
+        window.style |= WS_VISIBLE;
         presentation_cloaked = TRUE;
         assert(!root_toplevel_visible());
         presentation_cloaked = FALSE;
@@ -2071,6 +2196,8 @@ static void test_sync_before_window_creation(void)
 
 int main(void)
 {
+    test_backdrop_stacking();
+    test_fullscreen_backdrop();
     test_settled_fullscreen_move(FALSE);
     test_settled_fullscreen_move(TRUE);
     test_settled_fullscreen_renew_guards();
