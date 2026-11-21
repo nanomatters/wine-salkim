@@ -499,12 +499,17 @@ struct syscall_frame
     DWORD                 restore_flags; /* 00b4 */
     ULONG64               retval;        /* 00b8 */
     ULONG64               instrumentation_rip; /* 00c0 */
+    ULONG64               iret_flags;    /* 00c8 temporary push before iret */
+    struct machine_frame  iret_frame;    /* 00d0 temporary iret stack */
     DECLSPEC_ALIGN(64) XSAVE_FORMAT xsave;       /* 0100 */
     DECLSPEC_ALIGN(64) XSAVE_AREA_HEADER xstate;    /* 0300 */
 };
 
 C_ASSERT( offsetof( struct syscall_frame, retval ) == 0xb8 );
 C_ASSERT( offsetof( struct syscall_frame, instrumentation_rip ) == 0xc0 );
+C_ASSERT( offsetof( struct syscall_frame, iret_flags ) == 0xc8 );
+C_ASSERT( offsetof( struct syscall_frame, iret_frame ) == 0xd0 );
+C_ASSERT( offsetof( struct syscall_frame, iret_frame ) + sizeof(struct machine_frame) == 0xf8 );
 C_ASSERT( offsetof( struct syscall_frame, xsave ) == 0x100 );
 C_ASSERT( offsetof( struct syscall_frame, xstate ) == 0x300 );
 C_ASSERT( sizeof( struct syscall_frame ) == 0x340);
@@ -3109,6 +3114,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         RIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return_ptr;
         RCX_sig(sigcontext) = (ULONG_PTR)frame;
         RSP_sig(sigcontext) = (ULONG_PTR)frame;
+        EFL_sig(sigcontext) &= ~0x100;  /* restore the saved trap flag at the end of the retry */
     }
     else if (!is_inside_syscall( data, RSP_sig(sigcontext) ))
     {
@@ -3585,6 +3591,16 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  *           __wine_syscall_dispatcher
  */
 
+/* Build a temporary IRET stack so flags and instrumentation never overwrite
+ * the context that the SIGUSR1 handler reads and the retry restores. */
+#define PUSH_SYSCALL_IRET_FRAME \
+    "leaq 0xf8(%rcx),%rsp\n\t"          /* end of frame->iret_frame */ \
+    "pushq 0x90(%rcx)\n\t"             /* ss */ \
+    "pushq 0x88(%rcx)\n\t"             /* rsp */ \
+    "pushq 0x80(%rcx)\n\t"             /* eflags */ \
+    "pushq 0x78(%rcx)\n\t"             /* cs */ \
+    "pushq 0x70(%rcx)\n\t"             /* rip */
+
 /* The instrumentation entry point comes first. This allows the range between
  * __wine_syscall_dispatcher_instrumentation and __wine_syscall_dispatcher_save_end
  * to be considered "entering a syscall" in the SIGUSR1 handler.
@@ -3865,15 +3881,16 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    /* pop rcx-based kernel stack cfi */
                    __ASM_CFI(".cfi_restore_state\n")
 
-                   "1:\ttestl $0x2,%edx\n\t"       /* CONTEXT_INTEGER */
+                   "1:\t" PUSH_SYSCALL_IRET_FRAME
+                   "testl $0x2,%edx\n\t"           /* CONTEXT_INTEGER */
                    "jnz 1f\n\t"
                    /* CONTEXT_CONTROL */
-                   "movq (%rsp),%rcx\n\t"          /* frame->rip */
                    "pushq %r11\n\t"
-                   /* make sure that if trap flag is set the trap happens on the first instruction after iret */
-                   "andq $~0x4000,(%rsp)\n\t" /* make sure NT flag is not set, or iretq will fault */
-                   "popfq\n\t"
-                   "iretq\n"
+                   __ASM_CFI(".cfi_remember_state\n\t")
+                   "movq 8(%rsp),%rcx\n\t"         /* frame->iret_frame.rip */
+                   __ASM_CFI_CFA_IS_AT1(rsp, 0x60) /* frame->syscall_cfa at rsp - 0x20 */
+                   "jmp 4f\n\t"
+                   __ASM_CFI(".cfi_restore_state\n\t")
                    /* CONTEXT_INTEGER */
                    "1:\tmovq 0x00(%rcx),%rax\n\t"
                    "movq 0x18(%rcx),%rdx\n\t"
@@ -3881,25 +3898,30 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "movq 0x38(%rcx),%r9\n\t"
                    "movq 0x40(%rcx),%r10\n\t"
                    "movq 0x48(%rcx),%r11\n\t"
-                   "movq 0x10(%rcx),%rcx\n\t"
                    "pushfq\n\t"
-                   "andq $~0x4000,(%rsp)\n\t" /* make sure NT flag is not set, or iretq will fault */
+                   __ASM_CFI(".cfi_remember_state\n\t")
+                   "movq 0x10(%rcx),%rcx\n\t"
+                   "4:\t"
+                   /* Keep the native frame chain while returning through the temporary stack. */
+                   __ASM_CFI_CFA_IS_AT1(rsp, 0x60) /* frame->syscall_cfa at rsp - 0x20 */
+                   "andq $~0x4000,(%rsp)\n\t"      /* clear NT or iretq will fault */
+                   /* With live TF set by popfq, the trap must be delivered at the iret destination. */
                    "popfq\n\t"
+                   __ASM_CFI_CFA_IS_AT1(rsp, 0x58) /* frame->syscall_cfa at rsp - 0x28 */
                    "iretq\n"
+                   __ASM_CFI(".cfi_restore_state\n\t")
                    /* RESTORE_FLAGS_INSTRUMENTATION */
                    "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
                    "movq (%r10),%r10\n\t"
                    "test %r10,%r10\n\t"
                    "jz 3b\n\t"
+                   PUSH_SYSCALL_IRET_FRAME
                    "testl $0x2,%edx\n\t"          /* CONTEXT_INTEGER */
                    "jnz 1b\n\t"
-                   "movq %r10,(%rsp)\n\t"         /* frame->rip */
+                   "movq %r10,(%rsp)\n\t"         /* frame->iret_frame.rip */
                    "movq 0xc0(%rcx),%r10\n\t"     /* frame->instrumentation_rip */
                    "pushq %r11\n\t"
-                   /* make sure that if trap flag is set the trap happens on the first instruction after iret */
-                   "andq $~0x4000,(%rsp)\n\t" /* make sure NT flag is not set, or iretq will fault */
-                   "popfq\n\t"
-                   "iretq\n"
+                   "jmp 4b\n\t"
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return_end") ":\n"
 
                    /* pop rbp-based kernel stack cfi */
